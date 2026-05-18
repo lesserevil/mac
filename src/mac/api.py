@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from mac.models import AuthorizationError, MACError, NotFoundError
@@ -217,6 +219,32 @@ class RolloutCreate(BaseModel):
     artifact_uri: Optional[str] = None
     artifact_hash: Optional[str] = None
     health_policy: Dict[str, Any] = Field(default_factory=dict)
+    required_eval_set_id: Optional[str] = None
+
+
+class EvalSetCreate(BaseModel):
+    name: str
+    scoring: str = "higher_is_better"
+    description: str = ""
+    baseline_score: Optional[float] = None
+    regression_threshold: float = 0.0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_by: str = "human"
+
+
+class EvalSetBaselineUpdate(BaseModel):
+    baseline_score: float
+    actor: str = "human"
+
+
+class EvalRunRecord(BaseModel):
+    eval_set_id: str
+    target_kind: str
+    target_id: str
+    score: float
+    detail: Dict[str, Any] = Field(default_factory=dict)
+    evidence_id: Optional[str] = None
+    created_by: str = "human"
 
 
 class RolloutAdvance(BaseModel):
@@ -253,6 +281,8 @@ def _load_auth_tokens_from_env() -> Dict[str, List[str]]:
 
 def _required_scope(method: str, path: str) -> Optional[str]:
     if path == "/health":
+        return None
+    if path == "/ui" or path.startswith("/ui/"):
         return None
     if method == "GET":
         return "read"
@@ -296,6 +326,9 @@ def create_app(
     app = FastAPI(title="MAC Control Plane", version="0.1.0")
     app.state.control_plane = cp
     app.state.auth_tokens = tokens
+    ui_dir = Path(__file__).with_name("ui")
+    if ui_dir.exists():
+        app.mount("/ui/assets", StaticFiles(directory=str(ui_dir)), name="ui-assets")
 
     @app.exception_handler(MACError)
     async def handle_mac_error(request: Any, exc: MACError) -> JSONResponse:
@@ -321,6 +354,11 @@ def create_app(
     @app.get("/health")
     def health() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/ui", include_in_schema=False)
+    @app.get("/ui/", include_in_schema=False)
+    def dashboard() -> FileResponse:
+        return FileResponse(ui_dir / "index.html")
 
     @app.post("/tenants")
     def register_tenant(body: TenantRegister) -> Dict[str, Any]:
@@ -544,6 +582,39 @@ def create_app(
         subject_id: Optional[str] = Query(default=None),
     ) -> List[Dict[str, Any]]:
         return [record.to_dict() for record in cp.search_memory(task_id, subject_type, subject_id)]
+
+    @app.post("/eval-sets")
+    def create_eval_set(body: EvalSetCreate) -> Dict[str, Any]:
+        return cp.create_eval_set(**_data(body)).to_dict()
+
+    @app.get("/eval-sets")
+    def list_eval_sets() -> List[Dict[str, Any]]:
+        return [eval_set.to_dict() for eval_set in cp.list_eval_sets()]
+
+    @app.get("/eval-sets/{eval_set_id}")
+    def get_eval_set(eval_set_id: str) -> Dict[str, Any]:
+        return cp.get_eval_set(eval_set_id).to_dict()
+
+    @app.post("/eval-sets/{eval_set_id}/baseline")
+    def update_eval_set_baseline(eval_set_id: str, body: EvalSetBaselineUpdate) -> Dict[str, Any]:
+        return cp.update_eval_set_baseline(eval_set_id, body.baseline_score, body.actor).to_dict()
+
+    @app.get("/eval-sets/{eval_set_id}/events")
+    def list_eval_set_events(eval_set_id: str) -> List[Dict[str, Any]]:
+        return cp.list_eval_set_events(eval_set_id)
+
+    @app.post("/eval-runs")
+    def record_eval_run(body: EvalRunRecord) -> Dict[str, Any]:
+        data = _data(body)
+        eval_set_id = data.pop("eval_set_id")
+        return cp.record_eval_run(eval_set_id, **data).to_dict()
+
+    @app.get("/eval-runs")
+    def list_eval_runs(
+        eval_set_id: Optional[str] = Query(default=None),
+        target_id: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [run.to_dict() for run in cp.list_eval_runs(eval_set_id, target_id)]
 
     @app.post("/rollouts")
     def create_rollout(body: RolloutCreate) -> Dict[str, Any]:

@@ -346,8 +346,53 @@ def cmd_rollout_create(args: argparse.Namespace) -> None:
             artifact_uri=args.artifact_uri,
             artifact_hash=args.artifact_hash,
             health_policy=_json_arg(args.health_policy, {}),
+            required_eval_set_id=args.required_eval_set_id,
         )
     )
+
+
+def cmd_eval_set_create(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).create_eval_set(
+            args.name,
+            scoring=args.scoring,
+            description=args.description or "",
+            baseline_score=args.baseline_score,
+            regression_threshold=args.regression_threshold,
+            metadata=_json_arg(args.metadata, {}),
+            created_by=args.created_by,
+        )
+    )
+
+
+def cmd_eval_set_list(args: argparse.Namespace) -> None:
+    _print([eval_set.to_dict() for eval_set in _plane(args).list_eval_sets()])
+
+
+def cmd_eval_set_show(args: argparse.Namespace) -> None:
+    _print(_plane(args).get_eval_set(args.eval_set))
+
+
+def cmd_eval_set_baseline(args: argparse.Namespace) -> None:
+    _print(_plane(args).update_eval_set_baseline(args.eval_set, args.baseline_score, args.actor))
+
+
+def cmd_eval_run_record(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).record_eval_run(
+            args.eval_set,
+            args.target_kind,
+            args.target_id,
+            args.score,
+            detail=_json_arg(args.detail, {}),
+            evidence_id=args.evidence_id,
+            created_by=args.created_by,
+        )
+    )
+
+
+def cmd_eval_run_list(args: argparse.Namespace) -> None:
+    _print([run.to_dict() for run in _plane(args).list_eval_runs(args.eval_set, args.target_id)])
 
 
 def cmd_rollout_list(args: argparse.Namespace) -> None:
@@ -652,6 +697,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_create.add_argument("--artifact-uri")
     rollout_create.add_argument("--artifact-hash")
     rollout_create.add_argument("--health-policy")
+    rollout_create.add_argument("--required-eval-set-id")
     _set(cmd_rollout_create, rollout_create)
     rollout_list = rollout.add_parser("list")
     rollout_list.add_argument("--tenant-id")
@@ -680,6 +726,54 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_rescue.add_argument("--reason", required=True)
     rollout_rescue.add_argument("--detail")
     _set(cmd_rollout_rescue, rollout_rescue)
+
+    eval_root = sub.add_parser("eval", help="evaluation sets and runs").add_subparsers(
+        dest="eval_command", required=True
+    )
+    eval_set_grp = eval_root.add_parser("set", help="eval set commands").add_subparsers(
+        dest="eval_set_command", required=True
+    )
+    eval_set_create = eval_set_grp.add_parser("create")
+    eval_set_create.add_argument("name")
+    eval_set_create.add_argument(
+        "--scoring", choices=("higher_is_better", "lower_is_better"), default="higher_is_better"
+    )
+    eval_set_create.add_argument("--description", default="")
+    eval_set_create.add_argument("--baseline-score", type=float, default=None)
+    eval_set_create.add_argument("--regression-threshold", type=float, default=0.0)
+    eval_set_create.add_argument("--metadata")
+    eval_set_create.add_argument("--created-by", default="human")
+    _set(cmd_eval_set_create, eval_set_create)
+    eval_set_list = eval_set_grp.add_parser("list")
+    _set(cmd_eval_set_list, eval_set_list)
+    eval_set_show = eval_set_grp.add_parser("show")
+    eval_set_show.add_argument("eval_set")
+    _set(cmd_eval_set_show, eval_set_show)
+    eval_set_baseline = eval_set_grp.add_parser("baseline")
+    eval_set_baseline.add_argument("eval_set")
+    eval_set_baseline.add_argument("baseline_score", type=float)
+    eval_set_baseline.add_argument("--actor", default="human")
+    _set(cmd_eval_set_baseline, eval_set_baseline)
+
+    eval_run_grp = eval_root.add_parser("run", help="eval run commands").add_subparsers(
+        dest="eval_run_command", required=True
+    )
+    eval_run_record = eval_run_grp.add_parser("record")
+    eval_run_record.add_argument("eval_set")
+    eval_run_record.add_argument(
+        "target_kind",
+        choices=("rollout_version", "runtime_environment", "agent_build"),
+    )
+    eval_run_record.add_argument("target_id")
+    eval_run_record.add_argument("score", type=float)
+    eval_run_record.add_argument("--detail")
+    eval_run_record.add_argument("--evidence-id")
+    eval_run_record.add_argument("--created-by", default="human")
+    _set(cmd_eval_run_record, eval_run_record)
+    eval_run_list = eval_run_grp.add_parser("list")
+    eval_run_list.add_argument("--eval-set", dest="eval_set")
+    eval_run_list.add_argument("--target-id")
+    _set(cmd_eval_run_list, eval_run_list)
 
     return parser
 

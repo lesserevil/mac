@@ -16,6 +16,10 @@ from mac.models import (
     AgentStatus,
     AuthorizationError,
     EVIDENCE_KINDS,
+    EvalRun,
+    EvalScoringDirection,
+    EvalSet,
+    EvalTargetKind,
     Evidence,
     HealthStatus,
     HistoryEvent,
@@ -1832,6 +1836,249 @@ class ControlPlane:
         rows = self.store.query_all(sql, tuple(params))
         return [self._memory_from_row(row) for row in rows]
 
+    # Evaluation
+
+    def create_eval_set(
+        self,
+        name: str,
+        scoring: str = EvalScoringDirection.HIGHER_IS_BETTER.value,
+        description: str = "",
+        baseline_score: Optional[float] = None,
+        regression_threshold: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_by: str = "human",
+    ) -> EvalSet:
+        name = (name or "").strip()
+        if not name:
+            raise ValidationError("eval_set name is required")
+        scoring_value = _state_value(scoring)
+        try:
+            EvalScoringDirection(scoring_value)
+        except ValueError:
+            raise ValidationError("unsupported eval scoring direction: %s" % scoring_value)
+        if regression_threshold < 0:
+            raise ValidationError("regression_threshold must be >= 0")
+        now = utcnow()
+        eval_id = new_id("evalset")
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO eval_sets (
+                    id, name, description, scoring, baseline_score, regression_threshold,
+                    metadata, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    eval_id,
+                    name,
+                    description,
+                    scoring_value,
+                    None if baseline_score is None else float(baseline_score),
+                    float(regression_threshold),
+                    json_dumps(ensure_json_object(metadata)),
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_eval_set_event(
+                conn,
+                eval_id,
+                "eval_set.created",
+                created_by,
+                {
+                    "scoring": scoring_value,
+                    "baseline_score": baseline_score,
+                    "regression_threshold": float(regression_threshold),
+                },
+                now,
+            )
+        return self.get_eval_set(eval_id)
+
+    def get_eval_set(self, eval_set_id_or_name: str) -> EvalSet:
+        row = self.store.query_one(
+            "SELECT * FROM eval_sets WHERE id = ? OR name = ?",
+            (eval_set_id_or_name, eval_set_id_or_name),
+        )
+        if row is None:
+            raise NotFoundError("eval_set not found: %s" % eval_set_id_or_name)
+        return self._eval_set_from_row(row)
+
+    def list_eval_sets(self) -> List[EvalSet]:
+        rows = self.store.query_all("SELECT * FROM eval_sets ORDER BY name")
+        return [self._eval_set_from_row(row) for row in rows]
+
+    def update_eval_set_baseline(
+        self,
+        eval_set_id_or_name: str,
+        baseline_score: float,
+        actor: str = "human",
+    ) -> EvalSet:
+        eval_set = self.get_eval_set(eval_set_id_or_name)
+        new_baseline = float(baseline_score)
+        now = utcnow()
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE eval_sets SET baseline_score = ?, updated_at = ? WHERE id = ?",
+                (new_baseline, now, eval_set.id),
+            )
+            # Frozen `passed` on prior runs does NOT auto-recompute. Operators
+            # weakening or tightening the gate need this trail to explain why
+            # historical runs read differently from a re-evaluation.
+            self._insert_eval_set_event(
+                conn,
+                eval_set.id,
+                "eval_set.baseline_changed",
+                actor,
+                {
+                    "previous_baseline_score": eval_set.baseline_score,
+                    "new_baseline_score": new_baseline,
+                },
+                now,
+            )
+        return self.get_eval_set(eval_set.id)
+
+    def list_eval_set_events(self, eval_set_id_or_name: str) -> List[JsonDict]:
+        eval_set = self.get_eval_set(eval_set_id_or_name)
+        rows = self.store.query_all(
+            "SELECT * FROM eval_set_events WHERE eval_set_id = ? ORDER BY created_at, id",
+            (eval_set.id,),
+        )
+        return [
+            {
+                "id": row["id"],
+                "eval_set_id": row["eval_set_id"],
+                "event_type": row["event_type"],
+                "actor": row["actor"],
+                "detail": json_loads(row["detail"], {}),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def record_eval_run(
+        self,
+        eval_set_id_or_name: str,
+        target_kind: str,
+        target_id: str,
+        score: float,
+        detail: Optional[Dict[str, Any]] = None,
+        evidence_id: Optional[str] = None,
+        created_by: str = "human",
+    ) -> EvalRun:
+        eval_set = self.get_eval_set(eval_set_id_or_name)
+        target_kind_value = _state_value(target_kind)
+        try:
+            EvalTargetKind(target_kind_value)
+        except ValueError:
+            raise ValidationError("unsupported eval target_kind: %s" % target_kind_value)
+        if not target_id:
+            raise ValidationError("eval run target_id is required")
+        if evidence_id is not None:
+            evidence = self.get_evidence(evidence_id)
+            if evidence.kind != "eval":
+                raise ValidationError(
+                    "eval run evidence must have kind='eval' (got '%s')" % evidence.kind
+                )
+        score_f = float(score)
+        baseline = eval_set.baseline_score
+        threshold = eval_set.regression_threshold
+        if baseline is None:
+            delta = None
+            passed = True
+        else:
+            delta = score_f - baseline
+            if eval_set.scoring == EvalScoringDirection.HIGHER_IS_BETTER.value:
+                # passing means the score did not regress past the threshold
+                passed = delta >= -threshold
+            else:
+                # lower is better — score should not exceed baseline by more than threshold
+                passed = delta <= threshold
+        now = utcnow()
+        run_id = new_id("evalrun")
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO eval_runs (
+                    id, eval_set_id, target_kind, target_id, score, baseline_score,
+                    delta, threshold, passed, detail, evidence_id, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    eval_set.id,
+                    target_kind_value,
+                    target_id,
+                    score_f,
+                    baseline,
+                    delta,
+                    threshold,
+                    1 if passed else 0,
+                    json_dumps(ensure_json_object(detail)),
+                    evidence_id,
+                    created_by,
+                    now,
+                ),
+            )
+            self._insert_eval_set_event(
+                conn,
+                eval_set.id,
+                "eval_set.run_recorded",
+                created_by,
+                {
+                    "run_id": run_id,
+                    "target_kind": target_kind_value,
+                    "target_id": target_id,
+                    "score": score_f,
+                    "passed": bool(passed),
+                    "evidence_id": evidence_id,
+                },
+                now,
+            )
+        return self.get_eval_run(run_id)
+
+    def get_eval_run(self, run_id: str) -> EvalRun:
+        row = self.store.query_one("SELECT * FROM eval_runs WHERE id = ?", (run_id,))
+        if row is None:
+            raise NotFoundError("eval_run not found: %s" % run_id)
+        return self._eval_run_from_row(row)
+
+    def latest_eval_run(
+        self,
+        eval_set_id: str,
+        target_kind: str,
+        target_id: str,
+    ) -> Optional[EvalRun]:
+        row = self.store.query_one(
+            """
+            SELECT * FROM eval_runs
+            WHERE eval_set_id = ? AND target_kind = ? AND target_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (eval_set_id, _state_value(target_kind), target_id),
+        )
+        return self._eval_run_from_row(row) if row is not None else None
+
+    def list_eval_runs(
+        self,
+        eval_set_id: Optional[str] = None,
+        target_id: Optional[str] = None,
+    ) -> List[EvalRun]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if eval_set_id is not None:
+            clauses.append("eval_set_id = ?")
+            params.append(eval_set_id)
+        if target_id is not None:
+            clauses.append("target_id = ?")
+            params.append(target_id)
+        sql = "SELECT * FROM eval_runs"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at, id"
+        return [self._eval_run_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+
     # Rollout and rescue
 
     def create_rollout(
@@ -1846,6 +2093,7 @@ class ControlPlane:
         artifact_uri: Optional[str] = None,
         artifact_hash: Optional[str] = None,
         health_policy: Optional[Dict[str, Any]] = None,
+        required_eval_set_id: Optional[str] = None,
     ) -> Rollout:
         if not version:
             raise ValidationError("rollout version is required")
@@ -1867,6 +2115,8 @@ class ControlPlane:
             raise ValidationError("artifact_uri and artifact_hash must be provided together")
         if artifact_hash is not None:
             self._validate_artifact_hash(artifact_hash)
+        if required_eval_set_id is not None:
+            self.get_eval_set(required_eval_set_id)
         policy = ensure_json_object(health_policy)
         now = utcnow()
         rollout_id = new_id("rollout")
@@ -1875,8 +2125,8 @@ class ControlPlane:
             INSERT INTO rollouts (
                 id, version, strategy, status, target_percent, tenant_id, channel,
                 runtime_environment_id, artifact_uri, artifact_hash, health_policy,
-                created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                required_eval_set_id, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rollout_id,
@@ -1890,6 +2140,7 @@ class ControlPlane:
                 artifact_uri,
                 artifact_hash,
                 json_dumps(policy),
+                required_eval_set_id,
                 created_by,
                 now,
                 now,
@@ -2008,11 +2259,68 @@ class ControlPlane:
             detail.setdefault("target_percent", rule["target_percent"])
         target_percent = int(detail.get("target_percent", rollout.target_percent))
         now = utcnow()
-        self.store.execute(
-            "UPDATE rollouts SET status = ?, target_percent = ?, updated_at = ? WHERE id = ?",
-            (status, target_percent, now, rollout_id),
-        )
-        self._record_rollout_event(rollout_id, "rollout.%s" % action, actor, detail)
+
+        # The eval gate is read inside the transaction that commits the rollout
+        # status change. BEGIN IMMEDIATE blocks concurrent writers (including
+        # record_eval_run), so a failing run cannot land between gate-read and
+        # commit. The conditional UPDATE on status ensures no other writer
+        # advanced the rollout out from under us.
+        with self.store.transaction() as conn:
+            if action == "promote" and rollout.required_eval_set_id is not None:
+                eval_set_row = conn.execute(
+                    "SELECT id FROM eval_sets WHERE id = ?",
+                    (rollout.required_eval_set_id,),
+                ).fetchone()
+                if eval_set_row is None:
+                    raise ValidationError(
+                        "rollout promote blocked: required eval_set %s no longer exists"
+                        % rollout.required_eval_set_id
+                    )
+                run_row = conn.execute(
+                    """
+                    SELECT id, score, delta, threshold, passed
+                    FROM eval_runs
+                    WHERE eval_set_id = ? AND target_kind = ? AND target_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        rollout.required_eval_set_id,
+                        EvalTargetKind.ROLLOUT_VERSION.value,
+                        rollout.version,
+                    ),
+                ).fetchone()
+                if run_row is None:
+                    raise ValidationError(
+                        "rollout promote requires an eval_run against %s for version %s"
+                        % (rollout.required_eval_set_id, rollout.version)
+                    )
+                if not bool(run_row["passed"]):
+                    raise ValidationError(
+                        "rollout promote blocked: latest eval_run %s did not pass (score=%s delta=%s threshold=%s)"
+                        % (run_row["id"], run_row["score"], run_row["delta"], run_row["threshold"])
+                    )
+                detail.setdefault("eval_run_id", run_row["id"])
+                detail.setdefault("eval_score", run_row["score"])
+            cursor = conn.execute(
+                """
+                UPDATE rollouts
+                SET status = ?, target_percent = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (status, target_percent, now, rollout_id, rollout.status),
+            )
+            if cursor.rowcount != 1:
+                raise TransitionError(
+                    "rollout %s status changed during advance; retry" % rollout_id
+                )
+            conn.execute(
+                """
+                INSERT INTO rollout_events (id, rollout_id, event_type, actor, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (new_id("revt"), rollout_id, "rollout.%s" % action, actor, json_dumps(detail), now),
+            )
         return self.get_rollout(rollout_id)
 
     def evaluate_rollout_health(
@@ -2345,6 +2653,8 @@ class ControlPlane:
         )
 
     def _rollout_from_row(self, row: Any) -> Rollout:
+        keys = row.keys() if hasattr(row, "keys") else []
+        required_eval_set_id = row["required_eval_set_id"] if "required_eval_set_id" in keys else None
         return Rollout(
             row["id"],
             row["version"],
@@ -2357,9 +2667,41 @@ class ControlPlane:
             row["artifact_uri"],
             row["artifact_hash"],
             json_loads(row["health_policy"], {}),
+            required_eval_set_id,
             row["created_by"],
             row["created_at"],
             row["updated_at"],
+        )
+
+    def _eval_set_from_row(self, row: Any) -> "EvalSet":
+        return EvalSet(
+            row["id"],
+            row["name"],
+            row["description"],
+            row["scoring"],
+            row["baseline_score"],
+            row["regression_threshold"],
+            json_loads(row["metadata"], {}),
+            row["created_by"],
+            row["created_at"],
+            row["updated_at"],
+        )
+
+    def _eval_run_from_row(self, row: Any) -> "EvalRun":
+        return EvalRun(
+            row["id"],
+            row["eval_set_id"],
+            row["target_kind"],
+            row["target_id"],
+            row["score"],
+            row["baseline_score"],
+            row["delta"],
+            row["threshold"],
+            bool(row["passed"]),
+            json_loads(row["detail"], {}),
+            row["evidence_id"],
+            row["created_by"],
+            row["created_at"],
         )
 
     # Internal helpers
@@ -2388,6 +2730,26 @@ class ControlPlane:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (new_id("revt"), rollout_id, event_type, actor, json_dumps(detail), utcnow()),
+        )
+
+    def _insert_eval_set_event(
+        self,
+        conn: Any,
+        eval_set_id: str,
+        event_type: str,
+        actor: str,
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        # Uses the caller's connection so the event lands in the same transaction
+        # as the originating write (create / baseline change / run record). Audit
+        # trail and durable state must commit together.
+        conn.execute(
+            """
+            INSERT INTO eval_set_events (id, eval_set_id, event_type, actor, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_id("eevt"), eval_set_id, event_type, actor, json_dumps(detail), when),
         )
 
     def _rollout_install_ready(self, rollout: Rollout) -> None:

@@ -30,6 +30,7 @@ This project provides durable contracts for coordinating a fleet:
 - Reproducible runtime manifests with stable digests and secret-value checks.
 - Tenant, user, Persona, Hermes instance, and platform binding records for multi-user expansion.
 - Project bridge, operational memory/provenance records, and gated rollout/rescue workflows.
+- Evaluation contract: named `eval_sets` (scoring direction, baseline, regression threshold) and `eval_runs` against rollout versions, runtime environments, or agent builds; rollouts can require a passing `eval_run` before `promote`.
 - FastAPI REST API and `mac` CLI.
 - Hermes-side `mac-hermes` adapter for registration, sanitized task creation, status replies, and memory write-back payloads.
 
@@ -87,6 +88,13 @@ Set `MAC_API_TOKEN` for one admin token, or `MAC_API_TOKENS` as JSON such as
 tokens. With no API token configured, the local prototype API remains open for
 development.
 
+The built-in dashboard is served at `/ui`. Static dashboard assets are public so
+the browser can load the shell, while data requests still use the same API token
+rules as the REST API. Enter a token with `read` scope in the dashboard when API
+tokens are enabled. The dashboard source is plain TypeScript in
+`src/mac/ui/app.ts`; the checked-in `app.js` browser output is served directly so
+there is no Node.js, npm, bundler, or frontend build step.
+
 Key route groups:
 
 - `/tenants`, `/users`, `/personas`
@@ -98,6 +106,7 @@ Key route groups:
 - `/runtimes`, `/runtime-runs`
 - `/bridge/items`, `/memory`
 - `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
+- `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-runs`
 
 ## CLI Examples
 
@@ -130,6 +139,18 @@ mac --db mac.db rollout create 1.2.0 canary --runtime runtime_... \
 mac --db mac.db rollout advance rollout_... start_canary --actor human
 mac --db mac.db rollout health rollout_... \
     --checks '{"runtime":"healthy","canary":"ok"}' --actor monitor
+
+# Evaluation: define a scored eval set, record runs against rollout versions,
+# and gate promotion on a passing run.
+mac --db mac.db eval set create task-success-rate \
+    --scoring higher_is_better --baseline-score 0.90 --regression-threshold 0.02
+mac --db mac.db eval run record evalset_... rollout_version 1.2.0 0.93
+mac --db mac.db rollout create 1.3.0 canary --runtime runtime_... \
+    --artifact-uri artifact://mac/1.3.0 --artifact-hash sha256:def456 \
+    --required-eval-set-id evalset_... --created-by human
+mac --db mac.db rollout advance rollout_... start_canary --actor human
+# promote refused until a passing eval run exists for version 1.3.0
+mac --db mac.db rollout advance rollout_... promote --actor human
 ```
 
 Hermes-facing API adapter:

@@ -1,3 +1,4 @@
+import json
 import threading
 
 import pytest
@@ -715,3 +716,230 @@ def test_runtime_manifest_rejects_nested_latest_and_substring_secret_fields(cp):
             {"image": "python:3.12"},
             "human",
         )
+
+
+def test_eval_set_scoring_higher_is_better_pass_fail(cp):
+    eval_set = cp.create_eval_set(
+        "task-success-rate",
+        scoring="higher_is_better",
+        baseline_score=0.80,
+        regression_threshold=0.02,
+    )
+    passing = cp.record_eval_run(eval_set.id, "rollout_version", "v1", 0.81)
+    assert passing.passed is True
+    assert passing.delta == pytest.approx(0.01)
+
+    inside_threshold = cp.record_eval_run(eval_set.id, "rollout_version", "v1", 0.79)
+    assert inside_threshold.passed is True  # 0.01 below baseline, within 0.02 threshold
+
+    regression = cp.record_eval_run(eval_set.id, "rollout_version", "v1", 0.70)
+    assert regression.passed is False
+    assert regression.delta == pytest.approx(-0.10)
+
+
+def test_eval_set_scoring_lower_is_better_pass_fail(cp):
+    eval_set = cp.create_eval_set(
+        "p95-latency-ms",
+        scoring="lower_is_better",
+        baseline_score=200.0,
+        regression_threshold=20.0,
+    )
+    improvement = cp.record_eval_run(eval_set.id, "runtime_environment", "rt1", 150.0)
+    assert improvement.passed is True
+
+    inside_threshold = cp.record_eval_run(eval_set.id, "runtime_environment", "rt1", 215.0)
+    assert inside_threshold.passed is True
+
+    regression = cp.record_eval_run(eval_set.id, "runtime_environment", "rt1", 260.0)
+    assert regression.passed is False
+
+
+def test_eval_run_without_baseline_passes_and_can_seed_baseline(cp):
+    eval_set = cp.create_eval_set("first-run", scoring="higher_is_better")
+    run = cp.record_eval_run(eval_set.id, "rollout_version", "v0", 0.55)
+    assert run.passed is True
+    assert run.delta is None
+
+    updated = cp.update_eval_set_baseline(eval_set.id, 0.60)
+    assert updated.baseline_score == pytest.approx(0.60)
+    # subsequent runs are now compared against the seeded baseline
+    follow_up = cp.record_eval_run(eval_set.id, "rollout_version", "v1", 0.50)
+    assert follow_up.passed is False
+
+
+def test_rollout_promote_requires_passing_eval_run(cp):
+    eval_set = cp.create_eval_set(
+        "smoke-eval",
+        scoring="higher_is_better",
+        baseline_score=0.90,
+        regression_threshold=0.01,
+    )
+    rollout = create_verified_rollout(cp, "2.0")
+    # attach the eval_set requirement after-the-fact via a fresh rollout
+    runtime = create_runtime(cp, "runtime-2.1")
+    gated = cp.create_rollout(
+        "2.1",
+        "canary",
+        10,
+        "human",
+        runtime_environment_id=runtime.id,
+        artifact_uri="artifact://mac/2.1",
+        artifact_hash="sha256:abc123",
+        required_eval_set_id=eval_set.id,
+    )
+    cp.advance_rollout(gated.id, "start_canary", "human")
+    cp.evaluate_rollout_health(gated.id, {}, "human")  # default health gate passes
+
+    # No eval run yet — promote refused.
+    with pytest.raises(ValidationError):
+        cp.advance_rollout(gated.id, "promote", "human")
+
+    # A failing run is still refused.
+    cp.record_eval_run(eval_set.id, "rollout_version", "2.1", 0.70)
+    with pytest.raises(ValidationError):
+        cp.advance_rollout(gated.id, "promote", "human")
+
+    # A passing run unlocks promote.
+    cp.record_eval_run(eval_set.id, "rollout_version", "2.1", 0.92)
+    promoted = cp.advance_rollout(gated.id, "promote", "human")
+    assert promoted.status == RolloutStatus.PROMOTED.value
+    assert promoted.target_percent == 100
+
+    # Sanity: an ungated rollout doesn't need an eval.
+    assert rollout.required_eval_set_id is None
+
+
+def test_eval_run_rejects_unknown_target_kind(cp):
+    eval_set = cp.create_eval_set("any", scoring="higher_is_better")
+    with pytest.raises(ValidationError):
+        cp.record_eval_run(eval_set.id, "not-a-real-kind", "x", 1.0)
+
+
+def test_evidence_kind_eval_is_accepted(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id, "eval", "artifact://scorecard.json", "eval scorecard", worker.id
+    )
+    assert evidence.kind == "eval"
+
+
+def _gated_rollout(cp, version, eval_set_id):
+    runtime = create_runtime(cp, "runtime-%s" % version)
+    rollout = cp.create_rollout(
+        version,
+        "canary",
+        10,
+        "human",
+        runtime_environment_id=runtime.id,
+        artifact_uri="artifact://mac/%s" % version,
+        artifact_hash="sha256:abc123",
+        required_eval_set_id=eval_set_id,
+    )
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    cp.evaluate_rollout_health(rollout.id, {}, "human")
+    return rollout
+
+
+def test_eval_gate_blocks_when_failing_run_supersedes_passing(cp):
+    eval_set = cp.create_eval_set(
+        "smoke",
+        scoring="higher_is_better",
+        baseline_score=0.90,
+        regression_threshold=0.01,
+    )
+    rollout = _gated_rollout(cp, "3.0", eval_set.id)
+    # An older passing run is no longer "latest" once a failing run lands.
+    cp.record_eval_run(eval_set.id, "rollout_version", "3.0", 0.95)
+    cp.record_eval_run(eval_set.id, "rollout_version", "3.0", 0.50)
+    with pytest.raises(ValidationError):
+        cp.advance_rollout(rollout.id, "promote", "human")
+
+
+def test_eval_run_rejects_non_eval_evidence(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    test_evidence = cp.add_evidence(
+        task.id, "test", "artifact://pytest", "pytest passed", worker.id
+    )
+    eval_set = cp.create_eval_set("any", scoring="higher_is_better")
+    with pytest.raises(ValidationError):
+        cp.record_eval_run(
+            eval_set.id,
+            "rollout_version",
+            "v1",
+            0.9,
+            evidence_id=test_evidence.id,
+        )
+
+
+def test_eval_gate_errors_clearly_when_required_eval_set_is_deleted(cp):
+    eval_set = cp.create_eval_set(
+        "smoke",
+        scoring="higher_is_better",
+        baseline_score=0.90,
+    )
+    rollout = _gated_rollout(cp, "4.0", eval_set.id)
+    cp.record_eval_run(eval_set.id, "rollout_version", "4.0", 0.95)
+    # Delete the eval_set directly to simulate retirement.
+    cp.store.execute("DELETE FROM eval_sets WHERE id = ?", (eval_set.id,))
+    with pytest.raises(ValidationError) as exc:
+        cp.advance_rollout(rollout.id, "promote", "human")
+    assert "no longer exists" in str(exc.value)
+
+
+def test_eval_gate_records_eval_run_id_in_rollout_event(cp):
+    eval_set = cp.create_eval_set(
+        "smoke",
+        scoring="higher_is_better",
+        baseline_score=0.90,
+        regression_threshold=0.01,
+    )
+    rollout = _gated_rollout(cp, "5.0", eval_set.id)
+    run = cp.record_eval_run(eval_set.id, "rollout_version", "5.0", 0.95)
+    cp.advance_rollout(rollout.id, "promote", "human")
+    rows = cp.store.query_all(
+        "SELECT event_type, detail FROM rollout_events WHERE rollout_id = ? ORDER BY created_at, id",
+        (rollout.id,),
+    )
+    promote = [row for row in rows if row["event_type"] == "rollout.promote"]
+    assert len(promote) == 1
+    detail = json.loads(promote[0]["detail"])
+    assert detail["eval_run_id"] == run.id
+    assert detail["eval_score"] == pytest.approx(0.95)
+
+
+def test_eval_set_baseline_change_writes_event(cp):
+    eval_set = cp.create_eval_set(
+        "drift",
+        scoring="higher_is_better",
+        baseline_score=0.80,
+    )
+    cp.update_eval_set_baseline(eval_set.id, 0.85, actor="release-manager")
+    events = cp.list_eval_set_events(eval_set.id)
+    types = [event["event_type"] for event in events]
+    assert "eval_set.created" in types
+    baseline_events = [event for event in events if event["event_type"] == "eval_set.baseline_changed"]
+    assert len(baseline_events) == 1
+    assert baseline_events[0]["actor"] == "release-manager"
+    assert baseline_events[0]["detail"]["previous_baseline_score"] == pytest.approx(0.80)
+    assert baseline_events[0]["detail"]["new_baseline_score"] == pytest.approx(0.85)
+
+
+def test_eval_run_event_records_run_id_and_passed(cp):
+    eval_set = cp.create_eval_set(
+        "smoke",
+        scoring="higher_is_better",
+        baseline_score=0.90,
+        regression_threshold=0.01,
+    )
+    run = cp.record_eval_run(eval_set.id, "rollout_version", "6.0", 0.95)
+    events = cp.list_eval_set_events(eval_set.id)
+    run_events = [event for event in events if event["event_type"] == "eval_set.run_recorded"]
+    assert len(run_events) == 1
+    assert run_events[0]["detail"]["run_id"] == run.id
+    assert run_events[0]["detail"]["passed"] is True

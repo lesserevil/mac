@@ -583,9 +583,47 @@ class Rollout:
     artifact_uri: Optional[str]
     artifact_hash: Optional[str]
     health_policy: JsonDict
+    required_eval_set_id: Optional[str]
     created_by: str
     created_at: str
     updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class EvalSet:
+    id: str
+    name: str
+    description: str
+    scoring: str
+    baseline_score: Optional[float]
+    regression_threshold: float
+    metadata: JsonDict
+    created_by: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class EvalRun:
+    id: str
+    eval_set_id: str
+    target_kind: str
+    target_id: str
+    score: float
+    baseline_score: Optional[float]
+    delta: Optional[float]
+    threshold: float
+    passed: bool
+    detail: JsonDict
+    evidence_id: Optional[str]
+    created_by: str
+    created_at: str
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

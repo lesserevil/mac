@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MAC Control Plane</title>
+    <link rel="stylesheet" href="/ui/assets/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary">
+        <div class="brand">
+          <span class="brand-mark">mac</span>
+          <span class="brand-name">Control Plane</span>
+        </div>
+        <nav class="nav" id="viewNav" aria-label="Dashboard views">
+          <button class="nav-item is-active" type="button" data-view="overview">Overview</button>
+          <button class="nav-item" type="button" data-view="agents">Agents</button>
+          <button class="nav-item" type="button" data-view="tasks">Tasks</button>
+          <button class="nav-item" type="button" data-view="hermes">Hermes</button>
+          <button class="nav-item" type="button" data-view="runtime">Runtime</button>
+        </nav>
+        <form class="token-form" id="tokenForm">
+          <label for="tokenInput">API Token</label>
+          <input id="tokenInput" name="token" type="password" autocomplete="off" placeholder="Bearer token">
+          <div class="token-actions">
+            <button type="submit">Use</button>
+            <button type="button" id="clearTokenButton">Clear</button>
+          </div>
+        </form>
+      </aside>
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">MAC</p>
+            <h1 id="viewTitle">Overview</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="sync-state" id="syncState">Not loaded</span>
+            <button class="primary-button" type="button" id="refreshButton">Refresh</button>
+          </div>
+        </header>
+        <section id="banner" class="banner" hidden></section>
+        <section id="content" class="content" aria-live="polite"></section>
+      </main>
+    </div>
+    <!-- app.ts is the maintained source; app.js is checked-in browser output. -->
+    <script type="module" src="/ui/assets/app.js"></script>
+  </body>
+</html>

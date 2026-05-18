@@ -358,6 +358,48 @@ class SQLiteStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS eval_sets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL,
+                    scoring TEXT NOT NULL,
+                    baseline_score REAL,
+                    regression_threshold REAL NOT NULL DEFAULT 0,
+                    metadata TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS eval_runs (
+                    id TEXT PRIMARY KEY,
+                    eval_set_id TEXT NOT NULL REFERENCES eval_sets(id) ON DELETE CASCADE,
+                    target_kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    baseline_score REAL,
+                    delta REAL,
+                    threshold REAL NOT NULL,
+                    passed INTEGER NOT NULL,
+                    detail TEXT NOT NULL,
+                    evidence_id TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_eval_runs_set_target
+                    ON eval_runs (eval_set_id, target_kind, target_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS eval_set_events (
+                    id TEXT PRIMARY KEY,
+                    eval_set_id TEXT NOT NULL REFERENCES eval_sets(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_eval_set_events_set
+                    ON eval_set_events (eval_set_id, created_at);
                 """
             )
             self._migrate()
@@ -373,6 +415,7 @@ class SQLiteStore:
         self._ensure_column("rollouts", "artifact_uri", "artifact_uri TEXT")
         self._ensure_column("rollouts", "artifact_hash", "artifact_hash TEXT")
         self._ensure_column("rollouts", "health_policy", "health_policy TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("rollouts", "required_eval_set_id", "required_eval_set_id TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(%s)" % table)}

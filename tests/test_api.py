@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from mac.api import create_app
@@ -128,3 +130,33 @@ def test_fastapi_can_require_scoped_bearer_tokens():
         json={"hostname": "host-1"},
     ).status_code == 200
     assert client.get("/machines", headers={"Authorization": "Bearer reader"}).status_code == 200
+
+
+def test_fastapi_serves_dashboard_shell_without_api_token():
+    client = TestClient(
+        create_app(
+            control_plane=ControlPlane.in_memory(),
+            auth_tokens={"reader": ["read"]},
+        )
+    )
+
+    ui_response = client.get("/ui")
+    assert ui_response.status_code == 200
+    assert "MAC Control Plane" in ui_response.text
+    assert "/ui/assets/app.js" in ui_response.text
+
+    script_response = client.get("/ui/assets/app.js")
+    assert script_response.status_code == 200
+    assert "fetchJSON" in script_response.text
+
+    assert client.get("/agents").status_code == 403
+    assert client.get("/agents", headers={"Authorization": "Bearer reader"}).status_code == 200
+
+
+def test_dashboard_has_typescript_source_without_node_toolchain_files():
+    root = Path(__file__).resolve().parents[1]
+
+    assert (root / "src/mac/ui/app.ts").exists()
+    assert (root / "src/mac/ui/app.js").exists()
+    assert not (root / "package.json").exists()
+    assert not (root / "package-lock.json").exists()
