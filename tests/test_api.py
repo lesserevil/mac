@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -294,3 +295,68 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert (root / "src/mac/ui/app.js").exists()
     assert not (root / "package.json").exists()
     assert not (root / "package-lock.json").exists()
+
+
+def test_fastapi_exposes_typed_agentbus_streams_and_ndjson_events():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "bus-host"}).json()
+    sender = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "sender"},
+    ).json()
+    recipient = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "recipient"},
+    ).json()
+
+    stream = client.post(
+        "/agentbus/streams",
+        json={
+            "sender_agent_id": sender["id"],
+            "recipient_agent_id": recipient["id"],
+            "content_type": "application/vnd.mac.delta+json",
+            "topic": "delta",
+        },
+    ).json()
+    first = client.post(
+        "/agentbus/streams/%s/chunks" % stream["id"],
+        json={
+            "sender_agent_id": sender["id"],
+            "payload": {"seq": 1, "text": "hello"},
+        },
+    ).json()
+    second = client.post(
+        "/agentbus/streams/%s/chunks" % stream["id"],
+        json={
+            "sender_agent_id": sender["id"],
+            "payload": {"seq": 2, "done": True},
+            "final": True,
+        },
+    ).json()
+
+    assert [first["sequence"], second["sequence"]] == [1, 2]
+    chunks = client.get(
+        "/agentbus/streams/%s/chunks" % stream["id"],
+        params={"agent_id": recipient["id"]},
+    ).json()
+    assert [chunk["payload"]["seq"] for chunk in chunks] == [1, 2]
+
+    events = client.get(
+        "/agentbus/streams/%s/events" % stream["id"],
+        params={"agent_id": recipient["id"], "timeout_seconds": 0.01},
+    )
+    lines = [line for line in events.text.splitlines() if line]
+    assert [json.loads(line)["sequence"] for line in lines] == [1, 2]
+
+    published = client.post(
+        "/agentbus",
+        json={
+            "sender_agent_id": sender["id"],
+            "recipient_agent_id": recipient["id"],
+            "content_type": "text/plain",
+            "payload_encoding": "text",
+            "payload": "one-shot",
+        },
+    ).json()
+    assert published["stream"]["status"] == "closed"
+    assert published["chunk"]["payload"] == "one-shot"

@@ -1656,3 +1656,52 @@ def test_events_task_detail_includes_from_to_states(cp):
     latest = transitions[0]
     assert latest["detail"].get("to_state") == "running"
     assert latest["detail"].get("from_state") == "claimed"
+
+
+def test_agentbus_streams_typed_content_without_weakening_control_messages(cp):
+    sender = register_agent(cp, "sender", ["python"])
+    recipient = register_agent(cp, "recipient", ["python"])
+    outsider = register_agent(cp, "outsider", ["python"])
+
+    with pytest.raises(ValidationError):
+        cp.send_message(
+            sender.id,
+            recipient.id,
+            "status_update",
+            {"status": "ok", "command": "not allowed here"},
+        )
+
+    stream = cp.open_agentbus_stream(
+        sender.id,
+        recipient_agent_id=recipient.id,
+        content_type="application/vnd.mac.patch+json",
+        topic="patch",
+        headers={"schema": "v1"},
+    )
+    first = cp.append_agentbus_chunk(
+        stream.id,
+        sender.id,
+        payload={"command": "stored-not-executed", "ops": [{"path": "README.md"}]},
+    )
+    second = cp.append_agentbus_chunk(
+        stream.id,
+        sender.id,
+        payload={"done": True},
+        final=True,
+    )
+
+    assert (first.sequence, second.sequence) == (1, 2)
+    refreshed = cp.get_agentbus_stream(stream.id)
+    assert refreshed.status == "closed"
+    assert refreshed.headers == {"schema": "v1"}
+
+    chunks = cp.read_agentbus_chunks(recipient.id, stream.id)
+    assert [chunk.sequence for chunk in chunks] == [1, 2]
+    assert chunks[0].payload["command"] == "stored-not-executed"
+    assert cp.read_agentbus_chunks(sender.id, stream.id, after_sequence=1)[0].payload == {
+        "done": True
+    }
+    with pytest.raises(AuthorizationError):
+        cp.read_agentbus_chunks(outsider.id, stream.id)
+    with pytest.raises(ValidationError):
+        cp.append_agentbus_chunk(stream.id, sender.id, payload={"late": True})

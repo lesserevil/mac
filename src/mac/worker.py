@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -76,6 +77,46 @@ class SubprocessExecutor:
             stderr=completed.stderr,
             metadata={"executor": self.argv},
         )
+
+
+def register_worker(
+    client: MacApiClient,
+    hostname: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+    resources: Optional[JsonDict] = None,
+    machine_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> JsonDict:
+    """Register or refresh the machine and agent rows for this worker process."""
+    host = (hostname or socket.gethostname()).strip()
+    if not host:
+        raise MacApiError("hostname is required for worker registration")
+    name = (agent_name or host).strip()
+    if not name:
+        raise MacApiError("agent_name is required for worker registration")
+    resolved_machine_id = machine_id or _stable_id("machine", host)
+    resolved_agent_id = agent_id or _stable_id("agent", name)
+    machine = client.post(
+        "/machines",
+        {
+            "hostname": host,
+            "machine_id": resolved_machine_id,
+            "labels": {"registered_by": "mac-agent"},
+            "resources": resources or {},
+            "trusted": True,
+        },
+    )
+    return client.post(
+        "/agents",
+        {
+            "machine_id": machine["id"],
+            "name": name,
+            "agent_id": resolved_agent_id,
+            "capabilities": capabilities or [],
+            "resources": resources or {},
+        },
+    )
 
 
 class MacWorker:
@@ -326,11 +367,48 @@ def _safe_path_component(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)[:180]
 
 
+def _stable_id(prefix: str, value: str) -> str:
+    return "%s_%s" % (prefix, _safe_path_component(value.lower()).strip("_") or "default")
+
+
+def _csv_arg(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _json_arg(value: Optional[str]) -> JsonDict:
+    if not value:
+        return {}
+    loaded = json.loads(value)
+    if not isinstance(loaded, dict):
+        raise MacApiError("resources must be a JSON object")
+    return loaded
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mac worker harness")
     parser.add_argument("--url", default=os.environ.get("MAC_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--token", default=os.environ.get("MAC_TOKEN"))
-    parser.add_argument("--agent-id", required=True)
+    parser.add_argument("--agent-id", default=os.environ.get("MAC_AGENT_ID"))
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help="register or refresh this host's machine and agent rows before running",
+    )
+    parser.add_argument("--machine-id", default=os.environ.get("MAC_MACHINE_ID"))
+    parser.add_argument("--hostname", default=os.environ.get("MAC_HOSTNAME"))
+    parser.add_argument("--agent-name", default=os.environ.get("MAC_AGENT_NAME"))
+    parser.add_argument(
+        "--capabilities",
+        default=os.environ.get("MAC_WORKER_CAPABILITIES", ""),
+        help="comma-separated capabilities to advertise when --register is used",
+    )
+    parser.add_argument(
+        "--resources",
+        default=os.environ.get("MAC_WORKER_RESOURCES"),
+        help="JSON resource/capacity object to advertise when --register is used",
+    )
     parser.add_argument("--workspace", default=".mac-agent-workspaces")
     parser.add_argument("--lease-seconds", type=int, default=900)
     parser.add_argument("--timeout", type=float)
@@ -355,9 +433,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to sleep between polls when no task is available",
     )
     parser.add_argument(
+        "--heartbeat-only",
+        action="store_true",
+        help="register/heartbeat once and exit without claiming tasks",
+    )
+    parser.add_argument(
         "--executor",
         nargs=argparse.REMAINDER,
-        required=True,
+        default=None,
         help="executor argv; use '--executor -- command args' if command starts with '-'",
     )
     return parser
@@ -365,19 +448,50 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    executor_argv = list(args.executor)
-    if executor_argv and executor_argv[0] == "--":
-        executor_argv = executor_argv[1:]
-    worker = MacWorker(
-        MacApiClient(args.url, token=args.token),
-        args.agent_id,
-        Path(args.workspace),
-        SubprocessExecutor(executor_argv, timeout=args.timeout),
-        lease_seconds=args.lease_seconds,
-        running_digest=args.running_digest,
-        poll_interval_seconds=args.poll_interval,
-    )
+    client = MacApiClient(args.url, token=args.token)
+    agent_id = args.agent_id
     try:
+        registered: Optional[JsonDict] = None
+        if args.register:
+            registered = register_worker(
+                client,
+                hostname=args.hostname,
+                agent_name=args.agent_name,
+                capabilities=_csv_arg(args.capabilities),
+                resources=_json_arg(args.resources),
+                machine_id=args.machine_id,
+                agent_id=args.agent_id,
+            )
+            agent_id = registered["id"]
+        if not agent_id:
+            raise MacApiError("--agent-id or --register is required")
+        if args.heartbeat_only:
+            heartbeat = client.post(
+                "/agents/%s/heartbeat" % quote(agent_id, safe=""),
+                {"status": "idle", "running_digest": args.running_digest},
+            )
+            print(
+                json.dumps(
+                    {"status": "heartbeat", "agent": heartbeat, "registered": registered},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        executor_argv = list(args.executor or [])
+        if executor_argv and executor_argv[0] == "--":
+            executor_argv = executor_argv[1:]
+        if not executor_argv:
+            raise MacApiError("--executor is required unless --heartbeat-only is set")
+        worker = MacWorker(
+            client,
+            agent_id,
+            Path(args.workspace),
+            SubprocessExecutor(executor_argv, timeout=args.timeout),
+            lease_seconds=args.lease_seconds,
+            running_digest=args.running_digest,
+            poll_interval_seconds=args.poll_interval,
+        )
         if args.loop:
             results = worker.run_forever(max_iterations=args.max_iterations)
             print(json.dumps([r.to_dict() for r in results], indent=2, sort_keys=True))

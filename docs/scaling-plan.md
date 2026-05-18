@@ -70,16 +70,21 @@ Harden the identity model:
 
 ### Phase 4: Fleet-Scale Dispatch
 
-Status: implemented as deterministic local dispatch policy.
+Status: implemented as deterministic local dispatch policy plus a worker
+registration/run loop.
 
 Improve dispatch without changing the core task contract:
 
+- Worker agents can self-register machine/agent identity, heartbeat without
+  claiming, or enter an executor-backed claim/start/evidence/submit loop.
 - Heartbeat freshness can mark stale agents offline during `tick`.
 - Agent resources can declare `capacity` / `max_concurrent_tasks`.
 - Dispatch round-robins tenants inside a tick while preserving per-tenant priority.
 - Task metadata can declare numeric/list/exact `resources` requirements.
 - Expired leases retry until `max_attempts`; exhausted tasks appear in
   `/dispatch/dead-letters`.
+- AgentBus typed streams provide ordered JSON/text/base64 chunks with durable
+  reads and NDJSON tailing for high-volume agent-to-agent content exchange.
 
 ### Phase 5: Review, Evidence, and Publication Hardening
 

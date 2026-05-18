@@ -127,6 +127,48 @@ The rollback script restores the prior mac source tree, mac venv, Hermes
 checkout, and service definitions or launchd plists that existed before the
 deploy pass, then restarts the mac-managed services.
 
+## Worker Agents
+
+The control-plane service does not execute tasks by itself. Each execution host
+must run a worker process that registers or refreshes its machine/agent row,
+heartbeats, then claims eligible open work with a real executor:
+
+```bash
+mac-agent --url http://127.0.0.1:8789 --register \
+  --agent-name rocky --hostname rocky.local \
+  --capabilities python,ops --resources '{"capacity":2}' \
+  --heartbeat-only
+
+mac-agent --url http://127.0.0.1:8789 --register \
+  --agent-name rocky --capabilities python,ops \
+  --workspace ~/.mac-agent/workspaces --loop \
+  --executor -- hermes run-once
+```
+
+Use `--heartbeat-only` during deploy validation when you want fleet visibility
+without claiming migrated ACC work. Start the `--loop` form only after the
+executor command is the intended production worker. Successful executions write
+log evidence and move tasks to `needs_review`; failed executions fail the task
+with evidence attached.
+
+## AgentBus
+
+`/messages` remains the constrained structured control bus and still rejects
+execution-shaped payloads. Agent-to-agent content exchange uses `/agentbus`
+instead:
+
+- `POST /agentbus/streams` opens a typed stream with `content_type`, `topic`,
+  optional task linkage, and optional recipient.
+- `POST /agentbus/streams/{id}/chunks` appends ordered JSON, text, or base64
+  chunks. `final=true` closes the stream atomically after the chunk.
+- `GET /agentbus/streams/{id}/chunks` reads durable chunks after a sequence.
+- `GET /agentbus/streams/{id}/events` tails chunks as NDJSON for streaming
+  consumers.
+
+This is a typed transport channel, not an execution channel. Agents must still
+turn received content into explicit task/evidence/review actions through the
+normal API.
+
 ## Docker / Podman
 
 ```bash

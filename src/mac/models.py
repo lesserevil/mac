@@ -237,6 +237,12 @@ class MessageStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class AgentBusStreamStatus(StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+    ABORTED = "aborted"
+
+
 class SecretAuditResult(StrEnum):
     GRANTED = "granted"
     DENIED = "denied"
@@ -484,6 +490,40 @@ class AgentMessage:
     status: str
     created_at: str
     delivered_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class AgentBusStream:
+    id: str
+    sender_agent_id: str
+    recipient_agent_id: Optional[str]
+    task_id: Optional[str]
+    topic: str
+    content_type: str
+    headers: JsonDict
+    status: str
+    created_at: str
+    updated_at: str
+    closed_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class AgentBusChunk:
+    id: str
+    stream_id: str
+    sequence: int
+    sender_agent_id: str
+    content_type: str
+    payload: Any
+    payload_encoding: str
+    size_bytes: int
+    created_at: str
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

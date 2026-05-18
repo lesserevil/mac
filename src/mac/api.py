@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -135,6 +137,35 @@ class MessageCreate(BaseModel):
     task_id: Optional[str] = None
     message_type: str
     payload: Dict[str, Any]
+
+
+class AgentBusOpen(BaseModel):
+    sender_agent_id: str
+    recipient_agent_id: Optional[str] = None
+    task_id: Optional[str] = None
+    topic: str = "content"
+    content_type: str = "application/json"
+    headers: Dict[str, Any] = Field(default_factory=dict)
+    stream_id: Optional[str] = None
+
+
+class AgentBusAppend(BaseModel):
+    sender_agent_id: str
+    content_type: Optional[str] = None
+    payload: Any = None
+    payload_encoding: str = "json"
+    final: bool = False
+
+
+class AgentBusPublish(BaseModel):
+    sender_agent_id: str
+    recipient_agent_id: Optional[str] = None
+    task_id: Optional[str] = None
+    topic: str = "content"
+    content_type: str = "application/json"
+    headers: Dict[str, Any] = Field(default_factory=dict)
+    payload: Any = None
+    payload_encoding: str = "json"
 
 
 class ReviewRequest(BaseModel):
@@ -378,6 +409,8 @@ def _required_scope(method: str, path: str) -> Optional[str]:
     if path.startswith("/agents/") and (
         path.endswith("/heartbeat") or path.endswith("/messages/deliver")
     ):
+        return "agent"
+    if path.startswith("/agentbus"):
         return "agent"
     if path.startswith("/dispatch"):
         return "dispatch"
@@ -970,6 +1003,75 @@ def create_app(
     @app.post("/agents/{agent_id}/messages/deliver")
     def deliver_messages(agent_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         return [message.to_dict() for message in cp.deliver_messages(agent_id, limit)]
+
+    @app.post("/agentbus/streams")
+    def open_agentbus_stream(body: AgentBusOpen) -> Dict[str, Any]:
+        return cp.open_agentbus_stream(**_data(body)).to_dict()
+
+    @app.get("/agentbus/streams")
+    def list_agentbus_streams(
+        agent_id: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            stream.to_dict()
+            for stream in cp.list_agentbus_streams(agent_id=agent_id, status=status, limit=limit)
+        ]
+
+    @app.post("/agentbus/streams/{stream_id}/chunks")
+    def append_agentbus_chunk(stream_id: str, body: AgentBusAppend) -> Dict[str, Any]:
+        return cp.append_agentbus_chunk(stream_id, **_data(body)).to_dict()
+
+    @app.get("/agentbus/streams/{stream_id}/chunks")
+    def read_agentbus_chunks(
+        stream_id: str,
+        agent_id: str,
+        after_sequence: int = Query(default=0),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            chunk.to_dict()
+            for chunk in cp.read_agentbus_chunks(agent_id, stream_id, after_sequence, limit)
+        ]
+
+    @app.post("/agentbus/streams/{stream_id}/close")
+    def close_agentbus_stream(
+        stream_id: str,
+        sender_agent_id: str,
+        status: str = "closed",
+    ) -> Dict[str, Any]:
+        return cp.close_agentbus_stream(stream_id, sender_agent_id, status).to_dict()
+
+    @app.post("/agentbus")
+    def publish_agentbus_content(body: AgentBusPublish) -> Dict[str, Any]:
+        return cp.publish_agentbus_content(**_data(body))
+
+    @app.get("/agentbus/streams/{stream_id}/events")
+    async def agentbus_stream_events(
+        stream_id: str,
+        agent_id: str,
+        after_sequence: int = Query(default=0),
+        timeout_seconds: float = Query(default=30.0),
+        poll_interval_seconds: float = Query(default=0.05),
+    ) -> StreamingResponse:
+        async def iter_events() -> Any:
+            cursor = max(0, int(after_sequence))
+            deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+            poll_interval = max(0.01, float(poll_interval_seconds))
+            while True:
+                chunks = cp.read_agentbus_chunks(agent_id, stream_id, cursor, limit=100)
+                for chunk in chunks:
+                    cursor = chunk.sequence
+                    yield json.dumps(chunk.to_dict(), sort_keys=True) + "\n"
+                stream = cp.get_agentbus_stream(stream_id)
+                if stream.status != "open" and not chunks:
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(poll_interval)
+
+        return StreamingResponse(iter_events(), media_type="application/x-ndjson")
 
     @app.post("/tasks/{task_id}/reviews")
     def request_review(task_id: str, body: ReviewRequest) -> Dict[str, Any]:

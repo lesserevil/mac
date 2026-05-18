@@ -23,6 +23,8 @@ This project provides durable contracts for coordinating a fleet:
 - Dispatcher that matches open work to healthy capable agents and accounts for
   tenant pool policy, resources, capacity, stale heartbeats, and expired leases.
 - Structured agent message bus that rejects arbitrary execution payloads.
+- Typed AgentBus streams for ordered agent-to-agent JSON, text, or base64
+  content chunks with NDJSON tailing semantics.
 - Review and publication pipeline that requires typed evidence, independent
   approved review, and publication hashes when policy requires them.
 - Optional scoped API bearer tokens for read/write/agent/dispatch/secret/admin access.
@@ -108,6 +110,7 @@ Key route groups:
 - `/tasks`, `/tasks/{id}/evidence`, `/tasks/{id}/reviews`
 - `/machines`, `/agents`, `/dispatch/tick`, `/dispatch/dead-letters`
 - `/messages`
+- `/agentbus`, `/agentbus/streams`, `/agentbus/streams/{id}/chunks`, `/agentbus/streams/{id}/events`
 - `/secrets`, `/secrets/{id}/access`, `/secrets/{id}/reveal`, `/secret-audits`
 - `/runtimes`, `/runtime-runs`
 - `/artifacts`, `/artifacts/{id_or_digest}` — canonical record for deliverables (kind, digest, uri, sbom_uri, signers); re-registering the same digest augments signers/metadata
@@ -186,10 +189,22 @@ mac --db mac.db migrate acc ~/.acc/data/acc.db --mode dry-run \
 mac --db mac.db migrate acc ~/.acc/data/acc.db --mode import \
     --report acc-migration-import.json
 
-# Minimal worker harness: claim one mac-owned task for a specific agent, run an
-# executor, record log evidence, and submit successful work for review.
+# Minimal worker harness: register/heartbeat first without claiming, then run
+# an executor-backed claim/start/evidence/submit loop.
+mac-agent --url http://127.0.0.1:8000 --register --agent-name rocky \
+    --hostname rocky.local --capabilities python,ops \
+    --resources '{"capacity":2}' --heartbeat-only
 mac-agent --url http://127.0.0.1:8000 --agent-id agent_... \
     --workspace ~/.mac-agent/workspaces --executor -- hermes run-once
+mac-agent --url http://127.0.0.1:8000 --register --agent-name rocky \
+    --capabilities python,ops --loop --workspace ~/.mac-agent/workspaces \
+    --executor -- hermes run-once
+
+# Typed AgentBus: durable ordered content chunks; this is transport, not exec.
+mac --db mac.db agentbus publish agent_sender --recipient-agent-id agent_recipient \
+    --content-type application/vnd.mac.delta+json \
+    --payload '{"kind":"delta","content":"hello"}'
+mac --db mac.db agentbus read bus_... agent_recipient
 ```
 
 Hermes-facing API adapter:

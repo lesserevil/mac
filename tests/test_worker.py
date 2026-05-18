@@ -7,7 +7,7 @@ from mac.api import create_app
 from mac.hermes_adapter import MacApiClient, MacApiError
 from mac.models import TaskState
 from mac.services import ControlPlane
-from mac.worker import MacWorker, WorkerExecution
+from mac.worker import MacWorker, WorkerExecution, register_worker
 
 
 def api_transport(client: TestClient):
@@ -213,3 +213,32 @@ def test_mac_worker_declares_running_digest_on_first_heartbeat(tmp_path: Path):
     distribution = cp.fleet_build_distribution()
     by_digest = {b["digest"]: b for b in distribution["buckets"]}
     assert by_digest[runtime.digest]["count"] == 1
+
+
+def test_register_worker_creates_identity_then_worker_claims_tasks(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    api = MacApiClient("http://mac.test", transport=api_transport(client))
+
+    registered = register_worker(
+        api,
+        hostname="rocky.local",
+        agent_name="rocky",
+        capabilities=["python"],
+        resources={"capacity": 2},
+    )
+    task = cp.create_task("registered worker task", required_capabilities=["python"])
+
+    worker = MacWorker(
+        api,
+        registered["id"],
+        tmp_path,
+        lambda _t, _d: WorkerExecution(0, "ok", stdout="ok\n"),
+    )
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    assert result.task["id"] == task.id
+    assert cp.get_agent(registered["id"]).name == "rocky"
+    assert cp.get_agent(registered["id"]).capabilities == ["python"]
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value

@@ -332,6 +332,93 @@ def cmd_message_inbox(args: argparse.Namespace) -> None:
     _print([message.to_dict() for message in _plane(args).deliver_messages(args.agent_id, args.limit)])
 
 
+def _agentbus_payload_arg(args: argparse.Namespace) -> Any:
+    if args.payload is None:
+        return None
+    if args.payload_encoding == "json":
+        return json.loads(args.payload)
+    return args.payload
+
+
+def cmd_agentbus_open(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).open_agentbus_stream(
+            args.sender_agent_id,
+            recipient_agent_id=args.recipient_agent_id,
+            content_type=args.content_type,
+            topic=args.topic,
+            headers=_json_arg(args.headers, {}),
+            task_id=args.task_id,
+            stream_id=args.stream_id,
+        )
+    )
+
+
+def cmd_agentbus_append(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).append_agentbus_chunk(
+            args.stream_id,
+            args.sender_agent_id,
+            payload=_agentbus_payload_arg(args),
+            content_type=args.content_type,
+            payload_encoding=args.payload_encoding,
+            final=args.final,
+        )
+    )
+
+
+def cmd_agentbus_close(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).close_agentbus_stream(
+            args.stream_id,
+            args.sender_agent_id,
+            status=args.status,
+        )
+    )
+
+
+def cmd_agentbus_list(args: argparse.Namespace) -> None:
+    _print(
+        [
+            stream.to_dict()
+            for stream in _plane(args).list_agentbus_streams(
+                agent_id=args.agent_id,
+                status=args.status,
+                limit=args.limit,
+            )
+        ]
+    )
+
+
+def cmd_agentbus_read(args: argparse.Namespace) -> None:
+    _print(
+        [
+            chunk.to_dict()
+            for chunk in _plane(args).read_agentbus_chunks(
+                args.agent_id,
+                args.stream_id,
+                after_sequence=args.after_sequence,
+                limit=args.limit,
+            )
+        ]
+    )
+
+
+def cmd_agentbus_publish(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).publish_agentbus_content(
+            args.sender_agent_id,
+            recipient_agent_id=args.recipient_agent_id,
+            content_type=args.content_type,
+            payload=_agentbus_payload_arg(args),
+            topic=args.topic,
+            headers=_json_arg(args.headers, {}),
+            task_id=args.task_id,
+            payload_encoding=args.payload_encoding,
+        )
+    )
+
+
 def cmd_review_request(args: argparse.Namespace) -> None:
     _print(_plane(args).request_review(args.task_id, args.reviewer_agent_id, args.actor))
 
@@ -900,6 +987,67 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.add_argument("agent_id")
     inbox.add_argument("--limit", type=int, default=50)
     _set(cmd_message_inbox, inbox)
+
+    agentbus = sub.add_parser(
+        "agentbus",
+        help="typed high-throughput agent-to-agent content streams",
+    ).add_subparsers(dest="agentbus_command", required=True)
+    bus_open = agentbus.add_parser("open")
+    bus_open.add_argument("sender_agent_id")
+    bus_open.add_argument("--recipient-agent-id")
+    bus_open.add_argument("--task-id")
+    bus_open.add_argument("--topic", default="content")
+    bus_open.add_argument("--content-type", default="application/json")
+    bus_open.add_argument("--headers")
+    bus_open.add_argument("--stream-id")
+    _set(cmd_agentbus_open, bus_open)
+
+    bus_append = agentbus.add_parser("append")
+    bus_append.add_argument("stream_id")
+    bus_append.add_argument("sender_agent_id")
+    bus_append.add_argument("--payload")
+    bus_append.add_argument("--content-type")
+    bus_append.add_argument(
+        "--payload-encoding",
+        choices=("json", "text", "base64"),
+        default="json",
+    )
+    bus_append.add_argument("--final", action="store_true")
+    _set(cmd_agentbus_append, bus_append)
+
+    bus_close = agentbus.add_parser("close")
+    bus_close.add_argument("stream_id")
+    bus_close.add_argument("sender_agent_id")
+    bus_close.add_argument("--status", choices=("closed", "aborted"), default="closed")
+    _set(cmd_agentbus_close, bus_close)
+
+    bus_list = agentbus.add_parser("list")
+    bus_list.add_argument("--agent-id")
+    bus_list.add_argument("--status", choices=("open", "closed", "aborted"))
+    bus_list.add_argument("--limit", type=int, default=100)
+    _set(cmd_agentbus_list, bus_list)
+
+    bus_read = agentbus.add_parser("read")
+    bus_read.add_argument("stream_id")
+    bus_read.add_argument("agent_id")
+    bus_read.add_argument("--after-sequence", type=int, default=0)
+    bus_read.add_argument("--limit", type=int, default=100)
+    _set(cmd_agentbus_read, bus_read)
+
+    bus_publish = agentbus.add_parser("publish")
+    bus_publish.add_argument("sender_agent_id")
+    bus_publish.add_argument("--recipient-agent-id")
+    bus_publish.add_argument("--task-id")
+    bus_publish.add_argument("--topic", default="content")
+    bus_publish.add_argument("--content-type", default="application/json")
+    bus_publish.add_argument("--headers")
+    bus_publish.add_argument("--payload")
+    bus_publish.add_argument(
+        "--payload-encoding",
+        choices=("json", "text", "base64"),
+        default="json",
+    )
+    _set(cmd_agentbus_publish, bus_publish)
 
     review = sub.add_parser("review", help="review pipeline commands").add_subparsers(dest="review_command", required=True)
     request = review.add_parser("request")

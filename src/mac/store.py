@@ -236,6 +236,39 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status
                     ON messages (recipient_agent_id, status);
 
+                CREATE TABLE IF NOT EXISTS agentbus_streams (
+                    id TEXT PRIMARY KEY,
+                    sender_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    recipient_agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+                    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                    topic TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    headers TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_agentbus_streams_recipient_status
+                    ON agentbus_streams (recipient_agent_id, status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_agentbus_streams_sender_status
+                    ON agentbus_streams (sender_agent_id, status, updated_at);
+
+                CREATE TABLE IF NOT EXISTS agentbus_chunks (
+                    id TEXT PRIMARY KEY,
+                    stream_id TEXT NOT NULL REFERENCES agentbus_streams(id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL,
+                    sender_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    content_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    payload_encoding TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(stream_id, sequence)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agentbus_chunks_stream_sequence
+                    ON agentbus_chunks (stream_id, sequence);
+
                 -- Per-agent operational events (mood transitions, nap
                 -- lifecycle, future agent-level audit). Flows through the
                 -- unified events view.

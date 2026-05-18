@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -12,6 +13,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from mac.models import (
     Agent,
+    AgentBusChunk,
+    AgentBusStream,
+    AgentBusStreamStatus,
     AgentMessage,
     AgentStatus,
     Artifact,
@@ -106,6 +110,11 @@ MESSAGE_TYPE_REQUIRED_FIELDS: Dict[str, Tuple[str, ...]] = {
     MessageType.NUDGE.value: ("task_id",),
     MessageType.DECISION_RECORD.value: ("summary",),
 }
+
+AGENTBUS_PAYLOAD_ENCODINGS = {"json", "text", "base64"}
+AGENTBUS_TYPED_CONTENT_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9.+_/-]*(;[A-Za-z0-9_.+-]+=[A-Za-z0-9_.+-]+)*$"
+)
 
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
 
@@ -2012,6 +2021,252 @@ class ControlPlane:
             rows = self.store.query_all("SELECT * FROM messages ORDER BY created_at, id")
         return [self._message_from_row(row) for row in rows]
 
+    # AgentBus typed content streams
+
+    def open_agentbus_stream(
+        self,
+        sender_agent_id: str,
+        recipient_agent_id: Optional[str] = None,
+        content_type: str = "application/json",
+        topic: str = "content",
+        headers: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        stream_id: Optional[str] = None,
+    ) -> AgentBusStream:
+        self.get_agent(sender_agent_id)
+        if recipient_agent_id is not None:
+            self.get_agent(recipient_agent_id)
+        if task_id is not None:
+            self.get_task(task_id)
+        self._validate_agentbus_content_type(content_type)
+        topic_value = self._validate_agentbus_topic(topic)
+        headers_json = json_dumps(ensure_json_object(headers))
+        sid = (stream_id or new_id("bus")).strip()
+        if not sid:
+            raise ValidationError("stream_id cannot be empty")
+        if self.store.query_one("SELECT id FROM agentbus_streams WHERE id = ?", (sid,)):
+            raise ValidationError("agentbus stream already exists: %s" % sid)
+        now = utcnow()
+        self.store.execute(
+            """
+            INSERT INTO agentbus_streams (
+                id, sender_agent_id, recipient_agent_id, task_id, topic,
+                content_type, headers, status, created_at, updated_at, closed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                sid,
+                sender_agent_id,
+                recipient_agent_id,
+                task_id,
+                topic_value,
+                content_type,
+                headers_json,
+                AgentBusStreamStatus.OPEN.value,
+                now,
+                now,
+            ),
+        )
+        return self.get_agentbus_stream(sid)
+
+    def append_agentbus_chunk(
+        self,
+        stream_id: str,
+        sender_agent_id: str,
+        payload: Any = None,
+        content_type: Optional[str] = None,
+        payload_encoding: str = "json",
+        final: bool = False,
+    ) -> AgentBusChunk:
+        self.get_agent(sender_agent_id)
+        payload_json = self._serialize_agentbus_payload(payload, payload_encoding)
+        chunk_id = new_id("chunk")
+        now = utcnow()
+        with self.store.transaction() as conn:
+            stream_row = conn.execute(
+                "SELECT * FROM agentbus_streams WHERE id = ?",
+                (stream_id,),
+            ).fetchone()
+            if stream_row is None:
+                raise NotFoundError("agentbus stream not found: %s" % stream_id)
+            if stream_row["sender_agent_id"] != sender_agent_id:
+                raise AuthorizationError("only the stream sender can append chunks")
+            if stream_row["status"] != AgentBusStreamStatus.OPEN.value:
+                raise ValidationError("agentbus stream is not open: %s" % stream_id)
+            chunk_content_type = content_type or stream_row["content_type"]
+            self._validate_agentbus_content_type(chunk_content_type)
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM agentbus_chunks WHERE stream_id = ?",
+                (stream_id,),
+            ).fetchone()
+            sequence = int(row["next_sequence"])
+            conn.execute(
+                """
+                INSERT INTO agentbus_chunks (
+                    id, stream_id, sequence, sender_agent_id, content_type,
+                    payload, payload_encoding, size_bytes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk_id,
+                    stream_id,
+                    sequence,
+                    sender_agent_id,
+                    chunk_content_type,
+                    payload_json,
+                    payload_encoding,
+                    len(payload_json.encode("utf-8")),
+                    now,
+                ),
+            )
+            if final:
+                conn.execute(
+                    """
+                    UPDATE agentbus_streams
+                    SET status = ?, updated_at = ?, closed_at = ?
+                    WHERE id = ?
+                    """,
+                    (AgentBusStreamStatus.CLOSED.value, now, now, stream_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE agentbus_streams SET updated_at = ? WHERE id = ?",
+                    (now, stream_id),
+                )
+        return self.get_agentbus_chunk(chunk_id)
+
+    def close_agentbus_stream(
+        self,
+        stream_id: str,
+        sender_agent_id: str,
+        status: str = AgentBusStreamStatus.CLOSED.value,
+    ) -> AgentBusStream:
+        stream = self.get_agentbus_stream(stream_id)
+        self.get_agent(sender_agent_id)
+        if stream.sender_agent_id != sender_agent_id:
+            raise AuthorizationError("only the stream sender can close the stream")
+        status_value = _state_value(status)
+        if status_value == AgentBusStreamStatus.OPEN.value:
+            raise ValidationError("agentbus close status cannot be open")
+        try:
+            AgentBusStreamStatus(status_value)
+        except ValueError:
+            raise ValidationError("unsupported agentbus stream status: %s" % status)
+        if stream.status != AgentBusStreamStatus.OPEN.value:
+            if stream.status == status_value:
+                return stream
+            raise ValidationError("agentbus stream already closed: %s" % stream_id)
+        now = utcnow()
+        self.store.execute(
+            """
+            UPDATE agentbus_streams
+            SET status = ?, updated_at = ?, closed_at = ?
+            WHERE id = ?
+            """,
+            (status_value, now, now, stream_id),
+        )
+        return self.get_agentbus_stream(stream_id)
+
+    def get_agentbus_stream(self, stream_id: str) -> AgentBusStream:
+        row = self.store.query_one("SELECT * FROM agentbus_streams WHERE id = ?", (stream_id,))
+        if row is None:
+            raise NotFoundError("agentbus stream not found: %s" % stream_id)
+        return self._agentbus_stream_from_row(row)
+
+    def get_agentbus_chunk(self, chunk_id: str) -> AgentBusChunk:
+        row = self.store.query_one("SELECT * FROM agentbus_chunks WHERE id = ?", (chunk_id,))
+        if row is None:
+            raise NotFoundError("agentbus chunk not found: %s" % chunk_id)
+        return self._agentbus_chunk_from_row(row)
+
+    def list_agentbus_streams(
+        self,
+        agent_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[AgentBusStream]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if agent_id is not None:
+            self.get_agent(agent_id)
+            clauses.append(
+                "(sender_agent_id = ? OR recipient_agent_id = ? OR recipient_agent_id IS NULL)"
+            )
+            params.extend([agent_id, agent_id])
+        if status is not None:
+            status_value = _state_value(status)
+            try:
+                AgentBusStreamStatus(status_value)
+            except ValueError:
+                raise ValidationError("unsupported agentbus stream status: %s" % status)
+            clauses.append("status = ?")
+            params.append(status_value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self.store.query_all(
+            "SELECT * FROM agentbus_streams%s ORDER BY updated_at DESC, id LIMIT ?" % where,
+            tuple(params),
+        )
+        return [self._agentbus_stream_from_row(row) for row in rows]
+
+    def read_agentbus_chunks(
+        self,
+        agent_id: str,
+        stream_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> List[AgentBusChunk]:
+        self.get_agent(agent_id)
+        stream = self.get_agentbus_stream(stream_id)
+        if not self._agentbus_authorized(stream, agent_id):
+            raise AuthorizationError("agent is not authorized for agentbus stream")
+        rows = self.store.query_all(
+            """
+            SELECT * FROM agentbus_chunks
+            WHERE stream_id = ? AND sequence > ?
+            ORDER BY sequence
+            LIMIT ?
+            """,
+            (
+                stream_id,
+                max(0, int(after_sequence)),
+                max(1, min(int(limit), 1000)),
+            ),
+        )
+        return [self._agentbus_chunk_from_row(row) for row in rows]
+
+    def publish_agentbus_content(
+        self,
+        sender_agent_id: str,
+        recipient_agent_id: Optional[str] = None,
+        content_type: str = "application/json",
+        payload: Any = None,
+        topic: str = "content",
+        headers: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        payload_encoding: str = "json",
+    ) -> JsonDict:
+        self._serialize_agentbus_payload(payload, payload_encoding)
+        stream = self.open_agentbus_stream(
+            sender_agent_id,
+            recipient_agent_id=recipient_agent_id,
+            content_type=content_type,
+            topic=topic,
+            headers=headers,
+            task_id=task_id,
+        )
+        chunk = self.append_agentbus_chunk(
+            stream.id,
+            sender_agent_id,
+            payload=payload,
+            payload_encoding=payload_encoding,
+            final=True,
+        )
+        return {
+            "stream": self.get_agentbus_stream(stream.id).to_dict(),
+            "chunk": chunk.to_dict(),
+        }
+
     # Reviews and publication
 
     def request_review(self, task_id: str, reviewer_agent_id: str, actor: str = "dispatcher") -> Review:
@@ -3872,6 +4127,34 @@ class ControlPlane:
             row["delivered_at"],
         )
 
+    def _agentbus_stream_from_row(self, row: Any) -> AgentBusStream:
+        return AgentBusStream(
+            row["id"],
+            row["sender_agent_id"],
+            row["recipient_agent_id"],
+            row["task_id"],
+            row["topic"],
+            row["content_type"],
+            json_loads(row["headers"], {}),
+            row["status"],
+            row["created_at"],
+            row["updated_at"],
+            row["closed_at"],
+        )
+
+    def _agentbus_chunk_from_row(self, row: Any) -> AgentBusChunk:
+        return AgentBusChunk(
+            row["id"],
+            row["stream_id"],
+            int(row["sequence"]),
+            row["sender_agent_id"],
+            row["content_type"],
+            json_loads(row["payload"], None),
+            row["payload_encoding"],
+            int(row["size_bytes"]),
+            row["created_at"],
+        )
+
     def _review_from_row(self, row: Any) -> Review:
         return Review(
             row["id"],
@@ -4366,6 +4649,40 @@ class ControlPlane:
                 % (message_type, ",".join(missing))
             )
         self._check_payload_is_json_safe(payload, ())
+
+    def _validate_agentbus_content_type(self, content_type: str) -> None:
+        if not isinstance(content_type, str) or not content_type.strip():
+            raise ValidationError("agentbus content_type is required")
+        if len(content_type) > 128 or not AGENTBUS_TYPED_CONTENT_RE.match(content_type):
+            raise ValidationError("invalid agentbus content_type: %s" % content_type)
+
+    def _validate_agentbus_topic(self, topic: str) -> str:
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValidationError("agentbus topic is required")
+        topic_value = topic.strip()
+        if len(topic_value) > 128 or any(ord(ch) < 32 for ch in topic_value):
+            raise ValidationError("invalid agentbus topic: %s" % topic)
+        return topic_value
+
+    def _serialize_agentbus_payload(self, payload: Any, payload_encoding: str) -> str:
+        if payload_encoding not in AGENTBUS_PAYLOAD_ENCODINGS:
+            raise ValidationError("unsupported agentbus payload_encoding: %s" % payload_encoding)
+        if payload_encoding in {"text", "base64"} and not isinstance(payload, str):
+            raise ValidationError("agentbus %s payload must be a string" % payload_encoding)
+        if payload_encoding == "base64":
+            try:
+                base64.b64decode(payload.encode("ascii"), validate=True)
+            except Exception as exc:  # noqa: BLE001 - normalize parser errors at API boundary.
+                raise ValidationError("agentbus base64 payload is invalid") from exc
+        try:
+            return json_dumps(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("agentbus payload must be JSON serializable") from exc
+
+    def _agentbus_authorized(self, stream: AgentBusStream, agent_id: str) -> bool:
+        if stream.recipient_agent_id is None:
+            return True
+        return agent_id in {stream.sender_agent_id, stream.recipient_agent_id}
 
     def _check_payload_is_json_safe(self, value: Any, path: Sequence[str]) -> None:
         """Reject non-JSON-serializable payloads early.
