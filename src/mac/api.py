@@ -698,6 +698,7 @@ def create_app(
 
     @app.get("/startup/hermes")
     def hermes_startup() -> Dict[str, Any]:
+        app.state.hermes_startup = build_hermes_startup_report()
         return app.state.hermes_startup
 
     @app.get("/ui", include_in_schema=False)
@@ -707,6 +708,7 @@ def create_app(
 
     @app.get("/dashboard/state")
     def dashboard_state() -> Dict[str, Any]:
+        app.state.hermes_startup = build_hermes_startup_report()
         return _dashboard_state(cp, app.state.hermes_startup)
 
     @app.get("/dashboard/agents/{agent_id}")
