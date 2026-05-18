@@ -436,19 +436,44 @@ backup_existing_artifacts() {
 }
 
 normalize_hermes_redaction_env() {
-  "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/.env" "$HOME/.acc/.env" <<'PY'
+  "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" "$HOME/.acc/.env" <<'PY'
 import json
+import re
 import sys
 import time
 from pathlib import Path
 
 report_path = Path(sys.argv[1])
-targets = [Path(item) for item in sys.argv[2:]]
+config_path = Path(sys.argv[2])
+targets = [Path(item) for item in sys.argv[3:]]
 report = {
     "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "policy": "HERMES_REDACT_SECRETS must not be false",
+    "policy": "Hermes secret redaction must not be false in env or config",
+    "config": {"path": str(config_path), "exists": config_path.exists(), "changed": False, "had_false": False},
     "files": [],
 }
+if config_path.exists() and config_path.is_file():
+    try:
+        config_lines = config_path.read_text(encoding="utf-8").splitlines()
+        output = []
+        changed = False
+        for line in config_lines:
+            if re.match(r"^(\s*redact_secrets\s*:\s*)(false|no|off|0)\s*$", line, flags=re.IGNORECASE):
+                prefix = re.match(r"^(\s*redact_secrets\s*:\s*)", line, flags=re.IGNORECASE).group(1)
+                output.append(prefix + "true")
+                changed = True
+                report["config"]["had_false"] = True
+            else:
+                output.append(line)
+        if changed:
+            backup = config_path.with_name(config_path.name + ".mac-redaction-backup-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+            backup.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+            backup.chmod(0o600)
+            config_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+            report["config"]["changed"] = True
+            report["config"]["backup"] = str(backup)
+    except OSError as exc:
+        report["config"]["error"] = str(exc)
 for path in targets:
     entry = {"path": str(path), "exists": path.exists(), "changed": False, "had_false": False}
     if not path.exists() or not path.is_file():
@@ -481,10 +506,10 @@ for path in targets:
         entry["backup"] = str(backup)
     report["files"].append(entry)
 report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-if any(item.get("changed") for item in report["files"]):
-    print("redaction: corrected inherited HERMES_REDACT_SECRETS=false drift")
+if report["config"].get("changed") or any(item.get("changed") for item in report["files"]):
+    print("redaction: corrected inherited secret-redaction=false drift")
 else:
-    print("redaction: no inherited HERMES_REDACT_SECRETS=false drift found")
+    print("redaction: no inherited secret-redaction=false drift found")
 PY
 }
 
