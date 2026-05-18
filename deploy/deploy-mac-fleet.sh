@@ -103,6 +103,20 @@ python_bin() {
 
 PY="$(python_bin)"
 
+ensure_dns_resolution() {
+  if getent hosts pypi.org >/dev/null 2>&1; then
+    return
+  fi
+  if [ "$OS_KIND" = "linux" ] && [ -f /run/systemd/resolve/resolv.conf ]; then
+    log "repairing DNS resolver path for package installation"
+    sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  fi
+  if ! getent hosts pypi.org >/dev/null 2>&1; then
+    log "ERROR: DNS resolution still fails after resolver repair"
+    exit 1
+  fi
+}
+
 ensure_venv_support() {
   local probe="$MAC_HOME/.venv-probe"
   rm -rf "$probe"
@@ -124,6 +138,7 @@ ensure_venv_support() {
 }
 
 log "deploy log: $DEPLOY_LOG"
+ensure_dns_resolution
 ensure_venv_support
 log "installing mac source"
 rm -rf "$SRC_DIR.new"
