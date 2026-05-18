@@ -158,6 +158,22 @@ ensure_venv_support() {
   exit 1
 }
 
+prepare_mac_venv() {
+  if [ ! -x "$VENV/bin/python" ]; then
+    return
+  fi
+  if "$VENV/bin/python" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+  then
+    return
+  fi
+  local backup="$MAC_HOME/backups/venv.${AGENT}.$(date -u +%Y%m%dT%H%M%SZ)"
+  log "existing mac venv uses Python < 3.11; moving it to $backup"
+  mv "$VENV" "$backup"
+}
+
 log "deploy log: $DEPLOY_LOG"
 ensure_dns_resolution
 ensure_venv_support
@@ -215,6 +231,7 @@ set -a
 set +a
 
 log "installing mac Python package"
+prepare_mac_venv
 "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$VENV/bin/python" -m pip install -e "$SRC_DIR" >/dev/null
