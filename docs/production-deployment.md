@@ -88,7 +88,9 @@ redeploys upstream `NousResearch/hermes-agent` into `~/.mac/hermes-agent`,
 applies the minimal multi-Slack Hermes patch, runs the ACC SQLite migration
 dry-run and import from `~/.acc/data/fleet.db` or `~/.acc/data/acc.db`, and
 starts a local `mac` service on `127.0.0.1:8789`. Linux hosts get
-`mac.service`; macOS hosts get `com.mac.control-plane`.
+`mac.service`; macOS hosts get `com.mac.control-plane`. The same deployment
+also starts a mac-managed Hermes gateway from the upstream checkout:
+`mac-hermes-gateway.service` on Linux and `com.mac.hermes-gateway` on macOS.
 
 Deployment logs and migration reports are written under `~/.mac/logs/` on each
 host:
@@ -98,6 +100,7 @@ host:
 - `acc-migration-import.json`
 - `startup-hermes.json`
 - `mac-service-journal.txt` on Linux, or `mac-service.log` on macOS
+- `hermes-gateway-journal.txt` on Linux, or `hermes-gateway.log` on macOS
 
 The activation shim for `slack_accounts.json` is intentionally applied by
 `mac` startup, not by the deploy script, so this path exercises the startup

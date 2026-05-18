@@ -300,6 +300,7 @@ fi
 install_linux_service() {
   local unit="/etc/systemd/system/mac.service"
   log "installing systemd service $unit"
+  install_hermes_gateway_wrapper
   sudo tee "$unit" >/dev/null <<EOF
 [Unit]
 Description=mac control plane replacement for ACC
@@ -326,6 +327,55 @@ EOF
   sleep 3
   sudo systemctl --no-pager -l status mac.service || true
   sudo journalctl -u mac.service -n 200 --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
+  install_linux_hermes_service
+}
+
+install_hermes_gateway_wrapper() {
+  local wrapper="$MAC_HOME/bin/hermes-gateway"
+  mkdir -p "$MAC_HOME/bin"
+  cat > "$wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+[ -f "$HOME/.acc/.env" ] && . "$HOME/.acc/.env"
+[ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
+[ -f "$HOME/.mac/mac.env" ] && . "$HOME/.mac/mac.env"
+set +a
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+exec "$HOME/.mac/hermes-agent/.venv/bin/python" "$HOME/.mac/hermes-agent/hermes" gateway run --replace
+EOF
+  chmod 700 "$wrapper"
+}
+
+install_linux_hermes_service() {
+  local unit="/etc/systemd/system/mac-hermes-gateway.service"
+  log "installing systemd service $unit"
+  sudo tee "$unit" >/dev/null <<EOF
+[Unit]
+Description=mac-managed Hermes gateway
+After=network-online.target mac.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$HERMES_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=$MAC_HOME/bin/hermes-gateway
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable mac-hermes-gateway.service
+  sudo systemctl restart mac-hermes-gateway.service
+  sleep 5
+  sudo systemctl --no-pager -l status mac-hermes-gateway.service || true
+  sudo journalctl -u mac-hermes-gateway.service -n 200 --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
 }
 
 install_darwin_service() {
@@ -333,6 +383,7 @@ install_darwin_service() {
   uid="$(id -u)"
   plist="$HOME/Library/LaunchAgents/com.mac.control-plane.plist"
   wrapper="$MAC_HOME/bin/mac-service"
+  install_hermes_gateway_wrapper
   mkdir -p "$MAC_HOME/bin" "$HOME/Library/LaunchAgents"
   cat > "$wrapper" <<'EOF'
 #!/usr/bin/env bash
@@ -371,6 +422,39 @@ EOF
   fi
   sleep 3
   launchctl list com.mac.control-plane || true
+  install_darwin_hermes_service "$uid"
+}
+
+install_darwin_hermes_service() {
+  local uid="$1" plist="$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mac.hermes-gateway</string>
+  <key>ProgramArguments</key>
+  <array><string>$MAC_HOME/bin/hermes-gateway</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>WorkingDirectory</key><string>$HERMES_DIR</string>
+  <key>StandardOutPath</key><string>$LOG_DIR/hermes-gateway.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/hermes-gateway.log</string>
+</dict>
+</plist>
+EOF
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$plist"
+  fi
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
+  launchctl enable "gui/$uid/com.mac.hermes-gateway"
+  if ! launchctl bootstrap "gui/$uid" "$plist"; then
+    launchctl kickstart -k "gui/$uid/com.mac.hermes-gateway"
+  fi
+  sleep 5
+  launchctl list com.mac.hermes-gateway || true
 }
 
 case "$OS_KIND" in
