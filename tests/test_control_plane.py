@@ -72,6 +72,58 @@ def test_hermes_identity_context_and_interaction_task_boundaries(cp):
     assert "SOUL.md" not in task.description
 
 
+def test_tenant_scoped_task_visibility_and_machine_pool_policy(cp):
+    tenant_a = cp.register_tenant("tenant-a")
+    tenant_b = cp.register_tenant("tenant-b")
+    hermes_a = cp.register_hermes_instance(tenant_a.id, "rocky")
+    hermes_b = cp.register_hermes_instance(tenant_b.id, "natasha")
+    task_a = cp.create_interaction_task(hermes_a.id, "A work", required_capabilities=["python"])
+    task_b = cp.create_interaction_task(
+        hermes_b.id,
+        "B work",
+        priority=50,
+        required_capabilities=["python"],
+    )
+    machine = cp.register_machine(
+        "private-a",
+        labels={"tenant_policy": {"mode": "private", "tenant_ids": [tenant_a.id]}},
+    )
+    agent = cp.register_agent(machine.id, "worker", capabilities=["python"])
+
+    assert [task.id for task in cp.list_tasks(tenant_id=tenant_a.id)] == [task_a.id]
+    assignment = cp.dispatch_once()
+
+    assert assignment["task"]["id"] == task_a.id
+    assert assignment["agent"]["id"] == agent.id
+    assert cp.get_task(task_b.id).state == TaskState.OPEN.value
+
+
+def test_tenant_scoped_secret_requires_machine_policy_and_capability(cp):
+    tenant_a = cp.register_tenant("tenant-a")
+    tenant_b = cp.register_tenant("tenant-b")
+    machine = cp.register_machine(
+        "private-a",
+        labels={"tenant_policy": {"mode": "private", "tenant_ids": [tenant_a.id]}},
+    )
+    agent = cp.register_agent(machine.id, "deployer", capabilities=["deploy"])
+    allowed = cp.create_secret(
+        "tenant-a-token",
+        "a-secret",
+        {"tenant_id": tenant_a.id, "capabilities": ["deploy"]},
+        "human",
+    )
+    denied = cp.create_secret(
+        "tenant-b-token",
+        "b-secret",
+        {"tenant_id": tenant_b.id, "capabilities": ["deploy"]},
+        "human",
+    )
+
+    assert cp.request_secret(allowed.id, agent.id, "deploy").granted is True
+    with pytest.raises(AuthorizationError):
+        cp.request_secret(denied.id, agent.id, "deploy")
+
+
 def finish_task(cp, task, worker, reviewer):
     if task.state == TaskState.OPEN.value:
         task, _lease = cp.claim_task(task.id, worker.id)
@@ -129,6 +181,71 @@ def test_dispatcher_matches_capabilities_and_expired_leases_recover(cp):
     assert [item.id for item in recovered] == [task.id]
     assert cp.get_task(task.id).state == TaskState.OPEN.value
     assert cp.get_agent(python_agent.id).status == AgentStatus.IDLE.value
+
+
+def test_dispatcher_respects_capacity_resources_and_dead_letters(cp):
+    small = register_agent(cp, "small", ["python"])
+    large_machine = cp.register_machine("large-host", resources={"memory_gb": 32})
+    large = cp.register_agent(
+        large_machine.id,
+        "large",
+        capabilities=["python"],
+        resources={"capacity": 2, "memory_gb": 16},
+    )
+    cp.create_task(
+        "needs memory",
+        required_capabilities=["python"],
+        metadata={"resources": {"memory_gb": 12}},
+    )
+    cp.create_task("second slot", required_capabilities=["python"])
+
+    first = cp.dispatch_once()
+    second = cp.dispatch_once()
+
+    assert first["agent"]["id"] == large.id
+    assert second["agent"]["id"] == large.id
+    assert cp.get_agent(small.id).status == AgentStatus.IDLE.value
+
+    dead = cp.create_task("dead letter", required_capabilities=["docs"], max_attempts=1)
+    docs = register_agent(cp, "docs-dead", ["docs"])
+    cp.claim_task(dead.id, docs.id, lease_seconds=-1)
+    cp.expire_leases(now=utcnow())
+
+    assert [task.id for task in cp.list_dead_letters()] == [dead.id]
+
+
+def test_tick_marks_stale_agents_offline_and_requeues_work(cp):
+    worker = register_agent(cp, "stale", ["python"])
+    task = cp.create_task("stale work", required_capabilities=["python"])
+    claimed, lease = cp.claim_task(task.id, worker.id)
+    cp.store.execute(
+        "UPDATE agents SET last_seen_at = '1970-01-01T00:00:00+00:00' WHERE id = ?",
+        (worker.id,),
+    )
+
+    tick = cp.tick(stale_after_seconds=60)
+
+    assert tick["stale_agents"][0]["id"] == worker.id
+    assert cp.get_agent(worker.id).status == AgentStatus.OFFLINE.value
+    assert cp.get_lease(lease.id).status == LeaseStatus.EXPIRED.value
+    assert cp.get_task(claimed.id).state == TaskState.OPEN.value
+    assert tick["assignments"] == []
+
+
+def test_dispatch_tick_round_robins_between_tenants(cp):
+    tenant_a = cp.register_tenant("tenant-a")
+    tenant_b = cp.register_tenant("tenant-b")
+    hermes_a = cp.register_hermes_instance(tenant_a.id, "rocky")
+    hermes_b = cp.register_hermes_instance(tenant_b.id, "bullwinkle")
+    task_a1 = cp.create_interaction_task(hermes_a.id, "A1", priority=100, required_capabilities=["python"])
+    cp.create_interaction_task(hermes_a.id, "A2", priority=90, required_capabilities=["python"])
+    task_b = cp.create_interaction_task(hermes_b.id, "B1", priority=10, required_capabilities=["python"])
+    for index in range(3):
+        register_agent(cp, "fair-%d" % index, ["python"])
+
+    tick = cp.tick(limit=2)
+
+    assert [item["task"]["id"] for item in tick["assignments"]] == [task_a1.id, task_b.id]
 
 
 def test_dependencies_block_until_parent_completes(cp):
@@ -307,6 +424,50 @@ def test_completion_requires_evidence_linked_from_approved_review(cp):
     publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
     assert publication.status == "published"
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+
+
+def test_publication_policy_requires_publication_evidence_with_hash(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "release",
+        required_capabilities=["python"],
+        metadata={"policy": {"require_publication_evidence": True}},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    test_evidence = cp.add_evidence(task.id, "test", "artifact://tests", "tests passed", worker.id)
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=test_evidence.id)
+
+    with pytest.raises(ValidationError):
+        cp.publish_task(task.id, "git://main", reviewer.id)
+    with pytest.raises(ValidationError):
+        cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=test_evidence.id)
+    with pytest.raises(ValidationError):
+        cp.add_evidence(task.id, "publication", "git://main", "published", reviewer.id)
+
+    pub_evidence = cp.add_evidence(
+        task.id,
+        "publication",
+        "git://main",
+        "published",
+        reviewer.id,
+        checksum="sha256:abc123",
+    )
+    publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=pub_evidence.id)
+
+    assert publication.content_hash == "sha256:abc123"
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+
+
+def test_evidence_kind_is_explicit(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+
+    with pytest.raises(ValidationError):
+        cp.add_evidence(task.id, "misc", "artifact://x", "unclassified", worker.id)
 
 
 def test_idle_heartbeat_requires_no_active_lease(cp):

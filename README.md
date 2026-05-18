@@ -20,10 +20,13 @@ This project provides durable contracts for coordinating a fleet:
 
 - SQLite-backed task ledger with state transitions, leases, history, evidence, dependencies, and recovery.
 - Machine and agent registry with capabilities, resources, health, and availability.
-- Dispatcher that matches open work to healthy capable agents and recovers expired leases.
+- Dispatcher that matches open work to healthy capable agents and accounts for
+  tenant pool policy, resources, capacity, stale heartbeats, and expired leases.
 - Structured agent message bus that rejects arbitrary execution payloads.
-- Review and publication pipeline that requires evidence and an approved review before completion.
-- Scoped secret handles with audit records and redacted API/CLI output.
+- Review and publication pipeline that requires typed evidence, independent
+  approved review, and publication hashes when policy requires them.
+- Optional scoped API bearer tokens for read/write/agent/dispatch/secret/admin access.
+- Tenant-scoped secret handles with audit records and redacted API/CLI output.
 - Reproducible runtime manifests with stable digests and secret-value checks.
 - Tenant, user, Persona, Hermes instance, and platform binding records for multi-user expansion.
 - Project bridge, operational memory/provenance records, and rollout/rescue workflows.
@@ -79,14 +82,19 @@ MAC_SECRET_KEY="..." uv run uvicorn mac.api:app --reload
 MAC_SECRET_KEY="..." uv run uvicorn mac.api:create_app --factory --reload
 ```
 
+Set `MAC_API_TOKEN` for one admin token, or `MAC_API_TOKENS` as JSON such as
+`{"reader":["read"],"worker":["agent","dispatch"]}` to require scoped bearer
+tokens. With no API token configured, the local prototype API remains open for
+development.
+
 Key route groups:
 
 - `/tenants`, `/users`, `/personas`
 - `/hermes-instances`, `/hermes-instances/{id}/context`, `/platform-bindings`
 - `/tasks`, `/tasks/{id}/evidence`, `/tasks/{id}/reviews`
-- `/machines`, `/agents`, `/dispatch/tick`
+- `/machines`, `/agents`, `/dispatch/tick`, `/dispatch/dead-letters`
 - `/messages`
-- `/secrets`, `/secret-audits`
+- `/secrets`, `/secrets/{id}/access`, `/secrets/{id}/reveal`, `/secret-audits`
 - `/runtimes`, `/runtime-runs`
 - `/bridge/items`, `/memory`
 - `/rollouts`

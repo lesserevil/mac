@@ -15,6 +15,7 @@ from mac.models import (
     AgentMessage,
     AgentStatus,
     AuthorizationError,
+    EVIDENCE_KINDS,
     Evidence,
     HealthStatus,
     HistoryEvent,
@@ -635,7 +636,7 @@ class ControlPlane:
             raise NotFoundError("task not found: %s" % task_id)
         return self._task_from_row(row)
 
-    def list_tasks(self, state: Optional[str] = None) -> List[Task]:
+    def list_tasks(self, state: Optional[str] = None, tenant_id: Optional[str] = None) -> List[Task]:
         if state:
             rows = self.store.query_all(
                 "SELECT * FROM tasks WHERE state = ? ORDER BY priority DESC, created_at",
@@ -643,7 +644,10 @@ class ControlPlane:
             )
         else:
             rows = self.store.query_all("SELECT * FROM tasks ORDER BY priority DESC, created_at")
-        return [self._task_from_row(row) for row in rows]
+        tasks = [self._task_from_row(row) for row in rows]
+        if tenant_id is not None:
+            tasks = [task for task in tasks if self._task_tenant_id(task) == tenant_id]
+        return tasks
 
     def task_detail(self, task_id: str) -> JsonDict:
         task = self.get_task(task_id)
@@ -697,6 +701,20 @@ class ControlPlane:
             (task_id,),
         )
         return [self._history_from_row(row) for row in rows]
+
+    def list_dead_letters(self, tenant_id: Optional[str] = None) -> List[Task]:
+        rows = self.store.query_all(
+            """
+            SELECT * FROM tasks
+            WHERE state = ? AND attempt_count >= max_attempts
+            ORDER BY updated_at, id
+            """,
+            (TaskState.FAILED.value,),
+        )
+        tasks = [self._task_from_row(row) for row in rows]
+        if tenant_id is not None:
+            tasks = [task for task in tasks if self._task_tenant_id(task) == tenant_id]
+        return tasks
 
     def transition_task(
         self,
@@ -822,6 +840,10 @@ class ControlPlane:
         self.get_task(task_id)
         if not kind or not uri or not summary:
             raise ValidationError("evidence requires kind, uri, and summary")
+        if kind not in EVIDENCE_KINDS:
+            raise ValidationError("unsupported evidence kind: %s" % kind)
+        if kind == "publication" and not checksum:
+            raise ValidationError("publication evidence requires a checksum")
         now = utcnow()
         evidence_id = new_id("ev")
         self.store.execute(
@@ -1113,12 +1135,39 @@ class ControlPlane:
         self.store.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
         return self.get_agent(agent_id)
 
+    def mark_stale_agents_offline(self, stale_after_seconds: int) -> List[Agent]:
+        cutoff = (
+            parse_time(utcnow()) - timedelta(seconds=max(1, int(stale_after_seconds)))
+        ).isoformat(timespec="microseconds")
+        rows = self.store.query_all(
+            """
+            SELECT * FROM agents
+            WHERE status != ? AND last_seen_at <= ?
+            ORDER BY last_seen_at, id
+            """,
+            (AgentStatus.OFFLINE.value, cutoff),
+        )
+        marked = []
+        for row in rows:
+            agent = self._agent_from_row(row)
+            marked.append(self.heartbeat_agent(agent.id, status=AgentStatus.OFFLINE.value))
+        return marked
+
     # Dispatcher
 
-    def dispatch_once(self, lease_seconds: int = 900) -> Optional[JsonDict]:
+    def dispatch_once(
+        self,
+        lease_seconds: int = 900,
+        skip_tenants: Optional[Iterable[str]] = None,
+    ) -> Optional[JsonDict]:
         self.expire_leases()
         self._unblock_ready_tasks()
-        tasks = self.list_tasks(TaskState.OPEN.value)
+        skipped = set(skip_tenants or [])
+        tasks = [
+            task
+            for task in self._dispatch_ordered_tasks()
+            if (self._task_tenant_id(task) or "") not in skipped
+        ]
         agents = self._available_agents()
         for task in tasks:
             for agent in agents:
@@ -1140,16 +1189,42 @@ class ControlPlane:
                 return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
         return None
 
-    def tick(self, lease_seconds: int = 900, limit: int = 100) -> JsonDict:
+    def tick(
+        self,
+        lease_seconds: int = 900,
+        limit: int = 100,
+        stale_after_seconds: Optional[int] = None,
+    ) -> JsonDict:
+        stale_agents = []
+        if stale_after_seconds is not None:
+            stale_agents = [
+                agent.to_dict()
+                for agent in self.mark_stale_agents_offline(stale_after_seconds)
+            ]
         expired = [task.to_dict() for task in self.expire_leases()]
         self._unblock_ready_tasks()
         assignments = []
+        served_tenants = set()
         for _ in range(limit):
-            assignment = self.dispatch_once(lease_seconds=lease_seconds)
+            assignment = self.dispatch_once(
+                lease_seconds=lease_seconds,
+                skip_tenants=served_tenants,
+            )
+            if assignment is None and served_tenants:
+                served_tenants.clear()
+                assignment = self.dispatch_once(lease_seconds=lease_seconds)
             if assignment is None:
                 break
             assignments.append(assignment)
-        return {"expired": expired, "assignments": assignments}
+            task_dict = assignment["task"]
+            origin = task_dict.get("metadata", {}).get("origin", {})
+            served_tenants.add(str(origin.get("tenant_id") or task_dict.get("metadata", {}).get("tenant_id") or ""))
+        return {
+            "stale_agents": stale_agents,
+            "expired": expired,
+            "assignments": assignments,
+            "dead_letters": [task.to_dict() for task in self.list_dead_letters()],
+        }
 
     # Communication bus
 
@@ -1337,10 +1412,19 @@ class ControlPlane:
             raise TransitionError("task must be in review before publication")
         if not self._completion_authorized(task_id):
             raise ValidationError("publication requires approved review and evidence")
+        content_hash = None
+        if self._task_requires_publication_evidence(task) and evidence_id is None:
+            raise ValidationError("publication policy requires publication evidence")
         if evidence_id is not None:
             evidence = self.get_evidence(evidence_id)
             if evidence.task_id != task_id:
                 raise ValidationError("publication evidence must belong to task")
+            if self._task_requires_publication_evidence(task):
+                if evidence.kind != "publication":
+                    raise ValidationError("publication policy requires publication evidence")
+                if not evidence.checksum:
+                    raise ValidationError("publication evidence requires a checksum")
+            content_hash = evidence.checksum
         owner_agent_id = task.owner_agent_id
         now = utcnow()
         publication_id = new_id("pub")
@@ -1357,8 +1441,8 @@ class ControlPlane:
                 raise TransitionError("task state changed during publish; retry")
             conn.execute(
                 """
-                INSERT INTO publications (id, task_id, target, status, evidence_id, created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO publications (id, task_id, target, status, evidence_id, content_hash, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     publication_id,
@@ -1366,6 +1450,7 @@ class ControlPlane:
                     target,
                     PublicationStatus.PUBLISHED.value,
                     evidence_id,
+                    content_hash,
                     created_by,
                     now,
                 ),
@@ -2017,6 +2102,7 @@ class ControlPlane:
             row["target"],
             row["status"],
             row["evidence_id"],
+            row["content_hash"],
             row["created_by"],
             row["created_at"],
         )
@@ -2170,34 +2256,49 @@ class ControlPlane:
             if self._dependencies_satisfied(task):
                 self.transition_task(task.id, TaskState.OPEN.value, "dispatcher", {"reason": "dependencies satisfied"})
 
+    def _dispatch_ordered_tasks(self) -> List[Task]:
+        groups: Dict[str, List[Task]] = {}
+        for task in self.list_tasks(TaskState.OPEN.value):
+            tenant_key = self._task_tenant_id(task) or ""
+            groups.setdefault(tenant_key, []).append(task)
+        for tenant_tasks in groups.values():
+            tenant_tasks.sort(key=lambda item: (-item.priority, item.created_at, item.id))
+        tenant_order = sorted(
+            groups,
+            key=lambda tenant_id: (-groups[tenant_id][0].priority, tenant_id),
+        )
+        ordered: List[Task] = []
+        while any(groups.values()):
+            for tenant_id in tenant_order:
+                if groups[tenant_id]:
+                    ordered.append(groups[tenant_id].pop(0))
+        return ordered
+
     def _available_agents(self) -> List[Agent]:
         rows = self.store.query_all(
             """
             SELECT a.* FROM agents a
             JOIN machines m ON m.id = a.machine_id
-            WHERE a.status = ? AND a.health_status = ? AND m.trusted = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM leases l
-                  JOIN tasks t ON t.lease_id = l.id
-                  WHERE l.agent_id = a.id
-                    AND l.status = ?
-                    AND t.owner_agent_id = a.id
-              )
+            WHERE a.status IN (?, ?) AND a.health_status = ? AND m.trusted = 1
             ORDER BY a.last_seen_at DESC, a.id
             """,
-            (AgentStatus.IDLE.value, HealthStatus.HEALTHY.value, LeaseStatus.ACTIVE.value),
+            (AgentStatus.IDLE.value, AgentStatus.BUSY.value, HealthStatus.HEALTHY.value),
         )
         return [self._agent_from_row(row) for row in rows]
 
     def _agent_available_for(self, agent: Agent, task: Task) -> bool:
-        if agent.status != AgentStatus.IDLE.value:
+        if agent.status not in {AgentStatus.IDLE.value, AgentStatus.BUSY.value}:
             return False
         if agent.health_status != HealthStatus.HEALTHY.value:
             return False
         machine = self.get_machine(agent.machine_id)
         if not machine.trusted:
             return False
-        if self._agent_has_active_lease(agent.id):
+        if self._agent_active_lease_count(agent.id) >= self._agent_capacity(agent):
+            return False
+        if not self._machine_allows_tenant(machine, self._task_tenant_id(task)):
+            return False
+        if not self._agent_resources_satisfy(agent, machine, task):
             return False
         capabilities = set(agent.capabilities)
         required = set(task.required_capabilities)
@@ -2223,6 +2324,79 @@ class ControlPlane:
             (agent_id, LeaseStatus.ACTIVE.value, agent_id),
         )
         return row is not None
+
+    def _agent_active_lease_count(self, agent_id: str) -> int:
+        row = self.store.query_one(
+            """
+            SELECT COUNT(*) AS count FROM leases l
+            JOIN tasks t ON t.lease_id = l.id
+            WHERE l.agent_id = ?
+              AND l.status = ?
+              AND t.owner_agent_id = ?
+            """,
+            (agent_id, LeaseStatus.ACTIVE.value, agent_id),
+        )
+        return int(row["count"] if row is not None else 0)
+
+    def _agent_capacity(self, agent: Agent) -> int:
+        for key in ("capacity", "max_concurrent_tasks"):
+            value = agent.resources.get(key)
+            if value is not None:
+                return max(1, int(value))
+        return 1
+
+    def _task_tenant_id(self, task: Task) -> Optional[str]:
+        origin = task.metadata.get("origin")
+        if isinstance(origin, dict) and origin.get("tenant_id"):
+            return str(origin["tenant_id"])
+        tenant_id = task.metadata.get("tenant_id")
+        return str(tenant_id) if tenant_id else None
+
+    def _machine_allows_tenant(self, machine: Machine, tenant_id: Optional[str]) -> bool:
+        policy = machine.labels.get("tenant_policy") or {}
+        if not isinstance(policy, dict):
+            return True
+        mode = str(policy.get("mode", "shared"))
+        allowed = set(policy.get("tenant_ids") or policy.get("allow_tenants") or [])
+        denied = set(policy.get("deny_tenants") or [])
+        if mode == "denied":
+            return False
+        if tenant_id is None:
+            return mode != "private"
+        if tenant_id in denied:
+            return False
+        if mode == "private":
+            return tenant_id in allowed
+        if allowed:
+            return tenant_id in allowed
+        return True
+
+    def _agent_resources_satisfy(self, agent: Agent, machine: Machine, task: Task) -> bool:
+        required = task.metadata.get("resources") or task.metadata.get("required_resources") or {}
+        if not isinstance(required, dict):
+            return True
+        available = dict(machine.resources)
+        available.update(agent.resources)
+        for key, needed in required.items():
+            current = available.get(key)
+            if isinstance(needed, (int, float)):
+                if current is None or float(current) < float(needed):
+                    return False
+            elif isinstance(needed, list):
+                if not set(needed).issubset(set(current or [])):
+                    return False
+            elif needed is not None and current != needed:
+                return False
+        return True
+
+    def _task_requires_publication_evidence(self, task: Task) -> bool:
+        policy = task.metadata.get("policy") or {}
+        if not isinstance(policy, dict):
+            return False
+        return bool(
+            policy.get("require_publication_evidence")
+            or policy.get("publication_evidence_required")
+        )
 
     def _expire_agent_active_leases(self, agent_id: str, timestamp: str, reason: str) -> None:
         rows = self.store.query_all(
@@ -2358,6 +2532,13 @@ class ControlPlane:
     def _secret_scope_allows(self, scopes: JsonDict, agent: Agent) -> bool:
         agents = set(scopes.get("agents") or [])
         capabilities = set(scopes.get("capabilities") or [])
+        tenant_scope = set(scopes.get("tenant_ids") or [])
+        if scopes.get("tenant_id"):
+            tenant_scope.add(str(scopes["tenant_id"]))
+        if tenant_scope:
+            machine = self.get_machine(agent.machine_id)
+            if not any(self._machine_allows_tenant(machine, tenant_id) for tenant_id in tenant_scope):
+                return False
         if agent.id in agents:
             return True
         if capabilities and capabilities.intersection(set(agent.capabilities)):

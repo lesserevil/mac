@@ -156,6 +156,9 @@ class PublicationStatus(StrEnum):
     FAILED = "failed"
 
 
+EVIDENCE_KINDS = {"test", "review", "artifact", "publication", "log"}
+
+
 class MessageType(StrEnum):
     HELP_REQUEST = "help_request"
     EVIDENCE_REQUEST = "evidence_request"
@@ -445,6 +448,7 @@ class Publication:
     target: str
     status: str
     evidence_id: Optional[str]
+    content_hash: Optional[str]
     created_by: str
     created_at: str
 

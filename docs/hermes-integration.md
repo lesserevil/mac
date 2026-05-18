@@ -40,6 +40,11 @@ registration = adapter.register_identity(
 )
 ```
 
+In production, configure `MAC_API_TOKEN` / `MAC_API_TOKENS` on the API and pass
+the matching Hermes token to `MacApiClient(..., token="...")`. Hermes generally
+needs `write` to create identity/task records and `read` to fetch summaries; a
+worker gateway may instead use narrower `agent` or `dispatch` scopes.
+
 The returned `hermes_instance.id` is the durable identity used for later task
 creation.
 

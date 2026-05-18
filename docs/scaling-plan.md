@@ -57,33 +57,42 @@ memory `sink` to Hermes' actual memory writer.
 
 ### Phase 3: Multi-Tenant Policy
 
+Status: implemented as local policy gates.
+
 Harden the identity model:
 
-- API authentication and scoped tokens.
-- Tenant-scoped task visibility.
-- Secret leases scoped by tenant, agent, and capability.
-- Machine pools that can be private, shared, or denied per tenant.
-- Platform binding ownership checks for Slack/Telegram/Discord surfaces.
+- API authentication and scoped tokens are available through `MAC_API_TOKEN`,
+  `MAC_API_TOKENS`, or explicit `create_app(auth_tokens=...)`.
+- Tenant-scoped task visibility uses Hermes interaction origin metadata.
+- Secret leases are scoped by tenant, agent, machine policy, and capability.
+- Machine pools use `labels.tenant_policy` with shared/private/denied behavior.
+- Platform binding ownership checks prevent cross-tenant or cross-instance use.
 
 ### Phase 4: Fleet-Scale Dispatch
 
+Status: implemented as deterministic local dispatch policy.
+
 Improve dispatch without changing the core task contract:
 
-- Heartbeat freshness and offline detection.
-- Agent capacity and concurrency limits.
-- Fairness across tenants and priorities.
-- Capability/resource matching beyond simple capability subsets.
-- Lease renewal deadlines, retries, and dead-letter reporting.
+- Heartbeat freshness can mark stale agents offline during `tick`.
+- Agent resources can declare `capacity` / `max_concurrent_tasks`.
+- Dispatch round-robins tenants inside a tick while preserving per-tenant priority.
+- Task metadata can declare numeric/list/exact `resources` requirements.
+- Expired leases retry until `max_attempts`; exhausted tasks appear in
+  `/dispatch/dead-letters`.
 
 ### Phase 5: Review, Evidence, and Publication Hardening
 
+Status: implemented.
+
 Move from prototype gates to production gates:
 
-- Enforce reviewer independence from the worker.
-- Require approved reviews to reference evidence.
-- Distinguish test, review, artifact, and publication evidence.
-- Add branch/artifact publication records with content hashes.
-- Make completion impossible without publication evidence when policy requires it.
+- Reviewer independence from current or prior task owners is enforced.
+- Approved reviews must reference task evidence.
+- Evidence kinds are explicit: `test`, `review`, `artifact`, `publication`, `log`.
+- Publications carry `content_hash` from publication evidence when provided.
+- Tasks with `metadata.policy.require_publication_evidence` cannot publish
+  without publication evidence and checksum.
 
 ### Phase 6: Rollout and Rescue
 

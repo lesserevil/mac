@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -121,6 +122,7 @@ class HeartbeatRequest(BaseModel):
 class DispatchRequest(BaseModel):
     lease_seconds: int = 900
     limit: int = 100
+    stale_after_seconds: Optional[int] = None
 
 
 class MessageCreate(BaseModel):
@@ -160,6 +162,12 @@ class SecretCreate(BaseModel):
 class SecretAccessRequest(BaseModel):
     accessor_agent_id: str
     purpose: str
+    ttl_seconds: int = 300
+
+
+class SecretRevealRequest(BaseModel):
+    audit_id: str
+    accessor_agent_id: str
 
 
 class RuntimeCreate(BaseModel):
@@ -216,10 +224,60 @@ class RolloutRescue(BaseModel):
     reason: str
 
 
-def create_app(db_path: Optional[str] = None, control_plane: Optional[ControlPlane] = None) -> FastAPI:
+def _load_auth_tokens_from_env() -> Dict[str, List[str]]:
+    raw = os.environ.get("MAC_API_TOKENS")
+    if raw:
+        loaded = json.loads(raw)
+        return {str(token): [str(scope) for scope in scopes] for token, scopes in loaded.items()}
+    single = os.environ.get("MAC_API_TOKEN")
+    return {single: ["admin"]} if single else {}
+
+
+def _required_scope(method: str, path: str) -> Optional[str]:
+    if path == "/health":
+        return None
+    if method == "GET":
+        return "read"
+    if path.startswith("/agents/") and (
+        path.endswith("/heartbeat") or path.endswith("/messages/deliver")
+    ):
+        return "agent"
+    if path.startswith("/dispatch"):
+        return "dispatch"
+    if path.startswith("/secrets") or path.startswith("/secret-audits"):
+        return "secret"
+    return "write"
+
+
+def _authorize_request(
+    method: str,
+    path: str,
+    authorization: Optional[str],
+    auth_tokens: Dict[str, List[str]],
+) -> None:
+    required = _required_scope(method, path)
+    if required is None or not auth_tokens:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise AuthorizationError("missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    scopes = set(auth_tokens.get(token) or [])
+    if not scopes:
+        raise AuthorizationError("unknown bearer token")
+    if "admin" not in scopes and required not in scopes:
+        raise AuthorizationError("token lacks required scope: %s" % required)
+
+
+def create_app(
+    db_path: Optional[str] = None,
+    control_plane: Optional[ControlPlane] = None,
+    auth_tokens: Optional[Dict[str, List[str]]] = None,
+) -> FastAPI:
     cp = control_plane or ControlPlane(SQLiteStore(db_path or "mac.db"))
+    tokens = auth_tokens if auth_tokens is not None else _load_auth_tokens_from_env()
     app = FastAPI(title="MAC Control Plane", version="0.1.0")
     app.state.control_plane = cp
+    app.state.auth_tokens = tokens
 
     @app.exception_handler(MACError)
     async def handle_mac_error(request: Any, exc: MACError) -> JSONResponse:
@@ -228,6 +286,19 @@ def create_app(db_path: Optional[str] = None, control_plane: Optional[ControlPla
         if isinstance(exc, AuthorizationError):
             return JSONResponse(status_code=403, content={"detail": str(exc)})
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.middleware("http")
+    async def authenticate(request: Request, call_next: Any) -> Any:
+        try:
+            _authorize_request(
+                request.method,
+                request.url.path,
+                request.headers.get("authorization"),
+                tokens,
+            )
+        except AuthorizationError as exc:
+            return JSONResponse(status_code=403, content={"detail": str(exc)})
+        return await call_next(request)
 
     @app.get("/health")
     def health() -> Dict[str, str]:
@@ -299,8 +370,11 @@ def create_app(db_path: Optional[str] = None, control_plane: Optional[ControlPla
         return cp.create_task(actor=actor, **data).to_dict()
 
     @app.get("/tasks")
-    def list_tasks(state: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
-        return [task.to_dict() for task in cp.list_tasks(state)]
+    def list_tasks(
+        state: Optional[str] = Query(default=None),
+        tenant_id: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [task.to_dict() for task in cp.list_tasks(state, tenant_id)]
 
     @app.get("/tasks/{task_id}")
     def get_task(task_id: str) -> Dict[str, Any]:
@@ -357,7 +431,11 @@ def create_app(db_path: Optional[str] = None, control_plane: Optional[ControlPla
 
     @app.post("/dispatch/tick")
     def dispatch_tick(body: DispatchRequest) -> Dict[str, Any]:
-        return cp.tick(body.lease_seconds, body.limit)
+        return cp.tick(body.lease_seconds, body.limit, body.stale_after_seconds)
+
+    @app.get("/dispatch/dead-letters")
+    def dead_letters(tenant_id: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
+        return [task.to_dict() for task in cp.list_dead_letters(tenant_id)]
 
     @app.post("/messages")
     def send_message(body: MessageCreate) -> Dict[str, Any]:
@@ -393,7 +471,19 @@ def create_app(db_path: Optional[str] = None, control_plane: Optional[ControlPla
 
     @app.post("/secrets/{secret_id}/access")
     def request_secret(secret_id: str, body: SecretAccessRequest) -> Dict[str, Any]:
-        return cp.request_secret(secret_id, body.accessor_agent_id, body.purpose).to_dict()
+        return cp.request_secret(
+            secret_id,
+            body.accessor_agent_id,
+            body.purpose,
+            body.ttl_seconds,
+        ).to_dict()
+
+    @app.post("/secrets/{secret_id}/reveal")
+    def reveal_secret(secret_id: str, body: SecretRevealRequest) -> Dict[str, Any]:
+        return {
+            "secret_id": secret_id,
+            "value": cp.reveal_secret(secret_id, body.audit_id, body.accessor_agent_id),
+        }
 
     @app.get("/secret-audits")
     def list_secret_audits(secret_id: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:

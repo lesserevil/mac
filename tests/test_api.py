@@ -49,6 +49,11 @@ def test_fastapi_exposes_core_workflow_and_redacts_secrets():
     ).json()
     assert handle["handle"].startswith("secret://")
     assert "never-return-this" not in str(handle)
+    revealed = client.post(
+        "/secrets/%s/reveal" % secret["id"],
+        json={"audit_id": handle["audit_id"], "accessor_agent_id": agent["id"]},
+    ).json()
+    assert revealed["value"] == "never-return-this"
 
 
 def test_fastapi_exposes_hermes_identity_boundary():
@@ -97,3 +102,29 @@ def test_fastapi_exposes_hermes_identity_boundary():
     ).json()
     assert task["metadata"]["origin"]["hermes_instance_id"] == hermes["id"]
     assert task["metadata"]["memory_boundary"]["mac_records_operational_provenance_only"] is True
+
+
+def test_fastapi_can_require_scoped_bearer_tokens():
+    client = TestClient(
+        create_app(
+            control_plane=ControlPlane.in_memory(),
+            auth_tokens={
+                "writer": ["write"],
+                "reader": ["read"],
+            },
+        )
+    )
+
+    assert client.get("/health").status_code == 200
+    assert client.post("/machines", json={"hostname": "host-1"}).status_code == 403
+    assert client.post(
+        "/machines",
+        headers={"Authorization": "Bearer reader"},
+        json={"hostname": "host-1"},
+    ).status_code == 403
+    assert client.post(
+        "/machines",
+        headers={"Authorization": "Bearer writer"},
+        json={"hostname": "host-1"},
+    ).status_code == 200
+    assert client.get("/machines", headers={"Authorization": "Bearer reader"}).status_code == 200

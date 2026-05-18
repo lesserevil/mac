@@ -254,6 +254,7 @@ class SQLiteStore:
                     target TEXT NOT NULL,
                     status TEXT NOT NULL,
                     evidence_id TEXT,
+                    content_hash TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -353,4 +354,15 @@ class SQLiteStore:
                 );
                 """
             )
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        self._ensure_column("secret_access_audit", "expires_at", "expires_at TEXT")
+        self._ensure_column("secret_access_audit", "revealed_at", "revealed_at TEXT")
+        self._ensure_column("publications", "content_hash", "content_hash TEXT")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(%s)" % table)}
+        if column not in columns:
+            self._conn.execute("ALTER TABLE %s ADD COLUMN %s" % (table, definition))
