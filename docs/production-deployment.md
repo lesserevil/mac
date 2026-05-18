@@ -27,6 +27,12 @@ deploying more than one writer.
 | `MAC_DB` | no | SQLite file path. Default `./mac.db`. |
 | `MAC_API_TOKEN` | no | Single admin bearer token. Set empty string is rejected. |
 | `MAC_API_TOKENS` | no | JSON `{token: [scopes,...]}` for scoped auth. Mutually exclusive with `MAC_API_TOKEN`. |
+| `HERMES_HOME` | no | Hermes state directory checked at startup. Default `~/.hermes`. |
+| `ACC_DIR` | no | Legacy ACC data directory checked for migration/state references. Default `~/.acc`. |
+| `MAC_HERMES_AGENT_DIR` | no | Hermes checkout inspected for the `slack_accounts.json` activation shim. Falls back to `HERMES_AGENT_DIR`, then `~/Src/hermes-agent` if present. |
+| `MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM` | no | Set `0` to disable startup patching of an explicit `MAC_HERMES_AGENT_DIR`. Default enabled only when the checkout path is explicit. |
+| `MAC_HERMES_STARTUP_CHECK` | no | Set `0` to disable Hermes state and Slack startup checks. Enabled by default. |
+| `MAC_REQUIRE_HERMES_STARTUP_READY` | no | Set `1` to fail `mac` startup when Hermes soul/memory/state references or Slack activation are not ready. |
 
 Generate a secret key once:
 
@@ -105,6 +111,8 @@ process. Restore is a file copy while the service is stopped.
 ## Observability
 
 - `GET /health` is the liveness/readiness signal. Returns `{"status":"ok"}`.
+- `GET /startup/hermes` returns the redacted Hermes startup report: file
+  existence/size/mtime metadata, warning strings, and Slack activation status.
 - `GET /events` is the unified audit stream — point a log shipper (vector,
   promtail, fluent-bit) at it with `since=` advancing every poll, or scrape
   the SQLite tables directly.

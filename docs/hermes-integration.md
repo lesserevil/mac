@@ -48,6 +48,48 @@ worker gateway may instead use narrower `agent` or `dispatch` scopes.
 The returned `hermes_instance.id` is the durable identity used for later task
 creation.
 
+## Startup State Check
+
+`mac` also performs a metadata-only Hermes startup check when the API process
+starts. The check inventories local Hermes-owned state references such as
+`SOUL.md`, `USER.md`, `MEMORY.md`, `state.db`, `memory_store.db`,
+`kanban.db`, `auth.json`, `.env`, `slack_accounts.json`, Slack channel
+mapping files, and selected `~/.acc/data` references. It returns only paths,
+existence, sizes, and mtimes; file contents are never returned.
+
+The report is exposed at:
+
+```bash
+curl $MAC_URL/startup/hermes
+```
+
+By default, missing state produces warnings but does not stop `mac`, which
+keeps local development and fresh installs simple. Set
+`MAC_REQUIRE_HERMES_STARTUP_READY=1` in production if startup should fail until
+the expected Hermes soul, memory, state, and Slack activation contract is
+present.
+
+Relevant environment:
+
+- `HERMES_HOME`: Hermes state directory; defaults to `~/.hermes`.
+- `ACC_DIR`: legacy ACC data directory for migration references; defaults to
+  `~/.acc`.
+- `MAC_HERMES_AGENT_DIR` / `HERMES_AGENT_DIR`: upstream Hermes checkout to
+  inspect for the Slack account-file activation shim.
+- `MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM=0`: disable the startup shim patcher
+  when `MAC_HERMES_AGENT_DIR` points at an explicit checkout. It is enabled by
+  default only for explicit checkout paths.
+- `MAC_HERMES_STARTUP_CHECK=0`: disable the check.
+- `MAC_REQUIRE_HERMES_STARTUP_READY=1`: fail startup when warnings are present.
+
+One current deployment caveat matters for an upstream-Hermes-based install:
+upstream `NousResearch/hermes-agent` enables Slack from `SLACK_BOT_TOKEN` or
+explicit Slack config. If a deployed agent relies only on
+`slack_accounts.json`, `mac` applies the account-file activation shim from
+ACC's `deploy/setup-hermes-venv.sh` when `MAC_HERMES_AGENT_DIR` explicitly
+points at the Hermes checkout. Without an explicit checkout path, `mac` only
+reports that the shim is missing and marks startup unready.
+
 ## Creating Tasks
 
 Hermes should summarize the user request and pass sanitized context:

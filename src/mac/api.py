@@ -10,7 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from mac.models import AuthorizationError, MACError, NotFoundError
+from mac.hermes_startup import build_hermes_startup_report
+from mac.models import AuthorizationError, MACError, NotFoundError, ValidationError
 from mac.services import ControlPlane
 from mac.store import SQLiteStore
 
@@ -616,6 +617,16 @@ def create_app(
     app = FastAPI(title="MAC Control Plane", version="0.1.0")
     app.state.control_plane = cp
     app.state.auth_tokens = tokens
+    app.state.hermes_startup = build_hermes_startup_report()
+    if (
+        os.environ.get("MAC_REQUIRE_HERMES_STARTUP_READY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and not app.state.hermes_startup["ready"]
+    ):
+        raise ValidationError(
+            "Hermes startup readiness failed: %s"
+            % "; ".join(app.state.hermes_startup["warnings"])
+        )
     ui_dir = Path(__file__).with_name("ui")
     if ui_dir.exists():
         app.mount("/ui/assets", StaticFiles(directory=str(ui_dir)), name="ui-assets")
@@ -644,6 +655,10 @@ def create_app(
     @app.get("/health")
     def health() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/startup/hermes")
+    def hermes_startup() -> Dict[str, Any]:
+        return app.state.hermes_startup
 
     @app.get("/ui", include_in_schema=False)
     @app.get("/ui/", include_in_schema=False)
