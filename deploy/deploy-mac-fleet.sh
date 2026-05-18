@@ -91,14 +91,24 @@ log() {
 }
 
 python_bin() {
-  if command -v python3 >/dev/null 2>&1; then
-    command -v python3
-  elif command -v python >/dev/null 2>&1; then
-    command -v python
-  else
-    log "ERROR: no python3/python found"
-    exit 1
-  fi
+  local candidate
+  for candidate in "${MAC_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 python3 python; do
+    [ -n "$candidate" ] || continue
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    candidate="$(command -v "$candidate")"
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+    then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  log "ERROR: no Python >= 3.11 found"
+  exit 1
 }
 
 PY="$(python_bin)"
