@@ -290,6 +290,90 @@ h3 {
   gap: 10px;
 }
 
+.action-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.action-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 8px;
+  align-items: end;
+  width: 100%;
+  margin-top: 12px;
+}
+
+.action-form.compact {
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+}
+
+.action-form label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.action-form input,
+.action-form select,
+.action-form textarea {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--ink);
+  padding: 8px 10px;
+  text-transform: none;
+}
+
+.action-form textarea {
+  min-height: 74px;
+  resize: vertical;
+}
+
+.action-form button,
+.action-strip button {
+  min-height: 36px;
+  border: 1px solid #2f6f63;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  padding: 0 12px;
+  font-weight: 800;
+}
+
+.action-status {
+  border: 1px solid #bdd4e9;
+  border-radius: 8px;
+  background: var(--blue-soft);
+  color: var(--blue);
+  padding: 10px 12px;
+}
+
+.danger-action button {
+  border-color: #b42318;
+  background: var(--danger);
+}
+
+details.action-box {
+  margin-top: 12px;
+  border: 1px solid #e5e9ef;
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 10px 12px;
+}
+
+details.action-box summary {
+  cursor: pointer;
+  font-weight: 800;
+}
+
 .agent-list,
 .record-list,
 .runtime-list,
@@ -315,6 +399,17 @@ h3 {
 
 .record.compact {
   box-shadow: none;
+}
+
+.timeline {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.timeline-item {
+  border-left: 3px solid #bdd4e9;
+  padding: 2px 0 2px 10px;
 }
 
 .record-header,
@@ -511,7 +606,7 @@ h3 {
   }
 
   .nav {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .nav-item {
@@ -550,7 +645,9 @@ h3 {
   .metric-grid,
   .row-grid,
   .task-lanes,
-  .toolbar {
+  .toolbar,
+  .action-form,
+  .action-form.compact {
     grid-template-columns: 1fr;
   }
 }

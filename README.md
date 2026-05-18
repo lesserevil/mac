@@ -90,15 +90,21 @@ development.
 
 The built-in dashboard is served at `/ui`. Static dashboard assets are public so
 the browser can load the shell, while data requests still use the same API token
-rules as the REST API. Enter a token with `read` scope in the dashboard when API
-tokens are enabled. The dashboard source is plain TypeScript in
-`src/mac/ui/app.ts`; the checked-in `app.js` browser output is served directly so
-there is no Node.js, npm, bundler, or frontend build step.
+rules as the REST API. Enter a token with the needed read/write/dispatch/secret
+scopes in the dashboard when API tokens are enabled. The dashboard source is
+plain TypeScript in `src/mac/ui/app.ts`; the checked-in `app.js` browser output
+is served directly so there is no Node.js, npm, bundler, or frontend build step.
+The dashboard has read models for overview, agents, task timelines, Hermes
+activity, runtime/rollout status, and redacted secret audits. Operator actions
+cover dispatch ticks, task transitions, evidence, reviews, publication, rollout
+advance/health/rescue, and secret handle requests. It deliberately does not
+expose a casual secret reveal action.
 
 Key route groups:
 
 - `/tenants`, `/users`, `/personas`
 - `/hermes-instances`, `/hermes-instances/{id}/context`, `/platform-bindings`
+- `/dashboard/state`, `/dashboard/agents/{id}`, `/dashboard/tasks/{id}/timeline`, `/dashboard/dispatch/explain`, `/dashboard/hermes/{id}/activity`, `/dashboard/rollouts/{id}/status`
 - `/tasks`, `/tasks/{id}/evidence`, `/tasks/{id}/reviews`
 - `/machines`, `/agents`, `/dispatch/tick`, `/dispatch/dead-letters`
 - `/messages`
@@ -106,7 +112,8 @@ Key route groups:
 - `/runtimes`, `/runtime-runs`
 - `/bridge/items`, `/memory`
 - `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
-- `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-runs`
+- `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-sets/{id}/events`, `/eval-runs`
+- `/events` — unified audit stream across task/rollout/eval_set/secret surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
 
 ## CLI Examples
 
@@ -151,6 +158,12 @@ mac --db mac.db rollout create 1.3.0 canary --runtime runtime_... \
 mac --db mac.db rollout advance rollout_... start_canary --actor human
 # promote refused until a passing eval run exists for version 1.3.0
 mac --db mac.db rollout advance rollout_... promote --actor human
+
+# Unified audit stream: one query across task/rollout/eval_set/secret events.
+mac --db mac.db events list --limit 50
+mac --db mac.db events list --subject-type rollout --subject-id rollout_...
+mac --db mac.db events list --prefix rollout. --since 2026-05-17T00:00:00+00:00
+mac --db mac.db events list --actor monitor --event-type rollout.health_failure_during_rescue
 ```
 
 Hermes-facing API adapter:

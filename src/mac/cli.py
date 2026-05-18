@@ -395,6 +395,21 @@ def cmd_eval_run_list(args: argparse.Namespace) -> None:
     _print([run.to_dict() for run in _plane(args).list_eval_runs(args.eval_set, args.target_id)])
 
 
+def cmd_events_list(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).list_events(
+            subject_type=args.subject_type,
+            subject_id=args.subject_id,
+            actor=args.actor,
+            event_type=args.event_type,
+            event_type_prefix=args.prefix,
+            since=args.since,
+            until=args.until,
+            limit=args.limit,
+        )
+    )
+
+
 def cmd_rollout_list(args: argparse.Namespace) -> None:
     _print([rollout.to_dict() for rollout in _plane(args).list_rollouts(args.tenant_id, args.channel)])
 
@@ -726,6 +741,29 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_rescue.add_argument("--reason", required=True)
     rollout_rescue.add_argument("--detail")
     _set(cmd_rollout_rescue, rollout_rescue)
+
+    events = sub.add_parser("events", help="unified audit stream").add_subparsers(
+        dest="events_command", required=True
+    )
+    events_list = events.add_parser(
+        "list",
+        help="list events across task/rollout/eval_set/secret audit surfaces",
+    )
+    events_list.add_argument(
+        "--subject-type",
+        choices=("task", "rollout", "eval_set", "secret"),
+    )
+    events_list.add_argument("--subject-id")
+    events_list.add_argument("--actor")
+    events_list.add_argument("--event-type", help="exact event_type match")
+    events_list.add_argument(
+        "--prefix",
+        help="event_type prefix (e.g. 'rollout.' for all rollout events)",
+    )
+    events_list.add_argument("--since", help="ISO timestamp lower bound (inclusive)")
+    events_list.add_argument("--until", help="ISO timestamp upper bound (inclusive)")
+    events_list.add_argument("--limit", type=int, default=100)
+    _set(cmd_events_list, events_list)
 
     eval_root = sub.add_parser("eval", help="evaluation sets and runs").add_subparsers(
         dest="eval_command", required=True

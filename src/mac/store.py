@@ -400,6 +400,46 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_eval_set_events_set
                     ON eval_set_events (eval_set_id, created_at);
+
+                -- Unified audit stream. Operators query one surface instead of
+                -- joining four per-resource tables. The view is read-only; each
+                -- write still goes to its owning table inside the originating
+                -- transaction, so audit trail and durable state commit together.
+                DROP VIEW IF EXISTS events;
+                CREATE VIEW events AS
+                    SELECT
+                        id,
+                        'task' AS subject_type,
+                        task_id AS subject_id,
+                        event_type,
+                        actor,
+                        json_set(
+                            COALESCE(NULLIF(detail, ''), '{}'),
+                            '$.from_state', from_state,
+                            '$.to_state', to_state
+                        ) AS detail,
+                        created_at
+                    FROM task_history
+                    UNION ALL
+                    SELECT id, 'rollout', rollout_id, event_type, actor, detail, created_at
+                    FROM rollout_events
+                    UNION ALL
+                    SELECT id, 'eval_set', eval_set_id, event_type, actor, detail, created_at
+                    FROM eval_set_events
+                    UNION ALL
+                    SELECT
+                        id,
+                        'secret',
+                        secret_id,
+                        'secret.' || result,
+                        accessor_agent_id,
+                        json_object(
+                            'purpose', purpose,
+                            'expires_at', expires_at,
+                            'revealed_at', revealed_at
+                        ),
+                        created_at
+                    FROM secret_access_audit;
                 """
             )
             self._migrate()

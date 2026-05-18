@@ -156,6 +156,13 @@ class PublicationStatus(StrEnum):
     FAILED = "failed"
 
 
+class RuntimeRunStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 EVIDENCE_KINDS = {"test", "review", "artifact", "publication", "log", "eval"}
 
 

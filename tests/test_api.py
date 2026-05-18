@@ -147,10 +147,103 @@ def test_fastapi_serves_dashboard_shell_without_api_token():
 
     script_response = client.get("/ui/assets/app.js")
     assert script_response.status_code == 200
-    assert "fetchJSON" in script_response.text
+    assert "requestJSON" in script_response.text
+    assert "data-action=\"dispatchTick\"" in script_response.text
 
     assert client.get("/agents").status_code == 403
     assert client.get("/agents", headers={"Authorization": "Bearer reader"}).status_code == 200
+
+
+def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+
+    machine = client.post("/machines", json={"hostname": "host-1"}).json()
+    agent = client.post(
+        "/agents",
+        json={
+            "machine_id": machine["id"],
+            "name": "worker",
+            "capabilities": ["python", "deploy"],
+            "resources": {"capacity": 2},
+        },
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={"title": "Dashboard task", "required_capabilities": ["python"]},
+    ).json()
+    secret = client.post(
+        "/secrets",
+        json={
+            "name": "dashboard-token",
+            "value": "never-render-this",
+            "scopes": {"capabilities": ["deploy"]},
+            "created_by": "human",
+        },
+    ).json()
+    handle = client.post(
+        "/secrets/%s/access" % secret["id"],
+        json={"accessor_agent_id": agent["id"], "purpose": "dashboard"},
+    ).json()
+
+    state = client.get("/dashboard/state").json()
+    assert state["overview"]["counts"]["agents"] == 1
+    assert state["dispatch"]["open_task_count"] == 1
+    assert state["dispatch"]["tasks"][0]["eligible_agent_count"] == 1
+    assert state["tasks"][0]["task"]["id"] == task["id"]
+    assert state["secrets"][0]["value"] == "***REDACTED***"
+    assert "never-render-this" not in str(state)
+    assert state["secret_audits"][0]["id"] == handle["audit_id"]
+
+    timeline = client.get("/dashboard/tasks/%s/timeline" % task["id"]).json()
+    assert timeline["task"]["title"] == "Dashboard task"
+    assert timeline["summary"]["state"] == "open"
+
+    agent_detail = client.get("/dashboard/agents/%s" % agent["id"]).json()
+    assert agent_detail["availability"]["eligible"] is True
+
+
+def test_events_endpoint_returns_unified_stream():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+
+    tenant = client.post("/tenants", json={"name": "ops"}).json()
+    machine = client.post("/machines", json={"hostname": "host-1"}).json()
+    agent = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={"title": "audited", "required_capabilities": ["python"]},
+    ).json()
+    client.post(
+        "/tasks/%s/claim" % task["id"],
+        params={"agent_id": agent["id"]},
+    )
+    secret = client.post(
+        "/secrets",
+        json={
+            "name": "audit-token",
+            "value": "v",
+            "scopes": {"capabilities": ["python"]},
+            "created_by": "human",
+        },
+    ).json()
+    client.post(
+        "/secrets/%s/access" % secret["id"],
+        json={"accessor_agent_id": agent["id"], "purpose": "test"},
+    )
+
+    events = client.get("/events", params={"limit": 200}).json()
+    types = {event["subject_type"] for event in events}
+    assert {"task", "secret"} <= types
+
+    task_only = client.get(
+        "/events",
+        params={"subject_type": "task", "subject_id": task["id"]},
+    ).json()
+    assert task_only
+    assert all(event["subject_id"] == task["id"] for event in task_only)
 
 
 def test_dashboard_has_typescript_source_without_node_toolchain_files():

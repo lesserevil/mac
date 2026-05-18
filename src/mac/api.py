@@ -276,7 +276,15 @@ def _load_auth_tokens_from_env() -> Dict[str, List[str]]:
         loaded = json.loads(raw)
         return {str(token): [str(scope) for scope in scopes] for token, scopes in loaded.items()}
     single = os.environ.get("MAC_API_TOKEN")
-    return {single: ["admin"]} if single else {}
+    if single is None:
+        return {}
+    single = single.strip()
+    if not single:
+        # Refuse silent-fail: an empty token would disable auth without intent.
+        raise ValueError(
+            "MAC_API_TOKEN is set but empty; unset it to leave the API open, or provide a non-empty token"
+        )
+    return {single: ["admin"]}
 
 
 def _required_scope(method: str, path: str) -> Optional[str]:
@@ -314,6 +322,242 @@ def _authorize_request(
         raise AuthorizationError("unknown bearer token")
     if "admin" not in scopes and required not in scopes:
         raise AuthorizationError("token lacks required scope: %s" % required)
+
+
+TERMINAL_DASHBOARD_STATES = {"completed", "failed", "cancelled"}
+
+
+def _task_origin(task: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = task.get("metadata") or {}
+    origin = metadata.get("origin") if isinstance(metadata, dict) else None
+    return origin if isinstance(origin, dict) else {}
+
+
+def _state_counts(items: List[Dict[str, Any]], key: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _dashboard_task(cp: ControlPlane, task_id: str) -> Dict[str, Any]:
+    detail = cp.task_detail(task_id)
+    summary = cp.task_summary(task_id)
+    detail["summary"] = summary
+    detail["publications"] = [
+        publication.to_dict() for publication in cp.list_publications(task_id)
+    ]
+    return detail
+
+
+def _dashboard_agent_base(
+    cp: ControlPlane,
+    agent: Any,
+    tasks: List[Any],
+    machines_by_id: Dict[str, Any],
+) -> Dict[str, Any]:
+    machine = machines_by_id.get(agent.machine_id)
+    active_tasks = [
+        task.to_dict()
+        for task in tasks
+        if task.owner_agent_id == agent.id and task.state not in TERMINAL_DASHBOARD_STATES
+    ]
+    reasons: List[str] = []
+    if machine is None:
+        reasons.append("missing machine")
+    elif not machine.trusted:
+        reasons.append("untrusted machine")
+    if agent.status not in {"idle", "busy"}:
+        reasons.append(agent.status)
+    if agent.health_status != "healthy":
+        reasons.append(agent.health_status)
+    capacity = cp._agent_capacity(agent)
+    active_lease_count = cp._agent_active_lease_count(agent.id)
+    if active_lease_count >= capacity:
+        reasons.append("at capacity")
+    return {
+        "agent": agent.to_dict(),
+        "machine": machine.to_dict() if machine is not None else None,
+        "active_tasks": active_tasks,
+        "capacity": capacity,
+        "active_lease_count": active_lease_count,
+        "availability": {
+            "eligible": not reasons,
+            "reasons": reasons,
+        },
+    }
+
+
+def _dashboard_dispatch_reasons(
+    cp: ControlPlane,
+    agent: Any,
+    task: Any,
+    machine: Optional[Any],
+) -> List[str]:
+    reasons: List[str] = []
+    if agent.status not in {"idle", "busy"}:
+        reasons.append("agent status is %s" % agent.status)
+    if agent.health_status != "healthy":
+        reasons.append("agent health is %s" % agent.health_status)
+    if machine is None:
+        reasons.append("agent machine is missing")
+    elif not machine.trusted:
+        reasons.append("machine is not trusted")
+    if cp._agent_active_lease_count(agent.id) >= cp._agent_capacity(agent):
+        reasons.append("agent is at capacity")
+    if machine is not None and not cp._machine_allows_tenant(machine, cp._task_tenant_id(task)):
+        reasons.append("machine tenant policy blocks task")
+    if machine is not None and not cp._agent_resources_satisfy(agent, machine, task):
+        reasons.append("resources do not satisfy task")
+    missing = sorted(set(task.required_capabilities) - set(agent.capabilities))
+    if missing:
+        reasons.append("missing capabilities: %s" % ", ".join(missing))
+    return reasons
+
+
+def _dashboard_dispatch_explain(
+    cp: ControlPlane,
+    tasks: Optional[List[Any]] = None,
+    agents: Optional[List[Any]] = None,
+    machines_by_id: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    tasks = tasks if tasks is not None else cp.list_tasks()
+    agents = agents if agents is not None else cp.list_agents()
+    machines_by_id = machines_by_id if machines_by_id is not None else {
+        machine.id: machine for machine in cp.list_machines()
+    }
+    open_tasks = [task for task in tasks if task.state == "open"]
+    explanations = []
+    for task in open_tasks:
+        candidates = []
+        for agent in agents:
+            machine = machines_by_id.get(agent.machine_id)
+            eligible = cp._agent_available_for(agent, task)
+            reasons = [] if eligible else _dashboard_dispatch_reasons(cp, agent, task, machine)
+            if not eligible and not reasons:
+                reasons.append("dispatch policy rejected pair")
+            candidates.append(
+                {
+                    "agent_id": agent.id,
+                    "agent_name": agent.name,
+                    "eligible": eligible,
+                    "reasons": reasons,
+                }
+            )
+        explanations.append(
+            {
+                "task": task.to_dict(),
+                "tenant_id": cp._task_tenant_id(task),
+                "candidates": candidates,
+                "eligible_agent_count": sum(1 for candidate in candidates if candidate["eligible"]),
+            }
+        )
+    return {"open_task_count": len(open_tasks), "tasks": explanations}
+
+
+def _dashboard_hermes_activity(
+    cp: ControlPlane,
+    instance_id: str,
+    tasks: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    context = cp.hermes_context(instance_id)
+    tasks = tasks if tasks is not None else cp.list_tasks()
+    interaction_tasks = [
+        task.to_dict()
+        for task in tasks
+        if _task_origin(task.to_dict()).get("hermes_instance_id") == instance_id
+    ]
+    return {"context": context, "interaction_tasks": interaction_tasks}
+
+
+def _dashboard_rollout_status(cp: ControlPlane, rollout_id: str) -> Dict[str, Any]:
+    rollout = cp.get_rollout(rollout_id)
+    runtime = (
+        cp.get_runtime(rollout.runtime_environment_id).to_dict()
+        if rollout.runtime_environment_id
+        else None
+    )
+    latest_eval = None
+    if rollout.required_eval_set_id is not None:
+        latest = cp.latest_eval_run(
+            rollout.required_eval_set_id,
+            "rollout_version",
+            rollout.version,
+        )
+        latest_eval = latest.to_dict() if latest is not None else None
+    return {
+        "rollout": rollout.to_dict(),
+        "runtime": runtime,
+        "events": cp.list_rollout_events(rollout_id),
+        "latest_eval_run": latest_eval,
+    }
+
+
+def _dashboard_state(cp: ControlPlane) -> Dict[str, Any]:
+    tenants = [tenant.to_dict() for tenant in cp.list_tenants()]
+    users = [user.to_dict() for user in cp.list_users()]
+    personas = [persona.to_dict() for persona in cp.list_personas()]
+    hermes_instances = [instance.to_dict() for instance in cp.list_hermes_instances()]
+    bindings = [binding.to_dict() for binding in cp.list_platform_bindings()]
+    machines = cp.list_machines()
+    machines_by_id = {machine.id: machine for machine in machines}
+    agents = cp.list_agents()
+    tasks = cp.list_tasks()
+    task_dicts = [task.to_dict() for task in tasks]
+    dead_letters = [task.to_dict() for task in cp.list_dead_letters()]
+    rollouts = cp.list_rollouts()
+    secrets = [secret.to_dict() for secret in cp.list_secrets()]
+    secret_audits = [audit.to_dict() for audit in cp.list_secret_audits()]
+    runtime_runs = [run.to_dict() for run in cp.list_runtime_runs()]
+    task_details = [_dashboard_task(cp, task.id) for task in tasks]
+    rollout_statuses = [_dashboard_rollout_status(cp, rollout.id) for rollout in rollouts]
+    return {
+        "overview": {
+            "counts": {
+                "tenants": len(tenants),
+                "users": len(users),
+                "personas": len(personas),
+                "hermes_instances": len(hermes_instances),
+                "platform_bindings": len(bindings),
+                "machines": len(machines),
+                "trusted_machines": sum(1 for machine in machines if machine.trusted),
+                "agents": len(agents),
+                "healthy_agents": sum(1 for agent in agents if agent.health_status == "healthy"),
+                "busy_agents": sum(1 for agent in agents if agent.status == "busy"),
+                "active_tasks": sum(
+                    1 for task in tasks if task.state not in TERMINAL_DASHBOARD_STATES
+                ),
+                "dead_letters": len(dead_letters),
+                "rollouts": len(rollouts),
+                "secrets": len(secrets),
+                "secret_audits": len(secret_audits),
+            },
+            "task_states": _state_counts(task_dicts, "state"),
+            "agent_statuses": _state_counts([agent.to_dict() for agent in agents], "status"),
+        },
+        "tenants": tenants,
+        "users": users,
+        "personas": personas,
+        "hermes_instances": hermes_instances,
+        "platform_bindings": bindings,
+        "machines": [machine.to_dict() for machine in machines],
+        "agents": [
+            _dashboard_agent_base(cp, agent, tasks, machines_by_id)
+            for agent in agents
+        ],
+        "tasks": task_details,
+        "dead_letters": dead_letters,
+        "dispatch": _dashboard_dispatch_explain(cp, tasks, agents, machines_by_id),
+        "messages": [message.to_dict() for message in cp.list_messages()],
+        "secrets": secrets,
+        "secret_audits": secret_audits,
+        "runtimes": [runtime.to_dict() for runtime in cp.list_runtimes()],
+        "runtime_runs": runtime_runs,
+        "rollouts": rollout_statuses,
+        "eval_sets": [eval_set.to_dict() for eval_set in cp.list_eval_sets()],
+        "eval_runs": [run.to_dict() for run in cp.list_eval_runs()],
+    }
 
 
 def create_app(
@@ -359,6 +603,40 @@ def create_app(
     @app.get("/ui/", include_in_schema=False)
     def dashboard() -> FileResponse:
         return FileResponse(ui_dir / "index.html")
+
+    @app.get("/dashboard/state")
+    def dashboard_state() -> Dict[str, Any]:
+        return _dashboard_state(cp)
+
+    @app.get("/dashboard/agents/{agent_id}")
+    def dashboard_agent(agent_id: str) -> Dict[str, Any]:
+        agent = cp.get_agent(agent_id)
+        tasks = cp.list_tasks()
+        machines_by_id = {machine.id: machine for machine in cp.list_machines()}
+        model = _dashboard_agent_base(cp, agent, tasks, machines_by_id)
+        model["messages"] = [message.to_dict() for message in cp.list_messages(agent_id)]
+        model["dispatch"] = [
+            item
+            for item in _dashboard_dispatch_explain(cp, tasks, [agent], machines_by_id)["tasks"]
+            if item["eligible_agent_count"] or item["candidates"]
+        ]
+        return model
+
+    @app.get("/dashboard/tasks/{task_id}/timeline")
+    def dashboard_task_timeline(task_id: str) -> Dict[str, Any]:
+        return _dashboard_task(cp, task_id)
+
+    @app.get("/dashboard/dispatch/explain")
+    def dashboard_dispatch_explain() -> Dict[str, Any]:
+        return _dashboard_dispatch_explain(cp)
+
+    @app.get("/dashboard/hermes/{instance_id}/activity")
+    def dashboard_hermes_activity(instance_id: str) -> Dict[str, Any]:
+        return _dashboard_hermes_activity(cp, instance_id)
+
+    @app.get("/dashboard/rollouts/{rollout_id}/status")
+    def dashboard_rollout_status(rollout_id: str) -> Dict[str, Any]:
+        return _dashboard_rollout_status(cp, rollout_id)
 
     @app.post("/tenants")
     def register_tenant(body: TenantRegister) -> Dict[str, Any]:
@@ -492,6 +770,28 @@ def create_app(
     @app.get("/dispatch/dead-letters")
     def dead_letters(tenant_id: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
         return [task.to_dict() for task in cp.list_dead_letters(tenant_id)]
+
+    @app.get("/events")
+    def list_events(
+        subject_type: Optional[str] = Query(default=None),
+        subject_id: Optional[str] = Query(default=None),
+        actor: Optional[str] = Query(default=None),
+        event_type: Optional[str] = Query(default=None),
+        event_type_prefix: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return cp.list_events(
+            subject_type=subject_type,
+            subject_id=subject_id,
+            actor=actor,
+            event_type=event_type,
+            event_type_prefix=event_type_prefix,
+            since=since,
+            until=until,
+            limit=limit,
+        )
 
     @app.post("/messages")
     def send_message(body: MessageCreate) -> Dict[str, Any]:

@@ -47,6 +47,7 @@ from mac.models import (
     RolloutStrategy,
     RuntimeEnvironment,
     RuntimeRun,
+    RuntimeRunStatus,
     SecretAccess,
     SecretAuditResult,
     SecretHandle,
@@ -705,6 +706,74 @@ class ControlPlane:
             (task_id,),
         )
         return [self._history_from_row(row) for row in rows]
+
+    # Unified audit / event stream
+
+    EVENT_SUBJECT_TYPES = ("task", "rollout", "eval_set", "secret")
+
+    def list_events(
+        self,
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        actor: Optional[str] = None,
+        event_type: Optional[str] = None,
+        event_type_prefix: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[JsonDict]:
+        """Query the unified audit stream across task/rollout/eval_set/secret events.
+
+        Filters compose with AND. Results are newest-first; cap is 1000 to keep
+        a single page bounded. Operators asking "what happened" should reach for
+        this method instead of joining the four per-resource audit tables.
+        """
+        if subject_type is not None and subject_type not in self.EVENT_SUBJECT_TYPES:
+            raise ValidationError(
+                "unsupported event subject_type: %s (allowed: %s)"
+                % (subject_type, ", ".join(self.EVENT_SUBJECT_TYPES))
+            )
+        clauses: List[str] = []
+        params: List[Any] = []
+        if subject_type is not None:
+            clauses.append("subject_type = ?")
+            params.append(subject_type)
+        if subject_id is not None:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        if actor is not None:
+            clauses.append("actor = ?")
+            params.append(actor)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if event_type_prefix is not None:
+            clauses.append("event_type LIKE ?")
+            params.append(event_type_prefix + "%")
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at <= ?")
+            params.append(until)
+        sql = "SELECT id, subject_type, subject_id, event_type, actor, detail, created_at FROM events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(min(max(1, int(limit)), 1000))
+        rows = self.store.query_all(sql, tuple(params))
+        return [
+            {
+                "id": row["id"],
+                "subject_type": row["subject_type"],
+                "subject_id": row["subject_id"],
+                "event_type": row["event_type"],
+                "actor": row["actor"],
+                "detail": json_loads(row["detail"], {}),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def list_dead_letters(self, tenant_id: Optional[str] = None) -> List[Task]:
         rows = self.store.query_all(
@@ -1504,6 +1573,17 @@ class ControlPlane:
             raise NotFoundError("publication not found: %s" % publication_id)
         return self._publication_from_row(row)
 
+    def list_publications(self, task_id: Optional[str] = None) -> List[Publication]:
+        if task_id is not None:
+            self.get_task(task_id)
+            rows = self.store.query_all(
+                "SELECT * FROM publications WHERE task_id = ? ORDER BY created_at, id",
+                (task_id,),
+            )
+        else:
+            rows = self.store.query_all("SELECT * FROM publications ORDER BY created_at, id")
+        return [self._publication_from_row(row) for row in rows]
+
     # Secrets boundary
 
     def create_secret(
@@ -1690,11 +1770,23 @@ class ControlPlane:
             INSERT INTO runtime_runs (id, task_id, agent_id, environment_id, status, evidence_id, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
             """,
-            (run_id, task_id, agent_id, runtime.id, "running", now, now),
+            (run_id, task_id, agent_id, runtime.id, RuntimeRunStatus.RUNNING.value, now, now),
         )
         return self.get_runtime_run(run_id)
 
-    def complete_runtime_run(self, run_id: str, evidence_id: str, status: str = "completed") -> RuntimeRun:
+    def complete_runtime_run(
+        self,
+        run_id: str,
+        evidence_id: str,
+        status: str = RuntimeRunStatus.COMPLETED.value,
+    ) -> RuntimeRun:
+        status_value = _state_value(status)
+        try:
+            RuntimeRunStatus(status_value)
+        except ValueError:
+            raise ValidationError("unsupported runtime_run status: %s" % status_value)
+        if status_value == RuntimeRunStatus.RUNNING.value:
+            raise ValidationError("complete_runtime_run cannot transition back to running")
         run = self.get_runtime_run(run_id)
         evidence = self.get_evidence(evidence_id)
         if evidence.task_id != run.task_id:
@@ -1702,7 +1794,7 @@ class ControlPlane:
         now = utcnow()
         self.store.execute(
             "UPDATE runtime_runs SET status = ?, evidence_id = ?, updated_at = ? WHERE id = ?",
-            (status, evidence_id, now, run_id),
+            (status_value, evidence_id, now, run_id),
         )
         return self.get_runtime_run(run_id)
 
@@ -1711,6 +1803,10 @@ class ControlPlane:
         if row is None:
             raise NotFoundError("runtime run not found: %s" % run_id)
         return self._runtime_run_from_row(row)
+
+    def list_runtime_runs(self) -> List[RuntimeRun]:
+        rows = self.store.query_all("SELECT * FROM runtime_runs ORDER BY created_at, id")
+        return [self._runtime_run_from_row(row) for row in rows]
 
     # Project bridge
 
@@ -2174,6 +2270,24 @@ class ControlPlane:
             raise NotFoundError("rollout not found: %s" % rollout_id)
         return self._rollout_from_row(row)
 
+    def list_rollout_events(self, rollout_id: str) -> List[JsonDict]:
+        self.get_rollout(rollout_id)
+        rows = self.store.query_all(
+            "SELECT * FROM rollout_events WHERE rollout_id = ? ORDER BY created_at, id",
+            (rollout_id,),
+        )
+        return [
+            {
+                "id": row["id"],
+                "rollout_id": row["rollout_id"],
+                "event_type": row["event_type"],
+                "actor": row["actor"],
+                "detail": json_loads(row["detail"], {}),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def list_rollouts(
         self,
         tenant_id: Optional[str] = None,
@@ -2345,6 +2459,23 @@ class ControlPlane:
         }
         self._record_rollout_event(rollout_id, "rollout.health_checked", actor, detail)
         if failed:
+            # Idempotency: if the rollout is already RESCUING, don't open another
+            # rescue task. Record that the additional failure happened and return
+            # the in-flight rescue task so callers can act on a stable handle.
+            if rollout.status == RolloutStatus.RESCUING.value:
+                self._record_rollout_event(
+                    rollout_id,
+                    "rollout.health_failure_during_rescue",
+                    actor,
+                    {"failed_checks": failed, "checks": checks_obj},
+                )
+                in_flight = self._in_flight_rescue_task(rollout_id)
+                return {
+                    "healthy": False,
+                    "failed_checks": failed,
+                    "rollout": rollout.to_dict(),
+                    "rescue_task": in_flight.to_dict() if in_flight is not None else None,
+                }
             rescued, task = self.rescue_rollout(
                 rollout_id,
                 actor,
@@ -2363,6 +2494,26 @@ class ControlPlane:
             "rollout": self.get_rollout(rollout_id).to_dict(),
             "rescue_task": None,
         }
+
+    def _in_flight_rescue_task(self, rollout_id: str) -> Optional[Task]:
+        """Return the most recent non-terminal rescue task for a rollout, if any."""
+        row = self.store.query_one(
+            """
+            SELECT * FROM tasks
+            WHERE project = 'rollout'
+              AND state NOT IN (?, ?, ?)
+              AND json_extract(metadata, '$.rollout_id') = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (
+                TaskState.COMPLETED.value,
+                TaskState.FAILED.value,
+                TaskState.CANCELLED.value,
+                rollout_id,
+            ),
+        )
+        return self._task_from_row(row) if row is not None else None
 
     def rescue_rollout(
         self,
@@ -3121,6 +3272,11 @@ class ControlPlane:
         if agent.id in agents:
             return True
         if capabilities and capabilities.intersection(set(agent.capabilities)):
+            return True
+        # Tenant-only scope: if the caller scoped solely by tenant, the tenant
+        # check above is the entire gate. Without this, tenant-only secrets are
+        # unreachable, which contradicts the API surface.
+        if tenant_scope and not agents and not capabilities:
             return True
         return False
 

@@ -943,3 +943,165 @@ def test_eval_run_event_records_run_id_and_passed(cp):
     assert len(run_events) == 1
     assert run_events[0]["detail"]["run_id"] == run.id
     assert run_events[0]["detail"]["passed"] is True
+
+
+def test_evaluate_rollout_health_failing_twice_does_not_duplicate_rescue(cp):
+    rollout = create_verified_rollout(
+        cp,
+        "7.0",
+        health_policy={"required_checks": ["runtime", "canary"]},
+    )
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    first = cp.evaluate_rollout_health(
+        rollout.id,
+        {"runtime": "healthy", "canary": {"status": "failed"}},
+        "monitor",
+    )
+    second = cp.evaluate_rollout_health(
+        rollout.id,
+        {"runtime": "healthy", "canary": {"status": "failed"}},
+        "monitor",
+    )
+    rescue_tasks = [
+        task for task in cp.list_tasks()
+        if task.metadata.get("rollout_id") == rollout.id and task.metadata.get("rescue")
+    ]
+    assert len(rescue_tasks) == 1
+    # The second call should return the same in-flight rescue task and record an
+    # additional health-failure event without spawning a duplicate task.
+    assert second["healthy"] is False
+    assert second["rescue_task"]["id"] == first["rescue_task"]["id"]
+    events = cp.store.query_all(
+        "SELECT event_type FROM rollout_events WHERE rollout_id = ? ORDER BY created_at, id",
+        (rollout.id,),
+    )
+    types = [row["event_type"] for row in events]
+    assert types.count("rollout.health_failure_during_rescue") == 1
+
+
+def test_tenant_only_secret_scope_grants_access_to_matching_machine(cp):
+    tenant = cp.register_tenant("scoped-tenant")
+    machine = cp.register_machine(
+        "scoped-host",
+        labels={"tenant_policy": {"mode": "private", "tenant_ids": [tenant.id]}},
+    )
+    agent = cp.register_agent(machine.id, "scoped-agent", capabilities=["any"])
+    secret = cp.create_secret(
+        "tenant-only", "abc", {"tenant_id": tenant.id}, "human"
+    )
+    handle = cp.request_secret(secret.id, agent.id, "deploy")
+    assert handle.granted is True
+    revealed = cp.reveal_secret(secret.id, handle.audit_id, agent.id)
+    assert revealed == "abc"
+
+
+def test_runtime_run_status_is_enum_validated(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    runtime = create_runtime(cp, "rt-status")
+    run = cp.create_runtime_run(task.id, worker.id, runtime.id)
+    assert run.status == "running"
+    evidence = cp.add_evidence(task.id, "test", "artifact://t", "tests", worker.id)
+    with pytest.raises(ValidationError):
+        cp.complete_runtime_run(run.id, evidence.id, status="bogus")
+    with pytest.raises(ValidationError):
+        cp.complete_runtime_run(run.id, evidence.id, status="running")
+    completed = cp.complete_runtime_run(run.id, evidence.id, status="completed")
+    assert completed.status == "completed"
+
+
+def test_events_view_unifies_all_audit_surfaces(cp):
+    # Generate one event of each kind.
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("audited", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    # rollout event
+    rollout = create_verified_rollout(cp, "8.0")
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    # eval_set event
+    eval_set = cp.create_eval_set("audit-eval", scoring="higher_is_better")
+    # secret event
+    deployer = register_agent(cp, "deployer", ["deploy"])
+    secret = cp.create_secret("audit-token", "x", {"capabilities": ["deploy"]}, "human")
+    cp.request_secret(secret.id, deployer.id, "audit-test")
+
+    events = cp.list_events(limit=500)
+    subject_types = {event["subject_type"] for event in events}
+    assert subject_types == {"task", "rollout", "eval_set", "secret"}
+    # Each event includes the unified shape.
+    for event in events:
+        assert set(event.keys()) >= {
+            "id",
+            "subject_type",
+            "subject_id",
+            "event_type",
+            "actor",
+            "detail",
+            "created_at",
+        }
+        assert isinstance(event["detail"], dict)
+
+
+def test_events_filter_by_subject_returns_only_matching_stream(cp):
+    rollout = create_verified_rollout(cp, "8.1")
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    eval_set = cp.create_eval_set("audit-eval-2", scoring="higher_is_better")
+    cp.update_eval_set_baseline(eval_set.id, 0.5)
+
+    rollout_events = cp.list_events(subject_type="rollout", subject_id=rollout.id)
+    assert rollout_events
+    assert {event["subject_type"] for event in rollout_events} == {"rollout"}
+    assert {event["subject_id"] for event in rollout_events} == {rollout.id}
+
+    eval_events = cp.list_events(subject_type="eval_set", subject_id=eval_set.id)
+    types = {event["event_type"] for event in eval_events}
+    assert "eval_set.created" in types
+    assert "eval_set.baseline_changed" in types
+
+
+def test_events_filter_by_event_type_prefix(cp):
+    rollout = create_verified_rollout(cp, "8.2")
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    cp.advance_rollout(rollout.id, "pause", "human")
+
+    rollout_prefix = cp.list_events(event_type_prefix="rollout.")
+    assert rollout_prefix
+    assert all(event["event_type"].startswith("rollout.") for event in rollout_prefix)
+
+
+def test_events_filter_by_actor_and_time_window(cp):
+    rollout = create_verified_rollout(cp, "8.3")
+    cp.advance_rollout(rollout.id, "start_canary", "alice")
+    cp.evaluate_rollout_health(rollout.id, {"runtime": "healthy"}, "bob")
+
+    alice_events = cp.list_events(actor="alice")
+    assert alice_events
+    assert all(event["actor"] == "alice" for event in alice_events)
+
+    # since filter
+    future = "2999-01-01T00:00:00+00:00"
+    assert cp.list_events(since=future) == []
+
+
+def test_events_rejects_unknown_subject_type(cp):
+    with pytest.raises(ValidationError):
+        cp.list_events(subject_type="not-a-real-subject")
+
+
+def test_events_task_detail_includes_from_to_states(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("transitions", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    task_events = cp.list_events(subject_type="task", subject_id=task.id)
+    transitions = [
+        event for event in task_events if event["event_type"] == "task.transitioned"
+    ]
+    assert transitions
+    # Most recent transition is to RUNNING.
+    latest = transitions[0]
+    assert latest["detail"].get("to_state") == "running"
+    assert latest["detail"].get("from_state") == "claimed"
