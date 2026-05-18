@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote, urlencode
+
+from mac.hermes_adapter import MacApiClient, MacApiError
+
+
+JsonDict = Dict[str, Any]
+Executor = Callable[[JsonDict, Path], "WorkerExecution"]
+
+
+@dataclass
+class WorkerExecution:
+    returncode: int
+    summary: str
+    stdout: str = ""
+    stderr: str = ""
+    metadata: JsonDict = field(default_factory=dict)
+
+    @property
+    def succeeded(self) -> bool:
+        return self.returncode == 0
+
+
+@dataclass
+class WorkerRunResult:
+    status: str
+    task: Optional[JsonDict] = None
+    lease: Optional[JsonDict] = None
+    evidence: Optional[JsonDict] = None
+    error: Optional[str] = None
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+class SubprocessExecutor:
+    def __init__(self, argv: List[str], timeout: Optional[float] = None) -> None:
+        if not argv:
+            raise MacApiError("executor command is required")
+        self.argv = argv
+        self.timeout = timeout
+
+    def __call__(self, task: JsonDict, task_dir: Path) -> WorkerExecution:
+        env = os.environ.copy()
+        env.update(
+            {
+                "MAC_TASK_ID": task["id"],
+                "MAC_TASK_FILE": str(task_dir / "task.json"),
+                "MAC_TASK_WORKSPACE": str(task_dir),
+            }
+        )
+        completed = subprocess.run(
+            self.argv,
+            cwd=str(task_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            check=False,
+        )
+        return WorkerExecution(
+            returncode=completed.returncode,
+            summary=_summary_from_output(completed.returncode, completed.stdout, completed.stderr),
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            metadata={"executor": self.argv},
+        )
+
+
+class MacWorker:
+    """Small worker harness for mac-owned tasks.
+
+    This is intentionally narrower than ACC's deployed worker. It proves the
+    claim/start/execute/evidence/review handoff without owning Hermes memory or
+    pretending to be the final production daemon.
+    """
+
+    def __init__(
+        self,
+        client: MacApiClient,
+        agent_id: str,
+        workspace: Path,
+        executor: Executor,
+        lease_seconds: int = 900,
+        running_digest: Optional[str] = None,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        if not agent_id:
+            raise MacApiError("agent_id is required")
+        self.client = client
+        self.agent_id = agent_id
+        self.workspace = workspace
+        self.executor = executor
+        self.lease_seconds = lease_seconds
+        self.running_digest = running_digest
+        self.poll_interval_seconds = float(poll_interval_seconds)
+        self._stop = False
+        self._declared_digest = False
+
+    def stop(self) -> None:
+        """Signal the run loop to exit after the current task."""
+        self._stop = True
+
+    def run_forever(self, max_iterations: Optional[int] = None) -> List[WorkerRunResult]:
+        """Loop run_once() with sleep on empty. Bounded by max_iterations for tests.
+
+        Reacts to SIGTERM/SIGINT for graceful shutdown when running as a daemon.
+        On exit, marks the agent offline so the control plane can requeue any
+        active lease held by this worker. The signal handlers installed for the
+        duration of this call are restored before return — the process-wide
+        SIGTERM/SIGINT state is not mutated past the worker's lifetime.
+        """
+        prior_handlers = self._install_signal_handlers()
+        results: List[WorkerRunResult] = []
+        iterations = 0
+        try:
+            while not self._stop and (max_iterations is None or iterations < max_iterations):
+                iterations += 1
+                outcome = self.run_once()
+                if outcome.status == "no_task":
+                    if max_iterations is None:
+                        time.sleep(self.poll_interval_seconds)
+                    continue
+                results.append(outcome)
+        finally:
+            self._restore_signal_handlers(prior_handlers)
+            self._shutdown()
+        return results
+
+    def _install_signal_handlers(self) -> Dict[int, Any]:
+        """Install graceful-stop signal handlers; return prior handlers so we
+        can restore them. Returns an empty dict if signals can't be installed
+        (e.g. when called outside the main thread)."""
+        prior: Dict[int, Any] = {}
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                prior[signum] = signal.signal(signum, lambda *_: self.stop())
+            except (ValueError, AttributeError, OSError):
+                # signal.signal raises if not in main thread or on platforms
+                # without the signal. Tests bound execution via max_iterations.
+                pass
+        return prior
+
+    def _restore_signal_handlers(self, prior: Dict[int, Any]) -> None:
+        for signum, handler in prior.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, AttributeError, OSError):
+                pass
+
+    def _shutdown(self) -> None:
+        # Best-effort: mark offline so the control plane requeues any active
+        # lease tied to this agent. Catch broadly: shutdown must not raise.
+        try:
+            self.client.post(
+                "/agents/%s/heartbeat" % quote(self.agent_id, safe=""),
+                {"status": "offline"},
+            )
+        except Exception:  # noqa: BLE001 — shutdown is a boundary
+            pass
+
+    def run_once(self) -> WorkerRunResult:
+        self._heartbeat()
+        assignment = self._claim_next_for_agent()
+        if assignment is None:
+            return WorkerRunResult(status="no_task")
+
+        task = assignment["task"]
+        lease = assignment["lease"]
+        task_id = task["id"]
+        try:
+            self.client.post(
+                "/tasks/%s/start?%s"
+                % (quote(task_id, safe=""), urlencode({"agent_id": self.agent_id})),
+                {},
+            )
+            task_dir = self._prepare_task_workspace(task, lease)
+            execution = self.executor(task, task_dir)
+            evidence = self._record_execution(task_id, task_dir, execution)
+            if execution.succeeded:
+                reviewed_task = self.client.post(
+                    "/tasks/%s/submit-for-review?%s"
+                    % (quote(task_id, safe=""), urlencode({"agent_id": self.agent_id})),
+                    {},
+                )
+                return WorkerRunResult(
+                    status="submitted_for_review",
+                    task=reviewed_task,
+                    lease=lease,
+                    evidence=evidence,
+                )
+            failed_task = self.client.post(
+                "/tasks/%s/transition" % quote(task_id, safe=""),
+                {
+                    "target_state": "failed",
+                    "actor": self.agent_id,
+                    "detail": {
+                        "reason": "executor_failed",
+                        "returncode": execution.returncode,
+                        "evidence_id": evidence["id"],
+                    },
+                },
+            )
+            return WorkerRunResult(
+                status="failed",
+                task=failed_task,
+                lease=lease,
+                evidence=evidence,
+                error=execution.summary,
+            )
+        except Exception as exc:
+            try:
+                self.client.post(
+                    "/tasks/%s/transition" % quote(task_id, safe=""),
+                    {
+                        "target_state": "failed",
+                        "actor": self.agent_id,
+                        "detail": {"reason": "worker_exception", "error": str(exc)},
+                    },
+                )
+            except Exception:
+                pass
+            raise
+
+    def _claim_next_for_agent(self) -> Optional[JsonDict]:
+        tasks = self.client.get("/tasks?state=open")
+        for task in tasks:
+            try:
+                return self.client.post(
+                    "/tasks/%s/claim?%s"
+                    % (
+                        quote(task["id"], safe=""),
+                        urlencode(
+                            {
+                                "agent_id": self.agent_id,
+                                "lease_seconds": self.lease_seconds,
+                            }
+                        ),
+                    ),
+                    {},
+                )
+            except MacApiError:
+                continue
+        return None
+
+    def _prepare_task_workspace(self, task: JsonDict, lease: JsonDict) -> Path:
+        task_dir = self.workspace / _safe_path_component(task["id"])
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "task.json").write_text(
+            json.dumps({"task": task, "lease": lease}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return task_dir
+
+    def _record_execution(
+        self,
+        task_id: str,
+        task_dir: Path,
+        execution: WorkerExecution,
+    ) -> JsonDict:
+        (task_dir / "stdout.txt").write_text(execution.stdout, encoding="utf-8")
+        (task_dir / "stderr.txt").write_text(execution.stderr, encoding="utf-8")
+        result_path = task_dir / "worker-result.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "returncode": execution.returncode,
+                    "summary": execution.summary,
+                    "metadata": execution.metadata,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return self.client.post(
+            "/tasks/%s/evidence" % quote(task_id, safe=""),
+            {
+                "kind": "log",
+                "uri": result_path.resolve().as_uri(),
+                "summary": execution.summary,
+                "created_by": self.agent_id,
+                "metadata": {
+                    "returncode": execution.returncode,
+                    "stdout": (task_dir / "stdout.txt").resolve().as_uri(),
+                    "stderr": (task_dir / "stderr.txt").resolve().as_uri(),
+                    **execution.metadata,
+                },
+            },
+        )
+
+    def _heartbeat(self) -> None:
+        payload: JsonDict = {}
+        # Declare the build the agent is running. Send the digest at most once
+        # per process; subsequent heartbeats are pure liveness pings.
+        if self.running_digest and not self._declared_digest:
+            payload["running_digest"] = self.running_digest
+        self.client.post(
+            "/agents/%s/heartbeat" % quote(self.agent_id, safe=""),
+            payload,
+        )
+        if self.running_digest and not self._declared_digest:
+            self._declared_digest = True
+
+
+def _summary_from_output(returncode: int, stdout: str, stderr: str) -> str:
+    stream = stdout if stdout.strip() else stderr
+    first_line = next((line.strip() for line in stream.splitlines() if line.strip()), "")
+    if first_line:
+        return first_line[:500]
+    return "executor completed" if returncode == 0 else "executor failed with returncode %d" % returncode
+
+
+def _safe_path_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)[:180]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="mac worker harness")
+    parser.add_argument("--url", default=os.environ.get("MAC_URL", "http://127.0.0.1:8000"))
+    parser.add_argument("--token", default=os.environ.get("MAC_TOKEN"))
+    parser.add_argument("--agent-id", required=True)
+    parser.add_argument("--workspace", default=".mac-agent-workspaces")
+    parser.add_argument("--lease-seconds", type=int, default=900)
+    parser.add_argument("--timeout", type=float)
+    parser.add_argument(
+        "--running-digest",
+        help="runtime_environments.digest the worker is running (declared at first heartbeat)",
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="run forever (poll for tasks). Default is run_once and exit.",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        help="cap iterations in --loop mode (mostly for tests)",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="seconds to sleep between polls when no task is available",
+    )
+    parser.add_argument(
+        "--executor",
+        nargs=argparse.REMAINDER,
+        required=True,
+        help="executor argv; use '--executor -- command args' if command starts with '-'",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    executor_argv = list(args.executor)
+    if executor_argv and executor_argv[0] == "--":
+        executor_argv = executor_argv[1:]
+    worker = MacWorker(
+        MacApiClient(args.url, token=args.token),
+        args.agent_id,
+        Path(args.workspace),
+        SubprocessExecutor(executor_argv, timeout=args.timeout),
+        lease_seconds=args.lease_seconds,
+        running_digest=args.running_digest,
+        poll_interval_seconds=args.poll_interval,
+    )
+    try:
+        if args.loop:
+            results = worker.run_forever(max_iterations=args.max_iterations)
+            print(json.dumps([r.to_dict() for r in results], indent=2, sort_keys=True))
+        else:
+            result = worker.run_once()
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    except MacApiError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, indent=2, sort_keys=True))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -110,6 +110,9 @@ Key route groups:
 - `/messages`
 - `/secrets`, `/secrets/{id}/access`, `/secrets/{id}/reveal`, `/secret-audits`
 - `/runtimes`, `/runtime-runs`
+- `/artifacts`, `/artifacts/{id_or_digest}` — canonical record for deliverables (kind, digest, uri, sbom_uri, signers); re-registering the same digest augments signers/metadata
+- `/environments`, `/environments/{id}/deploy|current|deployments` — environment registry + artifact→environment deployment edges; deploy atomically retires the prior active deployment
+- `/fleet/build-distribution` — aggregate live agents by `running_digest`; agents declare their build via `heartbeat`
 - `/bridge/items`, `/memory`
 - `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
 - `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-sets/{id}/events`, `/eval-runs`
@@ -159,11 +162,32 @@ mac --db mac.db rollout advance rollout_... start_canary --actor human
 # promote refused until a passing eval run exists for version 1.3.0
 mac --db mac.db rollout advance rollout_... promote --actor human
 
-# Unified audit stream: one query across task/rollout/eval_set/secret events.
+# Unified audit stream: one query across task/rollout/eval_set/secret/environment events.
 mac --db mac.db events list --limit 50
 mac --db mac.db events list --subject-type rollout --subject-id rollout_...
 mac --db mac.db events list --prefix rollout. --since 2026-05-17T00:00:00+00:00
 mac --db mac.db events list --actor monitor --event-type rollout.health_failure_during_rescue
+
+# Artifact registry + environment deployments + fleet build inventory.
+mac --db mac.db artifact register image sha256:abc... artifact://mac/v1.2.0 \
+    --created-by ci --sbom-uri sbom://mac/v1.2.0.spdx --signers ci,release-manager
+mac --db mac.db env register staging --channel release --created-by human
+mac --db mac.db env deploy staging sha256:abc... --actor release-bot
+mac --db mac.db env current staging
+mac --db mac.db agent heartbeat agent_... --running-digest <runtime-digest>
+mac --db mac.db fleet build-distribution
+
+# One-time ACC migration: dry-run first, then import open ACC work into mac.
+# Claimed/in-progress ACC tasks are blocked unless explicitly requeued with --allow-active.
+mac --db mac.db migrate acc ~/.acc/data/acc.db --mode dry-run \
+    --report acc-migration-dry-run.json
+mac --db mac.db migrate acc ~/.acc/data/acc.db --mode import \
+    --report acc-migration-import.json
+
+# Minimal worker harness: claim one mac-owned task for a specific agent, run an
+# executor, record log evidence, and submit successful work for review.
+mac-agent --url http://127.0.0.1:8000 --agent-id agent_... \
+    --workspace ~/.mac-agent/workspaces --executor -- hermes run-once
 ```
 
 Hermes-facing API adapter:

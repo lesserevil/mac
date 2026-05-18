@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -8,6 +9,7 @@ from mac.models import (
     AuthorizationError,
     HealthStatus,
     LeaseStatus,
+    NotFoundError,
     ReviewStatus,
     RolloutStatus,
     TaskState,
@@ -15,6 +17,7 @@ from mac.models import (
     ValidationError,
     utcnow,
 )
+from mac.migration import migrate_acc_sqlite
 from mac.services import ControlPlane
 
 
@@ -54,6 +57,308 @@ def create_verified_rollout(cp, version="1.0", strategy="canary", tenant_id=None
         artifact_hash="sha256:abc123",
         health_policy=health_policy or {},
     )
+
+
+def create_acc_migration_fixture(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE agents (
+            name TEXT PRIMARY KEY,
+            host TEXT,
+            status TEXT NOT NULL DEFAULT 'offline',
+            last_heartbeat TEXT,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE fleet_tasks (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            priority INTEGER NOT NULL DEFAULT 2,
+            claimed_by TEXT,
+            claimed_at TEXT,
+            claim_expires_at TEXT,
+            completed_at TEXT,
+            completed_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            task_type TEXT NOT NULL DEFAULT 'work',
+            review_of TEXT,
+            phase TEXT,
+            blocked_by TEXT NOT NULL DEFAULT '[]',
+            review_result TEXT,
+            output TEXT,
+            inputs TEXT NOT NULL DEFAULT '{}',
+            source TEXT NOT NULL DEFAULT 'fleet'
+        );
+        CREATE TABLE fleet_task_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            agent TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            branch TEXT,
+            commit_sha TEXT,
+            pr_url TEXT,
+            changed_files TEXT NOT NULL DEFAULT '[]',
+            failure_class TEXT,
+            started_at TEXT NOT NULL,
+            published_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            full_name TEXT,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE work_audit_events (
+            seq INTEGER PRIMARY KEY,
+            event_id TEXT NOT NULL UNIQUE,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            agent TEXT,
+            host TEXT,
+            task_id TEXT,
+            project_id TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            previous_hash TEXT,
+            hash TEXT NOT NULL
+        );
+        CREATE TABLE conversation_chains (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            workspace TEXT NOT NULL DEFAULT '',
+            channel_id TEXT NOT NULL DEFAULT '',
+            thread_id TEXT NOT NULL DEFAULT '',
+            root_event_id TEXT,
+            title TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            outcome TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            closed_at TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE conversation_chain_tasks (
+            chain_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            relationship TEXT NOT NULL DEFAULT 'spawned',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (chain_id, task_id)
+        );
+        CREATE TABLE conversation_chain_events (
+            id TEXT PRIMARY KEY,
+            chain_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            text TEXT,
+            occurred_at TEXT NOT NULL
+        );
+        CREATE TABLE bus_messages (
+            id TEXT PRIMARY KEY,
+            body TEXT
+        );
+        CREATE TABLE gateway_sessions (
+            session_key TEXT PRIMARY KEY,
+            messages_json TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO agents (name, host, status, last_heartbeat, data) VALUES (?, ?, ?, ?, ?)",
+        (
+            "rocky",
+            "do-host1",
+            "online",
+            "2026-05-18T07:13:07Z",
+            json.dumps({"capabilities": ["memory"], "lastSeen": "2026-05-18T07:13:07Z"}),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO fleet_tasks (
+            id, project_id, title, description, status, priority, claimed_by,
+            claimed_at, claim_expires_at, completed_at, completed_by, created_at,
+            updated_at, metadata, task_type, review_of, phase, blocked_by,
+            review_result, output, inputs, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "task-1",
+            "proj-1",
+            "Open ACC task",
+            "from ACC",
+            "open",
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "2026-05-18T07:00:00Z",
+            "2026-05-18T07:00:00Z",
+            json.dumps({"assigned_agent": "rocky", "beads_id": "ACC-1"}),
+            "work",
+            None,
+            None,
+            "[]",
+            None,
+            None,
+            "{}",
+            "beads-scanner",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO fleet_tasks (
+            id, project_id, title, description, status, priority, claimed_by,
+            claimed_at, claim_expires_at, completed_at, completed_by, created_at,
+            updated_at, metadata, task_type, review_of, phase, blocked_by,
+            review_result, output, inputs, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "task-2",
+            "proj-1",
+            "Completed ACC task",
+            "from ACC",
+            "completed",
+            2,
+            "bullwinkle",
+            "2026-05-18T07:05:00Z",
+            None,
+            "2026-05-18T07:09:00Z",
+            "bullwinkle",
+            "2026-05-18T07:01:00Z",
+            "2026-05-18T07:09:00Z",
+            json.dumps({"workflow_role": "work"}),
+            "work",
+            None,
+            None,
+            "[]",
+            "approved",
+            json.dumps({"branch": "task/task-2"}),
+            "{}",
+            "fleet",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO fleet_task_attempts (
+            attempt_id, task_id, agent, status, branch, commit_sha, pr_url,
+            changed_files, failure_class, started_at, published_at, completed_at,
+            updated_at, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "attempt-1",
+            "task-2",
+            "bullwinkle",
+            "ready_for_review",
+            "task/task-2",
+            "abc1234",
+            None,
+            json.dumps(["README.md"]),
+            None,
+            "2026-05-18T07:05:00Z",
+            "2026-05-18T07:08:00Z",
+            None,
+            "2026-05-18T07:08:00Z",
+            "{}",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO projects (id, name, full_name, data) VALUES (?, ?, ?, ?)",
+        ("proj-1", "ACC", "jordanh/ACC", json.dumps({"status": "active", "assignee": "rocky"})),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_audit_events (
+            seq, event_id, timestamp, event_type, agent, host, task_id, project_id,
+            metadata, previous_hash, hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            1,
+            "audit-1",
+            "2026-05-18T07:06:00Z",
+            "task_execution_started",
+            "bullwinkle",
+            "puck.local",
+            "task-2",
+            "proj-1",
+            "{}",
+            None,
+            "hash1",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_audit_events (
+            seq, event_id, timestamp, event_type, agent, host, task_id, project_id,
+            metadata, previous_hash, hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            2,
+            "audit-2",
+            "2026-05-18T07:08:00Z",
+            "branch_pushed",
+            "bullwinkle",
+            "puck.local",
+            "task-2",
+            "proj-1",
+            json.dumps({"branch": "task/task-2"}),
+            "hash1",
+            "hash2",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO conversation_chains (
+            id, source, workspace, channel_id, thread_id, root_event_id, title,
+            summary, status, outcome, created_at, updated_at, closed_at, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "chain-1",
+            "slack",
+            "T1",
+            "C1",
+            "1712345678.000100",
+            "evt-1",
+            "private chain title",
+            "private chain summary",
+            "active",
+            None,
+            "2026-05-18T07:00:00Z",
+            "2026-05-18T07:01:00Z",
+            None,
+            json.dumps({"contains": "private"}),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO conversation_chain_tasks (chain_id, task_id, relationship, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
+        ("chain-1", "task-1", "spawned", "2026-05-18T07:00:00Z", "{}"),
+    )
+    conn.execute(
+        "INSERT INTO conversation_chain_events (id, chain_id, event_type, text, occurred_at) VALUES (?, ?, ?, ?, ?)",
+        ("event-1", "chain-1", "message", "do not import this raw text", "2026-05-18T07:00:00Z"),
+    )
+    conn.execute("INSERT INTO bus_messages (id, body) VALUES (?, ?)", ("bus-1", "private bus body"))
+    conn.execute(
+        "INSERT INTO gateway_sessions (session_key, messages_json) VALUES (?, ?)",
+        ("session-1", json.dumps([{"text": "private session text"}])),
+    )
+    conn.commit()
+    conn.close()
 
 
 def test_hermes_identity_context_and_interaction_task_boundaries(cp):
@@ -378,6 +683,80 @@ def test_project_bridge_memory_and_rollout_rescue(cp):
     assert rescued.status == RolloutStatus.RESCUING.value
     assert rescue_task.priority == 100
     assert rescue_task.metadata["rescue"] is True
+
+
+def test_acc_migration_dry_run_reports_without_writing(cp, tmp_path):
+    acc_db = tmp_path / "acc.db"
+    create_acc_migration_fixture(acc_db)
+
+    report = migrate_acc_sqlite(cp, acc_db, mode="dry-run", audit_limit=1)
+
+    assert report.counts["agents"] == 1
+    assert report.counts["tasks"] == 2
+    assert report.counts["tasks_planned_for_import"] == 1
+    assert report.counts["terminal_tasks_skipped"] == 1
+    assert any("work_audit_events limited" in warning for warning in report.warnings)
+    assert {entry["table"] for entry in report.skipped_private_tables} == {
+        "bus_messages",
+        "gateway_sessions",
+        "conversation_chain_events",
+    }
+
+    # Dry-run must be a pure preflight.
+    assert cp.list_tasks() == []
+    all_payloads = json.dumps(report.to_dict(), sort_keys=True)
+    assert "do not import this raw text" not in all_payloads
+    assert "private chain title" not in all_payloads
+    assert "private session text" not in all_payloads
+
+
+def test_acc_migration_imports_open_tasks_once_with_crosswalk(cp, tmp_path):
+    acc_db = tmp_path / "acc.db"
+    create_acc_migration_fixture(acc_db)
+
+    report = migrate_acc_sqlite(cp, acc_db, mode="import", audit_limit=1)
+    again = migrate_acc_sqlite(cp, acc_db, mode="import", audit_limit=1)
+
+    assert report.import_report.tasks_imported == 1
+    assert report.import_report.agents_imported == 1
+    assert again.import_report.errors == []
+    assert len(cp.list_tasks()) == 1
+    assert len(cp.list_project_items()) == 1
+
+    task = cp.list_tasks()[0]
+    assert task.title == "Open ACC task"
+    assert task.project == "proj-1"
+    assert task.metadata["source"] == "acc"
+    assert task.metadata["external_id"] == "task-1"
+    assert task.metadata["acc_metadata"]["beads_id"] == "ACC-1"
+    memories = cp.search_memory(task_id=task.id)
+    assert {memory.record_type for memory in memories} >= {"imported", "acc.task_imported"}
+
+
+def test_acc_migration_blocks_active_tasks_unless_allowed(cp, tmp_path):
+    acc_db = tmp_path / "acc.db"
+    create_acc_migration_fixture(acc_db)
+    conn = sqlite3.connect(acc_db)
+    conn.execute(
+        "UPDATE fleet_tasks SET status = ?, claimed_by = ? WHERE id = ?",
+        ("claimed", "rocky", "task-1"),
+    )
+    conn.commit()
+    conn.close()
+
+    dry_run = migrate_acc_sqlite(cp, acc_db, mode="dry-run")
+    assert dry_run.blockers[0]["id"] == "task-1"
+    with pytest.raises(ValidationError):
+        migrate_acc_sqlite(cp, acc_db, mode="import")
+
+    allowed = migrate_acc_sqlite(cp, acc_db, mode="import", allow_active=True)
+    assert allowed.import_report.tasks_imported == 1
+    assert cp.list_tasks()[0].metadata["migration_requeued_from_active_acc_claim"] is True
+
+
+def test_acc_migration_rejects_missing_db(cp, tmp_path):
+    with pytest.raises(ValidationError):
+        migrate_acc_sqlite(cp, tmp_path / "missing.db")
 
 
 def test_concurrent_claim_picks_exactly_one_winner(cp):
@@ -1089,6 +1468,178 @@ def test_events_filter_by_actor_and_time_window(cp):
 def test_events_rejects_unknown_subject_type(cp):
     with pytest.raises(ValidationError):
         cp.list_events(subject_type="not-a-real-subject")
+
+
+def test_heartbeat_accepts_running_digest_only_for_known_runtime(cp):
+    worker = register_agent(cp, "fleet-worker", ["python"])
+    runtime = create_runtime(cp, "fleet-runtime")
+
+    # Unknown digest is rejected.
+    with pytest.raises(ValidationError):
+        cp.heartbeat_agent(worker.id, running_digest="sha256:not-registered")
+
+    refreshed = cp.heartbeat_agent(worker.id, running_digest=runtime.digest)
+    assert refreshed.running_digest == runtime.digest
+
+    # Empty string clears the digest (agent dropped its declared build).
+    cleared = cp.heartbeat_agent(worker.id, running_digest="")
+    assert cleared.running_digest is None
+
+
+def test_artifact_registry_register_get_and_idempotent_augment(cp):
+    art = cp.register_artifact(
+        "image",
+        "sha256:deadbeef",
+        "artifact://registry/mac:1.0",
+        "human",
+        sbom_uri="sbom://registry/mac:1.0.spdx",
+        signers=["ci"],
+        metadata={"build_id": "b-1"},
+    )
+    assert art.kind == "image"
+    assert art.digest == "sha256:deadbeef"
+    assert art.signers == ["ci"]
+
+    # Re-register with additional signer and updated metadata: digest is the key,
+    # signers merge, metadata merges, sbom_uri preserves if new is None.
+    art2 = cp.register_artifact(
+        "image",
+        "sha256:deadbeef",
+        "ignored-on-update",
+        "human",
+        signers=["release-manager"],
+        metadata={"approved_by": "alice"},
+    )
+    assert art2.id == art.id
+    assert set(art2.signers) == {"ci", "release-manager"}
+    assert art2.metadata["build_id"] == "b-1"
+    assert art2.metadata["approved_by"] == "alice"
+    assert art2.sbom_uri == "sbom://registry/mac:1.0.spdx"
+
+    # Lookup by digest or id.
+    assert cp.get_artifact("sha256:deadbeef").id == art.id
+    assert cp.get_artifact(art.id).digest == "sha256:deadbeef"
+
+
+def test_artifact_registry_rejects_missing_fields(cp):
+    with pytest.raises(ValidationError):
+        cp.register_artifact("", "sha256:x", "uri", "human")
+    with pytest.raises(ValidationError):
+        cp.register_artifact("image", "", "uri", "human")
+    with pytest.raises(ValidationError):
+        cp.register_artifact("image", "sha256:x", "", "human")
+
+
+def test_artifact_list_filters_by_kind(cp):
+    cp.register_artifact("image", "sha256:1", "u1", "human")
+    cp.register_artifact("image", "sha256:2", "u2", "human")
+    cp.register_artifact("package", "sha256:3", "u3", "human")
+    images = cp.list_artifacts(kind="image")
+    assert {a.digest for a in images} == {"sha256:1", "sha256:2"}
+    assert {a.kind for a in images} == {"image"}
+
+
+def test_environment_register_and_deploy_artifact_atomically_retires_prior(cp):
+    artifact_v1 = cp.register_artifact("image", "sha256:v1", "art://v1", "human")
+    artifact_v2 = cp.register_artifact("image", "sha256:v2", "art://v2", "human")
+    staging = cp.register_environment("staging", channel="release")
+    prod = cp.register_environment("prod", channel="release", promotes_from=staging.id)
+
+    # No deployment yet.
+    assert cp.current_deployment(staging.id) is None
+
+    # First deploy: becomes active, no prior to retire.
+    d1 = cp.deploy_artifact(staging.id, artifact_v1.id, "release-bot")
+    assert d1.status == "active"
+    assert d1.retired_at is None
+    assert cp.current_deployment(staging.id).id == d1.id
+
+    # Second deploy: retires the first, new one becomes active.
+    d2 = cp.deploy_artifact(staging.id, artifact_v2.id, "release-bot")
+    assert d2.status == "active"
+    assert cp.current_deployment(staging.id).id == d2.id
+    retired = cp.get_deployment(d1.id)
+    assert retired.status == "retired"
+    assert retired.retired_at is not None
+
+    # Deploy to prod environment is independent.
+    d3 = cp.deploy_artifact(prod.id, artifact_v2.id, "release-bot")
+    assert cp.current_deployment(prod.id).id == d3.id
+    assert cp.current_deployment(staging.id).id == d2.id
+
+
+def test_environment_register_validates_inputs(cp):
+    with pytest.raises(ValidationError):
+        cp.register_environment("")  # empty name
+    with pytest.raises(NotFoundError):
+        cp.register_environment("a", promotes_from="env_does_not_exist")
+
+
+def test_deploy_artifact_requires_known_artifact_and_environment(cp):
+    env = cp.register_environment("staging-fail")
+    with pytest.raises(NotFoundError):
+        cp.deploy_artifact(env.id, "art_does_not_exist", "release-bot")
+    art = cp.register_artifact("image", "sha256:lone", "uri", "human")
+    with pytest.raises(NotFoundError):
+        cp.deploy_artifact("env_does_not_exist", art.id, "release-bot")
+
+
+def test_environment_events_appear_in_unified_stream(cp):
+    artifact = cp.register_artifact("image", "sha256:env-test", "uri", "human")
+    env = cp.register_environment("audit-env", channel="release")
+    cp.deploy_artifact(env.id, artifact.id, "release-bot")
+    cp.deploy_artifact(env.id, artifact.id, "release-bot")  # retire-and-replace
+
+    env_events = cp.list_events(subject_type="environment", subject_id=env.id)
+    types = [event["event_type"] for event in env_events]
+    # newest-first ordering
+    assert "environment.created" in types
+    assert types.count("environment.deployed") == 2
+    assert types.count("environment.retired") == 1
+
+
+def test_list_environments_filters_by_tenant_and_channel(cp):
+    tenant = cp.register_tenant("env-tenant")
+    cp.register_environment("dev", tenant_id=tenant.id, channel="release")
+    cp.register_environment("prod", tenant_id=tenant.id, channel="release")
+    cp.register_environment("global-fleet", channel="fleet")
+
+    tenant_envs = cp.list_environments(tenant_id=tenant.id)
+    assert {env.name for env in tenant_envs} == {"dev", "prod"}
+
+    release_envs = cp.list_environments(channel="release")
+    assert {env.name for env in release_envs} == {"dev", "prod"}
+
+    fleet_envs = cp.list_environments(channel="fleet")
+    assert {env.name for env in fleet_envs} == {"global-fleet"}
+
+
+def test_fleet_build_distribution_buckets_by_digest(cp):
+    runtime_a = cp.create_runtime(
+        "rt-a",
+        {"image": "python:3.12@sha256:abc123", "dependencies": ["fastapi==0.111.0"]},
+        "human",
+    )
+    runtime_b = cp.create_runtime(
+        "rt-b",
+        {"image": "python:3.12@sha256:def456", "dependencies": ["fastapi==0.111.0"]},
+        "human",
+    )
+    a1 = register_agent(cp, "a1", ["python"])
+    a2 = register_agent(cp, "a2", ["python"])
+    b1 = register_agent(cp, "b1", ["python"])
+    offline = register_agent(cp, "offline", ["python"])
+    cp.heartbeat_agent(a1.id, running_digest=runtime_a.digest)
+    cp.heartbeat_agent(a2.id, running_digest=runtime_a.digest)
+    cp.heartbeat_agent(b1.id, running_digest=runtime_b.digest)
+    cp.heartbeat_agent(offline.id, status="offline")
+
+    dist = cp.fleet_build_distribution()
+    assert dist["total_live_agents"] == 3
+    by_digest = {bucket["digest"]: bucket for bucket in dist["buckets"]}
+    assert by_digest[runtime_a.digest]["count"] == 2
+    assert by_digest[runtime_b.digest]["count"] == 1
+    assert by_digest[runtime_a.digest]["percent"] == pytest.approx(66.67, abs=0.01)
 
 
 def test_events_task_detail_includes_from_to_states(cp):

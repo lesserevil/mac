@@ -214,6 +214,7 @@ class SQLiteStore:
                     status TEXT NOT NULL,
                     health_status TEXT NOT NULL,
                     current_task_id TEXT,
+                    running_digest TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL
@@ -283,6 +284,94 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_secret_audit_secret_created
                     ON secret_access_audit (secret_id, created_at);
+
+                -- Gateway-side provenance: who is talking to which Hermes
+                -- instance, in which platform thread, about which task.
+                -- Content stays in Hermes; mac only records the pointer.
+                CREATE TABLE IF NOT EXISTS conversation_threads (
+                    id TEXT PRIMARY KEY,
+                    platform_binding_id TEXT NOT NULL REFERENCES platform_bindings(id) ON DELETE CASCADE,
+                    external_thread_id TEXT NOT NULL,
+                    latest_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                    summary TEXT NOT NULL,
+                    metadata TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    UNIQUE(platform_binding_id, external_thread_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_conversation_threads_binding
+                    ON conversation_threads (platform_binding_id, last_seen_at);
+
+                -- Vector-memory-side provenance: a Hermes memory record may be
+                -- mirrored into a vector store (Qdrant, pgvector, etc.). mac
+                -- never stores embeddings; it only audits "this memory was
+                -- indexed at this point id in this collection."
+                CREATE TABLE IF NOT EXISTS vector_refs (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL REFERENCES memory_records(id) ON DELETE CASCADE,
+                    vector_db TEXT NOT NULL,
+                    collection TEXT NOT NULL,
+                    point_id TEXT NOT NULL,
+                    embedding_model TEXT,
+                    metadata TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(vector_db, collection, point_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_vector_refs_memory
+                    ON vector_refs (memory_id);
+
+                CREATE TABLE IF NOT EXISTS environments (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL,
+                    channel TEXT NOT NULL DEFAULT 'fleet',
+                    promotes_from TEXT REFERENCES environments(id) ON DELETE SET NULL,
+                    metadata TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS environment_events (
+                    id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_environment_events_env
+                    ON environment_events (environment_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS deployments (
+                    id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+                    artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+                    status TEXT NOT NULL,
+                    deployed_by TEXT NOT NULL,
+                    deployed_at TEXT NOT NULL,
+                    retired_at TEXT,
+                    metadata TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_deployments_env_active
+                    ON deployments (environment_id, retired_at);
+
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    digest TEXT NOT NULL UNIQUE,
+                    uri TEXT NOT NULL,
+                    sbom_uri TEXT,
+                    signers TEXT NOT NULL,
+                    metadata TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_artifacts_kind
+                    ON artifacts (kind);
 
                 CREATE TABLE IF NOT EXISTS runtime_environments (
                     id TEXT PRIMARY KEY,
@@ -439,7 +528,46 @@ class SQLiteStore:
                             'revealed_at', revealed_at
                         ),
                         created_at
-                    FROM secret_access_audit;
+                    FROM secret_access_audit
+                    UNION ALL
+                    SELECT id, 'environment', environment_id, event_type, actor, detail, created_at
+                    FROM environment_events
+                    UNION ALL
+                    -- Conversation threads project as one event per row: the
+                    -- "thread_tracked" observation at last_seen_at. This
+                    -- surfaces gateway activity in the unified audit stream
+                    -- without needing a sibling events table.
+                    SELECT
+                        id,
+                        'conversation_thread',
+                        id,
+                        'gateway.thread_tracked',
+                        'gateway',
+                        json_object(
+                            'platform_binding_id', platform_binding_id,
+                            'external_thread_id', external_thread_id,
+                            'latest_task_id', latest_task_id,
+                            'summary', summary
+                        ),
+                        last_seen_at
+                    FROM conversation_threads
+                    UNION ALL
+                    -- Vector refs project as one event per row: the
+                    -- "indexed" observation at creation time.
+                    SELECT
+                        id,
+                        'vector_ref',
+                        memory_id,
+                        'vector.indexed',
+                        created_by,
+                        json_object(
+                            'vector_db', vector_db,
+                            'collection', collection,
+                            'point_id', point_id,
+                            'embedding_model', embedding_model
+                        ),
+                        created_at
+                    FROM vector_refs;
                 """
             )
             self._migrate()
@@ -456,6 +584,7 @@ class SQLiteStore:
         self._ensure_column("rollouts", "artifact_hash", "artifact_hash TEXT")
         self._ensure_column("rollouts", "health_policy", "health_policy TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("rollouts", "required_eval_set_id", "required_eval_set_id TEXT")
+        self._ensure_column("agents", "running_digest", "running_digest TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(%s)" % table)}

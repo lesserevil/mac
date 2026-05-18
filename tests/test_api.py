@@ -246,6 +246,46 @@ def test_events_endpoint_returns_unified_stream():
     assert all(event["subject_id"] == task["id"] for event in task_only)
 
 
+def test_create_app_refuses_to_start_with_placeholder_secret_key():
+    """The deployment env example ships a placeholder long enough to pass the
+    32-char length check. Refusing it at startup prevents copy-and-deploy
+    deployments from encrypting with a known constant."""
+    import pytest
+    from mac.models import ValidationError
+    from mac.services import ControlPlane
+    from mac.store import SQLiteStore
+
+    with pytest.raises(ValidationError):
+        ControlPlane(
+            SQLiteStore(":memory:"),
+            secret_key="REPLACE-ME-WITH-A-32-PLUS-CHAR-RANDOM-STRING",
+        )
+
+
+def test_create_app_via_env_only_works_with_real_secret_key(monkeypatch, tmp_path):
+    """Simulate the Docker / systemd path: env-only configuration, fresh empty
+    DB directory, no MAC_API_TOKEN. The factory should succeed and /health
+    should answer 200."""
+    import importlib
+    import mac.api as api_module
+
+    db_path = tmp_path / "deploy.db"
+    monkeypatch.setenv(
+        "MAC_SECRET_KEY",
+        "deploy-smoke-key-with-32-plus-characters-of-entropy-abc",
+    )
+    monkeypatch.setenv("MAC_DB", str(db_path))
+    monkeypatch.delenv("MAC_API_TOKEN", raising=False)
+    monkeypatch.delenv("MAC_API_TOKENS", raising=False)
+    # Reload so the conditional `if MAC_SECRET_KEY: app = create_app()` re-runs.
+    importlib.reload(api_module)
+
+    client = TestClient(api_module.app)
+    assert client.get("/health").json() == {"status": "ok"}
+    # The DB file was created on first connect.
+    assert db_path.exists()
+
+
 def test_dashboard_has_typescript_source_without_node_toolchain_files():
     root = Path(__file__).resolve().parents[1]
 

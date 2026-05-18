@@ -163,6 +163,12 @@ class RuntimeRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class DeploymentStatus(StrEnum):
+    ACTIVE = "active"
+    RETIRED = "retired"
+    FAILED = "failed"
+
+
 EVIDENCE_KINDS = {"test", "review", "artifact", "publication", "log", "eval"}
 
 
@@ -420,6 +426,7 @@ class Agent:
     status: str
     health_status: str
     current_task_id: Optional[str]
+    running_digest: Optional[str]
     created_at: str
     updated_at: str
     last_seen_at: str
@@ -512,6 +519,85 @@ class SecretHandle:
     audit_id: str
     handle: str
     granted: bool
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class ConversationThread:
+    id: str
+    platform_binding_id: str
+    external_thread_id: str
+    latest_task_id: Optional[str]
+    summary: str
+    metadata: JsonDict
+    first_seen_at: str
+    last_seen_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class VectorRef:
+    id: str
+    memory_id: str
+    vector_db: str
+    collection: str
+    point_id: str
+    embedding_model: Optional[str]
+    metadata: JsonDict
+    created_by: str
+    created_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class Environment:
+    id: str
+    name: str
+    tenant_id: Optional[str]
+    channel: str
+    promotes_from: Optional[str]
+    metadata: JsonDict
+    created_by: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class Deployment:
+    id: str
+    environment_id: str
+    artifact_id: str
+    status: str
+    deployed_by: str
+    deployed_at: str
+    retired_at: Optional[str]
+    metadata: JsonDict
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class Artifact:
+    id: str
+    kind: str
+    digest: str
+    uri: str
+    sbom_uri: Optional[str]
+    signers: List[str]
+    metadata: JsonDict
+    created_by: str
+    created_at: str
+    updated_at: str
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

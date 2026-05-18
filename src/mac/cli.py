@@ -4,8 +4,10 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
+from mac.migration import import_jsonl, migrate_acc_sqlite
 from mac.models import MACError
 from mac.services import ControlPlane
 from mac.store import SQLiteStore
@@ -213,8 +215,13 @@ def cmd_agent_heartbeat(args: argparse.Namespace) -> None:
             status=args.status,
             health_status=args.health_status,
             resources=_json_arg(args.resources, None),
+            running_digest=args.running_digest,
         )
     )
+
+
+def cmd_fleet_build_distribution(args: argparse.Namespace) -> None:
+    _print(_plane(args).fleet_build_distribution())
 
 
 def cmd_dispatch_once(args: argparse.Namespace) -> None:
@@ -296,6 +303,91 @@ def cmd_runtime_create(args: argparse.Namespace) -> None:
 
 def cmd_runtime_list(args: argparse.Namespace) -> None:
     _print([runtime.to_dict() for runtime in _plane(args).list_runtimes()])
+
+
+def cmd_artifact_register(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).register_artifact(
+            args.kind,
+            args.digest,
+            args.uri,
+            args.created_by,
+            sbom_uri=args.sbom_uri,
+            signers=_csv(args.signers),
+            metadata=_json_arg(args.metadata, {}),
+        )
+    )
+
+
+def cmd_artifact_list(args: argparse.Namespace) -> None:
+    _print([a.to_dict() for a in _plane(args).list_artifacts(args.kind)])
+
+
+def cmd_artifact_show(args: argparse.Namespace) -> None:
+    _print(_plane(args).get_artifact(args.artifact))
+
+
+def cmd_migrate_import(args: argparse.Namespace) -> None:
+    report = import_jsonl(_plane(args), path=Path(args.path))
+    _print(report.to_dict())
+
+
+def cmd_migrate_acc(args: argparse.Namespace) -> None:
+    report = migrate_acc_sqlite(
+        _plane(args),
+        Path(args.acc_db),
+        mode=args.mode,
+        allow_active=args.allow_active,
+        audit_limit=args.audit_limit,
+        agent_home=Path(args.agent_home) if args.agent_home else None,
+    ).to_dict()
+    if args.report:
+        Path(args.report).write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    _print(report)
+
+
+def cmd_env_register(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).register_environment(
+            args.name,
+            tenant_id=args.tenant_id,
+            channel=args.channel,
+            promotes_from=args.promotes_from,
+            metadata=_json_arg(args.metadata, {}),
+            created_by=args.created_by,
+        )
+    )
+
+
+def cmd_env_list(args: argparse.Namespace) -> None:
+    _print([e.to_dict() for e in _plane(args).list_environments(args.tenant_id, args.channel)])
+
+
+def cmd_env_show(args: argparse.Namespace) -> None:
+    _print(_plane(args).get_environment(args.environment))
+
+
+def cmd_env_deploy(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).deploy_artifact(
+            args.environment,
+            args.artifact,
+            args.actor,
+            metadata=_json_arg(args.metadata, {}),
+        )
+    )
+
+
+def cmd_env_current(args: argparse.Namespace) -> None:
+    current = _plane(args).current_deployment(args.environment)
+    _print(current.to_dict() if current is not None else None)
+
+
+def cmd_env_deployments(args: argparse.Namespace) -> None:
+    _print([d.to_dict() for d in _plane(args).list_deployments(args.environment)])
 
 
 def cmd_bridge_import(args: argparse.Namespace) -> None:
@@ -598,7 +690,20 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--status")
     heartbeat.add_argument("--health-status")
     heartbeat.add_argument("--resources")
+    heartbeat.add_argument(
+        "--running-digest",
+        help="runtime_environments.digest declaring which build this agent is running",
+    )
     _set(cmd_agent_heartbeat, heartbeat)
+
+    fleet = sub.add_parser("fleet", help="fleet-wide queries").add_subparsers(
+        dest="fleet_command", required=True
+    )
+    fleet_build = fleet.add_parser(
+        "build-distribution",
+        help="aggregate live agents by running_digest",
+    )
+    _set(cmd_fleet_build_distribution, fleet_build)
 
     dispatch = sub.add_parser("dispatch", help="dispatcher commands").add_subparsers(dest="dispatch_command", required=True)
     assign = dispatch.add_parser("assign")
@@ -671,6 +776,61 @@ def build_parser() -> argparse.ArgumentParser:
     _set(cmd_runtime_create, runtime_create)
     runtime_list = runtime.add_parser("list")
     _set(cmd_runtime_list, runtime_list)
+
+    artifact = sub.add_parser(
+        "artifact",
+        help="artifact registry: canonical record for deliverables (images, packages, tarballs)",
+    ).add_subparsers(dest="artifact_command", required=True)
+    artifact_register = artifact.add_parser("register")
+    artifact_register.add_argument("kind", help="e.g. image, package, tarball, wheel")
+    artifact_register.add_argument("digest", help="canonical hash, e.g. sha256:abc...")
+    artifact_register.add_argument("uri")
+    artifact_register.add_argument("--created-by", required=True)
+    artifact_register.add_argument("--sbom-uri")
+    artifact_register.add_argument("--signers", help="comma-separated signer identities")
+    artifact_register.add_argument("--metadata")
+    _set(cmd_artifact_register, artifact_register)
+    artifact_list = artifact.add_parser("list")
+    artifact_list.add_argument("--kind")
+    _set(cmd_artifact_list, artifact_list)
+    artifact_show = artifact.add_parser("show")
+    artifact_show.add_argument("artifact", help="artifact id or digest")
+    _set(cmd_artifact_show, artifact_show)
+
+    env_root = sub.add_parser(
+        "env",
+        help="environments and deployments (artifact -> environment edges)",
+    ).add_subparsers(dest="env_command", required=True)
+    env_register = env_root.add_parser("register")
+    env_register.add_argument("name")
+    env_register.add_argument("--tenant-id")
+    env_register.add_argument("--channel", default="fleet")
+    env_register.add_argument("--promotes-from", help="upstream environment id")
+    env_register.add_argument("--metadata")
+    env_register.add_argument("--created-by", default="human")
+    _set(cmd_env_register, env_register)
+    env_list = env_root.add_parser("list")
+    env_list.add_argument("--tenant-id")
+    env_list.add_argument("--channel")
+    _set(cmd_env_list, env_list)
+    env_show = env_root.add_parser("show")
+    env_show.add_argument("environment", help="environment id or name")
+    _set(cmd_env_show, env_show)
+    env_deploy = env_root.add_parser(
+        "deploy",
+        help="record a new active deployment in an environment, retiring the prior one",
+    )
+    env_deploy.add_argument("environment", help="environment id or name")
+    env_deploy.add_argument("artifact", help="artifact id or digest")
+    env_deploy.add_argument("--actor", required=True)
+    env_deploy.add_argument("--metadata")
+    _set(cmd_env_deploy, env_deploy)
+    env_current = env_root.add_parser("current")
+    env_current.add_argument("environment")
+    _set(cmd_env_current, env_current)
+    env_deployments = env_root.add_parser("history")
+    env_deployments.add_argument("environment")
+    _set(cmd_env_deployments, env_deployments)
 
     bridge = sub.add_parser("bridge", help="external project bridge commands").add_subparsers(dest="bridge_command", required=True)
     bridge_import = bridge.add_parser("import")
@@ -751,7 +911,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     events_list.add_argument(
         "--subject-type",
-        choices=("task", "rollout", "eval_set", "secret"),
+        choices=("task", "rollout", "eval_set", "secret", "environment"),
     )
     events_list.add_argument("--subject-id")
     events_list.add_argument("--actor")
@@ -764,6 +924,40 @@ def build_parser() -> argparse.ArgumentParser:
     events_list.add_argument("--until", help="ISO timestamp upper bound (inclusive)")
     events_list.add_argument("--limit", type=int, default=100)
     _set(cmd_events_list, events_list)
+
+    migrate = sub.add_parser(
+        "migrate",
+        help="one-time migration from external systems",
+    ).add_subparsers(dest="migrate_command", required=True)
+    migrate_import = migrate.add_parser(
+        "import",
+        help="replay a JSONL stream of {record: tenant|user|task|evidence|history} rows",
+    )
+    migrate_import.add_argument("path", help="path to JSONL file")
+    _set(cmd_migrate_import, migrate_import)
+    migrate_acc = migrate.add_parser(
+        "acc",
+        help="dry-run or import an ACC SQLite database once",
+    )
+    migrate_acc.add_argument("acc_db", help="path to ACC SQLite DB, e.g. ~/.acc/data/acc.db")
+    migrate_acc.add_argument("--mode", choices=("dry-run", "import"), default="dry-run")
+    migrate_acc.add_argument(
+        "--allow-active",
+        action="store_true",
+        help="import claimed/in-progress ACC tasks as requeued mac tasks",
+    )
+    migrate_acc.add_argument(
+        "--audit-limit",
+        type=int,
+        default=1000,
+        help="latest ACC work_audit_events rows to carry as task provenance; 0 skips audit rows",
+    )
+    migrate_acc.add_argument(
+        "--agent-home",
+        help="home directory used for soul snapshot path hints; defaults to current home",
+    )
+    migrate_acc.add_argument("--report", help="write the migration report JSON to this path")
+    _set(cmd_migrate_acc, migrate_acc)
 
     eval_root = sub.add_parser("eval", help="evaluation sets and runs").add_subparsers(
         dest="eval_command", required=True

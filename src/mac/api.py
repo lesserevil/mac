@@ -119,6 +119,7 @@ class HeartbeatRequest(BaseModel):
     status: Optional[str] = None
     health_status: Optional[str] = None
     resources: Optional[Dict[str, Any]] = None
+    running_digest: Optional[str] = None
 
 
 class DispatchRequest(BaseModel):
@@ -170,6 +171,49 @@ class SecretAccessRequest(BaseModel):
 class SecretRevealRequest(BaseModel):
     audit_id: str
     accessor_agent_id: str
+
+
+class ArtifactRegister(BaseModel):
+    kind: str
+    digest: str
+    uri: str
+    created_by: str
+    sbom_uri: Optional[str] = None
+    signers: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationThreadTrack(BaseModel):
+    platform_binding_id: str
+    external_thread_id: str
+    summary: str = ""
+    latest_task_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class VectorRefRecord(BaseModel):
+    memory_id: str
+    vector_db: str
+    collection: str
+    point_id: str
+    embedding_model: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_by: str = "human"
+
+
+class EnvironmentRegister(BaseModel):
+    name: str
+    tenant_id: Optional[str] = None
+    channel: str = "fleet"
+    promotes_from: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_by: str = "human"
+
+
+class DeploymentCreate(BaseModel):
+    artifact_id: str
+    actor: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeCreate(BaseModel):
@@ -565,7 +609,9 @@ def create_app(
     control_plane: Optional[ControlPlane] = None,
     auth_tokens: Optional[Dict[str, List[str]]] = None,
 ) -> FastAPI:
-    cp = control_plane or ControlPlane(SQLiteStore(db_path or "mac.db"))
+    cp = control_plane or ControlPlane(
+        SQLiteStore(db_path or os.environ.get("MAC_DB") or "mac.db")
+    )
     tokens = auth_tokens if auth_tokens is not None else _load_auth_tokens_from_env()
     app = FastAPI(title="MAC Control Plane", version="0.1.0")
     app.state.control_plane = cp
@@ -755,6 +801,10 @@ def create_app(
     def list_agents() -> List[Dict[str, Any]]:
         return [agent.to_dict() for agent in cp.list_agents()]
 
+    @app.get("/fleet/build-distribution")
+    def fleet_build_distribution() -> Dict[str, Any]:
+        return cp.fleet_build_distribution()
+
     @app.post("/agents/{agent_id}/heartbeat")
     def heartbeat_agent(agent_id: str, body: HeartbeatRequest) -> Dict[str, Any]:
         return cp.heartbeat_agent(agent_id, **_data(body)).to_dict()
@@ -844,6 +894,75 @@ def create_app(
     @app.get("/secret-audits")
     def list_secret_audits(secret_id: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
         return [audit.to_dict() for audit in cp.list_secret_audits(secret_id)]
+
+    @app.post("/artifacts")
+    def register_artifact(body: ArtifactRegister) -> Dict[str, Any]:
+        return cp.register_artifact(**_data(body)).to_dict()
+
+    @app.get("/artifacts")
+    def list_artifacts(kind: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
+        return [artifact.to_dict() for artifact in cp.list_artifacts(kind)]
+
+    @app.get("/artifacts/{artifact_id_or_digest}")
+    def get_artifact(artifact_id_or_digest: str) -> Dict[str, Any]:
+        return cp.get_artifact(artifact_id_or_digest).to_dict()
+
+    @app.post("/conversation-threads")
+    def track_conversation(body: ConversationThreadTrack) -> Dict[str, Any]:
+        return cp.track_conversation(**_data(body)).to_dict()
+
+    @app.get("/conversation-threads")
+    def list_conversation_threads(
+        platform_binding_id: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [thread.to_dict() for thread in cp.list_conversation_threads(platform_binding_id)]
+
+    @app.get("/conversation-threads/{thread_id}")
+    def get_conversation_thread(thread_id: str) -> Dict[str, Any]:
+        return cp.get_conversation_thread(thread_id).to_dict()
+
+    @app.post("/vector-refs")
+    def record_vector_ref(body: VectorRefRecord) -> Dict[str, Any]:
+        return cp.record_vector_ref(**_data(body)).to_dict()
+
+    @app.get("/vector-refs")
+    def list_vector_refs(
+        memory_id: Optional[str] = Query(default=None),
+        vector_db: Optional[str] = Query(default=None),
+        collection: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [
+            ref.to_dict()
+            for ref in cp.list_vector_refs(memory_id, vector_db, collection)
+        ]
+
+    @app.post("/environments")
+    def register_environment(body: EnvironmentRegister) -> Dict[str, Any]:
+        return cp.register_environment(**_data(body)).to_dict()
+
+    @app.get("/environments")
+    def list_environments(
+        tenant_id: Optional[str] = Query(default=None),
+        channel: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [env.to_dict() for env in cp.list_environments(tenant_id, channel)]
+
+    @app.get("/environments/{env_id}")
+    def get_environment(env_id: str) -> Dict[str, Any]:
+        return cp.get_environment(env_id).to_dict()
+
+    @app.post("/environments/{env_id}/deploy")
+    def deploy_artifact(env_id: str, body: DeploymentCreate) -> Dict[str, Any]:
+        return cp.deploy_artifact(env_id, body.artifact_id, body.actor, body.metadata).to_dict()
+
+    @app.get("/environments/{env_id}/current")
+    def current_deployment(env_id: str) -> Optional[Dict[str, Any]]:
+        current = cp.current_deployment(env_id)
+        return current.to_dict() if current is not None else None
+
+    @app.get("/environments/{env_id}/deployments")
+    def list_deployments(env_id: str) -> List[Dict[str, Any]]:
+        return [d.to_dict() for d in cp.list_deployments(env_id)]
 
     @app.post("/runtimes")
     def create_runtime(body: RuntimeCreate) -> Dict[str, Any]:

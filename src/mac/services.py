@@ -14,7 +14,12 @@ from mac.models import (
     Agent,
     AgentMessage,
     AgentStatus,
+    Artifact,
     AuthorizationError,
+    ConversationThread,
+    Deployment,
+    DeploymentStatus,
+    Environment,
     EVIDENCE_KINDS,
     EvalRun,
     EvalScoringDirection,
@@ -59,6 +64,7 @@ from mac.models import (
     TransitionError,
     User,
     ValidationError,
+    VectorRef,
     coerce_list,
     ensure_json_object,
     json_dumps,
@@ -97,7 +103,6 @@ SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential"
 
 SECRET_HANDLE_DEFAULT_TTL_SECONDS = 300
 
-
 def _hash_manifest(manifest: JsonDict) -> str:
     return hashlib.sha256(json_dumps(manifest).encode("utf-8")).hexdigest()
 
@@ -122,6 +127,25 @@ class ControlPlane:
             )
         if len(raw_key) < 32:
             raise ValidationError("MAC_SECRET_KEY must be at least 32 characters")
+        # Refuse common placeholder substrings so the example env file in
+        # deploy/systemd/mac.env.example cannot be deployed verbatim. The
+        # placeholder is long enough to satisfy the length check, but lands
+        # every secret under a globally-known Fernet key. Better to fail loud
+        # at startup than encrypt with a known constant.
+        placeholder_substrings = (
+            "REPLACE-ME",
+            "REPLACE_ME",
+            "CHANGE-ME",
+            "CHANGE_ME",
+            "your-key-here",
+            "xxxxxxxx",
+        )
+        for marker in placeholder_substrings:
+            if marker.lower() in raw_key.lower():
+                raise ValidationError(
+                    "MAC_SECRET_KEY appears to be a placeholder (%r). "
+                    "Generate one with: openssl rand -base64 48" % marker
+                )
         fernet_key = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
@@ -709,7 +733,15 @@ class ControlPlane:
 
     # Unified audit / event stream
 
-    EVENT_SUBJECT_TYPES = ("task", "rollout", "eval_set", "secret")
+    EVENT_SUBJECT_TYPES = (
+        "task",
+        "rollout",
+        "eval_set",
+        "secret",
+        "environment",
+        "conversation_thread",
+        "vector_ref",
+    )
 
     def list_events(
         self,
@@ -1173,6 +1205,7 @@ class ControlPlane:
         status: Optional[str] = None,
         health_status: Optional[str] = None,
         resources: Optional[Dict[str, Any]] = None,
+        running_digest: Optional[str] = None,
     ) -> Agent:
         self.get_agent(agent_id)
         now = utcnow()
@@ -1198,6 +1231,26 @@ class ControlPlane:
         if resources is not None:
             updates.append("resources = ?")
             params.append(json_dumps(resources))
+        if running_digest is not None:
+            digest = running_digest.strip()
+            if digest:
+                # Anchor fleet rollout state to a known runtime build. If you
+                # roll out a new agent build, register the runtime first; the
+                # heartbeat that declares the new digest then becomes the truth
+                # source for "how many agents are on which build."
+                exists = self.store.query_one(
+                    "SELECT 1 FROM runtime_environments WHERE digest = ? LIMIT 1",
+                    (digest,),
+                )
+                if exists is None:
+                    raise ValidationError(
+                        "running_digest %s is not registered as a runtime_environments.digest"
+                        % digest
+                    )
+                updates.append("running_digest = ?")
+                params.append(digest)
+            else:
+                updates.append("running_digest = NULL")
         if status_value == AgentStatus.IDLE.value and self._agent_has_active_lease(agent_id):
             raise ValidationError("agent cannot report idle while holding an active lease")
         if status_value == AgentStatus.OFFLINE.value:
@@ -1207,6 +1260,31 @@ class ControlPlane:
         params.append(agent_id)
         self.store.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
         return self.get_agent(agent_id)
+
+    def fleet_build_distribution(self) -> JsonDict:
+        """Aggregate agents by their declared running_digest.
+
+        Useful for "what percent of the fleet is on v0.8 vs v0.9" without joining
+        rollouts. Agents with no declared digest are bucketed as 'unknown'.
+        """
+        rows = self.store.query_all(
+            """
+            SELECT COALESCE(running_digest, '') AS digest, COUNT(*) AS count
+            FROM agents
+            WHERE status != ?
+            GROUP BY running_digest
+            ORDER BY count DESC
+            """,
+            (AgentStatus.OFFLINE.value,),
+        )
+        buckets = [
+            {"digest": row["digest"] or None, "count": int(row["count"])}
+            for row in rows
+        ]
+        total = sum(bucket["count"] for bucket in buckets) or 1
+        for bucket in buckets:
+            bucket["percent"] = round(bucket["count"] * 100.0 / total, 2)
+        return {"total_live_agents": total if total > 0 else 0, "buckets": buckets}
 
     def mark_stale_agents_offline(self, stale_after_seconds: int) -> List[Agent]:
         cutoff = (
@@ -1727,6 +1805,340 @@ class ControlPlane:
             raise NotFoundError("secret not found or disabled: %s" % secret_id)
         return self._decrypt(row["ciphertext"])
 
+    # Artifact registry
+
+    def register_artifact(
+        self,
+        kind: str,
+        digest: str,
+        uri: str,
+        created_by: str,
+        sbom_uri: Optional[str] = None,
+        signers: Optional[Iterable[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "Artifact":
+        """Canonical record of a deliverable artifact (image, package, tarball, ...).
+
+        Digest is the unique key. Re-registering the same digest with new
+        sbom_uri/signers/metadata augments the record; uri and kind are pinned
+        on first write.
+        """
+        kind = (kind or "").strip()
+        digest = (digest or "").strip()
+        uri = (uri or "").strip()
+        if not kind:
+            raise ValidationError("artifact kind is required")
+        if not digest:
+            raise ValidationError("artifact digest is required")
+        if not uri:
+            raise ValidationError("artifact uri is required")
+        signer_list = coerce_list(signers)
+        now = utcnow()
+        existing = self.store.query_one(
+            "SELECT * FROM artifacts WHERE digest = ?", (digest,)
+        )
+        if existing is not None:
+            # Augment: merge signers and metadata; sbom_uri sets on first non-null.
+            existing_signers = json_loads(existing["signers"], [])
+            merged_signers = coerce_list(list(existing_signers) + signer_list)
+            existing_meta = json_loads(existing["metadata"], {})
+            merged_meta = dict(existing_meta)
+            if metadata:
+                merged_meta.update(metadata)
+            new_sbom = sbom_uri if sbom_uri is not None else existing["sbom_uri"]
+            self.store.execute(
+                """
+                UPDATE artifacts
+                SET sbom_uri = ?, signers = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_sbom,
+                    json_dumps(merged_signers),
+                    json_dumps(merged_meta),
+                    now,
+                    existing["id"],
+                ),
+            )
+            return self.get_artifact(existing["id"])
+        artifact_id = new_id("art")
+        self.store.execute(
+            """
+            INSERT INTO artifacts (
+                id, kind, digest, uri, sbom_uri, signers, metadata,
+                created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id,
+                kind,
+                digest,
+                uri,
+                sbom_uri,
+                json_dumps(signer_list),
+                json_dumps(ensure_json_object(metadata)),
+                created_by,
+                now,
+                now,
+            ),
+        )
+        return self.get_artifact(artifact_id)
+
+    def get_artifact(self, artifact_id_or_digest: str) -> "Artifact":
+        row = self.store.query_one(
+            "SELECT * FROM artifacts WHERE id = ? OR digest = ?",
+            (artifact_id_or_digest, artifact_id_or_digest),
+        )
+        if row is None:
+            raise NotFoundError("artifact not found: %s" % artifact_id_or_digest)
+        return self._artifact_from_row(row)
+
+    def list_artifacts(self, kind: Optional[str] = None) -> List["Artifact"]:
+        if kind:
+            rows = self.store.query_all(
+                "SELECT * FROM artifacts WHERE kind = ? ORDER BY created_at, id",
+                (kind,),
+            )
+        else:
+            rows = self.store.query_all("SELECT * FROM artifacts ORDER BY created_at, id")
+        return [self._artifact_from_row(row) for row in rows]
+
+    def _artifact_from_row(self, row: Any) -> "Artifact":
+        return Artifact(
+            row["id"],
+            row["kind"],
+            row["digest"],
+            row["uri"],
+            row["sbom_uri"],
+            json_loads(row["signers"], []),
+            json_loads(row["metadata"], {}),
+            row["created_by"],
+            row["created_at"],
+            row["updated_at"],
+        )
+
+    # Environment + deployment edge
+
+    def register_environment(
+        self,
+        name: str,
+        tenant_id: Optional[str] = None,
+        channel: str = "fleet",
+        promotes_from: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_by: str = "human",
+    ) -> "Environment":
+        name = (name or "").strip()
+        if not name:
+            raise ValidationError("environment name is required")
+        if tenant_id is not None:
+            self.get_tenant(tenant_id)
+        channel = (channel or "fleet").strip() or "fleet"
+        if promotes_from is not None:
+            self.get_environment(promotes_from)
+        now = utcnow()
+        env_id = new_id("env")
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO environments (
+                    id, name, tenant_id, channel, promotes_from, metadata,
+                    created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    env_id,
+                    name,
+                    tenant_id,
+                    channel,
+                    promotes_from,
+                    json_dumps(ensure_json_object(metadata)),
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_environment_event(
+                conn,
+                env_id,
+                "environment.created",
+                created_by,
+                {
+                    "name": name,
+                    "tenant_id": tenant_id,
+                    "channel": channel,
+                    "promotes_from": promotes_from,
+                },
+                now,
+            )
+        return self.get_environment(env_id)
+
+    def get_environment(self, env_id_or_name: str) -> "Environment":
+        row = self.store.query_one(
+            "SELECT * FROM environments WHERE id = ? OR name = ?",
+            (env_id_or_name, env_id_or_name),
+        )
+        if row is None:
+            raise NotFoundError("environment not found: %s" % env_id_or_name)
+        return self._environment_from_row(row)
+
+    def list_environments(
+        self,
+        tenant_id: Optional[str] = None,
+        channel: Optional[str] = None,
+    ) -> List["Environment"]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if channel is not None:
+            clauses.append("channel = ?")
+            params.append(channel)
+        sql = "SELECT * FROM environments"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY channel, name"
+        return [self._environment_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+
+    def deploy_artifact(
+        self,
+        environment_id: str,
+        artifact_id: str,
+        actor: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "Deployment":
+        """Atomically retire the current deployment in `environment_id` and
+        record `artifact_id` as the new active deployment. Two writers cannot
+        race because BEGIN IMMEDIATE serializes the retire+insert pair.
+        """
+        environment = self.get_environment(environment_id)
+        artifact = self.get_artifact(artifact_id)
+        now = utcnow()
+        deployment_id = new_id("deploy")
+        with self.store.transaction() as conn:
+            prior = conn.execute(
+                """
+                SELECT id, artifact_id FROM deployments
+                WHERE environment_id = ? AND retired_at IS NULL
+                """,
+                (environment.id,),
+            ).fetchall()
+            for row in prior:
+                conn.execute(
+                    "UPDATE deployments SET status = ?, retired_at = ? WHERE id = ?",
+                    (DeploymentStatus.RETIRED.value, now, row["id"]),
+                )
+                self._insert_environment_event(
+                    conn,
+                    environment.id,
+                    "environment.retired",
+                    actor,
+                    {"deployment_id": row["id"], "artifact_id": row["artifact_id"]},
+                    now,
+                )
+            conn.execute(
+                """
+                INSERT INTO deployments (
+                    id, environment_id, artifact_id, status, deployed_by,
+                    deployed_at, retired_at, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    deployment_id,
+                    environment.id,
+                    artifact.id,
+                    DeploymentStatus.ACTIVE.value,
+                    actor,
+                    now,
+                    json_dumps(ensure_json_object(metadata)),
+                ),
+            )
+            self._insert_environment_event(
+                conn,
+                environment.id,
+                "environment.deployed",
+                actor,
+                {
+                    "deployment_id": deployment_id,
+                    "artifact_id": artifact.id,
+                    "artifact_digest": artifact.digest,
+                },
+                now,
+            )
+        return self.get_deployment(deployment_id)
+
+    def get_deployment(self, deployment_id: str) -> "Deployment":
+        row = self.store.query_one(
+            "SELECT * FROM deployments WHERE id = ?", (deployment_id,)
+        )
+        if row is None:
+            raise NotFoundError("deployment not found: %s" % deployment_id)
+        return self._deployment_from_row(row)
+
+    def current_deployment(self, environment_id: str) -> Optional["Deployment"]:
+        env = self.get_environment(environment_id)
+        row = self.store.query_one(
+            """
+            SELECT * FROM deployments
+            WHERE environment_id = ? AND retired_at IS NULL
+            ORDER BY deployed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (env.id,),
+        )
+        return self._deployment_from_row(row) if row is not None else None
+
+    def list_deployments(self, environment_id: str) -> List["Deployment"]:
+        env = self.get_environment(environment_id)
+        rows = self.store.query_all(
+            "SELECT * FROM deployments WHERE environment_id = ? ORDER BY deployed_at, id",
+            (env.id,),
+        )
+        return [self._deployment_from_row(row) for row in rows]
+
+    def _environment_from_row(self, row: Any) -> "Environment":
+        return Environment(
+            row["id"],
+            row["name"],
+            row["tenant_id"],
+            row["channel"],
+            row["promotes_from"],
+            json_loads(row["metadata"], {}),
+            row["created_by"],
+            row["created_at"],
+            row["updated_at"],
+        )
+
+    def _deployment_from_row(self, row: Any) -> "Deployment":
+        return Deployment(
+            row["id"],
+            row["environment_id"],
+            row["artifact_id"],
+            row["status"],
+            row["deployed_by"],
+            row["deployed_at"],
+            row["retired_at"],
+            json_loads(row["metadata"], {}),
+        )
+
+    def _insert_environment_event(
+        self,
+        conn: Any,
+        environment_id: str,
+        event_type: str,
+        actor: str,
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO environment_events (id, environment_id, event_type, actor, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_id("envevt"), environment_id, event_type, actor, json_dumps(detail), when),
+        )
+
     # Runtime boundary
 
     def create_runtime(self, name: str, manifest: Dict[str, Any], created_by: str) -> RuntimeEnvironment:
@@ -1931,6 +2343,203 @@ class ControlPlane:
         sql += " ORDER BY created_at, id"
         rows = self.store.query_all(sql, tuple(params))
         return [self._memory_from_row(row) for row in rows]
+
+    # Gateway + vector-memory provenance
+    #
+    # These are mac-side audit seams for cross-process integrations. mac does
+    # not implement Slack/Telegram/Discord gateways or Qdrant/pgvector clients
+    # — those live on the Hermes side per the memory contract. What mac records
+    # is the *pointer*: "this thread is talking to that instance about that
+    # task" and "this memory record was indexed at that point in that
+    # collection." Operators can audit cross-process flow without mac ever
+    # touching conversation content or embeddings.
+
+    CONVERSATION_SUMMARY_MAX_CHARS = 500
+
+    def track_conversation(
+        self,
+        platform_binding_id: str,
+        external_thread_id: str,
+        summary: str = "",
+        latest_task_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "ConversationThread":
+        binding = self.get_platform_binding(platform_binding_id)
+        external_thread_id = (external_thread_id or "").strip()
+        if not external_thread_id:
+            raise ValidationError("external_thread_id is required")
+        # The summary is an operator-facing brief, not a transcript. Capping
+        # length enforces the boundary contract — gateways that try to dump
+        # conversation content here get truncated. Hermes still owns content.
+        if summary and len(summary) > self.CONVERSATION_SUMMARY_MAX_CHARS:
+            raise ValidationError(
+                "conversation summary too long (%d > %d); store transcripts in Hermes, not mac"
+                % (len(summary), self.CONVERSATION_SUMMARY_MAX_CHARS)
+            )
+        if latest_task_id is not None:
+            self.get_task(latest_task_id)
+        now = utcnow()
+        existing = self.store.query_one(
+            """
+            SELECT * FROM conversation_threads
+            WHERE platform_binding_id = ? AND external_thread_id = ?
+            """,
+            (binding.id, external_thread_id),
+        )
+        if existing is not None:
+            # Touch last_seen_at; preserve first_seen_at. Augment summary +
+            # metadata + latest_task_id only when caller passed them.
+            new_summary = summary if summary else existing["summary"]
+            existing_meta = json_loads(existing["metadata"], {})
+            if metadata:
+                existing_meta.update(metadata)
+            new_task = latest_task_id if latest_task_id is not None else existing["latest_task_id"]
+            self.store.execute(
+                """
+                UPDATE conversation_threads
+                SET summary = ?, metadata = ?, latest_task_id = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (new_summary, json_dumps(existing_meta), new_task, now, existing["id"]),
+            )
+            return self.get_conversation_thread(existing["id"])
+        thread_id = new_id("thread")
+        self.store.execute(
+            """
+            INSERT INTO conversation_threads (
+                id, platform_binding_id, external_thread_id, latest_task_id,
+                summary, metadata, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                thread_id,
+                binding.id,
+                external_thread_id,
+                latest_task_id,
+                summary,
+                json_dumps(ensure_json_object(metadata)),
+                now,
+                now,
+            ),
+        )
+        return self.get_conversation_thread(thread_id)
+
+    def get_conversation_thread(self, thread_id: str) -> "ConversationThread":
+        row = self.store.query_one(
+            "SELECT * FROM conversation_threads WHERE id = ?", (thread_id,)
+        )
+        if row is None:
+            raise NotFoundError("conversation thread not found: %s" % thread_id)
+        return self._conversation_thread_from_row(row)
+
+    def list_conversation_threads(
+        self,
+        platform_binding_id: Optional[str] = None,
+    ) -> List["ConversationThread"]:
+        if platform_binding_id:
+            rows = self.store.query_all(
+                """
+                SELECT * FROM conversation_threads
+                WHERE platform_binding_id = ?
+                ORDER BY last_seen_at DESC, id
+                """,
+                (platform_binding_id,),
+            )
+        else:
+            rows = self.store.query_all(
+                "SELECT * FROM conversation_threads ORDER BY last_seen_at DESC, id"
+            )
+        return [self._conversation_thread_from_row(row) for row in rows]
+
+    def record_vector_ref(
+        self,
+        memory_id: str,
+        vector_db: str,
+        collection: str,
+        point_id: str,
+        embedding_model: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_by: str = "human",
+    ) -> "VectorRef":
+        self.get_memory(memory_id)
+        if not vector_db or not collection or not point_id:
+            raise ValidationError("vector_db, collection, and point_id are required")
+        now = utcnow()
+        ref_id = new_id("vref")
+        self.store.execute(
+            """
+            INSERT INTO vector_refs (
+                id, memory_id, vector_db, collection, point_id,
+                embedding_model, metadata, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ref_id,
+                memory_id,
+                vector_db,
+                collection,
+                point_id,
+                embedding_model,
+                json_dumps(ensure_json_object(metadata)),
+                created_by,
+                now,
+            ),
+        )
+        return self.get_vector_ref(ref_id)
+
+    def get_vector_ref(self, ref_id: str) -> "VectorRef":
+        row = self.store.query_one("SELECT * FROM vector_refs WHERE id = ?", (ref_id,))
+        if row is None:
+            raise NotFoundError("vector ref not found: %s" % ref_id)
+        return self._vector_ref_from_row(row)
+
+    def list_vector_refs(
+        self,
+        memory_id: Optional[str] = None,
+        vector_db: Optional[str] = None,
+        collection: Optional[str] = None,
+    ) -> List["VectorRef"]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if memory_id is not None:
+            clauses.append("memory_id = ?")
+            params.append(memory_id)
+        if vector_db is not None:
+            clauses.append("vector_db = ?")
+            params.append(vector_db)
+        if collection is not None:
+            clauses.append("collection = ?")
+            params.append(collection)
+        sql = "SELECT * FROM vector_refs"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at, id"
+        return [self._vector_ref_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+
+    def _conversation_thread_from_row(self, row: Any) -> "ConversationThread":
+        return ConversationThread(
+            row["id"],
+            row["platform_binding_id"],
+            row["external_thread_id"],
+            row["latest_task_id"],
+            row["summary"],
+            json_loads(row["metadata"], {}),
+            row["first_seen_at"],
+            row["last_seen_at"],
+        )
+
+    def _vector_ref_from_row(self, row: Any) -> "VectorRef":
+        return VectorRef(
+            row["id"],
+            row["memory_id"],
+            row["vector_db"],
+            row["collection"],
+            row["point_id"],
+            row["embedding_model"],
+            json_loads(row["metadata"], {}),
+            row["created_by"],
+            row["created_at"],
+        )
 
     # Evaluation
 
@@ -2680,6 +3289,8 @@ class ControlPlane:
         )
 
     def _agent_from_row(self, row: Any) -> Agent:
+        keys = row.keys() if hasattr(row, "keys") else []
+        running_digest = row["running_digest"] if "running_digest" in keys else None
         return Agent(
             row["id"],
             row["machine_id"],
@@ -2689,6 +3300,7 @@ class ControlPlane:
             row["status"],
             row["health_status"],
             row["current_task_id"],
+            running_digest,
             row["created_at"],
             row["updated_at"],
             row["last_seen_at"],
