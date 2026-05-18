@@ -57,6 +57,11 @@ The identity framework reflects that split:
 
 ```bash
 uv run --extra dev pytest
+
+# Required: a 32+ char secret used to derive the Fernet key for the secrets table.
+# Without it, the CLI and API both refuse to start.
+export MAC_SECRET_KEY="$(openssl rand -base64 32)"
+
 uv run mac --db mac.db init
 uv run uvicorn mac.api:app --reload
 uv run mac-hermes --url http://127.0.0.1:8000 --help
@@ -66,10 +71,12 @@ The CLI stores state in `mac.db` by default. Use `--db path/to/file.db` or `MAC_
 
 ## API
 
-Run the REST API with:
+Run the REST API with `MAC_SECRET_KEY` set:
 
 ```bash
-uv run uvicorn mac.api:app --reload
+MAC_SECRET_KEY="..." uv run uvicorn mac.api:app --reload
+# or use factory mode to be explicit:
+MAC_SECRET_KEY="..." uv run uvicorn mac.api:create_app --factory --reload
 ```
 
 Key route groups:
@@ -97,6 +104,12 @@ mac --db mac.db interaction task hermes_... "Investigate deployment failure" --p
 mac --db mac.db task create "Implement feature" --required-capabilities python
 mac --db mac.db dispatch tick
 mac --db mac.db task show task_...
+
+# Secrets: prefer stdin or file input over argv to keep values out of shell history.
+echo -n "$GH_TOKEN" | mac --db mac.db secret set github-token \
+    --from-stdin --scopes '{"capabilities":["deploy"]}' --created-by human
+mac --db mac.db secret set release-key --from-file ./release.key \
+    --scopes '{"capabilities":["deploy"]}' --created-by human
 ```
 
 Hermes-facing API adapter:

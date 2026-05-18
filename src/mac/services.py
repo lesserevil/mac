@@ -6,6 +6,10 @@ import os
 from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
 from mac.models import (
     Agent,
     AgentMessage,
@@ -33,6 +37,7 @@ from mac.models import (
     Review,
     ReviewStatus,
     Rollout,
+    ROLLOUT_ACTIONS,
     RolloutStatus,
     RolloutStrategy,
     RuntimeEnvironment,
@@ -72,7 +77,19 @@ FORBIDDEN_MESSAGE_KEYS = {
     "shell",
 }
 
-SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential")
+MESSAGE_TYPE_REQUIRED_FIELDS: Dict[str, Tuple[str, ...]] = {
+    MessageType.HELP_REQUEST.value: ("question",),
+    MessageType.EVIDENCE_REQUEST.value: ("task_id",),
+    MessageType.STATUS_UPDATE.value: ("status",),
+    MessageType.REVIEW_REQUEST.value: ("task_id", "review_id"),
+    MessageType.REVIEW_RESULT.value: ("task_id", "status"),
+    MessageType.NUDGE.value: ("task_id",),
+    MessageType.DECISION_RECORD.value: ("summary",),
+}
+
+SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
+
+SECRET_HANDLE_DEFAULT_TTL_SECONDS = 300
 
 
 def _hash_manifest(manifest: JsonDict) -> str:
@@ -92,13 +109,47 @@ class ControlPlane:
         secret_key: Optional[str] = None,
     ) -> None:
         self.store = store or SQLiteStore()
-        self._secret_key = (secret_key or os.environ.get("MAC_SECRET_KEY") or "local-dev-key").encode(
-            "utf-8"
-        )
+        raw_key = secret_key if secret_key is not None else os.environ.get("MAC_SECRET_KEY")
+        if not raw_key:
+            raise ValidationError(
+                "MAC_SECRET_KEY is required (32+ chars). Set it in the environment or pass secret_key explicitly."
+            )
+        if len(raw_key) < 32:
+            raise ValidationError("MAC_SECRET_KEY must be at least 32 characters")
+        fernet_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"mac.control_plane.secrets.v1",
+            info=b"fernet-key",
+        ).derive(raw_key.encode("utf-8"))
+        self._fernet = Fernet(base64.urlsafe_b64encode(fernet_key))
 
     @classmethod
     def in_memory(cls) -> "ControlPlane":
-        return cls(SQLiteStore(":memory:"), secret_key="test-key")
+        return cls(SQLiteStore(":memory:"), secret_key="test-key-with-enough-entropy-32+chars")
+
+    def _resolved_json_column(
+        self,
+        table: str,
+        column: str,
+        row_id: str,
+        value: Optional[Dict[str, Any]],
+    ) -> str:
+        """Resolve a JSON column for register-style upserts.
+
+        If the caller explicitly passed a value, use it. Otherwise preserve the
+        existing row's value (so re-registering with no metadata does not wipe
+        previously-stored metadata). Defaults to {} for new rows.
+        """
+        if value is not None:
+            return json_dumps(ensure_json_object(value))
+        row = self.store.query_one(
+            "SELECT %s AS value FROM %s WHERE id = ?" % (column, table),
+            (row_id,),
+        )
+        if row is None or row["value"] is None:
+            return json_dumps({})
+        return row["value"]
 
     # Human-facing identity and Hermes boundary
 
@@ -116,6 +167,7 @@ class ControlPlane:
             tenant_id = existing["id"]
         now = utcnow()
         tid = tenant_id or new_id("tenant")
+        metadata_json = self._resolved_json_column("tenants", "metadata", tid, metadata)
         self.store.execute(
             """
             INSERT INTO tenants (id, name, metadata, created_at, updated_at)
@@ -125,7 +177,7 @@ class ControlPlane:
                 metadata = excluded.metadata,
                 updated_at = excluded.updated_at
             """,
-            (tid, name, json_dumps(ensure_json_object(metadata)), now, now),
+            (tid, name, metadata_json, now, now),
         )
         return self.get_tenant(tid)
 
@@ -162,6 +214,7 @@ class ControlPlane:
             user_id = existing["id"]
         now = utcnow()
         uid = user_id or new_id("user")
+        metadata_json = self._resolved_json_column("users", "metadata", uid, metadata)
         self.store.execute(
             """
             INSERT INTO users (id, tenant_id, handle, display_name, metadata, created_at, updated_at)
@@ -178,7 +231,7 @@ class ControlPlane:
                 tenant_id,
                 handle,
                 display_name or handle,
-                json_dumps(ensure_json_object(metadata)),
+                metadata_json,
                 now,
                 now,
             ),
@@ -226,6 +279,7 @@ class ControlPlane:
             persona_id = existing["id"]
         now = utcnow()
         pid = persona_id or new_id("persona")
+        metadata_json = self._resolved_json_column("personas", "metadata", pid, metadata)
         self.store.execute(
             """
             INSERT INTO personas (
@@ -245,7 +299,7 @@ class ControlPlane:
                 name,
                 soul_ref.strip(),
                 memory_scope.strip(),
-                json_dumps(ensure_json_object(metadata)),
+                metadata_json,
                 now,
                 now,
             ),
@@ -299,6 +353,7 @@ class ControlPlane:
             raise ValidationError("unsupported hermes instance status: %s" % status_value)
         now = utcnow()
         hid = instance_id or new_id("hermes")
+        metadata_json = self._resolved_json_column("hermes_instances", "metadata", hid, metadata)
         self.store.execute(
             """
             INSERT INTO hermes_instances (
@@ -322,7 +377,7 @@ class ControlPlane:
                 persona_id,
                 home_ref,
                 status_value,
-                json_dumps(ensure_json_object(metadata)),
+                metadata_json,
                 now,
                 now,
                 now,
@@ -373,6 +428,8 @@ class ControlPlane:
             binding_id = existing["id"]
         now = utcnow()
         bid = binding_id or new_id("binding")
+        scopes_json = self._resolved_json_column("platform_bindings", "scopes", bid, scopes)
+        metadata_json = self._resolved_json_column("platform_bindings", "metadata", bid, metadata)
         self.store.execute(
             """
             INSERT INTO platform_bindings (
@@ -396,8 +453,8 @@ class ControlPlane:
                 platform,
                 external_id,
                 display_name or external_id,
-                json_dumps(ensure_json_object(scopes)),
-                json_dumps(ensure_json_object(metadata)),
+                scopes_json,
+                metadata_json,
                 now,
                 now,
             ),
@@ -688,26 +745,39 @@ class ControlPlane:
         if not self._agent_available_for(agent, task):
             raise ValidationError("agent %s cannot claim task %s" % (agent_id, task_id))
         if task.attempt_count >= task.max_attempts:
-            return self.transition_task(task_id, TaskState.FAILED.value, "dispatcher", {"reason": "max attempts"}), self._empty_lease(task_id, agent_id)
+            self.transition_task(task_id, TaskState.FAILED.value, "dispatcher", {"reason": "max attempts"})
+            raise TransitionError("task %s exhausted max_attempts" % task_id)
         now = utcnow()
-        expires_at = (parse_time(now) + timedelta(seconds=int(lease_seconds))).isoformat(timespec="seconds")
+        expires_at = (parse_time(now) + timedelta(seconds=int(lease_seconds))).isoformat(timespec="microseconds")
         lease_id = new_id("lease")
         with self.store.transaction() as conn:
+            # Atomic claim: the UPDATE only succeeds if the task is still OPEN and
+            # unleased. rowcount==0 means another dispatcher already took it.
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET state = ?, owner_agent_id = ?, lease_id = ?, leased_until = ?,
+                    attempt_count = attempt_count + 1, updated_at = ?
+                WHERE id = ? AND state = ? AND lease_id IS NULL
+                """,
+                (
+                    TaskState.CLAIMED.value,
+                    agent_id,
+                    lease_id,
+                    expires_at,
+                    now,
+                    task_id,
+                    TaskState.OPEN.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TransitionError("task %s was claimed by another agent" % task_id)
             conn.execute(
                 """
                 INSERT INTO leases (id, task_id, agent_id, expires_at, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (lease_id, task_id, agent_id, expires_at, LeaseStatus.ACTIVE.value, now, now),
-            )
-            conn.execute(
-                """
-                UPDATE tasks
-                SET state = ?, owner_agent_id = ?, lease_id = ?, leased_until = ?,
-                    attempt_count = attempt_count + 1, updated_at = ?
-                WHERE id = ?
-                """,
-                (TaskState.CLAIMED.value, agent_id, lease_id, expires_at, now, task_id),
             )
             conn.execute(
                 """
@@ -801,7 +871,7 @@ class ControlPlane:
         if lease.status != LeaseStatus.ACTIVE.value:
             raise ValidationError("only active leases can be renewed")
         now = utcnow()
-        expires_at = (parse_time(now) + timedelta(seconds=int(lease_seconds))).isoformat(timespec="seconds")
+        expires_at = (parse_time(now) + timedelta(seconds=int(lease_seconds))).isoformat(timespec="microseconds")
         with self.store.transaction() as conn:
             conn.execute(
                 "UPDATE leases SET expires_at = ?, status = ?, updated_at = ? WHERE id = ?",
@@ -904,6 +974,8 @@ class ControlPlane:
             raise ValidationError("hostname is required")
         now = utcnow()
         mid = machine_id or new_id("machine")
+        labels_json = self._resolved_json_column("machines", "labels", mid, labels)
+        resources_json = self._resolved_json_column("machines", "resources", mid, resources)
         self.store.execute(
             """
             INSERT INTO machines (id, hostname, labels, resources, trusted, created_at, updated_at, last_seen_at)
@@ -919,8 +991,8 @@ class ControlPlane:
             (
                 mid,
                 hostname,
-                json_dumps(ensure_json_object(labels)),
-                json_dumps(ensure_json_object(resources)),
+                labels_json,
+                resources_json,
                 1 if trusted else 0,
                 now,
                 now,
@@ -951,6 +1023,16 @@ class ControlPlane:
             raise ValidationError("agent name is required")
         now = utcnow()
         aid = agent_id or new_id("agent")
+        if capabilities is None:
+            existing_caps = self.store.query_one(
+                "SELECT capabilities FROM agents WHERE id = ?", (aid,)
+            )
+            capabilities_json = (
+                existing_caps["capabilities"] if existing_caps is not None else json_dumps([])
+            )
+        else:
+            capabilities_json = json_dumps(coerce_list(capabilities))
+        resources_json = self._resolved_json_column("agents", "resources", aid, resources)
         self.store.execute(
             """
             INSERT INTO agents (
@@ -962,7 +1044,6 @@ class ControlPlane:
                 name = excluded.name,
                 capabilities = excluded.capabilities,
                 resources = excluded.resources,
-                health_status = excluded.health_status,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at
             """,
@@ -970,8 +1051,8 @@ class ControlPlane:
                 aid,
                 machine_id,
                 name,
-                json_dumps(coerce_list(capabilities)),
-                json_dumps(ensure_json_object(resources)),
+                capabilities_json,
+                resources_json,
                 AgentStatus.IDLE.value,
                 HealthStatus.HEALTHY.value,
                 now,
@@ -1002,15 +1083,32 @@ class ControlPlane:
         now = utcnow()
         updates = ["last_seen_at = ?", "updated_at = ?"]
         params: List[Any] = [now, now]
+        status_value: Optional[str] = None
         if status is not None:
+            status_value = _state_value(status)
+            try:
+                AgentStatus(status_value)
+            except ValueError:
+                raise ValidationError("unsupported agent status: %s" % status_value)
             updates.append("status = ?")
-            params.append(_state_value(status))
+            params.append(status_value)
         if health_status is not None:
+            health_value = _state_value(health_status)
+            try:
+                HealthStatus(health_value)
+            except ValueError:
+                raise ValidationError("unsupported agent health_status: %s" % health_value)
             updates.append("health_status = ?")
-            params.append(_state_value(health_status))
+            params.append(health_value)
         if resources is not None:
             updates.append("resources = ?")
             params.append(json_dumps(resources))
+        if status_value == AgentStatus.IDLE.value and self._agent_has_active_lease(agent_id):
+            raise ValidationError("agent cannot report idle while holding an active lease")
+        if status_value == AgentStatus.OFFLINE.value:
+            self._expire_agent_active_leases(agent_id, now, "heartbeat_offline")
+        if status_value in {AgentStatus.IDLE.value, AgentStatus.OFFLINE.value}:
+            updates.append("current_task_id = NULL")
         params.append(agent_id)
         self.store.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
         return self.get_agent(agent_id)
@@ -1024,16 +1122,22 @@ class ControlPlane:
         agents = self._available_agents()
         for task in tasks:
             for agent in agents:
-                if self._agent_available_for(agent, task):
+                if not self._agent_available_for(agent, task):
+                    continue
+                try:
                     claimed, lease = self.claim_task(task.id, agent.id, lease_seconds=lease_seconds)
-                    self.send_message(
-                        "dispatcher",
-                        agent.id,
-                        MessageType.NUDGE.value,
-                        {"task_id": claimed.id, "lease_id": lease.id, "reason": "assigned"},
-                        task_id=claimed.id,
-                    )
-                    return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
+                except (TransitionError, ValidationError):
+                    # task was already claimed, exhausted attempts, or otherwise
+                    # ineligible — try the next (task, agent) pair.
+                    continue
+                self.send_message(
+                    "dispatcher",
+                    agent.id,
+                    MessageType.NUDGE.value,
+                    {"task_id": claimed.id, "lease_id": lease.id, "reason": "assigned"},
+                    task_id=claimed.id,
+                )
+                return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
         return None
 
     def tick(self, lease_seconds: int = 900, limit: int = 100) -> JsonDict:
@@ -1063,11 +1167,12 @@ class ControlPlane:
             self.get_agent(recipient_agent_id)
         if task_id is not None:
             self.get_task(task_id)
+        message_type_value = _state_value(message_type)
         try:
-            MessageType(_state_value(message_type))
+            MessageType(message_type_value)
         except ValueError:
             raise ValidationError("unsupported message type: %s" % message_type)
-        self._validate_message_payload(payload)
+        self._validate_message_payload(message_type_value, payload)
         now = utcnow()
         message_id = new_id("msg")
         self.store.execute(
@@ -1133,6 +1238,10 @@ class ControlPlane:
     def request_review(self, task_id: str, reviewer_agent_id: str, actor: str = "dispatcher") -> Review:
         task = self.get_task(task_id)
         self.get_agent(reviewer_agent_id)
+        if self._agent_has_owned_task(task_id, reviewer_agent_id):
+            raise AuthorizationError(
+                "reviewer cannot be a prior or current owner of the reviewed task"
+            )
         if task.state == TaskState.NEEDS_REVIEW.value:
             self.transition_task(task_id, TaskState.REVIEWING.value, actor, {"reviewer_agent_id": reviewer_agent_id})
         elif task.state != TaskState.REVIEWING.value:
@@ -1176,6 +1285,8 @@ class ControlPlane:
             ReviewStatus.REJECTED.value,
         }:
             raise ValidationError("unsupported review decision: %s" % status_value)
+        if status_value == ReviewStatus.APPROVED.value and evidence_id is None:
+            raise ValidationError("approving a review requires an evidence_id")
         if evidence_id is not None:
             evidence = self.get_evidence(evidence_id)
             if evidence.task_id != review.task_id:
@@ -1230,32 +1341,72 @@ class ControlPlane:
             evidence = self.get_evidence(evidence_id)
             if evidence.task_id != task_id:
                 raise ValidationError("publication evidence must belong to task")
+        owner_agent_id = task.owner_agent_id
         now = utcnow()
         publication_id = new_id("pub")
-        self.store.execute(
-            """
-            INSERT INTO publications (id, task_id, target, status, evidence_id, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                publication_id,
-                task_id,
-                target,
-                PublicationStatus.PUBLISHED.value,
-                evidence_id,
-                created_by,
-                now,
-            ),
-        )
-        self._record_history(
-            task_id,
-            "task.published",
-            created_by,
-            None,
-            None,
-            {"publication_id": publication_id, "target": target},
-        )
-        self.transition_task(task_id, TaskState.COMPLETED.value, created_by, {"publication_id": publication_id})
+        with self.store.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL, updated_at = ?
+                WHERE id = ? AND state = ?
+                """,
+                (TaskState.COMPLETED.value, now, task_id, TaskState.REVIEWING.value),
+            )
+            if cursor.rowcount != 1:
+                raise TransitionError("task state changed during publish; retry")
+            conn.execute(
+                """
+                INSERT INTO publications (id, task_id, target, status, evidence_id, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    publication_id,
+                    task_id,
+                    target,
+                    PublicationStatus.PUBLISHED.value,
+                    evidence_id,
+                    created_by,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("hist"),
+                    task_id,
+                    "task.published",
+                    created_by,
+                    None,
+                    None,
+                    json_dumps({"publication_id": publication_id, "target": target}),
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("hist"),
+                    task_id,
+                    "task.transitioned",
+                    created_by,
+                    TaskState.REVIEWING.value,
+                    TaskState.COMPLETED.value,
+                    json_dumps({"publication_id": publication_id}),
+                    now,
+                ),
+            )
+            if owner_agent_id:
+                conn.execute(
+                    "UPDATE agents SET status = ?, current_task_id = NULL, updated_at = ? WHERE id = ?",
+                    (AgentStatus.IDLE.value, now, owner_agent_id),
+                )
         return self.get_publication(publication_id)
 
     def get_publication(self, publication_id: str) -> Publication:
@@ -1301,27 +1452,61 @@ class ControlPlane:
         rows = self.store.query_all("SELECT * FROM secrets ORDER BY name")
         return [self._secret_from_row(row) for row in rows]
 
-    def request_secret(self, secret_id_or_name: str, accessor_agent_id: str, purpose: str) -> SecretHandle:
+    def request_secret(
+        self,
+        secret_id_or_name: str,
+        accessor_agent_id: str,
+        purpose: str,
+        ttl_seconds: int = SECRET_HANDLE_DEFAULT_TTL_SECONDS,
+    ) -> SecretHandle:
         secret = self.get_secret(secret_id_or_name)
         agent = self.get_agent(accessor_agent_id)
-        granted = bool(secret.enabled and self._secret_scope_allows(secret.scopes, agent))
+        machine = self.get_machine(agent.machine_id)
+        granted = bool(
+            secret.enabled
+            and machine.trusted
+            and self._secret_scope_allows(secret.scopes, agent)
+        )
+        expires_at = None
+        if granted:
+            ttl = max(1, int(ttl_seconds))
+            expires_at = (parse_time(utcnow()) + timedelta(seconds=ttl)).isoformat(timespec="microseconds")
         audit = self._record_secret_access(
             secret.id,
             accessor_agent_id,
             purpose,
             SecretAuditResult.GRANTED.value if granted else SecretAuditResult.DENIED.value,
+            expires_at=expires_at,
         )
         if not granted:
             raise AuthorizationError("secret access denied")
         return SecretHandle(secret.id, audit.id, "secret://%s#%s" % (secret.id, audit.id), True)
 
     def rotate_secret(self, secret_id_or_name: str, value: str, actor: str) -> SecretRecord:
+        if not value:
+            raise ValidationError("rotation requires a new secret value")
         secret = self.get_secret(secret_id_or_name)
         now = utcnow()
-        self.store.execute(
-            "UPDATE secrets SET ciphertext = ?, updated_at = ?, rotated_at = ? WHERE id = ?",
-            (self._encrypt(value), now, now, secret.id),
-        )
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE secrets SET ciphertext = ?, updated_at = ?, rotated_at = ? WHERE id = ?",
+                (self._encrypt(value), now, now, secret.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO secret_access_audit (
+                    id, secret_id, accessor_agent_id, purpose, result, expires_at, revealed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+                """,
+                (
+                    new_id("audit"),
+                    secret.id,
+                    actor or "unspecified",
+                    "rotate",
+                    SecretAuditResult.ROTATED.value,
+                    now,
+                ),
+            )
         return self.get_secret(secret.id)
 
     def list_secret_audits(self, secret_id: Optional[str] = None) -> List[SecretAccess]:
@@ -1334,16 +1519,43 @@ class ControlPlane:
             rows = self.store.query_all("SELECT * FROM secret_access_audit ORDER BY created_at, id")
         return [self._secret_access_from_row(row) for row in rows]
 
-    def _reveal_secret_for_runtime(self, secret_id: str, audit_id: str) -> str:
-        audit = self.store.query_one(
-            "SELECT * FROM secret_access_audit WHERE id = ? AND secret_id = ? AND result = ?",
-            (audit_id, secret_id, SecretAuditResult.GRANTED.value),
-        )
-        if audit is None:
-            raise AuthorizationError("no granted audit for runtime secret reveal")
-        row = self.store.query_one("SELECT ciphertext FROM secrets WHERE id = ? AND enabled = 1", (secret_id,))
+    def reveal_secret(self, secret_id: str, audit_id: str, accessor_agent_id: str) -> str:
+        """Single-use, time-limited secret reveal.
+
+        The grant audit row must (1) name the same agent that is asking, (2) still
+        be within its TTL, and (3) not already have been revealed. On success the
+        audit row is marked revealed so the same handle cannot be redeemed twice.
+        """
+        now = utcnow()
+        with self.store.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE secret_access_audit
+                SET revealed_at = ?
+                WHERE id = ?
+                  AND secret_id = ?
+                  AND accessor_agent_id = ?
+                  AND result = ?
+                  AND revealed_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (
+                    now,
+                    audit_id,
+                    secret_id,
+                    accessor_agent_id,
+                    SecretAuditResult.GRANTED.value,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise AuthorizationError("secret handle is expired, already used, or not granted to this agent")
+            row = conn.execute(
+                "SELECT ciphertext FROM secrets WHERE id = ? AND enabled = 1",
+                (secret_id,),
+            ).fetchone()
         if row is None:
-            raise NotFoundError("secret not found: %s" % secret_id)
+            raise NotFoundError("secret not found or disabled: %s" % secret_id)
         return self._decrypt(row["ciphertext"])
 
     # Runtime boundary
@@ -1589,24 +1801,16 @@ class ControlPlane:
     ) -> Rollout:
         rollout = self.get_rollout(rollout_id)
         detail = detail or {}
-        if action == "start_canary":
-            if rollout.status != RolloutStatus.PLANNED.value:
-                raise TransitionError("canary can only start from planned")
-            status = RolloutStatus.CANARYING.value
-        elif action == "promote":
-            if rollout.status not in {RolloutStatus.PLANNED.value, RolloutStatus.CANARYING.value}:
-                raise TransitionError("rollout can only be promoted from planned or canarying")
-            status = RolloutStatus.PROMOTED.value
-            detail.setdefault("target_percent", 100)
-        elif action == "pause":
-            if rollout.status in {RolloutStatus.ROLLED_BACK.value, RolloutStatus.FAILED.value}:
-                raise TransitionError("terminal rollout cannot pause")
-            status = RolloutStatus.PAUSED.value
-        elif action == "rollback":
-            status = RolloutStatus.ROLLED_BACK.value
-            detail.setdefault("target_percent", 0)
-        else:
+        rule = ROLLOUT_ACTIONS.get(action)
+        if rule is None:
             raise ValidationError("unsupported rollout action: %s" % action)
+        if rollout.status not in rule["from"]:
+            raise TransitionError(
+                "rollout action %s not allowed from status %s" % (action, rollout.status)
+            )
+        status = rule["to"]
+        if "target_percent" in rule:
+            detail.setdefault("target_percent", rule["target_percent"])
         target_percent = int(detail.get("target_percent", rollout.target_percent))
         now = utcnow()
         self.store.execute(
@@ -1754,10 +1958,6 @@ class ControlPlane:
     def _lease_from_row(self, row: Any) -> Lease:
         return Lease(row["id"], row["task_id"], row["agent_id"], row["expires_at"], row["status"], row["created_at"], row["updated_at"])
 
-    def _empty_lease(self, task_id: str, agent_id: str) -> Lease:
-        now = utcnow()
-        return Lease("", task_id, agent_id, now, LeaseStatus.EXPIRED.value, now, now)
-
     def _machine_from_row(self, row: Any) -> Machine:
         return Machine(
             row["id"],
@@ -1840,6 +2040,8 @@ class ControlPlane:
             row["accessor_agent_id"],
             row["purpose"],
             row["result"],
+            row["expires_at"],
+            row["revealed_at"],
             row["created_at"],
         )
 
@@ -1932,12 +2134,29 @@ class ControlPlane:
         )
 
     def _completion_authorized(self, task_id: str) -> bool:
-        has_evidence = bool(self.list_evidence(task_id))
+        # An approved review must reference evidence that belongs to the same
+        # task. This is the contract the README promises: completion requires
+        # not just *some* evidence and *some* approval, but a documented link.
         approved = self.store.query_one(
-            "SELECT id FROM reviews WHERE task_id = ? AND status = ? LIMIT 1",
+            """
+            SELECT r.id FROM reviews r
+            JOIN evidence e ON e.id = r.evidence_id AND e.task_id = r.task_id
+            WHERE r.task_id = ? AND r.status = ?
+            LIMIT 1
+            """,
             (task_id, ReviewStatus.APPROVED.value),
         )
-        return bool(has_evidence and approved)
+        return approved is not None
+
+    def _agent_has_owned_task(self, task_id: str, agent_id: str) -> bool:
+        task = self.get_task(task_id)
+        if task.owner_agent_id == agent_id:
+            return True
+        prior = self.store.query_one(
+            "SELECT 1 FROM leases WHERE task_id = ? AND agent_id = ? LIMIT 1",
+            (task_id, agent_id),
+        )
+        return prior is not None
 
     def _dependencies_satisfied(self, task: Task) -> bool:
         for dep_id in task.dependencies:
@@ -1957,9 +2176,16 @@ class ControlPlane:
             SELECT a.* FROM agents a
             JOIN machines m ON m.id = a.machine_id
             WHERE a.status = ? AND a.health_status = ? AND m.trusted = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM leases l
+                  JOIN tasks t ON t.lease_id = l.id
+                  WHERE l.agent_id = a.id
+                    AND l.status = ?
+                    AND t.owner_agent_id = a.id
+              )
             ORDER BY a.last_seen_at DESC, a.id
             """,
-            (AgentStatus.IDLE.value, HealthStatus.HEALTHY.value),
+            (AgentStatus.IDLE.value, HealthStatus.HEALTHY.value, LeaseStatus.ACTIVE.value),
         )
         return [self._agent_from_row(row) for row in rows]
 
@@ -1970,6 +2196,8 @@ class ControlPlane:
             return False
         machine = self.get_machine(agent.machine_id)
         if not machine.trusted:
+            return False
+        if self._agent_has_active_lease(agent.id):
             return False
         capabilities = set(agent.capabilities)
         required = set(task.required_capabilities)
@@ -1982,30 +2210,145 @@ class ControlPlane:
             (AgentStatus.IDLE.value, now, agent_id),
         )
 
-    def _validate_message_payload(self, payload: Dict[str, Any]) -> None:
+    def _agent_has_active_lease(self, agent_id: str) -> bool:
+        row = self.store.query_one(
+            """
+            SELECT 1 FROM leases l
+            JOIN tasks t ON t.lease_id = l.id
+            WHERE l.agent_id = ?
+              AND l.status = ?
+              AND t.owner_agent_id = ?
+            LIMIT 1
+            """,
+            (agent_id, LeaseStatus.ACTIVE.value, agent_id),
+        )
+        return row is not None
+
+    def _expire_agent_active_leases(self, agent_id: str, timestamp: str, reason: str) -> None:
+        rows = self.store.query_all(
+            """
+            SELECT
+                l.id AS lease_id,
+                l.task_id AS task_id,
+                t.state AS task_state,
+                t.attempt_count AS attempt_count,
+                t.max_attempts AS max_attempts
+            FROM leases l
+            JOIN tasks t ON t.lease_id = l.id
+            WHERE l.agent_id = ?
+              AND l.status = ?
+              AND t.owner_agent_id = ?
+            ORDER BY l.created_at, l.id
+            """,
+            (agent_id, LeaseStatus.ACTIVE.value, agent_id),
+        )
+        if not rows:
+            return
+        with self.store.transaction() as conn:
+            for row in rows:
+                next_state = (
+                    TaskState.FAILED.value
+                    if row["attempt_count"] >= row["max_attempts"]
+                    else TaskState.OPEN.value
+                )
+                conn.execute(
+                    "UPDATE leases SET status = ?, updated_at = ? WHERE id = ?",
+                    (LeaseStatus.EXPIRED.value, timestamp, row["lease_id"]),
+                )
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL, updated_at = ?
+                    WHERE id = ? AND lease_id = ?
+                    """,
+                    (next_state, timestamp, row["task_id"], row["lease_id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("hist"),
+                        row["task_id"],
+                        "task.lease_expired",
+                        "dispatcher",
+                        row["task_state"],
+                        next_state,
+                        json_dumps(
+                            {
+                                "lease_id": row["lease_id"],
+                                "agent_id": agent_id,
+                                "reason": reason,
+                            }
+                        ),
+                        timestamp,
+                    ),
+                )
+
+    def _validate_message_payload(self, message_type: str, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             raise ValidationError("message payload must be a JSON object")
-        self._scan_for_forbidden_message_keys(payload, ())
+        required = MESSAGE_TYPE_REQUIRED_FIELDS.get(message_type, ())
+        missing = [field for field in required if payload.get(field) in (None, "")]
+        if missing:
+            raise ValidationError(
+                "message %s payload missing required field(s): %s"
+                % (message_type, ",".join(missing))
+            )
+        self._check_payload_is_json_safe(payload, ())
 
-    def _scan_for_forbidden_message_keys(self, value: Any, path: Sequence[str]) -> None:
+    def _check_payload_is_json_safe(self, value: Any, path: Sequence[str]) -> None:
+        """Reject non-JSON-serializable payloads early.
+
+        Workers consume messages as structured data and look up durable tasks
+        from the ledger. Message payloads are not an execution channel.
+        """
         if isinstance(value, dict):
             for key, nested in value.items():
-                key_lower = str(key).lower()
-                if key_lower in FORBIDDEN_MESSAGE_KEYS:
-                    raise ValidationError("message payload cannot contain execution key: %s" % ".".join(path + (str(key),)))
-                self._scan_for_forbidden_message_keys(nested, path + (str(key),))
+                if not isinstance(key, str):
+                    raise ValidationError(
+                        "message payload keys must be strings at %s" % ".".join(path)
+                    )
+                key_path = path + (key,)
+                if key.lower() in FORBIDDEN_MESSAGE_KEYS:
+                    raise ValidationError(
+                        "message payload cannot contain execution key: %s"
+                        % ".".join(key_path)
+                    )
+                self._check_payload_is_json_safe(nested, key_path)
         elif isinstance(value, list):
             for index, nested in enumerate(value):
-                self._scan_for_forbidden_message_keys(nested, path + (str(index),))
+                self._check_payload_is_json_safe(nested, path + (str(index),))
+        elif not isinstance(value, (str, int, float, bool, type(None))):
+            raise ValidationError(
+                "message payload contains non-JSON value at %s" % ".".join(path)
+            )
 
-    def _record_secret_access(self, secret_id: str, accessor_agent_id: str, purpose: str, result: str) -> SecretAccess:
+    def _record_secret_access(
+        self,
+        secret_id: str,
+        accessor_agent_id: str,
+        purpose: str,
+        result: str,
+        expires_at: Optional[str] = None,
+    ) -> SecretAccess:
         audit_id = new_id("audit")
         self.store.execute(
             """
-            INSERT INTO secret_access_audit (id, secret_id, accessor_agent_id, purpose, result, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO secret_access_audit (
+                id, secret_id, accessor_agent_id, purpose, result, expires_at, revealed_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
             """,
-            (audit_id, secret_id, accessor_agent_id, purpose or "unspecified", result, utcnow()),
+            (
+                audit_id,
+                secret_id,
+                accessor_agent_id,
+                purpose or "unspecified",
+                result,
+                expires_at,
+                utcnow(),
+            ),
         )
         row = self.store.query_one("SELECT * FROM secret_access_audit WHERE id = ?", (audit_id,))
         if row is None:
@@ -2015,40 +2358,55 @@ class ControlPlane:
     def _secret_scope_allows(self, scopes: JsonDict, agent: Agent) -> bool:
         agents = set(scopes.get("agents") or [])
         capabilities = set(scopes.get("capabilities") or [])
-        if "*" in agents or agent.id in agents:
+        if agent.id in agents:
             return True
-        if capabilities.intersection(set(agent.capabilities)):
+        if capabilities and capabilities.intersection(set(agent.capabilities)):
             return True
         return False
 
     def _encrypt(self, value: str) -> str:
-        value_bytes = value.encode("utf-8")
-        encrypted = bytes(byte ^ self._secret_key[index % len(self._secret_key)] for index, byte in enumerate(value_bytes))
-        return base64.urlsafe_b64encode(encrypted).decode("ascii")
+        return self._fernet.encrypt(value.encode("utf-8")).decode("ascii")
 
     def _decrypt(self, value: str) -> str:
-        encrypted = base64.urlsafe_b64decode(value.encode("ascii"))
-        plain = bytes(byte ^ self._secret_key[index % len(self._secret_key)] for index, byte in enumerate(encrypted))
-        return plain.decode("utf-8")
+        try:
+            return self._fernet.decrypt(value.encode("ascii")).decode("utf-8")
+        except InvalidToken as exc:
+            raise MACError("secret ciphertext failed authentication") from exc
 
     def _validate_runtime_manifest(self, manifest: JsonDict) -> None:
-        self._scan_runtime_manifest_for_secrets(manifest, ())
-        image = manifest.get("image")
-        if isinstance(image, str) and image.endswith(":latest"):
-            raise ValidationError("runtime image must be pinned, not :latest")
-        dependencies = manifest.get("dependencies", [])
-        if isinstance(dependencies, list):
-            for dep in dependencies:
-                if isinstance(dep, str) and dep.strip().endswith("*"):
-                    raise ValidationError("runtime dependencies must be pinned")
+        self._scan_runtime_manifest(manifest, ())
 
-    def _scan_runtime_manifest_for_secrets(self, value: Any, path: Sequence[str]) -> None:
+    def _scan_runtime_manifest(self, value: Any, path: Sequence[str]) -> None:
         if isinstance(value, dict):
             for key, nested in value.items():
-                key_lower = str(key).lower()
-                if any(hint in key_lower for hint in SECRET_FIELD_HINTS) and key_lower not in {"secret_refs", "secret_ref"}:
-                    raise ValidationError("runtime manifest cannot include raw secret field: %s" % ".".join(path + (str(key),)))
-                self._scan_runtime_manifest_for_secrets(nested, path + (str(key),))
-        elif isinstance(value, list):
+                key_str = str(key)
+                key_lower = key_str.lower()
+                if any(hint in key_lower for hint in SECRET_FIELD_HINTS) and key_lower not in {
+                    "secret_refs",
+                    "secret_ref",
+                }:
+                    raise ValidationError(
+                        "runtime manifest cannot include raw secret field: %s"
+                        % ".".join(path + (key_str,))
+                    )
+                self._scan_runtime_manifest(nested, path + (key_str,))
+            return
+        if isinstance(value, list):
+            # Top-level "dependencies" list must be pinned. Nested lists (e.g.
+            # inside an entrypoint) are not version specs.
+            in_dependencies = path and path[-1].lower() == "dependencies"
             for index, nested in enumerate(value):
-                self._scan_runtime_manifest_for_secrets(nested, path + (str(index),))
+                if in_dependencies and isinstance(nested, str) and nested.strip().endswith("*"):
+                    raise ValidationError("runtime dependencies must be pinned")
+                self._scan_runtime_manifest(nested, path + (str(index),))
+            return
+        if isinstance(value, str):
+            # Image references appear at any depth — e.g. multi-stage manifests,
+            # init containers, sidecars. Reject :latest anywhere a string ends
+            # with it; false positives are an acceptable cost for the guarantee.
+            stripped = value.strip()
+            if stripped.endswith(":latest"):
+                raise ValidationError(
+                    "runtime manifest field at %s pins :latest; pin a digest"
+                    % (".".join(path) or "(root)")
+                )

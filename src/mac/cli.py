@@ -262,7 +262,20 @@ def cmd_publish(args: argparse.Namespace) -> None:
 
 
 def cmd_secret_set(args: argparse.Namespace) -> None:
-    _print(_plane(args).create_secret(args.name, args.value, _json_arg(args.scopes, {}), args.created_by))
+    value = _resolve_secret_value(args)
+    _print(_plane(args).create_secret(args.name, value, _json_arg(args.scopes, {}), args.created_by))
+
+
+def _resolve_secret_value(args: argparse.Namespace) -> str:
+    sources = [bool(args.value), bool(args.from_stdin), bool(args.from_file)]
+    if sum(sources) != 1:
+        raise MACError("exactly one of <value>, --from-stdin, --from-file is required")
+    if args.from_stdin:
+        return sys.stdin.read().rstrip("\n")
+    if args.from_file:
+        with open(args.from_file, "r", encoding="utf-8") as handle:
+            return handle.read().rstrip("\n")
+    return args.value
 
 
 def cmd_secret_list(args: argparse.Namespace) -> None:
@@ -530,7 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
     secret = sub.add_parser("secret", help="secret boundary commands").add_subparsers(dest="secret_command", required=True)
     secret_set = secret.add_parser("set")
     secret_set.add_argument("name")
-    secret_set.add_argument("value")
+    secret_set.add_argument("value", nargs="?", default=None, help="secret value (avoid; prefer --from-stdin)")
+    secret_set.add_argument("--from-stdin", action="store_true", help="read value from stdin")
+    secret_set.add_argument("--from-file", help="read value from file path")
     secret_set.add_argument("--scopes", required=True)
     secret_set.add_argument("--created-by", required=True)
     _set(cmd_secret_set, secret_set)

@@ -175,6 +175,7 @@ class MessageStatus(StrEnum):
 class SecretAuditResult(StrEnum):
     GRANTED = "granted"
     DENIED = "denied"
+    ROTATED = "rotated"
 
 
 class RolloutStrategy(StrEnum):
@@ -191,6 +192,37 @@ class RolloutStatus(StrEnum):
     RESCUING = "rescuing"
     ROLLED_BACK = "rolled_back"
     FAILED = "failed"
+
+
+ROLLOUT_ACTIONS = {
+    "start_canary": {
+        "from": {RolloutStatus.PLANNED.value},
+        "to": RolloutStatus.CANARYING.value,
+    },
+    "promote": {
+        "from": {RolloutStatus.PLANNED.value, RolloutStatus.CANARYING.value, RolloutStatus.PAUSED.value},
+        "to": RolloutStatus.PROMOTED.value,
+        "target_percent": 100,
+    },
+    "pause": {
+        "from": {RolloutStatus.PLANNED.value, RolloutStatus.CANARYING.value},
+        "to": RolloutStatus.PAUSED.value,
+    },
+    "resume": {
+        "from": {RolloutStatus.PAUSED.value},
+        "to": RolloutStatus.CANARYING.value,
+    },
+    "rollback": {
+        "from": {
+            RolloutStatus.CANARYING.value,
+            RolloutStatus.PAUSED.value,
+            RolloutStatus.PROMOTED.value,
+            RolloutStatus.RESCUING.value,
+        },
+        "to": RolloutStatus.ROLLED_BACK.value,
+        "target_percent": 0,
+    },
+}
 
 
 class HermesInstanceStatus(StrEnum):
@@ -444,6 +476,8 @@ class SecretAccess:
     accessor_agent_id: str
     purpose: str
     result: str
+    expires_at: Optional[str]
+    revealed_at: Optional[str]
     created_at: str
 
     def to_dict(self) -> JsonDict:

@@ -1,11 +1,16 @@
+import threading
+
 import pytest
 
 from mac.models import (
     AgentStatus,
     AuthorizationError,
+    HealthStatus,
+    LeaseStatus,
     ReviewStatus,
     RolloutStatus,
     TaskState,
+    TransitionError,
     ValidationError,
     utcnow,
 )
@@ -155,7 +160,12 @@ def test_message_bus_accepts_structured_payloads_and_rejects_execution(cp):
     assert delivered[0].status == "delivered"
 
     with pytest.raises(ValidationError):
-        cp.send_message(sender.id, recipient.id, "help_request", {"command": "rm -rf /"})
+        cp.send_message(
+            sender.id,
+            recipient.id,
+            "help_request",
+            {"question": "Can you inspect this evidence?", "command": "rm -rf /"},
+        )
 
 
 def test_secrets_are_scoped_redacted_audited_and_not_stored_plaintext(cp):
@@ -171,7 +181,7 @@ def test_secrets_are_scoped_redacted_audited_and_not_stored_plaintext(cp):
     handle = cp.request_secret(secret.id, deployer.id, "publish release")
     assert handle.handle.startswith("secret://")
     assert "super-secret-token" not in handle.handle
-    assert cp._reveal_secret_for_runtime(secret.id, handle.audit_id) == "super-secret-token"
+    assert cp.reveal_secret(secret.id, handle.audit_id, deployer.id) == "super-secret-token"
 
     with pytest.raises(AuthorizationError):
         cp.request_secret(secret.id, docs.id, "read docs")
@@ -222,3 +232,211 @@ def test_project_bridge_memory_and_rollout_rescue(cp):
     assert rescued.status == RolloutStatus.RESCUING.value
     assert rescue_task.priority == 100
     assert rescue_task.metadata["rescue"] is True
+
+
+def test_concurrent_claim_picks_exactly_one_winner(cp):
+    worker_a = register_agent(cp, "worker-a", ["python"])
+    worker_b = register_agent(cp, "worker-b", ["python"])
+    task = cp.create_task("contested", required_capabilities=["python"])
+    results = {}
+    barrier = threading.Barrier(2)
+
+    def claim(name, agent_id):
+        barrier.wait()
+        try:
+            claimed, lease = cp.claim_task(task.id, agent_id)
+            results[name] = ("ok", claimed.id, lease.id)
+        except (TransitionError, ValidationError) as exc:
+            results[name] = ("err", str(exc), None)
+
+    threads = [
+        threading.Thread(target=claim, args=("a", worker_a.id)),
+        threading.Thread(target=claim, args=("b", worker_b.id)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    outcomes = [results[name][0] for name in ("a", "b")]
+    assert outcomes.count("ok") == 1
+    assert outcomes.count("err") == 1
+    final_task = cp.get_task(task.id)
+    assert final_task.state == TaskState.CLAIMED.value
+    assert final_task.attempt_count == 1
+    leases = cp.store.query_all("SELECT id FROM leases WHERE task_id = ?", (task.id,))
+    assert len(leases) == 1
+
+
+def test_reviewer_cannot_be_task_owner(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("Implement thing", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(task.id, "test", "artifact://t", "tests passed", worker.id)
+    cp.submit_for_review(task.id, worker.id)
+
+    with pytest.raises(AuthorizationError):
+        cp.request_review(task.id, worker.id)
+
+
+def test_review_approval_requires_evidence_id(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(task.id, "test", "artifact://t", "tests passed", worker.id)
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+
+    with pytest.raises(ValidationError):
+        cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id)
+
+
+def test_completion_requires_evidence_linked_from_approved_review(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(task.id, "test", "artifact://t", "tests passed", worker.id)
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=evidence.id)
+    publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+    assert publication.status == "published"
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+
+
+def test_idle_heartbeat_requires_no_active_lease(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    claimed, lease = cp.claim_task(task.id, worker.id)
+    assert cp.get_agent(worker.id).current_task_id == task.id
+
+    with pytest.raises(ValidationError):
+        cp.heartbeat_agent(worker.id, status="not-a-real-state")
+    with pytest.raises(ValidationError):
+        cp.heartbeat_agent(worker.id, health_status="hot")
+    with pytest.raises(ValidationError):
+        cp.heartbeat_agent(worker.id, status=AgentStatus.IDLE.value)
+
+    refreshed = cp.get_agent(worker.id)
+    assert refreshed.status == AgentStatus.BUSY.value
+    assert refreshed.current_task_id == claimed.id
+
+    cp.release_lease(lease.id, worker.id)
+    refreshed = cp.heartbeat_agent(worker.id, status=AgentStatus.IDLE.value)
+    assert refreshed.status == AgentStatus.IDLE.value
+    assert refreshed.current_task_id is None
+
+
+def test_offline_heartbeat_expires_active_lease_and_requeues_work(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    claimed, lease = cp.claim_task(task.id, worker.id)
+
+    refreshed = cp.heartbeat_agent(worker.id, status=AgentStatus.OFFLINE.value)
+
+    assert refreshed.status == AgentStatus.OFFLINE.value
+    assert refreshed.current_task_id is None
+    assert cp.get_lease(lease.id).status == LeaseStatus.EXPIRED.value
+    recovered = cp.get_task(claimed.id)
+    assert recovered.state == TaskState.OPEN.value
+    assert recovered.owner_agent_id is None
+    assert cp.dispatch_once() is None
+
+
+def test_register_tenant_preserves_metadata_on_reregister(cp):
+    first = cp.register_tenant("acme", metadata={"region": "eu-west"})
+    second = cp.register_tenant("acme")
+    assert second.id == first.id
+    assert second.metadata == {"region": "eu-west"}
+
+
+def test_untrusted_machine_agent_cannot_request_secret(cp):
+    untrusted_machine = cp.register_machine("untrusted-host", trusted=False)
+    agent = cp.register_agent(untrusted_machine.id, "shady", capabilities=["deploy"])
+    secret = cp.create_secret(
+        "deploy-token", "value-xyz", {"capabilities": ["deploy"]}, "human"
+    )
+    with pytest.raises(AuthorizationError):
+        cp.request_secret(secret.id, agent.id, "deploy")
+
+
+def test_secret_handle_is_single_use_and_agent_bound(cp):
+    deployer = register_agent(cp, "deployer", ["deploy"])
+    other = register_agent(cp, "other", ["deploy"])
+    secret = cp.create_secret(
+        "deploy-token", "value-xyz", {"capabilities": ["deploy"]}, "human"
+    )
+    handle = cp.request_secret(secret.id, deployer.id, "deploy")
+    # Wrong agent cannot redeem.
+    with pytest.raises(AuthorizationError):
+        cp.reveal_secret(secret.id, handle.audit_id, other.id)
+    # Correct agent succeeds once.
+    assert cp.reveal_secret(secret.id, handle.audit_id, deployer.id) == "value-xyz"
+    # Same handle cannot be redeemed again.
+    with pytest.raises(AuthorizationError):
+        cp.reveal_secret(secret.id, handle.audit_id, deployer.id)
+
+
+def test_secret_handle_expires(cp):
+    deployer = register_agent(cp, "deployer", ["deploy"])
+    secret = cp.create_secret(
+        "deploy-token", "value-xyz", {"capabilities": ["deploy"]}, "human"
+    )
+    handle = cp.request_secret(secret.id, deployer.id, "deploy", ttl_seconds=1)
+    cp.store.execute(
+        "UPDATE secret_access_audit SET expires_at = '1970-01-01T00:00:00+00:00' WHERE id = ?",
+        (handle.audit_id,),
+    )
+    with pytest.raises(AuthorizationError):
+        cp.reveal_secret(secret.id, handle.audit_id, deployer.id)
+
+
+def test_rotate_secret_writes_audit_row(cp):
+    secret = cp.create_secret(
+        "deploy-token", "v1", {"capabilities": ["deploy"]}, "human"
+    )
+    cp.rotate_secret(secret.id, "v2", "human-operator")
+    audits = cp.list_secret_audits(secret.id)
+    rotations = [a for a in audits if a.result == "rotated"]
+    assert len(rotations) == 1
+    assert rotations[0].accessor_agent_id == "human-operator"
+
+
+def test_rollout_pause_then_resume_round_trips(cp):
+    rollout = cp.create_rollout("1.0", "canary", 10, "human")
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    paused = cp.advance_rollout(rollout.id, "pause", "human")
+    assert paused.status == RolloutStatus.PAUSED.value
+    resumed = cp.advance_rollout(rollout.id, "resume", "human")
+    assert resumed.status == RolloutStatus.CANARYING.value
+
+
+def test_rollout_promote_from_paused_is_allowed_pause_from_promoted_is_not(cp):
+    rollout = cp.create_rollout("1.1", "canary", 10, "human")
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    cp.advance_rollout(rollout.id, "pause", "human")
+    promoted = cp.advance_rollout(rollout.id, "promote", "human")
+    assert promoted.status == RolloutStatus.PROMOTED.value
+    assert promoted.target_percent == 100
+    with pytest.raises(TransitionError):
+        cp.advance_rollout(rollout.id, "pause", "human")
+
+
+def test_runtime_manifest_rejects_nested_latest_and_substring_secret_fields(cp):
+    with pytest.raises(ValidationError):
+        cp.create_runtime(
+            "nested-latest",
+            {"containers": [{"image": "python:latest"}]},
+            "human",
+        )
+    with pytest.raises(ValidationError):
+        cp.create_runtime(
+            "leaky-api-key",
+            {"image": "python:3.12@sha256:abc", "env": {"api_key": "raw"}},
+            "human",
+        )

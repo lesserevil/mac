@@ -14,9 +14,13 @@ class SQLiteStore:
         self.path = path
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        if path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._initialize()
 
     def close(self) -> None:
@@ -26,25 +30,24 @@ class SQLiteStore:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            self._conn.execute("BEGIN")
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
-                self._conn.commit()
+                self._conn.execute("COMMIT")
             except Exception:
-                self._conn.rollback()
+                self._conn.execute("ROLLBACK")
                 raise
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
+        # Autocommit semantics: SQLite commits a single statement on its own.
+        # Inside an explicit transaction() block, statements run as part of that
+        # transaction instead.
         with self._lock:
-            cursor = self._conn.execute(sql, params)
-            self._conn.commit()
-            return cursor
+            return self._conn.execute(sql, params)
 
     def executemany(self, sql: str, params: Iterable[Sequence[Any]]) -> sqlite3.Cursor:
         with self._lock:
-            cursor = self._conn.executemany(sql, params)
-            self._conn.commit()
-            return cursor
+            return self._conn.executemany(sql, params)
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
         with self._lock:
@@ -273,6 +276,8 @@ class SQLiteStore:
                     accessor_agent_id TEXT NOT NULL,
                     purpose TEXT NOT NULL,
                     result TEXT NOT NULL,
+                    expires_at TEXT,
+                    revealed_at TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_secret_audit_secret_created

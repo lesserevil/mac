@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query
@@ -452,4 +453,9 @@ def create_app(db_path: Optional[str] = None, control_plane: Optional[ControlPla
     return app
 
 
-app = create_app()
+# Only build the default app when a secret key is present, so importing the
+# module (e.g. from tests) does not require MAC_SECRET_KEY. Run uvicorn with
+# `mac.api:create_app --factory` to be explicit, or set MAC_SECRET_KEY before
+# `mac.api:app`.
+if os.environ.get("MAC_SECRET_KEY"):
+    app = create_app()
