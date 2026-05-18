@@ -236,6 +236,63 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status
                     ON messages (recipient_agent_id, status);
 
+                -- Per-agent operational events (mood transitions, nap
+                -- lifecycle, future agent-level audit). Flows through the
+                -- unified events view.
+                CREATE TABLE IF NOT EXISTS agent_events (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_events_agent_created
+                    ON agent_events (agent_id, created_at);
+
+                -- Append-only mood transitions. The current mood is the most
+                -- recent row per agent where cleared_at IS NULL and
+                -- (expires_at IS NULL OR expires_at > now). Agents pick their
+                -- own mood; mac records.
+                CREATE TABLE IF NOT EXISTS mood_overlays (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    mode TEXT NOT NULL,
+                    reason TEXT,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    set_by TEXT NOT NULL,
+                    set_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    cleared_at TEXT,
+                    cleared_by TEXT,
+                    cleared_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_mood_overlays_agent_set_at
+                    ON mood_overlays (agent_id, set_at);
+
+                CREATE TABLE IF NOT EXISTS nap_schedules (
+                    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                    offset_minutes INTEGER NOT NULL,
+                    window_minutes INTEGER NOT NULL DEFAULT 15,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_completed_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS nap_runs (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    summary_evidence_id TEXT,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_nap_runs_agent_started
+                    ON nap_runs (agent_id, started_at);
+
                 CREATE TABLE IF NOT EXISTS reviews (
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -532,6 +589,9 @@ class SQLiteStore:
                     UNION ALL
                     SELECT id, 'environment', environment_id, event_type, actor, detail, created_at
                     FROM environment_events
+                    UNION ALL
+                    SELECT id, 'agent', agent_id, event_type, actor, detail, created_at
+                    FROM agent_events
                     UNION ALL
                     -- Conversation threads project as one event per row: the
                     -- "thread_tracked" observation at last_seen_at. This

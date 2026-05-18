@@ -184,6 +184,42 @@ class ArtifactRegister(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class MoodSet(BaseModel):
+    mode: str
+    set_by: Optional[str] = None
+    reason: Optional[str] = None
+    ttl_seconds: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MoodClear(BaseModel):
+    cleared_by: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class NapConfigure(BaseModel):
+    offset_minutes: Optional[int] = None
+    window_minutes: int = 15
+    enabled: bool = True
+    actor: Optional[str] = None
+
+
+class NapBegin(BaseModel):
+    actor: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class NapComplete(BaseModel):
+    summary_evidence_id: Optional[str] = None
+    detail: Optional[Dict[str, Any]] = None
+    actor: Optional[str] = None
+
+
+class NapFail(BaseModel):
+    reason: str
+    actor: Optional[str] = None
+
+
 class ConversationThreadTrack(BaseModel):
     platform_binding_id: str
     external_thread_id: str
@@ -819,6 +855,65 @@ def create_app(
     @app.get("/fleet/build-distribution")
     def fleet_build_distribution() -> Dict[str, Any]:
         return cp.fleet_build_distribution()
+
+    # Mood — agent-self-reported emotional state
+    @app.put("/agents/{agent_id}/mood")
+    @app.post("/agents/{agent_id}/mood")
+    def set_mood(agent_id: str, body: MoodSet) -> Dict[str, Any]:
+        return cp.set_mood(agent_id, **_data(body)).to_dict()
+
+    @app.get("/agents/{agent_id}/mood")
+    def get_mood(agent_id: str) -> Optional[Dict[str, Any]]:
+        overlay = cp.get_current_mood(agent_id)
+        return overlay.to_dict() if overlay is not None else None
+
+    @app.delete("/agents/{agent_id}/mood")
+    def clear_mood(agent_id: str, body: MoodClear) -> Optional[Dict[str, Any]]:
+        cleared = cp.clear_mood(agent_id, **_data(body))
+        return cleared.to_dict() if cleared is not None else None
+
+    @app.get("/agents/{agent_id}/mood/history")
+    def list_mood_history(agent_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return [overlay.to_dict() for overlay in cp.list_mood_history(agent_id, limit=limit)]
+
+    # Nap — daily memory-consolidation lifecycle
+    @app.put("/agents/{agent_id}/nap-schedule")
+    @app.post("/agents/{agent_id}/nap-schedule")
+    def configure_nap(agent_id: str, body: NapConfigure) -> Dict[str, Any]:
+        return cp.configure_nap(agent_id, **_data(body)).to_dict()
+
+    @app.get("/agents/{agent_id}/nap-schedule")
+    def get_nap_schedule(agent_id: str) -> Optional[Dict[str, Any]]:
+        schedule = cp.get_nap_schedule(agent_id)
+        return schedule.to_dict() if schedule is not None else None
+
+    @app.get("/agents/{agent_id}/nap-schedule/next")
+    def next_nap_window(agent_id: str) -> Optional[Dict[str, Any]]:
+        return cp.next_nap_window(agent_id)
+
+    @app.get("/nap-schedules")
+    def list_nap_schedules() -> List[Dict[str, Any]]:
+        return [schedule.to_dict() for schedule in cp.list_nap_schedules()]
+
+    @app.post("/agents/{agent_id}/nap-runs")
+    def begin_nap(agent_id: str, body: NapBegin) -> Dict[str, Any]:
+        return cp.begin_nap(agent_id, **_data(body)).to_dict()
+
+    @app.get("/nap-runs")
+    def list_nap_runs(agent_id: Optional[str] = Query(default=None)) -> List[Dict[str, Any]]:
+        return [run.to_dict() for run in cp.list_nap_runs(agent_id)]
+
+    @app.get("/nap-runs/{run_id}")
+    def get_nap_run(run_id: str) -> Dict[str, Any]:
+        return cp.get_nap_run(run_id).to_dict()
+
+    @app.post("/nap-runs/{run_id}/complete")
+    def complete_nap(run_id: str, body: NapComplete) -> Dict[str, Any]:
+        return cp.complete_nap(run_id, **_data(body)).to_dict()
+
+    @app.post("/nap-runs/{run_id}/fail")
+    def fail_nap(run_id: str, body: NapFail) -> Dict[str, Any]:
+        return cp.fail_nap(run_id, **_data(body)).to_dict()
 
     @app.post("/agents/{agent_id}/heartbeat")
     def heartbeat_agent(agent_id: str, body: HeartbeatRequest) -> Dict[str, Any]:

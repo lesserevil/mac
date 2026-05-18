@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -16,6 +16,14 @@ from mac.models import (
     AgentStatus,
     Artifact,
     AuthorizationError,
+    MOOD_MODES,
+    MoodMode,
+    MoodOverlay,
+    NAP_DEFAULT_DURATION_MINUTES,
+    NAP_WINDOW_MINUTES,
+    NapRun,
+    NapSchedule,
+    NapStatus,
     ConversationThread,
     Deployment,
     DeploymentStatus,
@@ -741,6 +749,7 @@ class ControlPlane:
         "environment",
         "conversation_thread",
         "vector_ref",
+        "agent",
     )
 
     def list_events(
@@ -1285,6 +1294,550 @@ class ControlPlane:
         for bucket in buckets:
             bucket["percent"] = round(bucket["count"] * 100.0 / total, 2)
         return {"total_live_agents": total if total > 0 else 0, "buckets": buckets}
+
+    # Mood overlays (agent-self-reported emotional state)
+    #
+    # The contract: agents pick their own mood based on local signals (recent
+    # outcomes, retry counts, review rejections — already in the events
+    # stream). mac records and audits transitions; it does NOT derive mood on
+    # the agent's behalf. Operators can read, but the authoritative caller is
+    # the agent itself.
+
+    def set_mood(
+        self,
+        agent_id: str,
+        mode: str,
+        set_by: Optional[str] = None,
+        reason: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> MoodOverlay:
+        """Record a mood transition for `agent_id`.
+
+        Replaces any prior active overlay atomically: clears the prior row's
+        `cleared_at` in the same transaction as the new insert. `set_by`
+        defaults to `agent_id` — moods are self-reported.
+        """
+        agent = self.get_agent(agent_id)
+        mode_value = _state_value(mode)
+        if mode_value not in MOOD_MODES:
+            raise ValidationError(
+                "unsupported mood mode: %s (allowed: %s)"
+                % (mode_value, ", ".join(sorted(MOOD_MODES)))
+            )
+        actor = (set_by or agent.id).strip() or agent.id
+        now = utcnow()
+        expires_at = None
+        if ttl_seconds is not None:
+            if int(ttl_seconds) <= 0:
+                raise ValidationError("mood ttl_seconds must be > 0 when provided")
+            expires_at = (
+                parse_time(now) + timedelta(seconds=int(ttl_seconds))
+            ).isoformat(timespec="microseconds")
+        overlay_id = new_id("mood")
+        metadata_json = json_dumps(ensure_json_object(metadata))
+        with self.store.transaction() as conn:
+            # End any prior active overlay so reads of "current mood" stay
+            # single-rowed without a partial index.
+            conn.execute(
+                """
+                UPDATE mood_overlays
+                SET cleared_at = ?, cleared_by = ?, cleared_reason = ?
+                WHERE agent_id = ? AND cleared_at IS NULL
+                """,
+                (now, actor, "replaced", agent.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO mood_overlays (
+                    id, agent_id, mode, reason, metadata,
+                    set_by, set_at, expires_at,
+                    cleared_at, cleared_by, cleared_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                """,
+                (overlay_id, agent.id, mode_value, reason, metadata_json, actor, now, expires_at),
+            )
+            self._insert_agent_event(
+                conn,
+                agent.id,
+                "agent.mood_set",
+                actor,
+                {
+                    "overlay_id": overlay_id,
+                    "mode": mode_value,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                },
+                now,
+            )
+        return self.get_mood_overlay(overlay_id)
+
+    def get_current_mood(self, agent_id: str) -> Optional[MoodOverlay]:
+        """Return the agent's current mood, or None if no active overlay."""
+        agent = self.get_agent(agent_id)
+        now = utcnow()
+        row = self.store.query_one(
+            """
+            SELECT * FROM mood_overlays
+            WHERE agent_id = ?
+              AND cleared_at IS NULL
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY set_at DESC, id DESC
+            LIMIT 1
+            """,
+            (agent.id, now),
+        )
+        return self._mood_overlay_from_row(row) if row is not None else None
+
+    def clear_mood(
+        self,
+        agent_id: str,
+        cleared_by: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[MoodOverlay]:
+        """End the agent's active overlay if any. Returns the cleared overlay
+        (post-update) or None if nothing was active."""
+        agent = self.get_agent(agent_id)
+        actor = (cleared_by or agent.id).strip() or agent.id
+        now = utcnow()
+        with self.store.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM mood_overlays
+                WHERE agent_id = ? AND cleared_at IS NULL
+                ORDER BY set_at DESC, id DESC
+                LIMIT 1
+                """,
+                (agent.id,),
+            ).fetchone()
+            if row is None:
+                return None
+            overlay_id = row["id"]
+            conn.execute(
+                """
+                UPDATE mood_overlays
+                SET cleared_at = ?, cleared_by = ?, cleared_reason = ?
+                WHERE id = ?
+                """,
+                (now, actor, reason, overlay_id),
+            )
+            self._insert_agent_event(
+                conn,
+                agent.id,
+                "agent.mood_cleared",
+                actor,
+                {"overlay_id": overlay_id, "reason": reason},
+                now,
+            )
+        return self.get_mood_overlay(overlay_id)
+
+    def get_mood_overlay(self, overlay_id: str) -> MoodOverlay:
+        row = self.store.query_one(
+            "SELECT * FROM mood_overlays WHERE id = ?", (overlay_id,)
+        )
+        if row is None:
+            raise NotFoundError("mood overlay not found: %s" % overlay_id)
+        return self._mood_overlay_from_row(row)
+
+    def list_mood_history(self, agent_id: str, limit: int = 50) -> List[MoodOverlay]:
+        agent = self.get_agent(agent_id)
+        rows = self.store.query_all(
+            """
+            SELECT * FROM mood_overlays
+            WHERE agent_id = ?
+            ORDER BY set_at DESC, id DESC
+            LIMIT ?
+            """,
+            (agent.id, min(max(1, int(limit)), 500)),
+        )
+        return [self._mood_overlay_from_row(row) for row in rows]
+
+    def _mood_overlay_from_row(self, row: Any) -> MoodOverlay:
+        return MoodOverlay(
+            row["id"],
+            row["agent_id"],
+            row["mode"],
+            row["reason"],
+            json_loads(row["metadata"], {}),
+            row["set_by"],
+            row["set_at"],
+            row["expires_at"],
+            row["cleared_at"],
+            row["cleared_by"],
+            row["cleared_reason"],
+        )
+
+    def _insert_agent_event(
+        self,
+        conn: Any,
+        agent_id: str,
+        event_type: str,
+        actor: str,
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO agent_events (id, agent_id, event_type, actor, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_id("aevt"), agent_id, event_type, actor, json_dumps(detail), when),
+        )
+
+    # Nap schedule + lifecycle
+    #
+    # Each agent has a single nap_schedule row (offset_minutes, window_minutes).
+    # The offset defaults to a stable hash of the agent's name to spread the
+    # fleet across the early-UTC window (matches ACC's spec, MD5 % 360). Nap
+    # *execution* is off-process — the agent (or a sidecar) decides what to
+    # summarize and where to store it. mac records begin/complete events and
+    # links to the produced summary evidence + vector refs.
+
+    @staticmethod
+    def _deterministic_nap_offset(agent_name: str) -> int:
+        """MD5-derived UTC-midnight offset in minutes, in [0, NAP_WINDOW_MINUTES).
+
+        Matches ACC's spec so existing fleet schedules round-trip identically
+        when migrated.
+        """
+        digest = hashlib.md5(agent_name.encode("utf-8")).digest()
+        # Take first 8 bytes as little-endian u64, matching md5_u64 convention.
+        value = int.from_bytes(digest[:8], byteorder="little", signed=False)
+        return int(value % NAP_WINDOW_MINUTES)
+
+    def configure_nap(
+        self,
+        agent_id: str,
+        offset_minutes: Optional[int] = None,
+        window_minutes: int = NAP_DEFAULT_DURATION_MINUTES,
+        enabled: bool = True,
+        actor: Optional[str] = None,
+    ) -> NapSchedule:
+        agent = self.get_agent(agent_id)
+        if offset_minutes is None:
+            offset_minutes = self._deterministic_nap_offset(agent.name)
+        offset_minutes = int(offset_minutes)
+        if not 0 <= offset_minutes < NAP_WINDOW_MINUTES:
+            raise ValidationError(
+                "nap offset_minutes must be in [0, %d)" % NAP_WINDOW_MINUTES
+            )
+        window_minutes = int(window_minutes)
+        if window_minutes <= 0 or window_minutes > 120:
+            raise ValidationError("nap window_minutes must be in (0, 120]")
+        now = utcnow()
+        actor_value = (actor or agent.id).strip() or agent.id
+        with self.store.transaction() as conn:
+            existing = conn.execute(
+                "SELECT enabled, offset_minutes, window_minutes FROM nap_schedules WHERE agent_id = ?",
+                (agent.id,),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO nap_schedules (
+                    agent_id, offset_minutes, window_minutes, enabled,
+                    last_completed_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    offset_minutes = excluded.offset_minutes,
+                    window_minutes = excluded.window_minutes,
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (agent.id, offset_minutes, window_minutes, 1 if enabled else 0, now),
+            )
+            self._insert_agent_event(
+                conn,
+                agent.id,
+                "agent.nap_configured",
+                actor_value,
+                {
+                    "offset_minutes": offset_minutes,
+                    "window_minutes": window_minutes,
+                    "enabled": bool(enabled),
+                    "previous": (
+                        {
+                            "offset_minutes": existing["offset_minutes"],
+                            "window_minutes": existing["window_minutes"],
+                            "enabled": bool(existing["enabled"]),
+                        }
+                        if existing is not None
+                        else None
+                    ),
+                },
+                now,
+            )
+        return self.get_nap_schedule(agent.id)
+
+    def get_nap_schedule(self, agent_id: str) -> Optional[NapSchedule]:
+        agent = self.get_agent(agent_id)
+        row = self.store.query_one(
+            "SELECT * FROM nap_schedules WHERE agent_id = ?", (agent.id,)
+        )
+        return self._nap_schedule_from_row(row) if row is not None else None
+
+    def list_nap_schedules(self) -> List[NapSchedule]:
+        rows = self.store.query_all(
+            "SELECT * FROM nap_schedules ORDER BY offset_minutes, agent_id"
+        )
+        return [self._nap_schedule_from_row(row) for row in rows]
+
+    def next_nap_window(
+        self,
+        agent_id: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Compute the next UTC nap window for `agent_id`, or None if the
+        schedule is disabled. The window is `[start, start + window)` where
+        start is the next future occurrence of `offset_minutes after 00:00 UTC`.
+        """
+        schedule = self.get_nap_schedule(agent_id)
+        if schedule is None or not schedule.enabled:
+            return None
+        reference = now if now is not None else datetime.now(timezone.utc)
+        midnight = reference.replace(hour=0, minute=0, second=0, microsecond=0)
+        candidate = midnight + timedelta(minutes=schedule.offset_minutes)
+        if candidate <= reference:
+            candidate = candidate + timedelta(days=1)
+        end = candidate + timedelta(minutes=schedule.window_minutes)
+        return {
+            "agent_id": schedule.agent_id,
+            "start": candidate.isoformat(timespec="microseconds"),
+            "end": end.isoformat(timespec="microseconds"),
+            "offset_minutes": schedule.offset_minutes,
+            "window_minutes": schedule.window_minutes,
+        }
+
+    def begin_nap(
+        self,
+        agent_id: str,
+        actor: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> NapRun:
+        """Start a nap. Transitions the agent to DRAINING so the dispatcher
+        will not assign new work. Refuses if the agent currently holds an
+        active lease — call `release_lease` or wait for completion first.
+        """
+        agent = self.get_agent(agent_id)
+        if self._agent_has_active_lease(agent.id):
+            raise ValidationError(
+                "agent %s holds an active lease; release it before napping" % agent.id
+            )
+        actor_value = (actor or agent.id).strip() or agent.id
+        now = utcnow()
+        run_id = new_id("nap")
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE agents
+                SET status = ?, current_task_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (AgentStatus.DRAINING.value, now, agent.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO nap_runs (
+                    id, agent_id, status, started_at, completed_at,
+                    summary_evidence_id, detail, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    agent.id,
+                    NapStatus.RUNNING.value,
+                    now,
+                    json_dumps(ensure_json_object(detail)),
+                    now,
+                    now,
+                ),
+            )
+            self._insert_agent_event(
+                conn,
+                agent.id,
+                "agent.nap_started",
+                actor_value,
+                {"nap_run_id": run_id},
+                now,
+            )
+        return self.get_nap_run(run_id)
+
+    def complete_nap(
+        self,
+        run_id: str,
+        summary_evidence_id: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+        actor: Optional[str] = None,
+    ) -> NapRun:
+        """Mark the nap complete, restore the agent to IDLE, and update the
+        schedule's last_completed_at. If `summary_evidence_id` is provided, the
+        evidence row must be `kind='log'` and belong to no task (nap output is
+        an agent artifact, not a task artifact) — enforced by inspecting the
+        row before linking.
+        """
+        run = self.get_nap_run(run_id)
+        if run.status != NapStatus.RUNNING.value:
+            raise TransitionError(
+                "nap_run %s is %s, not running" % (run_id, run.status)
+            )
+        if summary_evidence_id is not None:
+            # The summary lives in `evidence` so it shows up in audit queries
+            # alongside task evidence. We accept `log` (the natural kind for an
+            # agent-produced summary) — operators wanting tighter typing can
+            # add a future "memory" kind.
+            evidence = self.get_evidence(summary_evidence_id)
+            if evidence.kind != "log":
+                raise ValidationError(
+                    "nap summary evidence must have kind='log' (got %r)" % evidence.kind
+                )
+        agent = self.get_agent(run.agent_id)
+        actor_value = (actor or agent.id).strip() or agent.id
+        now = utcnow()
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE nap_runs
+                SET status = ?, completed_at = ?, summary_evidence_id = ?,
+                    detail = COALESCE(?, detail), updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    NapStatus.COMPLETED.value,
+                    now,
+                    summary_evidence_id,
+                    json_dumps(ensure_json_object(detail)) if detail is not None else None,
+                    now,
+                    run_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE nap_schedules
+                SET last_completed_at = ?, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (now, now, agent.id),
+            )
+            # Only restore the agent if it is still DRAINING — an offline
+            # transition during the nap (operator intervention, heartbeat
+            # offline) wins.
+            conn.execute(
+                """
+                UPDATE agents
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (AgentStatus.IDLE.value, now, agent.id, AgentStatus.DRAINING.value),
+            )
+            self._insert_agent_event(
+                conn,
+                agent.id,
+                "agent.nap_completed",
+                actor_value,
+                {
+                    "nap_run_id": run_id,
+                    "summary_evidence_id": summary_evidence_id,
+                },
+                now,
+            )
+        return self.get_nap_run(run_id)
+
+    def fail_nap(
+        self,
+        run_id: str,
+        reason: str,
+        actor: Optional[str] = None,
+    ) -> NapRun:
+        """Mark the nap failed and restore the agent. The reason lands in the
+        nap_run.detail and in the agent event for audit. Schedule's
+        last_completed_at is NOT advanced — a failed nap doesn't count."""
+        run = self.get_nap_run(run_id)
+        if run.status != NapStatus.RUNNING.value:
+            raise TransitionError(
+                "nap_run %s is %s, not running" % (run_id, run.status)
+            )
+        agent = self.get_agent(run.agent_id)
+        actor_value = (actor or agent.id).strip() or agent.id
+        if not reason:
+            raise ValidationError("fail_nap requires a reason")
+        now = utcnow()
+        merged_detail = dict(run.detail)
+        merged_detail["failure_reason"] = reason
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE nap_runs
+                SET status = ?, completed_at = ?, detail = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    NapStatus.FAILED.value,
+                    now,
+                    json_dumps(merged_detail),
+                    now,
+                    run_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE agents
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (AgentStatus.IDLE.value, now, agent.id, AgentStatus.DRAINING.value),
+            )
+            self._insert_agent_event(
+                conn,
+                agent.id,
+                "agent.nap_failed",
+                actor_value,
+                {"nap_run_id": run_id, "reason": reason},
+                now,
+            )
+        return self.get_nap_run(run_id)
+
+    def get_nap_run(self, run_id: str) -> NapRun:
+        row = self.store.query_one(
+            "SELECT * FROM nap_runs WHERE id = ?", (run_id,)
+        )
+        if row is None:
+            raise NotFoundError("nap_run not found: %s" % run_id)
+        return self._nap_run_from_row(row)
+
+    def list_nap_runs(self, agent_id: Optional[str] = None) -> List[NapRun]:
+        if agent_id is not None:
+            agent = self.get_agent(agent_id)
+            rows = self.store.query_all(
+                "SELECT * FROM nap_runs WHERE agent_id = ? ORDER BY started_at DESC, id DESC",
+                (agent.id,),
+            )
+        else:
+            rows = self.store.query_all(
+                "SELECT * FROM nap_runs ORDER BY started_at DESC, id DESC"
+            )
+        return [self._nap_run_from_row(row) for row in rows]
+
+    def _nap_schedule_from_row(self, row: Any) -> NapSchedule:
+        return NapSchedule(
+            row["agent_id"],
+            int(row["offset_minutes"]),
+            int(row["window_minutes"]),
+            bool(row["enabled"]),
+            row["last_completed_at"],
+            row["updated_at"],
+        )
+
+    def _nap_run_from_row(self, row: Any) -> NapRun:
+        return NapRun(
+            row["id"],
+            row["agent_id"],
+            row["status"],
+            row["started_at"],
+            row["completed_at"],
+            row["summary_evidence_id"],
+            json_loads(row["detail"], {}),
+            row["created_at"],
+            row["updated_at"],
+        )
 
     def mark_stale_agents_offline(self, stale_after_seconds: int) -> List[Agent]:
         cutoff = (

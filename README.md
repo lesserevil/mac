@@ -116,7 +116,9 @@ Key route groups:
 - `/bridge/items`, `/memory`
 - `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
 - `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-sets/{id}/events`, `/eval-runs`
-- `/events` — unified audit stream across task/rollout/eval_set/secret surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
+- `/events` — unified audit stream across task/rollout/eval_set/secret/environment/conversation_thread/vector_ref/agent surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
+- `/agents/{id}/mood`, `/agents/{id}/mood/history` — agent-self-reported emotional state (warm/cheerful/sad/curt/cold/irritated/angry/enraged) with reason + optional TTL; transitions flow through `/events` as `subject_type=agent`
+- `/agents/{id}/nap-schedule`, `/agents/{id}/nap-schedule/next`, `/nap-schedules`, `/nap-runs`, `/nap-runs/{id}/complete`, `/nap-runs/{id}/fail` — daily memory-consolidation lifecycle. Offset defaults to `md5(agent.name) %% 360` minutes (spreads the fleet across the 0–6h UTC window). mac coordinates `begin → DRAINING → complete/fail`; summarization and vector storage are off-process and linked via `evidence` + `vector_refs`.
 
 ## CLI Examples
 

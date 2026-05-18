@@ -169,6 +169,44 @@ class DeploymentStatus(StrEnum):
     FAILED = "failed"
 
 
+class MoodMode(StrEnum):
+    """Agent-self-reported emotional state.
+
+    Agents pick their own mood based on local signals (recent task outcomes,
+    retry counts, review rejections). The control plane records and audits
+    transitions; it does not derive mood from observations on behalf of an
+    agent. Operators read via GET /agents/{id}/mood; agents set via POST.
+    """
+
+    WARM = "warm"
+    CHEERFUL = "cheerful"
+    SAD = "sad"
+    CURT = "curt"
+    COLD = "cold"
+    IRRITATED = "irritated"
+    ANGRY = "angry"
+    ENRAGED = "enraged"
+
+
+MOOD_MODES: frozenset = frozenset(m.value for m in MoodMode)
+
+
+class NapStatus(StrEnum):
+    """Lifecycle states for one nap_run."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+# Daily nap offset is computed deterministically from the agent's name so the
+# fleet spreads itself across the early-UTC window. Matches ACC's spec
+# (md5_u64(name) %% 360 minutes after 00:00 UTC).
+NAP_WINDOW_MINUTES = 360
+NAP_DEFAULT_DURATION_MINUTES = 15
+
+
 EVIDENCE_KINDS = {"test", "review", "artifact", "publication", "log", "eval"}
 
 
@@ -550,6 +588,63 @@ class VectorRef:
     metadata: JsonDict
     created_by: str
     created_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class MoodOverlay:
+    """One mood transition. Append-only; current mood is the most recent row
+    for an agent where `cleared_at IS NULL AND (expires_at IS NULL OR expires_at > now)`."""
+
+    id: str
+    agent_id: str
+    mode: str
+    reason: Optional[str]
+    metadata: JsonDict
+    set_by: str
+    set_at: str
+    expires_at: Optional[str]
+    cleared_at: Optional[str]
+    cleared_by: Optional[str]
+    cleared_reason: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class NapSchedule:
+    """One row per agent. `offset_minutes` is the UTC-midnight-offset window
+    start; defaults to a stable hash of agent.name to spread the fleet."""
+
+    agent_id: str
+    offset_minutes: int
+    window_minutes: int
+    enabled: bool
+    last_completed_at: Optional[str]
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class NapRun:
+    """One execution of an agent's nap. mac records the lifecycle and the link
+    to the produced summary evidence; the actual summarization and embedding
+    happens off-process (Hermes / worker / Qdrant indexer)."""
+
+    id: str
+    agent_id: str
+    status: str
+    started_at: str
+    completed_at: Optional[str]
+    summary_evidence_id: Optional[str]
+    detail: JsonDict
+    created_at: str
+    updated_at: str
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

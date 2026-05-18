@@ -224,6 +224,90 @@ def cmd_fleet_build_distribution(args: argparse.Namespace) -> None:
     _print(_plane(args).fleet_build_distribution())
 
 
+def cmd_mood_set(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).set_mood(
+            args.agent_id,
+            args.mode,
+            set_by=args.set_by,
+            reason=args.reason,
+            ttl_seconds=args.ttl_seconds,
+            metadata=_json_arg(args.metadata, {}),
+        )
+    )
+
+
+def cmd_mood_show(args: argparse.Namespace) -> None:
+    overlay = _plane(args).get_current_mood(args.agent_id)
+    _print(overlay.to_dict() if overlay is not None else None)
+
+
+def cmd_mood_clear(args: argparse.Namespace) -> None:
+    cleared = _plane(args).clear_mood(
+        args.agent_id, cleared_by=args.cleared_by, reason=args.reason
+    )
+    _print(cleared.to_dict() if cleared is not None else None)
+
+
+def cmd_mood_history(args: argparse.Namespace) -> None:
+    _print(
+        [
+            overlay.to_dict()
+            for overlay in _plane(args).list_mood_history(args.agent_id, limit=args.limit)
+        ]
+    )
+
+
+def cmd_nap_configure(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).configure_nap(
+            args.agent_id,
+            offset_minutes=args.offset_minutes,
+            window_minutes=args.window_minutes,
+            enabled=not args.disabled,
+            actor=args.actor,
+        )
+    )
+
+
+def cmd_nap_show(args: argparse.Namespace) -> None:
+    schedule = _plane(args).get_nap_schedule(args.agent_id)
+    _print(schedule.to_dict() if schedule is not None else None)
+
+
+def cmd_nap_next(args: argparse.Namespace) -> None:
+    _print(_plane(args).next_nap_window(args.agent_id))
+
+
+def cmd_nap_begin(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).begin_nap(
+            args.agent_id,
+            actor=args.actor,
+            detail=_json_arg(args.detail, {}),
+        )
+    )
+
+
+def cmd_nap_complete(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).complete_nap(
+            args.run_id,
+            summary_evidence_id=args.evidence_id,
+            detail=_json_arg(args.detail, None),
+            actor=args.actor,
+        )
+    )
+
+
+def cmd_nap_fail(args: argparse.Namespace) -> None:
+    _print(_plane(args).fail_nap(args.run_id, args.reason, actor=args.actor))
+
+
+def cmd_nap_list(args: argparse.Namespace) -> None:
+    _print([run.to_dict() for run in _plane(args).list_nap_runs(args.agent_id)])
+
+
 def cmd_dispatch_once(args: argparse.Namespace) -> None:
     _print(_plane(args).dispatch_once(args.lease_seconds))
 
@@ -704,6 +788,96 @@ def build_parser() -> argparse.ArgumentParser:
         help="aggregate live agents by running_digest",
     )
     _set(cmd_fleet_build_distribution, fleet_build)
+
+    mood = sub.add_parser(
+        "mood",
+        help="agent mood overlays (agents self-report; operators query)",
+    ).add_subparsers(dest="mood_command", required=True)
+    mood_set = mood.add_parser("set", help="record a mood transition")
+    mood_set.add_argument("agent_id")
+    mood_set.add_argument(
+        "mode",
+        choices=(
+            "warm",
+            "cheerful",
+            "sad",
+            "curt",
+            "cold",
+            "irritated",
+            "angry",
+            "enraged",
+        ),
+    )
+    mood_set.add_argument("--set-by", help="actor (defaults to agent_id)")
+    mood_set.add_argument("--reason", help="why the agent picked this mode")
+    mood_set.add_argument("--ttl-seconds", type=int)
+    mood_set.add_argument("--metadata")
+    _set(cmd_mood_set, mood_set)
+    mood_show = mood.add_parser("show", help="current mood for an agent")
+    mood_show.add_argument("agent_id")
+    _set(cmd_mood_show, mood_show)
+    mood_clear = mood.add_parser("clear", help="end the active overlay")
+    mood_clear.add_argument("agent_id")
+    mood_clear.add_argument("--cleared-by")
+    mood_clear.add_argument("--reason")
+    _set(cmd_mood_clear, mood_clear)
+    mood_history = mood.add_parser("history", help="mood transitions for an agent")
+    mood_history.add_argument("agent_id")
+    mood_history.add_argument("--limit", type=int, default=50)
+    _set(cmd_mood_history, mood_history)
+
+    nap = sub.add_parser(
+        "nap",
+        help="agent nap schedule and lifecycle (daily memory consolidation)",
+    ).add_subparsers(dest="nap_command", required=True)
+    nap_configure = nap.add_parser(
+        "configure",
+        help="set or refresh an agent's nap schedule (offset defaults to a deterministic hash of agent.name)",
+    )
+    nap_configure.add_argument("agent_id")
+    nap_configure.add_argument(
+        "--offset-minutes",
+        type=int,
+        help="0-359; omit to derive deterministically from agent name",
+    )
+    nap_configure.add_argument("--window-minutes", type=int, default=15)
+    nap_configure.add_argument("--disabled", action="store_true")
+    nap_configure.add_argument("--actor")
+    _set(cmd_nap_configure, nap_configure)
+    nap_show = nap.add_parser("show")
+    nap_show.add_argument("agent_id")
+    _set(cmd_nap_show, nap_show)
+    nap_next = nap.add_parser("next", help="compute the next nap window")
+    nap_next.add_argument("agent_id")
+    _set(cmd_nap_next, nap_next)
+    nap_begin = nap.add_parser(
+        "begin",
+        help="start a nap; transitions the agent to DRAINING",
+    )
+    nap_begin.add_argument("agent_id")
+    nap_begin.add_argument("--actor")
+    nap_begin.add_argument("--detail")
+    _set(cmd_nap_begin, nap_begin)
+    nap_complete = nap.add_parser(
+        "complete",
+        help="mark a nap_run completed and restore the agent",
+    )
+    nap_complete.add_argument("run_id")
+    nap_complete.add_argument(
+        "--evidence-id",
+        help="evidence row (kind='log') with the summary artifact pointer",
+    )
+    nap_complete.add_argument("--detail")
+    nap_complete.add_argument("--actor")
+    _set(cmd_nap_complete, nap_complete)
+    nap_fail = nap.add_parser("fail", help="mark a nap_run failed and restore the agent")
+    nap_fail.add_argument("run_id")
+    nap_fail.add_argument("--reason", required=True)
+    nap_fail.add_argument("--actor")
+    _set(cmd_nap_fail, nap_fail)
+    nap_list = nap.add_parser("list", help="list nap_runs")
+    nap_list.add_argument("--agent-id")
+    _set(cmd_nap_list, nap_list)
 
     dispatch = sub.add_parser("dispatch", help="dispatcher commands").add_subparsers(dest="dispatch_command", required=True)
     assign = dispatch.add_parser("assign")
