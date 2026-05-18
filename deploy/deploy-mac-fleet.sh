@@ -321,7 +321,8 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable --now mac.service
+  sudo systemctl enable mac.service
+  sudo systemctl restart mac.service
   sleep 3
   sudo systemctl --no-pager -l status mac.service || true
   sudo journalctl -u mac.service -n 200 --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
@@ -359,9 +360,15 @@ EOF
 </dict>
 </plist>
 EOF
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$plist"
+  fi
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
   launchctl bootout "gui/$uid/com.mac.control-plane" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$uid" "$plist"
   launchctl enable "gui/$uid/com.mac.control-plane"
+  if ! launchctl bootstrap "gui/$uid" "$plist"; then
+    launchctl kickstart -k "gui/$uid/com.mac.control-plane"
+  fi
   sleep 3
   launchctl list com.mac.control-plane || true
 }
