@@ -255,8 +255,6 @@ def _maybe_apply_slack_account_activation_shim(
         not result["enabled"]
         or agent_dir is None
         or not account_file_present
-        or env_token_present
-        or explicit_config
         or shim_present
     ):
         return result

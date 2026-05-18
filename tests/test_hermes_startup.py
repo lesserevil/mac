@@ -152,6 +152,76 @@ def apply_env_overrides(config):
     assert "slack_accounts_configured = _slack_accounts_file_configured()" in patched
 
 
+def test_startup_applies_slack_accounts_shim_even_when_slack_has_other_activation(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    config_py = agent_dir / "gateway" / "config.py"
+    _write(hermes_home / "config.yaml", "slack:\n  enabled: true\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(hermes_home / "slack_accounts.json", '{"workspace":"T123"}')
+    _write(
+        config_py,
+        '''from typing import Callable
+import os
+
+
+class Platform:
+    SLACK = "slack"
+
+
+class PlatformConfig:
+    pass
+
+
+def get_hermes_home():
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Built-in platform connection checkers
+_PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] = {
+}
+
+
+def apply_env_overrides(config):
+    # Slack
+    slack_token = os.getenv("SLACK_BOT_TOKEN")
+    if slack_token:
+        if Platform.SLACK not in config.platforms:
+            # No yaml config for Slack — env-only setup, enable it
+            config.platforms[Platform.SLACK] = PlatformConfig()
+            config.platforms[Platform.SLACK].enabled = True
+        else:
+            slack_config = config.platforms[Platform.SLACK]
+            enabled_was_explicit = bool(slack_config.extra.pop("_enabled_explicit", False))
+            if not slack_config.enabled and not enabled_was_explicit:
+                # Top-level Slack settings such as channel prompts should not
+                # turn an env-token setup into a disabled platform. Only an
+                # explicit slack.enabled/platforms.slack.enabled false should.
+                slack_config.enabled = True
+        # If yaml config exists, respect its enabled flag (don't override
+        # explicit enabled: false). Token is still stored so skills that
+        # send Slack messages can use it without activating the gateway adapter.
+        config.platforms[Platform.SLACK].token = slack_token
+''',
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["slack"]["activation_source"] == "explicit_config"
+    assert report["slack"]["account_file_activation_shim_present"] is True
+    assert report["slack"]["account_file_activation_shim_patch"]["applied"] is True
+
+
 def test_slack_bot_token_satisfies_upstream_slack_activation(monkeypatch, tmp_path):
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
