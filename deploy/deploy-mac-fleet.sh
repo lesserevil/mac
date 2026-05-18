@@ -103,15 +103,26 @@ python_bin() {
 
 PY="$(python_bin)"
 
+dns_lookup() {
+  if command -v getent >/dev/null 2>&1; then
+    getent hosts pypi.org >/dev/null 2>&1
+    return
+  fi
+  "$PY" - <<'PY' >/dev/null 2>&1
+import socket
+socket.getaddrinfo("pypi.org", 443)
+PY
+}
+
 ensure_dns_resolution() {
-  if getent hosts pypi.org >/dev/null 2>&1; then
+  if dns_lookup; then
     return
   fi
   if [ "$OS_KIND" = "linux" ] && [ -f /run/systemd/resolve/resolv.conf ]; then
     log "repairing DNS resolver path for package installation"
     sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
   fi
-  if ! getent hosts pypi.org >/dev/null 2>&1; then
+  if ! dns_lookup; then
     log "ERROR: DNS resolution still fails after resolver repair"
     exit 1
   fi
