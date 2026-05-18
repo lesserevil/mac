@@ -334,7 +334,24 @@ def cmd_memory_search(args: argparse.Namespace) -> None:
 
 
 def cmd_rollout_create(args: argparse.Namespace) -> None:
-    _print(_plane(args).create_rollout(args.version, args.strategy, args.target_percent, args.created_by))
+    _print(
+        _plane(args).create_rollout(
+            args.version,
+            args.strategy,
+            args.target_percent,
+            args.created_by,
+            tenant_id=args.tenant_id,
+            channel=args.channel,
+            runtime_environment_id=args.runtime,
+            artifact_uri=args.artifact_uri,
+            artifact_hash=args.artifact_hash,
+            health_policy=_json_arg(args.health_policy, {}),
+        )
+    )
+
+
+def cmd_rollout_list(args: argparse.Namespace) -> None:
+    _print([rollout.to_dict() for rollout in _plane(args).list_rollouts(args.tenant_id, args.channel)])
 
 
 def cmd_rollout_advance(args: argparse.Namespace) -> None:
@@ -342,8 +359,34 @@ def cmd_rollout_advance(args: argparse.Namespace) -> None:
 
 
 def cmd_rollout_rescue(args: argparse.Namespace) -> None:
-    rollout, task = _plane(args).rescue_rollout(args.rollout_id, args.actor, args.reason)
+    rollout, task = _plane(args).rescue_rollout(
+        args.rollout_id,
+        args.actor,
+        args.reason,
+        _json_arg(args.detail, {}),
+    )
     _print({"rollout": rollout.to_dict(), "task": task.to_dict()})
+
+
+def cmd_rollout_verify_artifact(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).verify_rollout_artifact(
+            args.rollout_id,
+            args.artifact_uri,
+            args.artifact_hash,
+            args.actor,
+        )
+    )
+
+
+def cmd_rollout_health(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).evaluate_rollout_health(
+            args.rollout_id,
+            _json_arg(args.checks, {}),
+            args.actor,
+        )
+    )
 
 
 def _set(func: Callable[[argparse.Namespace], None], parser: argparse.ArgumentParser) -> None:
@@ -603,17 +646,39 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_create.add_argument("strategy")
     rollout_create.add_argument("--target-percent", type=int, default=10)
     rollout_create.add_argument("--created-by", required=True)
+    rollout_create.add_argument("--tenant-id")
+    rollout_create.add_argument("--channel", default="fleet")
+    rollout_create.add_argument("--runtime")
+    rollout_create.add_argument("--artifact-uri")
+    rollout_create.add_argument("--artifact-hash")
+    rollout_create.add_argument("--health-policy")
     _set(cmd_rollout_create, rollout_create)
+    rollout_list = rollout.add_parser("list")
+    rollout_list.add_argument("--tenant-id")
+    rollout_list.add_argument("--channel")
+    _set(cmd_rollout_list, rollout_list)
     rollout_advance = rollout.add_parser("advance")
     rollout_advance.add_argument("rollout_id")
     rollout_advance.add_argument("action")
     rollout_advance.add_argument("--actor", required=True)
     rollout_advance.add_argument("--detail")
     _set(cmd_rollout_advance, rollout_advance)
+    rollout_artifact = rollout.add_parser("verify-artifact")
+    rollout_artifact.add_argument("rollout_id")
+    rollout_artifact.add_argument("--artifact-uri", required=True)
+    rollout_artifact.add_argument("--artifact-hash", required=True)
+    rollout_artifact.add_argument("--actor", required=True)
+    _set(cmd_rollout_verify_artifact, rollout_artifact)
+    rollout_health = rollout.add_parser("health")
+    rollout_health.add_argument("rollout_id")
+    rollout_health.add_argument("--checks", required=True)
+    rollout_health.add_argument("--actor", required=True)
+    _set(cmd_rollout_health, rollout_health)
     rollout_rescue = rollout.add_parser("rescue")
     rollout_rescue.add_argument("rollout_id")
     rollout_rescue.add_argument("--actor", required=True)
     rollout_rescue.add_argument("--reason", required=True)
+    rollout_rescue.add_argument("--detail")
     _set(cmd_rollout_rescue, rollout_rescue)
 
     return parser

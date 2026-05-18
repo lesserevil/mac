@@ -29,7 +29,7 @@ This project provides durable contracts for coordinating a fleet:
 - Tenant-scoped secret handles with audit records and redacted API/CLI output.
 - Reproducible runtime manifests with stable digests and secret-value checks.
 - Tenant, user, Persona, Hermes instance, and platform binding records for multi-user expansion.
-- Project bridge, operational memory/provenance records, and rollout/rescue workflows.
+- Project bridge, operational memory/provenance records, and gated rollout/rescue workflows.
 - FastAPI REST API and `mac` CLI.
 - Hermes-side `mac-hermes` adapter for registration, sanitized task creation, status replies, and memory write-back payloads.
 
@@ -97,7 +97,7 @@ Key route groups:
 - `/secrets`, `/secrets/{id}/access`, `/secrets/{id}/reveal`, `/secret-audits`
 - `/runtimes`, `/runtime-runs`
 - `/bridge/items`, `/memory`
-- `/rollouts`
+- `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
 
 ## CLI Examples
 
@@ -118,6 +118,18 @@ echo -n "$GH_TOKEN" | mac --db mac.db secret set github-token \
     --from-stdin --scopes '{"capabilities":["deploy"]}' --created-by human
 mac --db mac.db secret set release-key --from-file ./release.key \
     --scopes '{"capabilities":["deploy"]}' --created-by human
+
+# Rollouts require a pinned runtime and verified sha256 artifact before install.
+mac --db mac.db runtime create mac-runtime \
+    --manifest '{"image":"python:3.12@sha256:abc123","dependencies":["fastapi==0.111.0"]}' \
+    --created-by human
+mac --db mac.db rollout create 1.2.0 canary --runtime runtime_... \
+    --artifact-uri artifact://mac/1.2.0 --artifact-hash sha256:abc123 \
+    --health-policy '{"required_checks":["runtime","canary"]}' \
+    --created-by human
+mac --db mac.db rollout advance rollout_... start_canary --actor human
+mac --db mac.db rollout health rollout_... \
+    --checks '{"runtime":"healthy","canary":"ok"}' --actor monitor
 ```
 
 Hermes-facing API adapter:

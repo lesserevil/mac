@@ -211,6 +211,12 @@ class RolloutCreate(BaseModel):
     strategy: str
     target_percent: int
     created_by: str
+    tenant_id: Optional[str] = None
+    channel: str = "fleet"
+    runtime_environment_id: Optional[str] = None
+    artifact_uri: Optional[str] = None
+    artifact_hash: Optional[str] = None
+    health_policy: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RolloutAdvance(BaseModel):
@@ -222,6 +228,18 @@ class RolloutAdvance(BaseModel):
 class RolloutRescue(BaseModel):
     actor: str
     reason: str
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RolloutArtifactVerify(BaseModel):
+    artifact_uri: str
+    artifact_hash: str
+    actor: str
+
+
+class RolloutHealthReport(BaseModel):
+    actor: str
+    checks: Dict[str, Any]
 
 
 def _load_auth_tokens_from_env() -> Dict[str, List[str]]:
@@ -531,13 +549,33 @@ def create_app(
     def create_rollout(body: RolloutCreate) -> Dict[str, Any]:
         return cp.create_rollout(**_data(body)).to_dict()
 
+    @app.get("/rollouts")
+    def list_rollouts(
+        tenant_id: Optional[str] = Query(default=None),
+        channel: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [rollout.to_dict() for rollout in cp.list_rollouts(tenant_id, channel)]
+
     @app.post("/rollouts/{rollout_id}/advance")
     def advance_rollout(rollout_id: str, body: RolloutAdvance) -> Dict[str, Any]:
         return cp.advance_rollout(rollout_id, body.action, body.actor, body.detail).to_dict()
 
+    @app.post("/rollouts/{rollout_id}/artifact")
+    def verify_rollout_artifact(rollout_id: str, body: RolloutArtifactVerify) -> Dict[str, Any]:
+        return cp.verify_rollout_artifact(
+            rollout_id,
+            body.artifact_uri,
+            body.artifact_hash,
+            body.actor,
+        ).to_dict()
+
+    @app.post("/rollouts/{rollout_id}/health")
+    def evaluate_rollout_health(rollout_id: str, body: RolloutHealthReport) -> Dict[str, Any]:
+        return cp.evaluate_rollout_health(rollout_id, body.checks, body.actor)
+
     @app.post("/rollouts/{rollout_id}/rescue")
     def rescue_rollout(rollout_id: str, body: RolloutRescue) -> Dict[str, Any]:
-        rollout, task = cp.rescue_rollout(rollout_id, body.actor, body.reason)
+        rollout, task = cp.rescue_rollout(rollout_id, body.actor, body.reason, body.detail)
         return {"rollout": rollout.to_dict(), "task": task.to_dict()}
 
     return app

@@ -96,13 +96,19 @@ Move from prototype gates to production gates:
 
 ### Phase 6: Rollout and Rescue
 
+Status: implemented.
+
 Make self-update safe:
 
-- Runtime manifests with strict pins and content digests.
-- Canary rollout health gates.
-- Automatic pause/rescue task creation on failed health checks.
-- Per-tenant or per-fleet rollout channels.
-- Artifact verification before install or promotion.
+- Runtime manifests reject `:latest`, raw secret fields, unpinned
+  dependencies, and image references without `@sha256:` digests.
+- Canary rollout promotion requires a passing health gate.
+- Failed health checks automatically move the rollout into rescue, drop target
+  percent to 0, and create an ops rescue task.
+- Rollouts can target `fleet` or named tenant channels and can be filtered by
+  `tenant_id` / `channel`.
+- Canary start and promotion require a runtime environment plus a verified
+  `sha256:<digest>` artifact.
 
 ## Near-Term Contract Tests
 
@@ -115,6 +121,7 @@ The next tests should make these risks explicit:
 - A Hermes interaction task cannot use a user or platform binding from another tenant.
 - Secret handles cannot be revealed without a granted audit.
 - Runtime manifests reject unpinned images and version ranges.
+- Rollouts cannot install or promote without verified artifacts and health gates.
 
 ## Success Definition
 

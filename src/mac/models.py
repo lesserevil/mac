@@ -156,7 +156,18 @@ class PublicationStatus(StrEnum):
     FAILED = "failed"
 
 
-EVIDENCE_KINDS = {"test", "review", "artifact", "publication", "log"}
+EVIDENCE_KINDS = {"test", "review", "artifact", "publication", "log", "eval"}
+
+
+class EvalScoringDirection(StrEnum):
+    HIGHER_IS_BETTER = "higher_is_better"
+    LOWER_IS_BETTER = "lower_is_better"
+
+
+class EvalTargetKind(StrEnum):
+    ROLLOUT_VERSION = "rollout_version"
+    RUNTIME_ENVIRONMENT = "runtime_environment"
+    AGENT_BUILD = "agent_build"
 
 
 class MessageType(StrEnum):
@@ -566,6 +577,12 @@ class Rollout:
     strategy: str
     status: str
     target_percent: int
+    tenant_id: Optional[str]
+    channel: str
+    runtime_environment_id: Optional[str]
+    artifact_uri: Optional[str]
+    artifact_hash: Optional[str]
+    health_policy: JsonDict
     created_by: str
     created_at: str
     updated_at: str

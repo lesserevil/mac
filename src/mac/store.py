@@ -339,6 +339,12 @@ class SQLiteStore:
                     strategy TEXT NOT NULL,
                     status TEXT NOT NULL,
                     target_percent INTEGER NOT NULL,
+                    tenant_id TEXT,
+                    channel TEXT NOT NULL DEFAULT 'fleet',
+                    runtime_environment_id TEXT,
+                    artifact_uri TEXT,
+                    artifact_hash TEXT,
+                    health_policy TEXT NOT NULL DEFAULT '{}',
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -361,6 +367,12 @@ class SQLiteStore:
         self._ensure_column("secret_access_audit", "expires_at", "expires_at TEXT")
         self._ensure_column("secret_access_audit", "revealed_at", "revealed_at TEXT")
         self._ensure_column("publications", "content_hash", "content_hash TEXT")
+        self._ensure_column("rollouts", "tenant_id", "tenant_id TEXT")
+        self._ensure_column("rollouts", "channel", "channel TEXT NOT NULL DEFAULT 'fleet'")
+        self._ensure_column("rollouts", "runtime_environment_id", "runtime_environment_id TEXT")
+        self._ensure_column("rollouts", "artifact_uri", "artifact_uri TEXT")
+        self._ensure_column("rollouts", "artifact_hash", "artifact_hash TEXT")
+        self._ensure_column("rollouts", "health_policy", "health_policy TEXT NOT NULL DEFAULT '{}'")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(%s)" % table)}

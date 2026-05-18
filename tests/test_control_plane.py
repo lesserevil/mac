@@ -27,6 +27,34 @@ def register_agent(cp, name="agent", capabilities=None):
     return cp.register_agent(machine.id, name, capabilities=capabilities or [])
 
 
+def create_runtime(cp, name="runtime"):
+    return cp.create_runtime(
+        name,
+        {
+            "image": "python:3.12@sha256:abc123",
+            "dependencies": ["fastapi==0.111.0"],
+            "entrypoint": ["pytest"],
+        },
+        "human",
+    )
+
+
+def create_verified_rollout(cp, version="1.0", strategy="canary", tenant_id=None, channel="fleet", health_policy=None):
+    runtime = create_runtime(cp, "runtime-%s" % version)
+    return cp.create_rollout(
+        version,
+        strategy,
+        10,
+        "human",
+        tenant_id=tenant_id,
+        channel=channel,
+        runtime_environment_id=runtime.id,
+        artifact_uri="artifact://mac/%s" % version,
+        artifact_hash="sha256:abc123",
+        health_policy=health_policy or {},
+    )
+
+
 def test_hermes_identity_context_and_interaction_task_boundaries(cp):
     tenant = cp.register_tenant("acme")
     user = cp.register_user(tenant.id, "jordan", display_name="Jordan")
@@ -341,7 +369,7 @@ def test_project_bridge_memory_and_rollout_rescue(cp):
     assert cp.get_task(item.task_id).metadata["external_id"] == "42"
     assert cp.search_memory(task_id=item.task_id)[0].record_type == "imported"
 
-    rollout = cp.create_rollout("0.2.0", "canary", 10, "human")
+    rollout = create_verified_rollout(cp, "0.2.0")
     canary = cp.advance_rollout(rollout.id, "start_canary", "human")
     assert canary.status == RolloutStatus.CANARYING.value
 
@@ -569,7 +597,7 @@ def test_rotate_secret_writes_audit_row(cp):
 
 
 def test_rollout_pause_then_resume_round_trips(cp):
-    rollout = cp.create_rollout("1.0", "canary", 10, "human")
+    rollout = create_verified_rollout(cp, "1.0")
     cp.advance_rollout(rollout.id, "start_canary", "human")
     paused = cp.advance_rollout(rollout.id, "pause", "human")
     assert paused.status == RolloutStatus.PAUSED.value
@@ -578,14 +606,94 @@ def test_rollout_pause_then_resume_round_trips(cp):
 
 
 def test_rollout_promote_from_paused_is_allowed_pause_from_promoted_is_not(cp):
-    rollout = cp.create_rollout("1.1", "canary", 10, "human")
+    rollout = create_verified_rollout(cp, "1.1")
     cp.advance_rollout(rollout.id, "start_canary", "human")
+    cp.evaluate_rollout_health(rollout.id, {"runtime": "healthy"}, "monitor")
     cp.advance_rollout(rollout.id, "pause", "human")
     promoted = cp.advance_rollout(rollout.id, "promote", "human")
     assert promoted.status == RolloutStatus.PROMOTED.value
     assert promoted.target_percent == 100
     with pytest.raises(TransitionError):
         cp.advance_rollout(rollout.id, "pause", "human")
+
+
+def test_rollout_install_requires_runtime_and_verified_artifact(cp):
+    rollout = cp.create_rollout("2.0", "canary", 10, "human")
+    with pytest.raises(ValidationError):
+        cp.advance_rollout(rollout.id, "start_canary", "human")
+
+    runtime = create_runtime(cp, "runtime-2.0")
+    rollout = cp.create_rollout(
+        "2.1",
+        "canary",
+        10,
+        "human",
+        runtime_environment_id=runtime.id,
+    )
+    with pytest.raises(ValidationError):
+        cp.advance_rollout(rollout.id, "start_canary", "human")
+    with pytest.raises(ValidationError):
+        cp.verify_rollout_artifact(rollout.id, "artifact://mac/2.1", "md5:not-ok", "human")
+
+    verified = cp.verify_rollout_artifact(
+        rollout.id,
+        "artifact://mac/2.1",
+        "sha256:abc123",
+        "human",
+    )
+    assert verified.artifact_hash == "sha256:abc123"
+    assert cp.advance_rollout(rollout.id, "start_canary", "human").status == RolloutStatus.CANARYING.value
+
+
+def test_rollout_health_gate_blocks_promotion_and_failed_health_rescues(cp):
+    rollout = create_verified_rollout(
+        cp,
+        "2.2",
+        health_policy={"required_checks": ["runtime", "canary"]},
+    )
+    with pytest.raises(TransitionError):
+        cp.advance_rollout(rollout.id, "promote", "human")
+    cp.advance_rollout(rollout.id, "start_canary", "human")
+    with pytest.raises(ValidationError):
+        cp.advance_rollout(rollout.id, "promote", "human")
+
+    result = cp.evaluate_rollout_health(
+        rollout.id,
+        {"runtime": "healthy", "canary": {"status": "failed"}},
+        "monitor",
+    )
+
+    assert result["healthy"] is False
+    assert result["failed_checks"] == ["canary"]
+    assert result["rollout"]["status"] == RolloutStatus.RESCUING.value
+    assert result["rollout"]["target_percent"] == 0
+    assert result["rescue_task"]["metadata"]["failed_checks"] == ["canary"]
+
+    healthy = create_verified_rollout(
+        cp,
+        "2.3",
+        health_policy={"required_checks": ["runtime", "canary"]},
+    )
+    cp.advance_rollout(healthy.id, "start_canary", "human")
+    cp.evaluate_rollout_health(healthy.id, {"runtime": True, "canary": "ok"}, "monitor")
+    assert cp.advance_rollout(healthy.id, "promote", "human").status == RolloutStatus.PROMOTED.value
+
+
+def test_rollout_channels_scope_tenant_and_fleet(cp):
+    tenant = cp.register_tenant("rollout-tenant")
+    fleet = create_verified_rollout(cp, "3.0", strategy="full", channel="fleet")
+    tenant_rollout = create_verified_rollout(
+        cp,
+        "3.1",
+        strategy="full",
+        tenant_id=tenant.id,
+        channel="tenant-stable",
+    )
+
+    assert [rollout.id for rollout in cp.list_rollouts(channel="fleet")] == [fleet.id]
+    assert [rollout.id for rollout in cp.list_rollouts(tenant_id=tenant.id)] == [tenant_rollout.id]
+    assert tenant_rollout.tenant_id == tenant.id
+    assert tenant_rollout.channel == "tenant-stable"
 
 
 def test_runtime_manifest_rejects_nested_latest_and_substring_secret_fields(cp):
@@ -599,5 +707,11 @@ def test_runtime_manifest_rejects_nested_latest_and_substring_secret_fields(cp):
         cp.create_runtime(
             "leaky-api-key",
             {"image": "python:3.12@sha256:abc", "env": {"api_key": "raw"}},
+            "human",
+        )
+    with pytest.raises(ValidationError):
+        cp.create_runtime(
+            "unpinned-image",
+            {"image": "python:3.12"},
             "human",
         )

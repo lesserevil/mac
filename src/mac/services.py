@@ -1840,9 +1840,20 @@ class ControlPlane:
         strategy: str,
         target_percent: int,
         created_by: str,
+        tenant_id: Optional[str] = None,
+        channel: str = "fleet",
+        runtime_environment_id: Optional[str] = None,
+        artifact_uri: Optional[str] = None,
+        artifact_hash: Optional[str] = None,
+        health_policy: Optional[Dict[str, Any]] = None,
     ) -> Rollout:
         if not version:
             raise ValidationError("rollout version is required")
+        if tenant_id is not None:
+            self.get_tenant(tenant_id)
+        channel = (channel or "fleet").strip()
+        if not channel:
+            raise ValidationError("rollout channel is required")
         strategy_value = _state_value(strategy)
         try:
             RolloutStrategy(strategy_value)
@@ -1850,12 +1861,22 @@ class ControlPlane:
             raise ValidationError("unsupported rollout strategy: %s" % strategy_value)
         if int(target_percent) < 0 or int(target_percent) > 100:
             raise ValidationError("rollout target percent must be between 0 and 100")
+        if runtime_environment_id is not None:
+            self.get_runtime(runtime_environment_id)
+        if bool(artifact_uri) != bool(artifact_hash):
+            raise ValidationError("artifact_uri and artifact_hash must be provided together")
+        if artifact_hash is not None:
+            self._validate_artifact_hash(artifact_hash)
+        policy = ensure_json_object(health_policy)
         now = utcnow()
         rollout_id = new_id("rollout")
         self.store.execute(
             """
-            INSERT INTO rollouts (id, version, strategy, status, target_percent, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO rollouts (
+                id, version, strategy, status, target_percent, tenant_id, channel,
+                runtime_environment_id, artifact_uri, artifact_hash, health_policy,
+                created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rollout_id,
@@ -1863,12 +1884,37 @@ class ControlPlane:
                 strategy_value,
                 RolloutStatus.PLANNED.value,
                 int(target_percent),
+                tenant_id,
+                channel,
+                runtime_environment_id,
+                artifact_uri,
+                artifact_hash,
+                json_dumps(policy),
                 created_by,
                 now,
                 now,
             ),
         )
-        self._record_rollout_event(rollout_id, "rollout.created", created_by, {"target_percent": int(target_percent)})
+        self._record_rollout_event(
+            rollout_id,
+            "rollout.created",
+            created_by,
+            {
+                "target_percent": int(target_percent),
+                "tenant_id": tenant_id,
+                "channel": channel,
+                "runtime_environment_id": runtime_environment_id,
+                "artifact_uri": artifact_uri,
+                "artifact_hash": artifact_hash,
+            },
+        )
+        if artifact_uri and artifact_hash:
+            self._record_rollout_event(
+                rollout_id,
+                "rollout.artifact_verified",
+                created_by,
+                {"artifact_uri": artifact_uri, "artifact_hash": artifact_hash},
+            )
         return self.get_rollout(rollout_id)
 
     def get_rollout(self, rollout_id: str) -> Rollout:
@@ -1876,6 +1922,55 @@ class ControlPlane:
         if row is None:
             raise NotFoundError("rollout not found: %s" % rollout_id)
         return self._rollout_from_row(row)
+
+    def list_rollouts(
+        self,
+        tenant_id: Optional[str] = None,
+        channel: Optional[str] = None,
+    ) -> List[Rollout]:
+        clauses = []
+        params: List[Any] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if channel is not None:
+            clauses.append("channel = ?")
+            params.append(channel)
+        sql = "SELECT * FROM rollouts"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at, id"
+        return [self._rollout_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+
+    def verify_rollout_artifact(
+        self,
+        rollout_id: str,
+        artifact_uri: str,
+        artifact_hash: str,
+        actor: str,
+    ) -> Rollout:
+        rollout = self.get_rollout(rollout_id)
+        if rollout.status not in {RolloutStatus.PLANNED.value, RolloutStatus.PAUSED.value}:
+            raise TransitionError("artifact can only be verified before install or while paused")
+        if not artifact_uri:
+            raise ValidationError("artifact_uri is required")
+        self._validate_artifact_hash(artifact_hash)
+        now = utcnow()
+        self.store.execute(
+            """
+            UPDATE rollouts
+            SET artifact_uri = ?, artifact_hash = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (artifact_uri, artifact_hash, now, rollout_id),
+        )
+        self._record_rollout_event(
+            rollout_id,
+            "rollout.artifact_verified",
+            actor,
+            {"artifact_uri": artifact_uri, "artifact_hash": artifact_hash},
+        )
+        return self.get_rollout(rollout_id)
 
     def advance_rollout(
         self,
@@ -1893,6 +1988,21 @@ class ControlPlane:
             raise TransitionError(
                 "rollout action %s not allowed from status %s" % (action, rollout.status)
             )
+        if action in {"start_canary", "promote"}:
+            self._rollout_install_ready(rollout)
+        if (
+            action == "promote"
+            and rollout.strategy == RolloutStrategy.CANARY.value
+            and rollout.status == RolloutStatus.PLANNED.value
+        ):
+            raise TransitionError("canary rollout must start canary before promotion")
+        if (
+            action == "promote"
+            and rollout.strategy == RolloutStrategy.CANARY.value
+            and rollout.status in {RolloutStatus.CANARYING.value, RolloutStatus.PAUSED.value}
+            and not self._latest_rollout_health_passed(rollout.id)
+        ):
+            raise ValidationError("canary promotion requires a passing health gate")
         status = rule["to"]
         if "target_percent" in rule:
             detail.setdefault("target_percent", rule["target_percent"])
@@ -1905,21 +2015,76 @@ class ControlPlane:
         self._record_rollout_event(rollout_id, "rollout.%s" % action, actor, detail)
         return self.get_rollout(rollout_id)
 
-    def rescue_rollout(self, rollout_id: str, actor: str, reason: str) -> Tuple[Rollout, Task]:
+    def evaluate_rollout_health(
+        self,
+        rollout_id: str,
+        checks: Dict[str, Any],
+        actor: str,
+    ) -> JsonDict:
+        rollout = self.get_rollout(rollout_id)
+        checks_obj = ensure_json_object(checks)
+        required = self._required_rollout_checks(rollout, checks_obj)
+        failed = [
+            check
+            for check in required
+            if not self._health_check_passed(checks_obj.get(check))
+        ]
+        detail = {
+            "checks": checks_obj,
+            "required_checks": required,
+            "failed_checks": failed,
+            "status": "failed" if failed else "healthy",
+        }
+        self._record_rollout_event(rollout_id, "rollout.health_checked", actor, detail)
+        if failed:
+            rescued, task = self.rescue_rollout(
+                rollout_id,
+                actor,
+                "health gate failed: %s" % ", ".join(failed),
+                detail={"failed_checks": failed, "checks": checks_obj},
+            )
+            return {
+                "healthy": False,
+                "failed_checks": failed,
+                "rollout": rescued.to_dict(),
+                "rescue_task": task.to_dict(),
+            }
+        return {
+            "healthy": True,
+            "failed_checks": [],
+            "rollout": self.get_rollout(rollout_id).to_dict(),
+            "rescue_task": None,
+        }
+
+    def rescue_rollout(
+        self,
+        rollout_id: str,
+        actor: str,
+        reason: str,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Rollout, Task]:
         rollout = self.get_rollout(rollout_id)
         now = utcnow()
         self.store.execute(
             "UPDATE rollouts SET status = ?, target_percent = ?, updated_at = ? WHERE id = ?",
             (RolloutStatus.RESCUING.value, 0, now, rollout_id),
         )
-        self._record_rollout_event(rollout_id, "rollout.rescue_started", actor, {"reason": reason})
+        rescue_detail = {"reason": reason}
+        rescue_detail.update(ensure_json_object(detail))
+        self._record_rollout_event(rollout_id, "rollout.rescue_started", actor, rescue_detail)
         task = self.create_task(
             "Rescue rollout %s" % rollout.version,
             description=reason,
             project="rollout",
             priority=100,
             required_capabilities=["ops"],
-            metadata={"rollout_id": rollout_id, "rescue": True},
+            metadata={
+                "rollout_id": rollout_id,
+                "rescue": True,
+                "tenant_id": rollout.tenant_id,
+                "channel": rollout.channel,
+                "failed_checks": rescue_detail.get("failed_checks", []),
+            },
             actor=actor,
         )
         self.add_memory(
@@ -2186,6 +2351,12 @@ class ControlPlane:
             row["strategy"],
             row["status"],
             row["target_percent"],
+            row["tenant_id"],
+            row["channel"],
+            row["runtime_environment_id"],
+            row["artifact_uri"],
+            row["artifact_hash"],
+            json_loads(row["health_policy"], {}),
             row["created_by"],
             row["created_at"],
             row["updated_at"],
@@ -2218,6 +2389,52 @@ class ControlPlane:
             """,
             (new_id("revt"), rollout_id, event_type, actor, json_dumps(detail), utcnow()),
         )
+
+    def _rollout_install_ready(self, rollout: Rollout) -> None:
+        if not rollout.runtime_environment_id:
+            raise ValidationError("rollout requires a runtime environment before install")
+        self.get_runtime(rollout.runtime_environment_id)
+        if not rollout.artifact_uri or not rollout.artifact_hash:
+            raise ValidationError("rollout artifact must be verified before install")
+        self._validate_artifact_hash(rollout.artifact_hash)
+
+    def _latest_rollout_health_passed(self, rollout_id: str) -> bool:
+        row = self.store.query_one(
+            """
+            SELECT detail FROM rollout_events
+            WHERE rollout_id = ? AND event_type = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (rollout_id, "rollout.health_checked"),
+        )
+        if row is None:
+            return False
+        detail = json_loads(row["detail"], {})
+        return detail.get("status") == "healthy"
+
+    def _required_rollout_checks(self, rollout: Rollout, checks: JsonDict) -> List[str]:
+        required = rollout.health_policy.get("required_checks")
+        if required:
+            return [str(check) for check in required]
+        return sorted(str(check) for check in checks)
+
+    def _health_check_passed(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in {"ok", "pass", "passed", "healthy", "success"}
+        if isinstance(value, dict):
+            status = value.get("status")
+            return self._health_check_passed(status)
+        return False
+
+    def _validate_artifact_hash(self, artifact_hash: str) -> None:
+        if not artifact_hash or not artifact_hash.startswith("sha256:"):
+            raise ValidationError("artifact_hash must be a sha256:<digest> value")
+        digest = artifact_hash.removeprefix("sha256:")
+        if len(digest) < 6:
+            raise ValidationError("artifact_hash digest is too short")
 
     def _completion_authorized(self, task_id: str) -> bool:
         # An approved review must reference evidence that belongs to the same
@@ -2590,4 +2807,9 @@ class ControlPlane:
                 raise ValidationError(
                     "runtime manifest field at %s pins :latest; pin a digest"
                     % (".".join(path) or "(root)")
+                )
+            if path and path[-1].lower() in {"image", "container_image"} and "@sha256:" not in stripped:
+                raise ValidationError(
+                    "runtime manifest image at %s must include a sha256 digest"
+                    % ".".join(path)
                 )
