@@ -337,9 +337,11 @@ install_hermes_gateway_wrapper() {
 #!/usr/bin/env bash
 set -euo pipefail
 set -a
+set +u
 [ -f "$HOME/.acc/.env" ] && . "$HOME/.acc/.env"
 [ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
 [ -f "$HOME/.mac/mac.env" ] && . "$HOME/.mac/mac.env"
+set -u
 set +a
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 exec "$HOME/.mac/hermes-agent/.venv/bin/python" "$HOME/.mac/hermes-agent/hermes" gateway run --replace
@@ -364,7 +366,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$MAC_HOME/bin/hermes-gateway
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=20
+TimeoutStopSec=120
 LimitNOFILE=65536
 
 [Install]
