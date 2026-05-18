@@ -190,6 +190,7 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert state["dispatch"]["open_task_count"] == 1
     assert state["dispatch"]["tasks"][0]["eligible_agent_count"] == 1
     assert state["tasks"][0]["task"]["id"] == task["id"]
+    assert state["hermes_startup"]["operator_health"]["status"] in {"healthy", "degraded"}
     assert state["secrets"][0]["value"] == "***REDACTED***"
     assert "never-render-this" not in str(state)
     assert state["secret_audits"][0]["id"] == handle["audit_id"]

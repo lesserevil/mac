@@ -575,7 +575,10 @@ def _dashboard_rollout_status(cp: ControlPlane, rollout_id: str) -> Dict[str, An
     }
 
 
-def _dashboard_state(cp: ControlPlane) -> Dict[str, Any]:
+def _dashboard_state(
+    cp: ControlPlane,
+    hermes_startup: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     tenants = [tenant.to_dict() for tenant in cp.list_tenants()]
     users = [user.to_dict() for user in cp.list_users()]
     personas = [persona.to_dict() for persona in cp.list_personas()]
@@ -638,6 +641,7 @@ def _dashboard_state(cp: ControlPlane) -> Dict[str, Any]:
         "rollouts": rollout_statuses,
         "eval_sets": [eval_set.to_dict() for eval_set in cp.list_eval_sets()],
         "eval_runs": [run.to_dict() for run in cp.list_eval_runs()],
+        "hermes_startup": hermes_startup,
     }
 
 
@@ -703,7 +707,7 @@ def create_app(
 
     @app.get("/dashboard/state")
     def dashboard_state() -> Dict[str, Any]:
-        return _dashboard_state(cp)
+        return _dashboard_state(cp, app.state.hermes_startup)
 
     @app.get("/dashboard/agents/{agent_id}")
     def dashboard_agent(agent_id: str) -> Dict[str, Any]:

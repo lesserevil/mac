@@ -149,12 +149,14 @@ function renderBanner() {
 function renderOverview() {
   const data = mustData();
   const counts = data.overview.counts;
+  const startup = data.hermes_startup;
+  const startupStatus = startup?.operator_health?.status || (startup?.ready ? "healthy" : "degraded");
   return `
     <section class="metric-grid">
       ${metric("Agents", counts.agents || 0, `${counts.healthy_agents || 0} healthy, ${counts.busy_agents || 0} busy`)}
       ${metric("Machines", counts.machines || 0, `${counts.trusted_machines || 0} trusted`)}
       ${metric("Active Tasks", counts.active_tasks || 0, `${counts.dead_letters || 0} dead letters`)}
-      ${metric("Hermes", counts.hermes_instances || 0, `${counts.platform_bindings || 0} bindings`)}
+      ${metric("Hermes", counts.hermes_instances || 0, `${startupStatus}, ${counts.platform_bindings || 0} bindings`)}
     </section>
     <section class="surface">
       <h2>Dispatch</h2>
@@ -243,7 +245,36 @@ function renderHermes() {
       ${metric("Instances", data.hermes_instances.length, `${data.platform_bindings.length} bindings`)}
       ${metric("Interaction Tasks", data.tasks.filter((detail) => taskOrigin(detail.task).hermes_instance_id).length, "from Hermes")}
     </section>
+    ${hermesStartupPanel(data.hermes_startup)}
     <section class="record-list">${data.hermes_instances.length ? data.hermes_instances.map((instance) => hermesRecord(instance, data)).join("") : `<div class="empty-state">No Hermes instances</div>`}</section>
+  `;
+}
+
+function hermesStartupPanel(startup) {
+  if (!startup) {
+    return `<section class="surface"><h2>Startup Health</h2><div class="empty-state">No startup report</div></section>`;
+  }
+  const operator = startup.operator_health || {};
+  const security = startup.security?.secret_redaction || {};
+  const slack = startup.slack || {};
+  const logs = startup.logs || {};
+  const warnings = startup.warnings || [];
+  return `
+    <section class="surface">
+      <h2>Startup Health</h2>
+      <div class="chip-row">
+        ${chip(String(operator.status || (startup.ready ? "healthy" : "degraded")), startup.ready ? "good" : "bad")}
+        ${chip(`redaction ${security.effective === false ? "off" : "on"}`, security.effective === false ? "bad" : "good")}
+        ${chip(`logs ${Number(logs.actionable_count || 0)}`, Number(logs.actionable_count || 0) ? "bad" : "good")}
+      </div>
+      <div class="row-grid">
+        ${field("State refs", operator.state_refs_existing ?? 0)}
+        ${field("Slack activation", slack.activation_source || operator.slack_activation_source || "unknown")}
+        ${field("Redaction source", security.source || "unknown")}
+        ${field("Log classes", logs.classes?.length ?? 0)}
+      </div>
+      ${warnings.length ? `<div class="timeline">${warnings.map((warning) => timelineItem("warning", warning, "")).join("")}</div>` : ""}
+    </section>
   `;
 }
 

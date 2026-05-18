@@ -85,26 +85,47 @@ deploy/deploy-mac-fleet.sh
 
 It ships this repository to each host, installs `mac` into `~/.mac/venv`,
 redeploys upstream `NousResearch/hermes-agent` into `~/.mac/hermes-agent`,
-applies the minimal multi-Slack Hermes patch, runs the ACC SQLite migration
+applies the minimal multi-Slack Hermes patch, preinstalls configured Hermes
+messaging dependencies before service start, runs the ACC SQLite migration
 dry-run and import from `~/.acc/data/fleet.db` or `~/.acc/data/acc.db`, and
 starts a local `mac` service on `127.0.0.1:8789`. Linux hosts get
 `mac.service`; macOS hosts get `com.mac.control-plane`. The same deployment
 also starts a mac-managed Hermes gateway from the upstream checkout:
 `mac-hermes-gateway.service` on Linux and `com.mac.hermes-gateway` on macOS.
+Runtime lazy dependency installs are disabled after the preinstall step, and
+`HERMES_REDACT_SECRETS=false` in inherited Hermes env files is corrected to
+`true` because disabled redaction is treated as state drift.
 
 Deployment logs and migration reports are written under `~/.mac/logs/` on each
 host:
 
 - `deploy-*.log`
+- `deploy-manifest-*-pre.json`, `deploy-manifest-*-post.json`, and
+  `deploy-manifest-latest.json`
+- `rollback-*.sh` and `rollback-latest.sh`
 - `acc-migration-dry-run.json`
 - `acc-migration-import.json`
+- `acc-migration-status.json`
 - `startup-hermes.json`
+- `hermes-messaging-deps.json`
+- `hermes-redaction-normalization.json`
+- `hermes-log-summary.json`
 - `mac-service-journal.txt` on Linux, or `mac-service.log` on macOS
 - `hermes-gateway-journal.txt` on Linux, or `hermes-gateway.log` on macOS
 
 The activation shim for `slack_accounts.json` is intentionally applied by
 `mac` startup, not by the deploy script, so this path exercises the startup
 patch capability.
+
+To roll back the most recent deployment on a host:
+
+```bash
+~/.mac/logs/rollback-latest.sh
+```
+
+The rollback script restores the prior mac source tree, mac venv, Hermes
+checkout, and service definitions or launchd plists that existed before the
+deploy pass, then restarts the mac-managed services.
 
 ## Docker / Podman
 

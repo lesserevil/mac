@@ -103,6 +103,134 @@ def _config_explicitly_enables_slack(config_path: Path) -> bool:
     return bool(re.search(r"(?mi)^\s*slack\s*:\s*\{\s*enabled\s*:\s*true", text))
 
 
+def _bool_value(raw: Optional[str]) -> Optional[bool]:
+    if raw is None:
+        return None
+    value = raw.strip().strip("\"'").lower()
+    if value in TRUTHY:
+        return True
+    if value in FALSY:
+        return False
+    return None
+
+
+def _env_file_redaction_ref(path: Path, role: str) -> Dict[str, Any]:
+    ref = _file_ref(path, role, True)
+    ref["redact_secrets"] = "unset"
+    ref["redact_secrets_disabled"] = False
+    text = _read_small_text(path)
+    if not text:
+        return ref
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip() != "HERMES_REDACT_SECRETS":
+            continue
+        parsed = _bool_value(value)
+        if parsed is None:
+            ref["redact_secrets"] = "invalid"
+        else:
+            ref["redact_secrets"] = "true" if parsed else "false"
+            ref["redact_secrets_disabled"] = not parsed
+        break
+    return ref
+
+
+def _config_redaction_value(config_path: Path) -> str:
+    text = _read_small_text(config_path)
+    if not text:
+        return "unset"
+    match = re.search(r"(?mi)^\s*redact_secrets\s*:\s*(true|false|yes|no|on|off|1|0)\s*$", text)
+    if not match:
+        return "unset"
+    parsed = _bool_value(match.group(1))
+    if parsed is None:
+        return "invalid"
+    return "true" if parsed else "false"
+
+
+def _secret_redaction_report(hermes_home: Path, acc_dir: Path) -> Dict[str, Any]:
+    env_value = _bool_value(os.environ.get("HERMES_REDACT_SECRETS"))
+    config_value = _config_redaction_value(hermes_home / "config.yaml")
+    env_files = [
+        _env_file_redaction_ref(hermes_home / ".env", "hermes_env"),
+        _env_file_redaction_ref(acc_dir / ".env", "acc_env"),
+    ]
+    disabled_files = [
+        ref["role"] for ref in env_files if ref.get("redact_secrets_disabled")
+    ]
+
+    if env_value is not None:
+        effective = env_value
+        source = "environment"
+    elif config_value in {"true", "false"}:
+        effective = config_value == "true"
+        source = "config"
+    else:
+        effective = True
+        source = "default"
+
+    warnings = []
+    if env_value is False:
+        warnings.append("Hermes secret redaction is disabled by HERMES_REDACT_SECRETS")
+    if config_value == "false":
+        warnings.append("Hermes config disables secret redaction")
+    if disabled_files:
+        warnings.append(
+            "Inherited Hermes environment files disable secret redaction: %s"
+            % ", ".join(disabled_files)
+        )
+
+    return {
+        "effective": effective,
+        "source": source,
+        "environment": (
+            "unset"
+            if os.environ.get("HERMES_REDACT_SECRETS") is None
+            else ("true" if env_value is True else "false" if env_value is False else "invalid")
+        ),
+        "config": config_value,
+        "env_files": env_files,
+        "drift_detected": bool(warnings),
+        "warnings": warnings,
+    }
+
+
+def _log_classification_report() -> Dict[str, Any]:
+    default_path = Path("~/.mac/logs/hermes-log-summary.json").expanduser()
+    path = _expand_path(os.environ.get("MAC_HERMES_LOG_SUMMARY"), str(default_path))
+    report: Dict[str, Any] = {
+        "summary": _file_ref(path, "hermes_log_summary", False),
+        "known_benign_classes": [
+            "controlled_restart",
+            "slack_file_public_unhandled",
+        ],
+        "actionable_count": 0,
+        "benign_count": 0,
+        "classes": [],
+        "warnings": [],
+    }
+    try:
+        import json
+
+        if path.exists() and path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            classes = data.get("classes") if isinstance(data, dict) else []
+            if isinstance(classes, list):
+                report["classes"] = classes
+            report["actionable_count"] = int(data.get("actionable_count", 0))
+            report["benign_count"] = int(data.get("benign_count", 0))
+    except Exception as exc:
+        report["warnings"].append("could not read Hermes log summary: %s" % exc)
+    if report["actionable_count"]:
+        report["warnings"].append(
+            "Hermes gateway logs contain actionable classified warnings"
+        )
+    return report
+
+
 def _hermes_agent_dir_info() -> tuple[Optional[Path], bool]:
     configured = os.environ.get("MAC_HERMES_AGENT_DIR") or os.environ.get("HERMES_AGENT_DIR")
     if configured:
@@ -348,6 +476,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "warnings": [],
             "state_refs": [],
             "slack": {"activation_source": "startup_check_disabled"},
+            "security": {
+                "secret_redaction": {"effective": True, "source": "startup_check_disabled"}
+            },
+            "logs": {"classes": [], "actionable_count": 0, "benign_count": 0},
+            "operator_health": {"status": "healthy"},
         }
 
     hermes_home = _expand_path(os.environ.get("HERMES_HOME"), "~/.hermes")
@@ -356,6 +489,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     acc_refs = _refs(acc_dir, ACC_STATE_REF_CANDIDATES)
     state_refs = hermes_refs + acc_refs
     slack = _slack_activation_report(hermes_home, hermes_refs)
+    secret_redaction = _secret_redaction_report(hermes_home, acc_dir)
+    logs = _log_classification_report()
 
     warnings: List[str] = []
     if not hermes_home.exists():
@@ -370,6 +505,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         warnings.append("Hermes state.db is missing")
     if slack["warning"]:
         warnings.append(slack["warning"])
+    warnings.extend(secret_redaction["warnings"])
+    warnings.extend(logs["warnings"])
 
     checks = {
         "hermes_home_exists": hermes_home.exists(),
@@ -381,7 +518,12 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "slack_activates_if_configured": (
             not slack["account_file_present"] or bool(slack["can_activate"])
         ),
+        "secret_redaction_enabled": bool(secret_redaction["effective"])
+        and not secret_redaction["drift_detected"],
+        "logs_have_no_actionable_classes": not bool(logs["actionable_count"]),
     }
+    state_refs_existing = sum(1 for ref in state_refs if ref["exists"])
+    operator_status = "healthy" if not warnings else "degraded"
 
     return {
         "enabled": True,
@@ -392,4 +534,13 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "warnings": warnings,
         "state_refs": state_refs,
         "slack": slack,
+        "security": {"secret_redaction": secret_redaction},
+        "logs": logs,
+        "operator_health": {
+            "status": operator_status,
+            "state_refs_existing": state_refs_existing,
+            "slack_activation_source": slack["activation_source"],
+            "secret_redaction_effective": secret_redaction["effective"],
+            "log_actionable_count": logs["actionable_count"],
+        },
     }

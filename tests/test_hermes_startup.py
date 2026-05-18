@@ -18,8 +18,10 @@ def _clear_startup_env(monkeypatch) -> None:
     for name in (
         "ACC_DIR",
         "HERMES_AGENT_DIR",
+        "HERMES_REDACT_SECRETS",
         "HERMES_HOME",
         "MAC_HERMES_AGENT_DIR",
+        "MAC_HERMES_LOG_SUMMARY",
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
         "MAC_REQUIRE_HERMES_STARTUP_READY",
@@ -238,6 +240,71 @@ def test_slack_bot_token_satisfies_upstream_slack_activation(monkeypatch, tmp_pa
     assert report["ready"] is True
     assert report["slack"]["activation_source"] == "slack_bot_token"
     assert "xoxb-not-returned" not in str(report)
+
+
+def test_startup_fails_readiness_when_secret_redaction_is_disabled(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["security"]["secret_redaction"]["effective"] is False
+    assert report["checks"]["secret_redaction_enabled"] is False
+    assert "secret redaction is disabled" in " ".join(report["warnings"])
+
+
+def test_startup_detects_inherited_env_file_redaction_drift(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    acc_dir = tmp_path / ".acc"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(hermes_home / ".env", "HERMES_REDACT_SECRETS=false\nSECRET=not-returned")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("ACC_DIR", str(acc_dir))
+    monkeypatch.setenv("HERMES_REDACT_SECRETS", "true")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["security"]["secret_redaction"]["effective"] is True
+    assert report["security"]["secret_redaction"]["drift_detected"] is True
+    assert report["security"]["secret_redaction"]["env_files"][0]["redact_secrets"] == "false"
+    assert "not-returned" not in str(report)
+
+
+def test_startup_includes_gateway_log_classification(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    log_summary = tmp_path / "hermes-log-summary.json"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        log_summary,
+        '{"classes":[{"name":"secret_redaction_disabled","severity":"critical","count":1}],"actionable_count":1,"benign_count":0}',
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_LOG_SUMMARY", str(log_summary))
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["logs"]["actionable_count"] == 1
+    assert report["operator_health"]["status"] == "degraded"
 
 
 def test_api_exposes_hermes_startup_report_and_can_fail_closed(monkeypatch, tmp_path):
