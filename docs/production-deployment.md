@@ -75,6 +75,34 @@ curl -fsS http://127.0.0.1:8000/health
 The unit binds to `127.0.0.1:8000`. Put a TLS-terminating reverse proxy
 (nginx, Caddy) in front for external access — do not expose the bare port.
 
+## One-Time ACC Replacement Deploy
+
+For the current Rocky/Natasha/Bullwinkle cutover, use the fleet deploy script:
+
+```bash
+deploy/deploy-mac-fleet.sh
+```
+
+It ships this repository to each host, installs `mac` into `~/.mac/venv`,
+redeploys upstream `NousResearch/hermes-agent` into `~/.mac/hermes-agent`,
+applies the minimal multi-Slack Hermes patch, runs the ACC SQLite migration
+dry-run and import from `~/.acc/data/fleet.db` or `~/.acc/data/acc.db`, and
+starts a local `mac` service on `127.0.0.1:8789`. Linux hosts get
+`mac.service`; macOS hosts get `com.mac.control-plane`.
+
+Deployment logs and migration reports are written under `~/.mac/logs/` on each
+host:
+
+- `deploy-*.log`
+- `acc-migration-dry-run.json`
+- `acc-migration-import.json`
+- `startup-hermes.json`
+- `mac-service-journal.txt` on Linux, or `mac-service.log` on macOS
+
+The activation shim for `slack_accounts.json` is intentionally applied by
+`mac` startup, not by the deploy script, so this path exercises the startup
+patch capability.
+
 ## Docker / Podman
 
 ```bash
