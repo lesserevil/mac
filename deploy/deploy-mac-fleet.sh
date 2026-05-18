@@ -103,7 +103,28 @@ python_bin() {
 
 PY="$(python_bin)"
 
+ensure_venv_support() {
+  local probe="$MAC_HOME/.venv-probe"
+  rm -rf "$probe"
+  if "$PY" -m venv "$probe" >/dev/null 2>&1; then
+    rm -rf "$probe"
+    return
+  fi
+  rm -rf "$probe"
+  if [ "$OS_KIND" = "linux" ] && command -v apt-get >/dev/null 2>&1; then
+    log "installing python3-venv prerequisite"
+    sudo apt-get update >/dev/null
+    sudo apt-get install -y python3-venv >/dev/null
+    "$PY" -m venv "$probe" >/dev/null
+    rm -rf "$probe"
+    return
+  fi
+  log "ERROR: python venv support is unavailable and could not be installed automatically"
+  exit 1
+}
+
 log "deploy log: $DEPLOY_LOG"
+ensure_venv_support
 log "installing mac source"
 rm -rf "$SRC_DIR.new"
 mkdir -p "$SRC_DIR.new"
