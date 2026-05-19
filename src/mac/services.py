@@ -115,6 +115,8 @@ AGENTBUS_PAYLOAD_ENCODINGS = {"json", "text", "base64"}
 AGENTBUS_TYPED_CONTENT_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9.+_/-]*(;[A-Za-z0-9_.+-]+=[A-Za-z0-9_.+-]+)*$"
 )
+AGENTBUS_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+AGENTBUS_MAX_CHUNK_BYTES = 256 * 1024
 
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
 
@@ -2034,16 +2036,20 @@ class ControlPlane:
         stream_id: Optional[str] = None,
     ) -> AgentBusStream:
         self.get_agent(sender_agent_id)
-        if recipient_agent_id is not None:
-            self.get_agent(recipient_agent_id)
+        if not recipient_agent_id:
+            raise ValidationError("agentbus stream requires a recipient_agent_id")
+        self.get_agent(recipient_agent_id)
         if task_id is not None:
             self.get_task(task_id)
         self._validate_agentbus_content_type(content_type)
         topic_value = self._validate_agentbus_topic(topic)
         headers_json = json_dumps(ensure_json_object(headers))
-        sid = (stream_id or new_id("bus")).strip()
-        if not sid:
-            raise ValidationError("stream_id cannot be empty")
+        if stream_id is None:
+            sid = new_id("bus")
+        else:
+            sid = stream_id.strip() if isinstance(stream_id, str) else ""
+            if not AGENTBUS_STREAM_ID_RE.match(sid):
+                raise ValidationError("invalid agentbus stream_id: %s" % stream_id)
         if self.store.query_one("SELECT id FROM agentbus_streams WHERE id = ?", (sid,)):
             raise ValidationError("agentbus stream already exists: %s" % sid)
         now = utcnow()
@@ -2189,9 +2195,7 @@ class ControlPlane:
         params: List[Any] = []
         if agent_id is not None:
             self.get_agent(agent_id)
-            clauses.append(
-                "(sender_agent_id = ? OR recipient_agent_id = ? OR recipient_agent_id IS NULL)"
-            )
+            clauses.append("(sender_agent_id = ? OR recipient_agent_id = ?)")
             params.extend([agent_id, agent_id])
         if status is not None:
             status_value = _state_value(status)
@@ -4675,13 +4679,16 @@ class ControlPlane:
             except Exception as exc:  # noqa: BLE001 - normalize parser errors at API boundary.
                 raise ValidationError("agentbus base64 payload is invalid") from exc
         try:
-            return json_dumps(payload)
+            serialized = json_dumps(payload)
         except (TypeError, ValueError) as exc:
             raise ValidationError("agentbus payload must be JSON serializable") from exc
+        if len(serialized.encode("utf-8")) > AGENTBUS_MAX_CHUNK_BYTES:
+            raise ValidationError(
+                "agentbus chunk exceeds %d-byte limit" % AGENTBUS_MAX_CHUNK_BYTES
+            )
+        return serialized
 
     def _agentbus_authorized(self, stream: AgentBusStream, agent_id: str) -> bool:
-        if stream.recipient_agent_id is None:
-            return True
         return agent_id in {stream.sender_agent_id, stream.recipient_agent_id}
 
     def _check_payload_is_json_safe(self, value: Any, path: Sequence[str]) -> None:

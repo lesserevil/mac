@@ -1705,3 +1705,34 @@ def test_agentbus_streams_typed_content_without_weakening_control_messages(cp):
         cp.read_agentbus_chunks(outsider.id, stream.id)
     with pytest.raises(ValidationError):
         cp.append_agentbus_chunk(stream.id, sender.id, payload={"late": True})
+
+
+def test_agentbus_enforces_recipient_chunk_size_and_stream_id_shape(cp):
+    sender = register_agent(cp, "sender", ["python"])
+    recipient = register_agent(cp, "recipient", ["python"])
+
+    with pytest.raises(ValidationError):
+        cp.open_agentbus_stream(sender.id)
+    with pytest.raises(ValidationError):
+        cp.open_agentbus_stream(sender.id, recipient_agent_id=recipient.id, stream_id="bad id")
+    with pytest.raises(ValidationError):
+        cp.open_agentbus_stream(
+            sender.id, recipient_agent_id=recipient.id, stream_id="x" * 200
+        )
+    with pytest.raises(ValidationError):
+        cp.open_agentbus_stream(sender.id, recipient_agent_id=recipient.id, stream_id="../etc")
+
+    stream = cp.open_agentbus_stream(
+        sender.id,
+        recipient_agent_id=recipient.id,
+        stream_id="bus_alpha-01",
+    )
+    assert stream.id == "bus_alpha-01"
+
+    with pytest.raises(ValidationError):
+        cp.append_agentbus_chunk(
+            stream.id,
+            sender.id,
+            payload={"blob": "x" * (256 * 1024 + 1)},
+        )
+    assert cp.read_agentbus_chunks(recipient.id, stream.id) == []

@@ -1053,19 +1053,27 @@ def create_app(
         agent_id: str,
         after_sequence: int = Query(default=0),
         timeout_seconds: float = Query(default=30.0),
-        poll_interval_seconds: float = Query(default=0.05),
+        poll_interval_seconds: float = Query(default=0.25),
     ) -> StreamingResponse:
+        # Authorize before we start streaming so denials surface as proper HTTP
+        # errors rather than a half-open response.
+        cp.read_agentbus_chunks(agent_id, stream_id, 0, limit=1)
+
         async def iter_events() -> Any:
             cursor = max(0, int(after_sequence))
-            deadline = time.monotonic() + max(0.0, float(timeout_seconds))
-            poll_interval = max(0.01, float(poll_interval_seconds))
+            timeout = min(60.0, max(0.0, float(timeout_seconds)))
+            deadline = time.monotonic() + timeout
+            poll_interval = min(5.0, max(0.25, float(poll_interval_seconds)))
             while True:
                 chunks = cp.read_agentbus_chunks(agent_id, stream_id, cursor, limit=100)
                 for chunk in chunks:
                     cursor = chunk.sequence
                     yield json.dumps(chunk.to_dict(), sort_keys=True) + "\n"
-                stream = cp.get_agentbus_stream(stream_id)
-                if stream.status != "open" and not chunks:
+                if chunks:
+                    if time.monotonic() >= deadline:
+                        break
+                    continue
+                if cp.get_agentbus_stream(stream_id).status != "open":
                     break
                 if time.monotonic() >= deadline:
                     break

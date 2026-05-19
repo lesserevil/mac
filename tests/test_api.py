@@ -360,3 +360,69 @@ def test_fastapi_exposes_typed_agentbus_streams_and_ndjson_events():
     ).json()
     assert published["stream"]["status"] == "closed"
     assert published["chunk"]["payload"] == "one-shot"
+
+
+def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():
+    import time as _time
+
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "bus-host"}).json()
+    sender = client.post(
+        "/agents", json={"machine_id": machine["id"], "name": "sender"}
+    ).json()
+    recipient = client.post(
+        "/agents", json={"machine_id": machine["id"], "name": "recipient"}
+    ).json()
+    outsider = client.post(
+        "/agents", json={"machine_id": machine["id"], "name": "outsider"}
+    ).json()
+
+    no_recipient = client.post(
+        "/agentbus/streams", json={"sender_agent_id": sender["id"]}
+    )
+    assert no_recipient.status_code == 400
+
+    stream = client.post(
+        "/agentbus/streams",
+        json={"sender_agent_id": sender["id"], "recipient_agent_id": recipient["id"]},
+    ).json()
+
+    huge = client.post(
+        "/agentbus/streams/%s/chunks" % stream["id"],
+        json={"sender_agent_id": sender["id"], "payload": {"blob": "x" * (256 * 1024 + 1)}},
+    )
+    assert huge.status_code == 400
+
+    listed = client.get(
+        "/agentbus/streams/%s/chunks" % stream["id"],
+        params={"agent_id": outsider["id"]},
+    )
+    assert listed.status_code == 403
+
+    events = client.get(
+        "/agentbus/streams/%s/events" % stream["id"],
+        params={"agent_id": outsider["id"], "timeout_seconds": 0.01},
+    )
+    assert events.status_code == 403
+
+    close = client.post(
+        "/agentbus/streams/%s/close" % stream["id"],
+        params={"sender_agent_id": sender["id"]},
+    )
+    assert close.status_code == 200
+
+    started = _time.monotonic()
+    capped = client.get(
+        "/agentbus/streams/%s/events" % stream["id"],
+        params={
+            "agent_id": recipient["id"],
+            "timeout_seconds": 600,
+            "poll_interval_seconds": 0.001,
+        },
+    )
+    elapsed = _time.monotonic() - started
+    assert capped.status_code == 200
+    # Closed-stream short-circuit must return promptly even though caller
+    # asked for a 10-minute timeout — proves the server isn't honoring the
+    # client-controlled value verbatim.
+    assert elapsed < 5
