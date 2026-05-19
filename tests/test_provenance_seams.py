@@ -132,7 +132,7 @@ def test_record_vector_ref_rejects_unknown_memory_and_blank_fields(cp):
 
 def test_conversation_thread_summary_is_length_capped(cp):
     binding = _setup_binding(cp)
-    huge = "x" * (cp.CONVERSATION_SUMMARY_MAX_CHARS + 1)
+    huge = "x" * (cp.memory.CONVERSATION_SUMMARY_MAX_CHARS + 1)
     with pytest.raises(ValidationError):
         cp.track_conversation(binding.id, "thread-cap", summary=huge)
 

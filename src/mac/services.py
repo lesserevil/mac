@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -48,7 +48,6 @@ from mac.models import (
     MACError,
     Machine,
     MemoryRecord,
-    MessageStatus,
     MessageType,
     NotFoundError,
     ObservabilityEvent,
@@ -87,43 +86,16 @@ from mac.models import (
     utcnow,
     validate_transition,
 )
+from mac.agentbus_service import AgentBusService
+from mac.memory_service import MemoryService
+from mac.messaging_service import MessagingService
 from mac.observability_service import ObservabilityService
+from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
 
 
-FORBIDDEN_MESSAGE_KEYS = {
-    "argv",
-    "cmd",
-    "code",
-    "command",
-    "exec",
-    "executable",
-    "powershell",
-    "script",
-    "shell",
-}
-
-MESSAGE_TYPE_REQUIRED_FIELDS: Dict[str, Tuple[str, ...]] = {
-    MessageType.HELP_REQUEST.value: ("question",),
-    MessageType.EVIDENCE_REQUEST.value: ("task_id",),
-    MessageType.STATUS_UPDATE.value: ("status",),
-    MessageType.REVIEW_REQUEST.value: ("task_id", "review_id"),
-    MessageType.REVIEW_RESULT.value: ("task_id", "status"),
-    MessageType.NUDGE.value: ("task_id",),
-    MessageType.DECISION_RECORD.value: ("summary",),
-}
-
-AGENTBUS_PAYLOAD_ENCODINGS = {"json", "text", "base64"}
-AGENTBUS_TYPED_CONTENT_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9.+_/-]*(;[A-Za-z0-9_.+-]+=[A-Za-z0-9_.+-]+)*$"
-)
-AGENTBUS_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
-AGENTBUS_TOPIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,127}$")
-AGENTBUS_MAX_CHUNK_BYTES = 256 * 1024
-
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
 
-SECRET_HANDLE_DEFAULT_TTL_SECONDS = 300
 
 def _hash_manifest(manifest: JsonDict) -> str:
     return hashlib.sha256(json_dumps(manifest).encode("utf-8")).hexdigest()
@@ -178,6 +150,27 @@ class ControlPlane:
         # Domain sub-services. New domains should land here as their own
         # service classes rather than as more methods on ControlPlane.
         self.observability = ObservabilityService(self.store)
+        self.agentbus = AgentBusService(self.store, self.observability)
+        self.secrets = SecretsService(
+            self.store,
+            self.observability,
+            self._fernet,
+            get_agent=self.get_agent,
+            get_machine=self.get_machine,
+            machine_allows_tenant=self._machine_allows_tenant,
+        )
+        self.memory = MemoryService(
+            self.store,
+            get_task=self.get_task,
+            get_evidence=self.get_evidence,
+            get_platform_binding=self.get_platform_binding,
+            record_history=self._record_history,
+        )
+        self.messaging = MessagingService(
+            self.store,
+            get_agent=self.get_agent,
+            get_task=self.get_task,
+        )
 
     @classmethod
     def in_memory(cls) -> "ControlPlane":
@@ -2091,407 +2084,49 @@ class ControlPlane:
 
     # Communication bus
 
-    def send_message(
-        self,
-        sender_agent_id: str,
-        recipient_agent_id: Optional[str],
-        message_type: str,
-        payload: Dict[str, Any],
-        task_id: Optional[str] = None,
-    ) -> AgentMessage:
-        if sender_agent_id != "dispatcher":
-            self.get_agent(sender_agent_id)
-        if recipient_agent_id is not None:
-            self.get_agent(recipient_agent_id)
-        if task_id is not None:
-            self.get_task(task_id)
-        message_type_value = _state_value(message_type)
-        try:
-            MessageType(message_type_value)
-        except ValueError:
-            raise ValidationError("unsupported message type: %s" % message_type)
-        self._validate_message_payload(message_type_value, payload)
-        now = utcnow()
-        message_id = new_id("msg")
-        self.store.execute(
-            """
-            INSERT INTO messages (
-                id, sender_agent_id, recipient_agent_id, task_id, message_type,
-                payload, status, created_at, delivered_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                message_id,
-                sender_agent_id,
-                recipient_agent_id,
-                task_id,
-                _state_value(message_type),
-                json_dumps(payload),
-                MessageStatus.QUEUED.value,
-                now,
-            ),
-        )
-        return self.get_message(message_id)
+    # Agent control messages: thin facade over ``self.messaging``.
+
+    def send_message(self, *args: Any, **kwargs: Any) -> AgentMessage:
+        return self.messaging.send_message(*args, **kwargs)
 
     def get_message(self, message_id: str) -> AgentMessage:
-        row = self.store.query_one("SELECT * FROM messages WHERE id = ?", (message_id,))
-        if row is None:
-            raise NotFoundError("message not found: %s" % message_id)
-        return self._message_from_row(row)
+        return self.messaging.get_message(message_id)
 
-    def deliver_messages(self, agent_id: str, limit: int = 50) -> List[AgentMessage]:
-        self.get_agent(agent_id)
-        rows = self.store.query_all(
-            """
-            SELECT * FROM messages
-            WHERE status = ? AND (recipient_agent_id = ? OR recipient_agent_id IS NULL)
-            ORDER BY created_at, id
-            LIMIT ?
-            """,
-            (MessageStatus.QUEUED.value, agent_id, int(limit)),
-        )
-        now = utcnow()
-        messages = []
-        for row in rows:
-            message = self._message_from_row(row)
-            self.store.execute(
-                "UPDATE messages SET status = ?, delivered_at = ? WHERE id = ?",
-                (MessageStatus.DELIVERED.value, now, message.id),
-            )
-            messages.append(self.get_message(message.id))
-        return messages
+    def deliver_messages(self, *args: Any, **kwargs: Any) -> List[AgentMessage]:
+        return self.messaging.deliver_messages(*args, **kwargs)
 
-    def list_messages(self, agent_id: Optional[str] = None) -> List[AgentMessage]:
-        if agent_id:
-            rows = self.store.query_all(
-                "SELECT * FROM messages WHERE recipient_agent_id = ? ORDER BY created_at, id",
-                (agent_id,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM messages ORDER BY created_at, id")
-        return [self._message_from_row(row) for row in rows]
+    def list_messages(self, *args: Any, **kwargs: Any) -> List[AgentMessage]:
+        return self.messaging.list_messages(*args, **kwargs)
 
-    # AgentBus typed content streams
+    # AgentBus typed content streams: thin facade over ``self.agentbus``.
+    # New code should call ``cp.agentbus.<method>`` directly.
 
-    def open_agentbus_stream(
-        self,
-        sender_agent_id: str,
-        recipient_agent_id: Optional[str] = None,
-        content_type: str = "application/json",
-        topic: str = "content",
-        headers: Optional[Dict[str, Any]] = None,
-        task_id: Optional[str] = None,
-        stream_id: Optional[str] = None,
-    ) -> AgentBusStream:
-        self.get_agent(sender_agent_id)
-        if not recipient_agent_id:
-            raise ValidationError("agentbus stream requires a recipient_agent_id")
-        self.get_agent(recipient_agent_id)
-        if task_id is not None:
-            self.get_task(task_id)
-        self._validate_agentbus_content_type(content_type)
-        topic_value = self._validate_agentbus_topic(topic)
-        headers_json = json_dumps(ensure_json_object(headers))
-        if stream_id is None:
-            sid = new_id("bus")
-        else:
-            sid = stream_id.strip() if isinstance(stream_id, str) else ""
-            if not AGENTBUS_STREAM_ID_RE.match(sid):
-                raise ValidationError("invalid agentbus stream_id: %s" % stream_id)
-        if self.store.query_one("SELECT id FROM agentbus_streams WHERE id = ?", (sid,)):
-            raise ValidationError("agentbus stream already exists: %s" % sid)
-        now = utcnow()
-        self.store.execute(
-            """
-            INSERT INTO agentbus_streams (
-                id, sender_agent_id, recipient_agent_id, task_id, topic,
-                content_type, headers, status, created_at, updated_at, closed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                sid,
-                sender_agent_id,
-                recipient_agent_id,
-                task_id,
-                topic_value,
-                content_type,
-                headers_json,
-                AgentBusStreamStatus.OPEN.value,
-                now,
-                now,
-            ),
-        )
-        self.record_log(
-            "agentbus.stream.opened",
-            layer="agentbus",
-            source=sender_agent_id,
-            subject_type="agentbus_stream",
-            subject_id=sid,
-            detail={
-                "sender_agent_id": sender_agent_id,
-                "recipient_agent_id": recipient_agent_id,
-                "task_id": task_id,
-                "topic": topic_value,
-                "content_type": content_type,
-                "header_keys": sorted(ensure_json_object(headers).keys()),
-            },
-        )
-        return self.get_agentbus_stream(sid)
+    def open_agentbus_stream(self, *args: Any, **kwargs: Any) -> AgentBusStream:
+        return self.agentbus.open_stream(*args, **kwargs)
 
-    def append_agentbus_chunk(
-        self,
-        stream_id: str,
-        sender_agent_id: str,
-        payload: Any = None,
-        content_type: Optional[str] = None,
-        payload_encoding: str = "json",
-        final: bool = False,
-    ) -> AgentBusChunk:
-        self.get_agent(sender_agent_id)
-        payload_json = self._serialize_agentbus_payload(payload, payload_encoding)
-        chunk_id = new_id("chunk")
-        now = utcnow()
-        with self.store.transaction() as conn:
-            stream_row = conn.execute(
-                "SELECT * FROM agentbus_streams WHERE id = ?",
-                (stream_id,),
-            ).fetchone()
-            if stream_row is None:
-                raise NotFoundError("agentbus stream not found: %s" % stream_id)
-            if stream_row["sender_agent_id"] != sender_agent_id:
-                raise AuthorizationError("only the stream sender can append chunks")
-            if stream_row["status"] != AgentBusStreamStatus.OPEN.value:
-                raise ValidationError("agentbus stream is not open: %s" % stream_id)
-            chunk_content_type = content_type or stream_row["content_type"]
-            self._validate_agentbus_content_type(chunk_content_type)
-            row = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM agentbus_chunks WHERE stream_id = ?",
-                (stream_id,),
-            ).fetchone()
-            sequence = int(row["next_sequence"])
-            conn.execute(
-                """
-                INSERT INTO agentbus_chunks (
-                    id, stream_id, sequence, sender_agent_id, content_type,
-                    payload, payload_encoding, size_bytes, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chunk_id,
-                    stream_id,
-                    sequence,
-                    sender_agent_id,
-                    chunk_content_type,
-                    payload_json,
-                    payload_encoding,
-                    len(payload_json.encode("utf-8")),
-                    now,
-                ),
-            )
-            if final:
-                conn.execute(
-                    """
-                    UPDATE agentbus_streams
-                    SET status = ?, updated_at = ?, closed_at = ?
-                    WHERE id = ?
-                    """,
-                    (AgentBusStreamStatus.CLOSED.value, now, now, stream_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE agentbus_streams SET updated_at = ? WHERE id = ?",
-                    (now, stream_id),
-                )
-        chunk = self.get_agentbus_chunk(chunk_id)
-        self.record_log(
-            "agentbus.chunk.appended",
-            layer="agentbus",
-            source=sender_agent_id,
-            subject_type="agentbus_stream",
-            subject_id=stream_id,
-            detail={
-                "chunk_id": chunk.id,
-                "sequence": chunk.sequence,
-                "sender_agent_id": sender_agent_id,
-                "content_type": chunk.content_type,
-                "payload_encoding": chunk.payload_encoding,
-                "size_bytes": chunk.size_bytes,
-                "final": bool(final),
-            },
-        )
-        return chunk
+    def append_agentbus_chunk(self, *args: Any, **kwargs: Any) -> AgentBusChunk:
+        return self.agentbus.append_chunk(*args, **kwargs)
 
-    def close_agentbus_stream(
-        self,
-        stream_id: str,
-        sender_agent_id: str,
-        status: str = AgentBusStreamStatus.CLOSED.value,
-    ) -> AgentBusStream:
-        stream = self.get_agentbus_stream(stream_id)
-        self.get_agent(sender_agent_id)
-        if stream.sender_agent_id != sender_agent_id:
-            raise AuthorizationError("only the stream sender can close the stream")
-        status_value = _state_value(status)
-        if status_value == AgentBusStreamStatus.OPEN.value:
-            raise ValidationError("agentbus close status cannot be open")
-        try:
-            AgentBusStreamStatus(status_value)
-        except ValueError:
-            raise ValidationError("unsupported agentbus stream status: %s" % status)
-        if stream.status != AgentBusStreamStatus.OPEN.value:
-            if stream.status == status_value:
-                return stream
-            raise ValidationError("agentbus stream already closed: %s" % stream_id)
-        now = utcnow()
-        self.store.execute(
-            """
-            UPDATE agentbus_streams
-            SET status = ?, updated_at = ?, closed_at = ?
-            WHERE id = ?
-            """,
-            (status_value, now, now, stream_id),
-        )
-        self.record_log(
-            "agentbus.stream.closed",
-            layer="agentbus",
-            source=sender_agent_id,
-            subject_type="agentbus_stream",
-            subject_id=stream_id,
-            detail={"sender_agent_id": sender_agent_id, "status": status_value},
-        )
-        return self.get_agentbus_stream(stream_id)
+    def close_agentbus_stream(self, *args: Any, **kwargs: Any) -> AgentBusStream:
+        return self.agentbus.close_stream(*args, **kwargs)
 
     def get_agentbus_stream(self, stream_id: str) -> AgentBusStream:
-        row = self.store.query_one("SELECT * FROM agentbus_streams WHERE id = ?", (stream_id,))
-        if row is None:
-            raise NotFoundError("agentbus stream not found: %s" % stream_id)
-        return self._agentbus_stream_from_row(row)
+        return self.agentbus.get_stream(stream_id)
 
     def get_agentbus_chunk(self, chunk_id: str) -> AgentBusChunk:
-        row = self.store.query_one("SELECT * FROM agentbus_chunks WHERE id = ?", (chunk_id,))
-        if row is None:
-            raise NotFoundError("agentbus chunk not found: %s" % chunk_id)
-        return self._agentbus_chunk_from_row(row)
+        return self.agentbus.get_chunk(chunk_id)
 
-    def list_agentbus_streams(
-        self,
-        agent_id: Optional[str] = None,
-        status: Optional[str] = None,
-        limit: int = 100,
-    ) -> List[AgentBusStream]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if agent_id is not None:
-            self.get_agent(agent_id)
-            clauses.append("(sender_agent_id = ? OR recipient_agent_id = ?)")
-            params.extend([agent_id, agent_id])
-        if status is not None:
-            status_value = _state_value(status)
-            try:
-                AgentBusStreamStatus(status_value)
-            except ValueError:
-                raise ValidationError("unsupported agentbus stream status: %s" % status)
-            clauses.append("status = ?")
-            params.append(status_value)
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        params.append(max(1, min(int(limit), 1000)))
-        rows = self.store.query_all(
-            "SELECT * FROM agentbus_streams%s ORDER BY updated_at DESC, id LIMIT ?" % where,
-            tuple(params),
-        )
-        return [self._agentbus_stream_from_row(row) for row in rows]
+    def list_agentbus_streams(self, *args: Any, **kwargs: Any) -> List[AgentBusStream]:
+        return self.agentbus.list_streams(*args, **kwargs)
 
     def assert_agentbus_authorized(self, agent_id: str, stream_id: str) -> AgentBusStream:
-        self.get_agent(agent_id)
-        stream = self.get_agentbus_stream(stream_id)
-        if not self._agentbus_authorized(stream, agent_id):
-            raise AuthorizationError("agent is not authorized for agentbus stream")
-        return stream
+        return self.agentbus.assert_authorized(agent_id, stream_id)
 
-    def read_agentbus_chunks(
-        self,
-        agent_id: str,
-        stream_id: str,
-        after_sequence: int = 0,
-        limit: int = 100,
-    ) -> List[AgentBusChunk]:
-        self.assert_agentbus_authorized(agent_id, stream_id)
-        rows = self.store.query_all(
-            """
-            SELECT * FROM agentbus_chunks
-            WHERE stream_id = ? AND sequence > ?
-            ORDER BY sequence
-            LIMIT ?
-            """,
-            (
-                stream_id,
-                max(0, int(after_sequence)),
-                max(1, min(int(limit), 1000)),
-            ),
-        )
-        chunks = [self._agentbus_chunk_from_row(row) for row in rows]
-        if chunks:
-            self.record_log(
-                "agentbus.chunks.read",
-                layer="agentbus",
-                source=agent_id,
-                subject_type="agentbus_stream",
-                subject_id=stream_id,
-                detail={
-                    "agent_id": agent_id,
-                    "after_sequence": max(0, int(after_sequence)),
-                    "count": len(chunks),
-                    "last_sequence": chunks[-1].sequence,
-                },
-            )
-        return chunks
+    def read_agentbus_chunks(self, *args: Any, **kwargs: Any) -> List[AgentBusChunk]:
+        return self.agentbus.read_chunks(*args, **kwargs)
 
-    def publish_agentbus_content(
-        self,
-        sender_agent_id: str,
-        recipient_agent_id: Optional[str] = None,
-        content_type: str = "application/json",
-        payload: Any = None,
-        topic: str = "content",
-        headers: Optional[Dict[str, Any]] = None,
-        task_id: Optional[str] = None,
-        payload_encoding: str = "json",
-    ) -> JsonDict:
-        self._serialize_agentbus_payload(payload, payload_encoding)
-        stream = self.open_agentbus_stream(
-            sender_agent_id,
-            recipient_agent_id=recipient_agent_id,
-            content_type=content_type,
-            topic=topic,
-            headers=headers,
-            task_id=task_id,
-        )
-        chunk = self.append_agentbus_chunk(
-            stream.id,
-            sender_agent_id,
-            payload=payload,
-            payload_encoding=payload_encoding,
-            final=True,
-        )
-        self.record_log(
-            "agentbus.content.published",
-            layer="agentbus",
-            source=sender_agent_id,
-            subject_type="agentbus_stream",
-            subject_id=stream.id,
-            detail={
-                "sender_agent_id": sender_agent_id,
-                "recipient_agent_id": recipient_agent_id,
-                "topic": topic,
-                "content_type": content_type,
-                "payload_encoding": payload_encoding,
-                "chunk_id": chunk.id,
-            },
-        )
-        return {
-            "stream": self.get_agentbus_stream(stream.id).to_dict(),
-            "chunk": chunk.to_dict(),
-        }
+    def publish_agentbus_content(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.agentbus.publish(*args, **kwargs)
 
     # Reviews and publication
 
@@ -2729,148 +2364,29 @@ class ControlPlane:
             rows = self.store.query_all("SELECT * FROM publications ORDER BY created_at, id")
         return [self._publication_from_row(row) for row in rows]
 
-    # Secrets boundary
+    # Secrets boundary: thin facade over ``self.secrets``. New code should
+    # call ``cp.secrets.<method>`` directly.
 
-    def create_secret(
-        self,
-        name: str,
-        value: str,
-        scopes: Dict[str, Any],
-        created_by: str,
-    ) -> SecretRecord:
-        if not name or not value:
-            raise ValidationError("secret name and value are required")
-        if not scopes:
-            raise ValidationError("secret scopes are required")
-        now = utcnow()
-        secret_id = new_id("secret")
-        self.store.execute(
-            """
-            INSERT INTO secrets (id, name, scopes, ciphertext, created_by, created_at, updated_at, rotated_at, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1)
-            """,
-            (secret_id, name, json_dumps(scopes), self._encrypt(value), created_by, now, now),
-        )
-        return self.get_secret(secret_id)
+    def create_secret(self, *args: Any, **kwargs: Any) -> SecretRecord:
+        return self.secrets.create_secret(*args, **kwargs)
 
     def get_secret(self, secret_id_or_name: str) -> SecretRecord:
-        row = self.store.query_one(
-            "SELECT * FROM secrets WHERE id = ? OR name = ?",
-            (secret_id_or_name, secret_id_or_name),
-        )
-        if row is None:
-            raise NotFoundError("secret not found: %s" % secret_id_or_name)
-        return self._secret_from_row(row)
+        return self.secrets.get_secret(secret_id_or_name)
 
     def list_secrets(self) -> List[SecretRecord]:
-        rows = self.store.query_all("SELECT * FROM secrets ORDER BY name")
-        return [self._secret_from_row(row) for row in rows]
+        return self.secrets.list_secrets()
 
-    def request_secret(
-        self,
-        secret_id_or_name: str,
-        accessor_agent_id: str,
-        purpose: str,
-        ttl_seconds: int = SECRET_HANDLE_DEFAULT_TTL_SECONDS,
-    ) -> SecretHandle:
-        secret = self.get_secret(secret_id_or_name)
-        agent = self.get_agent(accessor_agent_id)
-        machine = self.get_machine(agent.machine_id)
-        granted = bool(
-            secret.enabled
-            and machine.trusted
-            and self._secret_scope_allows(secret.scopes, agent)
-        )
-        expires_at = None
-        if granted:
-            ttl = max(1, int(ttl_seconds))
-            expires_at = (parse_time(utcnow()) + timedelta(seconds=ttl)).isoformat(timespec="microseconds")
-        audit = self._record_secret_access(
-            secret.id,
-            accessor_agent_id,
-            purpose,
-            SecretAuditResult.GRANTED.value if granted else SecretAuditResult.DENIED.value,
-            expires_at=expires_at,
-        )
-        if not granted:
-            raise AuthorizationError("secret access denied")
-        return SecretHandle(secret.id, audit.id, "secret://%s#%s" % (secret.id, audit.id), True)
+    def request_secret(self, *args: Any, **kwargs: Any) -> SecretHandle:
+        return self.secrets.request_secret(*args, **kwargs)
 
-    def rotate_secret(self, secret_id_or_name: str, value: str, actor: str) -> SecretRecord:
-        if not value:
-            raise ValidationError("rotation requires a new secret value")
-        secret = self.get_secret(secret_id_or_name)
-        now = utcnow()
-        with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE secrets SET ciphertext = ?, updated_at = ?, rotated_at = ? WHERE id = ?",
-                (self._encrypt(value), now, now, secret.id),
-            )
-            conn.execute(
-                """
-                INSERT INTO secret_access_audit (
-                    id, secret_id, accessor_agent_id, purpose, result, expires_at, revealed_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
-                """,
-                (
-                    new_id("audit"),
-                    secret.id,
-                    actor or "unspecified",
-                    "rotate",
-                    SecretAuditResult.ROTATED.value,
-                    now,
-                ),
-            )
-        return self.get_secret(secret.id)
+    def rotate_secret(self, *args: Any, **kwargs: Any) -> SecretRecord:
+        return self.secrets.rotate_secret(*args, **kwargs)
 
-    def list_secret_audits(self, secret_id: Optional[str] = None) -> List[SecretAccess]:
-        if secret_id:
-            rows = self.store.query_all(
-                "SELECT * FROM secret_access_audit WHERE secret_id = ? ORDER BY created_at, id",
-                (secret_id,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM secret_access_audit ORDER BY created_at, id")
-        return [self._secret_access_from_row(row) for row in rows]
+    def list_secret_audits(self, *args: Any, **kwargs: Any) -> List[SecretAccess]:
+        return self.secrets.list_audits(*args, **kwargs)
 
-    def reveal_secret(self, secret_id: str, audit_id: str, accessor_agent_id: str) -> str:
-        """Single-use, time-limited secret reveal.
-
-        The grant audit row must (1) name the same agent that is asking, (2) still
-        be within its TTL, and (3) not already have been revealed. On success the
-        audit row is marked revealed so the same handle cannot be redeemed twice.
-        """
-        now = utcnow()
-        with self.store.transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE secret_access_audit
-                SET revealed_at = ?
-                WHERE id = ?
-                  AND secret_id = ?
-                  AND accessor_agent_id = ?
-                  AND result = ?
-                  AND revealed_at IS NULL
-                  AND (expires_at IS NULL OR expires_at > ?)
-                """,
-                (
-                    now,
-                    audit_id,
-                    secret_id,
-                    accessor_agent_id,
-                    SecretAuditResult.GRANTED.value,
-                    now,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise AuthorizationError("secret handle is expired, already used, or not granted to this agent")
-            row = conn.execute(
-                "SELECT ciphertext FROM secrets WHERE id = ? AND enabled = 1",
-                (secret_id,),
-            ).fetchone()
-        if row is None:
-            raise NotFoundError("secret not found or disabled: %s" % secret_id)
-        return self._decrypt(row["ciphertext"])
+    def reveal_secret(self, *args: Any, **kwargs: Any) -> str:
+        return self.secrets.reveal_secret(*args, **kwargs)
 
     # Artifact registry
 
@@ -3356,271 +2872,35 @@ class ControlPlane:
         rows = self.store.query_all("SELECT * FROM project_items ORDER BY created_at, id")
         return [self._project_item_from_row(row) for row in rows]
 
-    # Memory and provenance
+    # Memory + conversation threads + vector refs: thin facade over
+    # ``self.memory``. New code should call ``cp.memory.<method>`` directly.
 
-    def add_memory(
-        self,
-        task_id: Optional[str],
-        subject_type: str,
-        subject_id: Optional[str],
-        record_type: str,
-        content: str,
-        evidence_id: Optional[str],
-        created_by: str,
-    ) -> MemoryRecord:
-        if task_id is not None:
-            self.get_task(task_id)
-        if evidence_id is not None:
-            self.get_evidence(evidence_id)
-        if not subject_type or not record_type or not content:
-            raise ValidationError("memory requires subject_type, record_type, and content")
-        now = utcnow()
-        memory_id = new_id("mem")
-        self.store.execute(
-            """
-            INSERT INTO memory_records (
-                id, task_id, subject_type, subject_id, record_type, content, evidence_id, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (memory_id, task_id, subject_type, subject_id, record_type, content, evidence_id, created_by, now),
-        )
-        if task_id:
-            self._record_history(
-                task_id,
-                "task.memory_recorded",
-                created_by,
-                None,
-                None,
-                {"memory_id": memory_id, "record_type": record_type},
-            )
-        return self.get_memory(memory_id)
+    def add_memory(self, *args: Any, **kwargs: Any) -> MemoryRecord:
+        return self.memory.add_memory(*args, **kwargs)
 
     def get_memory(self, memory_id: str) -> MemoryRecord:
-        row = self.store.query_one("SELECT * FROM memory_records WHERE id = ?", (memory_id,))
-        if row is None:
-            raise NotFoundError("memory record not found: %s" % memory_id)
-        return self._memory_from_row(row)
+        return self.memory.get_memory(memory_id)
 
-    def search_memory(
-        self,
-        task_id: Optional[str] = None,
-        subject_type: Optional[str] = None,
-        subject_id: Optional[str] = None,
-    ) -> List[MemoryRecord]:
-        clauses = []
-        params: List[Any] = []
-        if task_id:
-            clauses.append("task_id = ?")
-            params.append(task_id)
-        if subject_type:
-            clauses.append("subject_type = ?")
-            params.append(subject_type)
-        if subject_id:
-            clauses.append("subject_id = ?")
-            params.append(subject_id)
-        sql = "SELECT * FROM memory_records"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at, id"
-        rows = self.store.query_all(sql, tuple(params))
-        return [self._memory_from_row(row) for row in rows]
+    def search_memory(self, *args: Any, **kwargs: Any) -> List[MemoryRecord]:
+        return self.memory.search_memory(*args, **kwargs)
 
-    # Gateway + vector-memory provenance
-    #
-    # These are mac-side audit seams for cross-process integrations. mac does
-    # not implement Slack/Telegram/Discord gateways or Qdrant/pgvector clients
-    # — those live on the Hermes side per the memory contract. What mac records
-    # is the *pointer*: "this thread is talking to that instance about that
-    # task" and "this memory record was indexed at that point in that
-    # collection." Operators can audit cross-process flow without mac ever
-    # touching conversation content or embeddings.
+    def track_conversation(self, *args: Any, **kwargs: Any) -> ConversationThread:
+        return self.memory.track_conversation(*args, **kwargs)
 
-    CONVERSATION_SUMMARY_MAX_CHARS = 500
+    def get_conversation_thread(self, thread_id: str) -> ConversationThread:
+        return self.memory.get_conversation_thread(thread_id)
 
-    def track_conversation(
-        self,
-        platform_binding_id: str,
-        external_thread_id: str,
-        summary: str = "",
-        latest_task_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> "ConversationThread":
-        binding = self.get_platform_binding(platform_binding_id)
-        external_thread_id = (external_thread_id or "").strip()
-        if not external_thread_id:
-            raise ValidationError("external_thread_id is required")
-        # The summary is an operator-facing brief, not a transcript. Capping
-        # length enforces the boundary contract — gateways that try to dump
-        # conversation content here get truncated. Hermes still owns content.
-        if summary and len(summary) > self.CONVERSATION_SUMMARY_MAX_CHARS:
-            raise ValidationError(
-                "conversation summary too long (%d > %d); store transcripts in Hermes, not mac"
-                % (len(summary), self.CONVERSATION_SUMMARY_MAX_CHARS)
-            )
-        if latest_task_id is not None:
-            self.get_task(latest_task_id)
-        now = utcnow()
-        existing = self.store.query_one(
-            """
-            SELECT * FROM conversation_threads
-            WHERE platform_binding_id = ? AND external_thread_id = ?
-            """,
-            (binding.id, external_thread_id),
-        )
-        if existing is not None:
-            # Touch last_seen_at; preserve first_seen_at. Augment summary +
-            # metadata + latest_task_id only when caller passed them.
-            new_summary = summary if summary else existing["summary"]
-            existing_meta = json_loads(existing["metadata"], {})
-            if metadata:
-                existing_meta.update(metadata)
-            new_task = latest_task_id if latest_task_id is not None else existing["latest_task_id"]
-            self.store.execute(
-                """
-                UPDATE conversation_threads
-                SET summary = ?, metadata = ?, latest_task_id = ?, last_seen_at = ?
-                WHERE id = ?
-                """,
-                (new_summary, json_dumps(existing_meta), new_task, now, existing["id"]),
-            )
-            return self.get_conversation_thread(existing["id"])
-        thread_id = new_id("thread")
-        self.store.execute(
-            """
-            INSERT INTO conversation_threads (
-                id, platform_binding_id, external_thread_id, latest_task_id,
-                summary, metadata, first_seen_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                thread_id,
-                binding.id,
-                external_thread_id,
-                latest_task_id,
-                summary,
-                json_dumps(ensure_json_object(metadata)),
-                now,
-                now,
-            ),
-        )
-        return self.get_conversation_thread(thread_id)
+    def list_conversation_threads(self, *args: Any, **kwargs: Any) -> List[ConversationThread]:
+        return self.memory.list_conversation_threads(*args, **kwargs)
 
-    def get_conversation_thread(self, thread_id: str) -> "ConversationThread":
-        row = self.store.query_one(
-            "SELECT * FROM conversation_threads WHERE id = ?", (thread_id,)
-        )
-        if row is None:
-            raise NotFoundError("conversation thread not found: %s" % thread_id)
-        return self._conversation_thread_from_row(row)
+    def record_vector_ref(self, *args: Any, **kwargs: Any) -> VectorRef:
+        return self.memory.record_vector_ref(*args, **kwargs)
 
-    def list_conversation_threads(
-        self,
-        platform_binding_id: Optional[str] = None,
-    ) -> List["ConversationThread"]:
-        if platform_binding_id:
-            rows = self.store.query_all(
-                """
-                SELECT * FROM conversation_threads
-                WHERE platform_binding_id = ?
-                ORDER BY last_seen_at DESC, id
-                """,
-                (platform_binding_id,),
-            )
-        else:
-            rows = self.store.query_all(
-                "SELECT * FROM conversation_threads ORDER BY last_seen_at DESC, id"
-            )
-        return [self._conversation_thread_from_row(row) for row in rows]
+    def get_vector_ref(self, ref_id: str) -> VectorRef:
+        return self.memory.get_vector_ref(ref_id)
 
-    def record_vector_ref(
-        self,
-        memory_id: str,
-        vector_db: str,
-        collection: str,
-        point_id: str,
-        embedding_model: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        created_by: str = "human",
-    ) -> "VectorRef":
-        self.get_memory(memory_id)
-        if not vector_db or not collection or not point_id:
-            raise ValidationError("vector_db, collection, and point_id are required")
-        now = utcnow()
-        ref_id = new_id("vref")
-        self.store.execute(
-            """
-            INSERT INTO vector_refs (
-                id, memory_id, vector_db, collection, point_id,
-                embedding_model, metadata, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ref_id,
-                memory_id,
-                vector_db,
-                collection,
-                point_id,
-                embedding_model,
-                json_dumps(ensure_json_object(metadata)),
-                created_by,
-                now,
-            ),
-        )
-        return self.get_vector_ref(ref_id)
-
-    def get_vector_ref(self, ref_id: str) -> "VectorRef":
-        row = self.store.query_one("SELECT * FROM vector_refs WHERE id = ?", (ref_id,))
-        if row is None:
-            raise NotFoundError("vector ref not found: %s" % ref_id)
-        return self._vector_ref_from_row(row)
-
-    def list_vector_refs(
-        self,
-        memory_id: Optional[str] = None,
-        vector_db: Optional[str] = None,
-        collection: Optional[str] = None,
-    ) -> List["VectorRef"]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if memory_id is not None:
-            clauses.append("memory_id = ?")
-            params.append(memory_id)
-        if vector_db is not None:
-            clauses.append("vector_db = ?")
-            params.append(vector_db)
-        if collection is not None:
-            clauses.append("collection = ?")
-            params.append(collection)
-        sql = "SELECT * FROM vector_refs"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at, id"
-        return [self._vector_ref_from_row(row) for row in self.store.query_all(sql, tuple(params))]
-
-    def _conversation_thread_from_row(self, row: Any) -> "ConversationThread":
-        return ConversationThread(
-            row["id"],
-            row["platform_binding_id"],
-            row["external_thread_id"],
-            row["latest_task_id"],
-            row["summary"],
-            json_loads(row["metadata"], {}),
-            row["first_seen_at"],
-            row["last_seen_at"],
-        )
-
-    def _vector_ref_from_row(self, row: Any) -> "VectorRef":
-        return VectorRef(
-            row["id"],
-            row["memory_id"],
-            row["vector_db"],
-            row["collection"],
-            row["point_id"],
-            row["embedding_model"],
-            json_loads(row["metadata"], {}),
-            row["created_by"],
-            row["created_at"],
-        )
+    def list_vector_refs(self, *args: Any, **kwargs: Any) -> List[VectorRef]:
+        return self.memory.list_vector_refs(*args, **kwargs)
 
     # Evaluation
 
@@ -4401,47 +3681,6 @@ class ControlPlane:
             row["last_seen_at"],
         )
 
-    def _message_from_row(self, row: Any) -> AgentMessage:
-        return AgentMessage(
-            row["id"],
-            row["sender_agent_id"],
-            row["recipient_agent_id"],
-            row["task_id"],
-            row["message_type"],
-            json_loads(row["payload"], {}),
-            row["status"],
-            row["created_at"],
-            row["delivered_at"],
-        )
-
-    def _agentbus_stream_from_row(self, row: Any) -> AgentBusStream:
-        return AgentBusStream(
-            row["id"],
-            row["sender_agent_id"],
-            row["recipient_agent_id"],
-            row["task_id"],
-            row["topic"],
-            row["content_type"],
-            json_loads(row["headers"], {}),
-            row["status"],
-            row["created_at"],
-            row["updated_at"],
-            row["closed_at"],
-        )
-
-    def _agentbus_chunk_from_row(self, row: Any) -> AgentBusChunk:
-        return AgentBusChunk(
-            row["id"],
-            row["stream_id"],
-            int(row["sequence"]),
-            row["sender_agent_id"],
-            row["content_type"],
-            json_loads(row["payload"], None),
-            row["payload_encoding"],
-            int(row["size_bytes"]),
-            row["created_at"],
-        )
-
     def _review_from_row(self, row: Any) -> Review:
         return Review(
             row["id"],
@@ -4463,30 +3702,6 @@ class ControlPlane:
             row["evidence_id"],
             row["content_hash"],
             row["created_by"],
-            row["created_at"],
-        )
-
-    def _secret_from_row(self, row: Any) -> SecretRecord:
-        return SecretRecord(
-            row["id"],
-            row["name"],
-            json_loads(row["scopes"], {}),
-            row["created_by"],
-            row["created_at"],
-            row["updated_at"],
-            row["rotated_at"],
-            bool(row["enabled"]),
-        )
-
-    def _secret_access_from_row(self, row: Any) -> SecretAccess:
-        return SecretAccess(
-            row["id"],
-            row["secret_id"],
-            row["accessor_agent_id"],
-            row["purpose"],
-            row["result"],
-            row["expires_at"],
-            row["revealed_at"],
             row["created_at"],
         )
 
@@ -4523,19 +3738,6 @@ class ControlPlane:
             row["status"],
             row["created_at"],
             row["updated_at"],
-        )
-
-    def _memory_from_row(self, row: Any) -> MemoryRecord:
-        return MemoryRecord(
-            row["id"],
-            row["task_id"],
-            row["subject_type"],
-            row["subject_id"],
-            row["record_type"],
-            row["content"],
-            row["evidence_id"],
-            row["created_by"],
-            row["created_at"],
         )
 
     def _rollout_from_row(self, row: Any) -> Rollout:
@@ -5028,161 +4230,6 @@ class ControlPlane:
                     },
                     timestamp,
                 )
-
-    def _validate_message_payload(self, message_type: str, payload: Dict[str, Any]) -> None:
-        if not isinstance(payload, dict):
-            raise ValidationError("message payload must be a JSON object")
-        required = MESSAGE_TYPE_REQUIRED_FIELDS.get(message_type, ())
-        missing = [field for field in required if payload.get(field) in (None, "")]
-        if missing:
-            raise ValidationError(
-                "message %s payload missing required field(s): %s"
-                % (message_type, ",".join(missing))
-            )
-        self._check_payload_is_json_safe(payload, ())
-
-    def _validate_agentbus_content_type(self, content_type: str) -> None:
-        if not isinstance(content_type, str) or not content_type.strip():
-            raise ValidationError("agentbus content_type is required")
-        if len(content_type) > 128 or not AGENTBUS_TYPED_CONTENT_RE.match(content_type):
-            raise ValidationError("invalid agentbus content_type: %s" % content_type)
-
-    def _validate_agentbus_topic(self, topic: str) -> str:
-        if not isinstance(topic, str) or not topic.strip():
-            raise ValidationError("agentbus topic is required")
-        topic_value = topic.strip()
-        if not AGENTBUS_TOPIC_RE.match(topic_value):
-            raise ValidationError("invalid agentbus topic: %s" % topic)
-        return topic_value
-
-    def _serialize_agentbus_payload(self, payload: Any, payload_encoding: str) -> str:
-        if payload_encoding not in AGENTBUS_PAYLOAD_ENCODINGS:
-            raise ValidationError("unsupported agentbus payload_encoding: %s" % payload_encoding)
-        if payload_encoding in {"text", "base64"} and not isinstance(payload, str):
-            raise ValidationError("agentbus %s payload must be a string" % payload_encoding)
-        if payload_encoding == "base64":
-            try:
-                base64.b64decode(payload.encode("ascii"), validate=True)
-            except Exception as exc:  # noqa: BLE001 - normalize parser errors at API boundary.
-                raise ValidationError("agentbus base64 payload is invalid") from exc
-        try:
-            serialized = json_dumps(payload)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("agentbus payload must be JSON serializable") from exc
-        if len(serialized.encode("utf-8")) > AGENTBUS_MAX_CHUNK_BYTES:
-            raise ValidationError(
-                "agentbus chunk exceeds %d-byte limit" % AGENTBUS_MAX_CHUNK_BYTES
-            )
-        return serialized
-
-    def _agentbus_authorized(self, stream: AgentBusStream, agent_id: str) -> bool:
-        return agent_id in {stream.sender_agent_id, stream.recipient_agent_id}
-
-    def _check_payload_is_json_safe(self, value: Any, path: Sequence[str]) -> None:
-        """Reject non-JSON-serializable payloads early.
-
-        Workers consume messages as structured data and look up durable tasks
-        from the ledger. Message payloads are not an execution channel.
-        """
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                if not isinstance(key, str):
-                    raise ValidationError(
-                        "message payload keys must be strings at %s" % ".".join(path)
-                    )
-                key_path = path + (key,)
-                if key.lower() in FORBIDDEN_MESSAGE_KEYS:
-                    raise ValidationError(
-                        "message payload cannot contain execution key: %s"
-                        % ".".join(key_path)
-                    )
-                self._check_payload_is_json_safe(nested, key_path)
-        elif isinstance(value, list):
-            for index, nested in enumerate(value):
-                self._check_payload_is_json_safe(nested, path + (str(index),))
-        elif not isinstance(value, (str, int, float, bool, type(None))):
-            raise ValidationError(
-                "message payload contains non-JSON value at %s" % ".".join(path)
-            )
-
-    def _record_secret_access(
-        self,
-        secret_id: str,
-        accessor_agent_id: str,
-        purpose: str,
-        result: str,
-        expires_at: Optional[str] = None,
-    ) -> SecretAccess:
-        audit_id = new_id("audit")
-        when = utcnow()
-        self.store.execute(
-            """
-            INSERT INTO secret_access_audit (
-                id, secret_id, accessor_agent_id, purpose, result, expires_at, revealed_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-            """,
-            (
-                audit_id,
-                secret_id,
-                accessor_agent_id,
-                purpose or "unspecified",
-                result,
-                expires_at,
-                when,
-            ),
-        )
-        self.observability.insert_observation(
-            self.store,
-            "log",
-            "secret.%s" % result,
-            "control_plane",
-            "secret",
-            "warning" if result == SecretAuditResult.DENIED.value else "info",
-            None,
-            "",
-            "secret",
-            secret_id,
-            {
-                "accessor_agent_id": accessor_agent_id,
-                "purpose": purpose or "unspecified",
-                "expires_at": expires_at,
-            },
-            when,
-        )
-        row = self.store.query_one("SELECT * FROM secret_access_audit WHERE id = ?", (audit_id,))
-        if row is None:
-            raise NotFoundError("secret audit not found: %s" % audit_id)
-        return self._secret_access_from_row(row)
-
-    def _secret_scope_allows(self, scopes: JsonDict, agent: Agent) -> bool:
-        agents = set(scopes.get("agents") or [])
-        capabilities = set(scopes.get("capabilities") or [])
-        tenant_scope = set(scopes.get("tenant_ids") or [])
-        if scopes.get("tenant_id"):
-            tenant_scope.add(str(scopes["tenant_id"]))
-        if tenant_scope:
-            machine = self.get_machine(agent.machine_id)
-            if not any(self._machine_allows_tenant(machine, tenant_id) for tenant_id in tenant_scope):
-                return False
-        if agent.id in agents:
-            return True
-        if capabilities and capabilities.intersection(set(agent.capabilities)):
-            return True
-        # Tenant-only scope: if the caller scoped solely by tenant, the tenant
-        # check above is the entire gate. Without this, tenant-only secrets are
-        # unreachable, which contradicts the API surface.
-        if tenant_scope and not agents and not capabilities:
-            return True
-        return False
-
-    def _encrypt(self, value: str) -> str:
-        return self._fernet.encrypt(value.encode("utf-8")).decode("ascii")
-
-    def _decrypt(self, value: str) -> str:
-        try:
-            return self._fernet.decrypt(value.encode("ascii")).decode("utf-8")
-        except InvalidToken as exc:
-            raise MACError("secret ciphertext failed authentication") from exc
 
     def _validate_runtime_manifest(self, manifest: JsonDict) -> None:
         self._scan_runtime_manifest(manifest, ())
