@@ -1156,7 +1156,7 @@ else
 fi
 
 install_linux_service() {
-  local unit="/etc/systemd/system/mac.service"
+  local unit="/etc/systemd/system/mac.service" restart_since
   log "installing systemd service $unit"
   install_hermes_gateway_wrapper
   install_mac_agent_wrapper
@@ -1188,10 +1188,11 @@ WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
   sudo systemctl enable mac.service
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac.service
   sleep 3
   sudo systemctl --no-pager -l status mac.service || true
-  sudo journalctl -u mac.service --since "$DEPLOY_STARTED_ISO" --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
+  sudo journalctl -u mac.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
   install_linux_hermes_service
 }
 
@@ -1348,7 +1349,7 @@ PY
 }
 
 install_linux_hermes_service() {
-  local unit="/etc/systemd/system/mac-hermes-gateway.service"
+  local unit="/etc/systemd/system/mac-hermes-gateway.service" restart_since
   log "installing systemd service $unit"
   if sudo test -f "$unit"; then
     HERMES_UNIT_BACKUP="$MAC_HOME/backups/mac-hermes-gateway.service.${AGENT}.${DEPLOY_TS}"
@@ -1386,15 +1387,16 @@ WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
   sudo systemctl enable mac-hermes-gateway.service
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac-hermes-gateway.service
   sleep 5
   sudo systemctl --no-pager -l status mac-hermes-gateway.service || true
-  sudo journalctl -u mac-hermes-gateway.service --since "$DEPLOY_STARTED_ISO" --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
+  sudo journalctl -u mac-hermes-gateway.service --since "$restart_since" --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
   install_linux_agent_service
 }
 
 install_linux_agent_service() {
-  local unit="/etc/systemd/system/mac-agent.service"
+  local unit="/etc/systemd/system/mac-agent.service" restart_since
   log "installing systemd service $unit"
   if sudo test -f "$unit"; then
     MAC_AGENT_UNIT_BACKUP="$MAC_HOME/backups/mac-agent.service.${AGENT}.${DEPLOY_TS}"
@@ -1427,10 +1429,11 @@ WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
   sudo systemctl enable mac-agent.service
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac-agent.service
   sleep 3
   sudo systemctl --no-pager -l status mac-agent.service || true
-  sudo journalctl -u mac-agent.service --since "$DEPLOY_STARTED_ISO" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
+  sudo journalctl -u mac-agent.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
 install_darwin_service() {
