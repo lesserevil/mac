@@ -184,6 +184,28 @@ class AgentBusPublish(BaseModel):
     payload_encoding: str = "json"
 
 
+class ObservabilityMetricCreate(BaseModel):
+    name: str
+    value: float
+    unit: str = ""
+    layer: str = "external"
+    source: str = "agent"
+    level: str = "info"
+    subject_type: Optional[str] = None
+    subject_id: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ObservabilityLogCreate(BaseModel):
+    name: str
+    level: str = "info"
+    layer: str = "external"
+    source: str = "agent"
+    subject_type: Optional[str] = None
+    subject_id: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ReviewRequest(BaseModel):
     reviewer_agent_id: str
     actor: str = "dispatcher"
@@ -428,6 +450,8 @@ def _required_scope(method: str, path: str) -> Optional[str]:
         return "agent"
     if path.startswith("/agentbus"):
         return "agent"
+    if path.startswith("/observability"):
+        return "agent"
     if path.startswith("/dispatch"):
         return "dispatch"
     if path.startswith("/secrets") or path.startswith("/secret-audits"):
@@ -452,6 +476,14 @@ def _authorize_request(
         raise AuthorizationError("unknown bearer token")
     if "admin" not in scopes and required not in scopes:
         raise AuthorizationError("token lacks required scope: %s" % required)
+
+
+def _should_record_http_observation(path: str) -> bool:
+    return not (
+        path == "/health"
+        or path.startswith("/ui/assets")
+        or path.startswith("/observability/stream")
+    )
 
 
 TERMINAL_DASHBOARD_STATES = {"completed", "failed", "cancelled"}
@@ -690,6 +722,7 @@ def _dashboard_state(
         "rollouts": rollout_statuses,
         "eval_sets": [eval_set.to_dict() for eval_set in cp.list_eval_sets()],
         "eval_runs": [run.to_dict() for run in cp.list_eval_runs()],
+        "observability": cp.observability_summary(),
         "hermes_startup": hermes_startup,
     }
 
@@ -730,6 +763,10 @@ def create_app(
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next: Any) -> Any:
+        started = time.monotonic()
+        status_code = 500
+        error_name = ""
+        response: Any = None
         try:
             _authorize_request(
                 request.method,
@@ -738,8 +775,76 @@ def create_app(
                 tokens,
             )
         except AuthorizationError as exc:
-            return JSONResponse(status_code=403, content={"detail": str(exc)})
-        return await call_next(request)
+            status_code = 403
+            error_name = exc.__class__.__name__
+            response = JSONResponse(status_code=status_code, content={"detail": str(exc)})
+        if response is None:
+            try:
+                response = await call_next(request)
+                status_code = int(getattr(response, "status_code", 500))
+            except Exception as exc:
+                error_name = exc.__class__.__name__
+                raise
+            finally:
+                duration_ms = (time.monotonic() - started) * 1000.0
+                if _should_record_http_observation(request.url.path):
+                    level = "error" if status_code >= 500 else "warning" if status_code >= 400 else "info"
+                    detail = {
+                        "method": request.method,
+                        "path": request.url.path,
+                        "status_code": status_code,
+                        "duration_ms": round(duration_ms, 3),
+                    }
+                    if error_name:
+                        detail["error"] = error_name
+                    try:
+                        cp.record_metric(
+                            "http.request.duration_ms",
+                            duration_ms,
+                            unit="ms",
+                            layer="api",
+                            source="http",
+                            level=level,
+                            detail=detail,
+                        )
+                        cp.record_log(
+                            "http.request",
+                            level=level,
+                            layer="api",
+                            source="http",
+                            detail=detail,
+                        )
+                    except Exception:
+                        pass
+        elif _should_record_http_observation(request.url.path):
+            duration_ms = (time.monotonic() - started) * 1000.0
+            detail = {
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": status_code,
+                "duration_ms": round(duration_ms, 3),
+                "error": error_name,
+            }
+            try:
+                cp.record_metric(
+                    "http.request.duration_ms",
+                    duration_ms,
+                    unit="ms",
+                    layer="api",
+                    source="http",
+                    level="warning",
+                    detail=detail,
+                )
+                cp.record_log(
+                    "http.request",
+                    level="warning",
+                    layer="api",
+                    source="http",
+                    detail=detail,
+                )
+            except Exception:
+                pass
+        return response
 
     @app.get("/health")
     def health() -> Dict[str, str]:
@@ -1007,6 +1112,90 @@ def create_app(
             until=until,
             limit=limit,
         )
+
+    @app.post("/observability/metrics")
+    def record_observability_metric(body: ObservabilityMetricCreate) -> Dict[str, Any]:
+        return cp.record_metric(**_data(body)).to_dict()
+
+    @app.post("/observability/logs")
+    def record_observability_log(body: ObservabilityLogCreate) -> Dict[str, Any]:
+        return cp.record_log(**_data(body)).to_dict()
+
+    @app.get("/observability")
+    def list_observability(
+        kind: Optional[str] = Query(default=None),
+        layer: Optional[str] = Query(default=None),
+        level: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        subject_type: Optional[str] = Query(default=None),
+        subject_id: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        after_sequence: Optional[int] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            event.to_dict()
+            for event in cp.list_observability(
+                kind=kind,
+                layer=layer,
+                level=level,
+                name=name,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                since=since,
+                until=until,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/observability/summary")
+    def observability_summary(limit: int = Query(default=80)) -> Dict[str, Any]:
+        return cp.observability_summary(limit)
+
+    @app.get("/observability/stream")
+    async def observability_stream(
+        after_sequence: int = Query(default=0),
+        timeout_seconds: float = Query(default=30.0),
+        poll_interval_seconds: float = Query(default=0.5),
+        kind: Optional[str] = Query(default=None),
+        layer: Optional[str] = Query(default=None),
+        level: Optional[str] = Query(default=None),
+    ) -> StreamingResponse:
+        cp.list_observability(
+            kind=kind,
+            layer=layer,
+            level=level,
+            after_sequence=max(0, int(after_sequence)),
+            limit=1,
+        )
+
+        async def iter_observations() -> Any:
+            cursor = max(0, int(after_sequence))
+            deadline = time.monotonic() + _agentbus_clamp_timeout(timeout_seconds)
+            poll_interval = _agentbus_clamp_poll_interval(poll_interval_seconds)
+            while True:
+                observations = cp.list_observability(
+                    kind=kind,
+                    layer=layer,
+                    level=level,
+                    after_sequence=cursor,
+                    limit=100,
+                )
+                for observation in observations:
+                    cursor = observation.sequence
+                    yield json.dumps(observation.to_dict(), sort_keys=True) + "\n"
+                if observations:
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0)
+                    continue
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(poll_interval)
+
+        return StreamingResponse(iter_observations(), media_type="application/x-ndjson")
 
     @app.post("/messages")
     def send_message(body: MessageCreate) -> Dict[str, Any]:

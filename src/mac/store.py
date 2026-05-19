@@ -269,6 +269,28 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_agentbus_chunks_stream_sequence
                     ON agentbus_chunks (stream_id, sequence);
 
+                CREATE TABLE IF NOT EXISTS observability_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    layer TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    subject_type TEXT,
+                    subject_id TEXT,
+                    value REAL,
+                    unit TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_observability_events_created
+                    ON observability_events (created_at, sequence);
+                CREATE INDEX IF NOT EXISTS idx_observability_events_kind_layer
+                    ON observability_events (kind, layer, created_at);
+                CREATE INDEX IF NOT EXISTS idx_observability_events_name_created
+                    ON observability_events (name, created_at);
+
                 -- Per-agent operational events (mood transitions, nap
                 -- lifecycle, future agent-level audit). Flows through the
                 -- unified events view.

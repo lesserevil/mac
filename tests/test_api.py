@@ -145,11 +145,14 @@ def test_fastapi_serves_dashboard_shell_without_api_token():
     assert ui_response.status_code == 200
     assert "MAC Control Plane" in ui_response.text
     assert "/ui/assets/app.js" in ui_response.text
+    assert 'data-view="observability"' in ui_response.text
 
     script_response = client.get("/ui/assets/app.js")
     assert script_response.status_code == 200
     assert "requestJSON" in script_response.text
     assert "data-action=\"dispatchTick\"" in script_response.text
+    assert "renderObservability" in script_response.text
+    assert "/observability/stream" in script_response.text
 
     assert client.get("/agents").status_code == 403
     assert client.get("/agents", headers={"Authorization": "Bearer reader"}).status_code == 200
@@ -195,6 +198,8 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert state["secrets"][0]["value"] == "***REDACTED***"
     assert "never-render-this" not in str(state)
     assert state["secret_audits"][0]["id"] == handle["audit_id"]
+    assert "observability" in state
+    assert state["observability"]["counts"]["events"] >= 1
 
     timeline = client.get("/dashboard/tasks/%s/timeline" % task["id"]).json()
     assert timeline["task"]["title"] == "Dashboard task"
@@ -246,6 +251,81 @@ def test_events_endpoint_returns_unified_stream():
     ).json()
     assert task_only
     assert all(event["subject_id"] == task["id"] for event in task_only)
+
+
+def test_observability_api_records_lists_and_streams_metrics_and_logs():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+
+    metric = client.post(
+        "/observability/metrics",
+        json={
+            "name": "worker.queue.depth",
+            "value": 7,
+            "unit": "tasks",
+            "layer": "worker",
+            "source": "rocky",
+            "detail": {"queue": "default"},
+        },
+    ).json()
+    log = client.post(
+        "/observability/logs",
+        json={
+            "name": "worker.dispatch.waiting",
+            "level": "warning",
+            "layer": "worker",
+            "source": "rocky",
+            "detail": {"reason": "no lease"},
+        },
+    ).json()
+
+    assert metric["sequence"] < log["sequence"]
+    listed = client.get(
+        "/observability",
+        params={"kind": "metric", "layer": "worker"},
+    ).json()
+    assert [item["name"] for item in listed] == ["worker.queue.depth"]
+
+    summary = client.get("/observability/summary").json()
+    assert summary["counts"]["metrics"] >= 1
+    assert summary["counts"]["warnings"] >= 1
+    assert any(item["name"] == "worker.queue.depth" for item in summary["latest_metrics"])
+
+    streamed = client.get(
+        "/observability/stream",
+        params={
+            "after_sequence": metric["sequence"] - 1,
+            "layer": "worker",
+            "timeout_seconds": 0.01,
+        },
+    )
+    assert streamed.status_code == 200
+    lines = [json.loads(line) for line in streamed.text.splitlines() if line]
+    assert [line["id"] for line in lines[:2]] == [metric["id"], log["id"]]
+
+
+def test_observability_write_requires_agent_scope_when_auth_enabled():
+    client = TestClient(
+        create_app(
+            control_plane=ControlPlane.in_memory(),
+            auth_tokens={"reader": ["read"], "agent": ["agent"]},
+        )
+    )
+    body = {"name": "worker.queue.depth", "value": 1, "layer": "worker"}
+
+    assert client.post(
+        "/observability/metrics",
+        headers={"Authorization": "Bearer reader"},
+        json=body,
+    ).status_code == 403
+    assert client.post(
+        "/observability/metrics",
+        headers={"Authorization": "Bearer agent"},
+        json=body,
+    ).status_code == 200
+    assert client.get(
+        "/observability",
+        headers={"Authorization": "Bearer reader"},
+    ).status_code == 200
 
 
 def test_create_app_refuses_to_start_with_placeholder_secret_key():

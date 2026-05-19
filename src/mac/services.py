@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,9 @@ from mac.models import (
     MessageStatus,
     MessageType,
     NotFoundError,
+    OBSERVABILITY_KINDS,
+    OBSERVABILITY_LEVELS,
+    ObservabilityEvent,
     Persona,
     PlatformBinding,
     ProjectItem,
@@ -118,6 +122,7 @@ AGENTBUS_TYPED_CONTENT_RE = re.compile(
 AGENTBUS_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 AGENTBUS_TOPIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,127}$")
 AGENTBUS_MAX_CHUNK_BYTES = 256 * 1024
+OBSERVABILITY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,127}$")
 
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
 
@@ -828,6 +833,182 @@ class ControlPlane:
             for row in rows
         ]
 
+    # Observability: coherent metrics/logs across API, control-plane, workers,
+    # deployment shims, and external agents.
+
+    def record_observation(
+        self,
+        kind: str,
+        name: str,
+        layer: str = "control_plane",
+        source: str = "mac",
+        level: str = "info",
+        value: Optional[float] = None,
+        unit: str = "",
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> ObservabilityEvent:
+        return self._insert_observation(
+            self.store,
+            kind,
+            name,
+            layer,
+            source,
+            level,
+            value,
+            unit,
+            subject_type,
+            subject_id,
+            detail or {},
+            utcnow(),
+        )
+
+    def record_metric(
+        self,
+        name: str,
+        value: float,
+        unit: str = "",
+        layer: str = "control_plane",
+        source: str = "mac",
+        level: str = "info",
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> ObservabilityEvent:
+        return self.record_observation(
+            "metric",
+            name,
+            layer,
+            source,
+            level,
+            value,
+            unit,
+            subject_type,
+            subject_id,
+            detail,
+        )
+
+    def record_log(
+        self,
+        name: str,
+        level: str = "info",
+        layer: str = "control_plane",
+        source: str = "mac",
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> ObservabilityEvent:
+        return self.record_observation(
+            "log",
+            name,
+            layer,
+            source,
+            level,
+            None,
+            "",
+            subject_type,
+            subject_id,
+            detail,
+        )
+
+    def list_observability(
+        self,
+        kind: Optional[str] = None,
+        layer: Optional[str] = None,
+        level: Optional[str] = None,
+        name: Optional[str] = None,
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        after_sequence: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[ObservabilityEvent]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(self._normalize_observability_kind(kind))
+        if layer is not None:
+            clauses.append("layer = ?")
+            params.append(self._validate_observability_name(layer, "layer"))
+        if level is not None:
+            clauses.append("level = ?")
+            params.append(self._normalize_observability_level(level))
+        if name is not None:
+            clauses.append("name = ?")
+            params.append(self._validate_observability_name(name, "name"))
+        if subject_type is not None:
+            clauses.append("subject_type = ?")
+            params.append(subject_type)
+        if subject_id is not None:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at <= ?")
+            params.append(until)
+        if after_sequence is not None:
+            clauses.append("sequence > ?")
+            params.append(max(0, int(after_sequence)))
+        sql = "SELECT * FROM observability_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        if after_sequence is not None:
+            sql += " ORDER BY sequence ASC LIMIT ?"
+        else:
+            sql += " ORDER BY sequence DESC LIMIT ?"
+        params.append(min(max(1, int(limit)), 1000))
+        return [
+            self._observability_from_row(row)
+            for row in self.store.query_all(sql, tuple(params))
+        ]
+
+    def observability_summary(self, limit: int = 80) -> JsonDict:
+        latest = self.list_observability(limit=limit)
+        levels: Dict[str, int] = {}
+        layers: Dict[str, int] = {}
+        for item in latest:
+            levels[item.level] = levels.get(item.level, 0) + 1
+            layers[item.layer] = layers.get(item.layer, 0) + 1
+        metric_rows = self.store.query_all(
+            """
+            SELECT * FROM observability_events
+            WHERE kind = 'metric'
+            ORDER BY sequence DESC
+            LIMIT 500
+            """
+        )
+        seen = set()
+        latest_metrics: List[JsonDict] = []
+        for row in metric_rows:
+            item = self._observability_from_row(row)
+            key = (item.layer, item.source, item.name, item.unit)
+            if key in seen:
+                continue
+            seen.add(key)
+            latest_metrics.append(item.to_dict())
+            if len(latest_metrics) >= 24:
+                break
+        counts = {
+            "events": self._observability_count(),
+            "metrics": self._observability_count(kind="metric"),
+            "logs": self._observability_count(kind="log"),
+            "warnings": self._observability_count(level="warning"),
+            "errors": self._observability_count(level="error")
+            + self._observability_count(level="critical"),
+        }
+        return {
+            "counts": counts,
+            "levels": levels,
+            "layers": layers,
+            "latest": [item.to_dict() for item in latest],
+            "latest_metrics": latest_metrics,
+        }
+
     def list_dead_letters(self, tenant_id: Optional[str] = None) -> List[Task]:
         rows = self.store.query_all(
             """
@@ -1494,6 +1675,20 @@ class ControlPlane:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (new_id("aevt"), agent_id, event_type, actor, json_dumps(detail), when),
+        )
+        self._insert_observation(
+            conn,
+            "log",
+            event_type,
+            "control_plane",
+            "agent",
+            "info",
+            None,
+            "",
+            "agent",
+            agent_id,
+            {"actor": actor, **detail},
+            when,
         )
 
     # Nap schedule + lifecycle
@@ -2439,6 +2634,20 @@ class ControlPlane:
                     now,
                 ),
             )
+            self._insert_observation(
+                conn,
+                "log",
+                "task.published",
+                "control_plane",
+                "task",
+                "info",
+                None,
+                "",
+                "task",
+                task_id,
+                {"actor": created_by, "publication_id": publication_id, "target": target},
+                now,
+            )
             conn.execute(
                 """
                 INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
@@ -2454,6 +2663,25 @@ class ControlPlane:
                     json_dumps({"publication_id": publication_id}),
                     now,
                 ),
+            )
+            self._insert_observation(
+                conn,
+                "log",
+                "task.transitioned",
+                "control_plane",
+                "task",
+                "info",
+                None,
+                "",
+                "task",
+                task_id,
+                {
+                    "actor": created_by,
+                    "from_state": TaskState.REVIEWING.value,
+                    "to_state": TaskState.COMPLETED.value,
+                    "publication_id": publication_id,
+                },
+                now,
             )
             if owner_agent_id:
                 conn.execute(
@@ -2954,6 +3182,20 @@ class ControlPlane:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (new_id("envevt"), environment_id, event_type, actor, json_dumps(detail), when),
+        )
+        self._insert_observation(
+            conn,
+            "log",
+            event_type,
+            "control_plane",
+            "environment",
+            "info",
+            None,
+            "",
+            "environment",
+            environment_id,
+            {"actor": actor, **detail},
+            when,
         )
 
     # Runtime boundary
@@ -3861,6 +4103,20 @@ class ControlPlane:
                 """,
                 (new_id("revt"), rollout_id, "rollout.%s" % action, actor, json_dumps(detail), now),
             )
+            self._insert_observation(
+                conn,
+                "log",
+                "rollout.%s" % action,
+                "control_plane",
+                "rollout",
+                "info",
+                None,
+                "",
+                "rollout",
+                rollout_id,
+                {"actor": actor, **detail},
+                now,
+            )
         return self.get_rollout(rollout_id)
 
     def evaluate_rollout_health(
@@ -4314,6 +4570,131 @@ class ControlPlane:
 
     # Internal helpers
 
+    def _normalize_observability_kind(self, kind: str) -> str:
+        value = str(kind or "").strip().lower()
+        if value not in OBSERVABILITY_KINDS:
+            raise ValidationError(
+                "unsupported observability kind: %s (allowed: %s)"
+                % (kind, ", ".join(sorted(OBSERVABILITY_KINDS)))
+            )
+        return value
+
+    def _normalize_observability_level(self, level: str) -> str:
+        value = str(level or "info").strip().lower()
+        if value == "warn":
+            value = "warning"
+        if value not in OBSERVABILITY_LEVELS:
+            raise ValidationError(
+                "unsupported observability level: %s (allowed: %s)"
+                % (level, ", ".join(sorted(OBSERVABILITY_LEVELS)))
+            )
+        return value
+
+    def _validate_observability_name(self, value: str, field: str) -> str:
+        text = str(value or "").strip()
+        if not OBSERVABILITY_NAME_RE.match(text):
+            raise ValidationError("invalid observability %s: %s" % (field, value))
+        return text
+
+    def _normalize_observability_value(
+        self,
+        kind: str,
+        value: Optional[float],
+    ) -> Optional[float]:
+        if value is None:
+            if kind == "metric":
+                raise ValidationError("metric observations require a numeric value")
+            return None
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValidationError("observability value must be finite")
+        return number
+
+    def _insert_observation(
+        self,
+        conn: Any,
+        kind: str,
+        name: str,
+        layer: str,
+        source: str,
+        level: str,
+        value: Optional[float],
+        unit: str,
+        subject_type: Optional[str],
+        subject_id: Optional[str],
+        detail: Dict[str, Any],
+        when: str,
+    ) -> ObservabilityEvent:
+        kind_value = self._normalize_observability_kind(kind)
+        level_value = self._normalize_observability_level(level)
+        layer_value = self._validate_observability_name(layer or "control_plane", "layer")
+        source_value = self._validate_observability_name(source or "mac", "source")
+        name_value = self._validate_observability_name(name, "name")
+        value_float = self._normalize_observability_value(kind_value, value)
+        obs_id = new_id("obs")
+        conn.execute(
+            """
+            INSERT INTO observability_events (
+                id, kind, layer, source, level, name, subject_type, subject_id,
+                value, unit, detail, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                obs_id,
+                kind_value,
+                layer_value,
+                source_value,
+                level_value,
+                name_value,
+                subject_type,
+                subject_id,
+                value_float,
+                str(unit or ""),
+                json_dumps(ensure_json_object(detail)),
+                when,
+            ),
+        )
+        row = self.store.query_one("SELECT * FROM observability_events WHERE id = ?", (obs_id,))
+        if row is None:
+            raise NotFoundError("observability event not found: %s" % obs_id)
+        return self._observability_from_row(row)
+
+    def _observability_from_row(self, row: Any) -> ObservabilityEvent:
+        return ObservabilityEvent(
+            int(row["sequence"]),
+            row["id"],
+            row["kind"],
+            row["layer"],
+            row["source"],
+            row["level"],
+            row["name"],
+            row["subject_type"],
+            row["subject_id"],
+            row["value"],
+            row["unit"],
+            json_loads(row["detail"], {}),
+            row["created_at"],
+        )
+
+    def _observability_count(
+        self,
+        kind: Optional[str] = None,
+        level: Optional[str] = None,
+    ) -> int:
+        clauses = []
+        params: List[Any] = []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if level is not None:
+            clauses.append("level = ?")
+            params.append(level)
+        sql = "SELECT COUNT(*) AS count FROM observability_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        row = self.store.query_one(sql, tuple(params))
+        return int(row["count"]) if row is not None else 0
+
     def _record_history(
         self,
         task_id: str,
@@ -4323,21 +4704,51 @@ class ControlPlane:
         to_state: Optional[str],
         detail: Dict[str, Any],
     ) -> None:
+        when = utcnow()
         self.store.execute(
             """
             INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (new_id("hist"), task_id, event_type, actor, from_state, to_state, json_dumps(detail), utcnow()),
+            (new_id("hist"), task_id, event_type, actor, from_state, to_state, json_dumps(detail), when),
+        )
+        self._insert_observation(
+            self.store,
+            "log",
+            event_type,
+            "control_plane",
+            "task",
+            "info",
+            None,
+            "",
+            "task",
+            task_id,
+            {"actor": actor, "from_state": from_state, "to_state": to_state, **detail},
+            when,
         )
 
     def _record_rollout_event(self, rollout_id: str, event_type: str, actor: str, detail: Dict[str, Any]) -> None:
+        when = utcnow()
         self.store.execute(
             """
             INSERT INTO rollout_events (id, rollout_id, event_type, actor, detail, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (new_id("revt"), rollout_id, event_type, actor, json_dumps(detail), utcnow()),
+            (new_id("revt"), rollout_id, event_type, actor, json_dumps(detail), when),
+        )
+        self._insert_observation(
+            self.store,
+            "log",
+            event_type,
+            "control_plane",
+            "rollout",
+            "info",
+            None,
+            "",
+            "rollout",
+            rollout_id,
+            {"actor": actor, **detail},
+            when,
         )
 
     def _insert_eval_set_event(
@@ -4358,6 +4769,20 @@ class ControlPlane:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (new_id("eevt"), eval_set_id, event_type, actor, json_dumps(detail), when),
+        )
+        self._insert_observation(
+            conn,
+            "log",
+            event_type,
+            "control_plane",
+            "eval",
+            "info",
+            None,
+            "",
+            "eval_set",
+            eval_set_id,
+            {"actor": actor, **detail},
+            when,
         )
 
     def _rollout_install_ready(self, rollout: Rollout) -> None:
@@ -4646,6 +5071,27 @@ class ControlPlane:
                         timestamp,
                     ),
                 )
+                self._insert_observation(
+                    conn,
+                    "log",
+                    "task.lease_expired",
+                    "control_plane",
+                    "task",
+                    "warning",
+                    None,
+                    "",
+                    "task",
+                    row["task_id"],
+                    {
+                        "actor": "dispatcher",
+                        "from_state": row["task_state"],
+                        "to_state": next_state,
+                        "lease_id": row["lease_id"],
+                        "agent_id": agent_id,
+                        "reason": reason,
+                    },
+                    timestamp,
+                )
 
     def _validate_message_payload(self, message_type: str, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -4732,6 +5178,7 @@ class ControlPlane:
         expires_at: Optional[str] = None,
     ) -> SecretAccess:
         audit_id = new_id("audit")
+        when = utcnow()
         self.store.execute(
             """
             INSERT INTO secret_access_audit (
@@ -4745,8 +5192,26 @@ class ControlPlane:
                 purpose or "unspecified",
                 result,
                 expires_at,
-                utcnow(),
+                when,
             ),
+        )
+        self._insert_observation(
+            self.store,
+            "log",
+            "secret.%s" % result,
+            "control_plane",
+            "secret",
+            "warning" if result == SecretAuditResult.DENIED.value else "info",
+            None,
+            "",
+            "secret",
+            secret_id,
+            {
+                "accessor_agent_id": accessor_agent_id,
+                "purpose": purpose or "unspecified",
+                "expires_at": expires_at,
+            },
+            when,
         )
         row = self.store.query_one("SELECT * FROM secret_access_audit WHERE id = ?", (audit_id,))
         if row is None:

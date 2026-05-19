@@ -97,10 +97,10 @@ scopes in the dashboard when API tokens are enabled. The dashboard source is
 plain TypeScript in `src/mac/ui/app.ts`; the checked-in `app.js` browser output
 is served directly so there is no Node.js, npm, bundler, or frontend build step.
 The dashboard has read models for overview, agents, task timelines, Hermes
-activity, runtime/rollout status, and redacted secret audits. Operator actions
-cover dispatch ticks, task transitions, evidence, reviews, publication, rollout
-advance/health/rescue, and secret handle requests. It deliberately does not
-expose a casual secret reveal action.
+activity, runtime/rollout status, observability metrics/logs, and redacted
+secret audits. Operator actions cover dispatch ticks, task transitions,
+evidence, reviews, publication, rollout advance/health/rescue, and secret
+handle requests. It deliberately does not expose a casual secret reveal action.
 
 Key route groups:
 
@@ -120,6 +120,7 @@ Key route groups:
 - `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
 - `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-sets/{id}/events`, `/eval-runs`
 - `/events` — unified audit stream across task/rollout/eval_set/secret/environment/conversation_thread/vector_ref/agent surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
+- `/observability`, `/observability/metrics`, `/observability/logs`, `/observability/summary`, `/observability/stream` — low-level metric/log ingestion, query, summary, and NDJSON subscription across API, control-plane, worker, Hermes, deploy, and external-agent layers
 - `/agents/{id}/mood`, `/agents/{id}/mood/history` — agent-self-reported emotional state (warm/cheerful/sad/curt/cold/irritated/angry/enraged) with reason + optional TTL; transitions flow through `/events` as `subject_type=agent`
 - `/agents/{id}/nap-schedule`, `/agents/{id}/nap-schedule/next`, `/nap-schedules`, `/nap-runs`, `/nap-runs/{id}/complete`, `/nap-runs/{id}/fail` — daily memory-consolidation lifecycle. Offset defaults to `md5(agent.name) %% 360` minutes (spreads the fleet across the 0–6h UTC window). mac coordinates `begin → DRAINING → complete/fail`; summarization and vector storage are off-process and linked via `evidence` + `vector_refs`.
 

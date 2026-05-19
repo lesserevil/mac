@@ -220,10 +220,20 @@ process. Restore is a file copy while the service is stopped.
   the SQLite tables directly.
 - `mac --db /var/lib/mac/mac.db events list --since <iso>` is the operator's
   one-shot "what just happened" query.
+- `POST /observability/metrics` and `POST /observability/logs` ingest
+  layer/source/name/level observations from workers, Hermes adapters, deploy
+  scripts, and external monitors. POST requires `agent` scope when API tokens
+  are enabled.
+- `GET /observability` lists persisted observations; `GET
+  /observability/summary` returns dashboard aggregates and latest metric
+  snapshots; `GET /observability/stream` tails observations as NDJSON for live
+  dashboards or collectors.
 
-There is no built-in metrics endpoint yet. If you need Prometheus, wrap the
-process with `prometheus-fastapi-instrumentator` in your own deployment;
-upstream may grow this later.
+The FastAPI middleware records per-request `http.request.duration_ms` metrics
+and `http.request` logs. Control-plane task, agent, secret, environment,
+rollout, and eval events are mirrored into the observability stream with their
+original subject ids. The dashboard Observability tab uses the summary endpoint
+and an NDJSON subscription to visualize the live stream.
 
 ## Upgrade procedure
 
@@ -241,6 +251,4 @@ project does not yet support downgrades through schema deletes.
 
 - Single-writer SQLite. See topology note above.
 - No built-in TLS. Put a reverse proxy in front.
-- No metric ingestion endpoint. Track via the events stream or external
-  scraping.
 - `MAC_SECRET_KEY` rotation is manual.

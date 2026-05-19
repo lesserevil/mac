@@ -58,6 +58,11 @@ def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: P
     evidence = cp.list_evidence(task.id)
     assert evidence[0].summary == "tests passed"
     assert evidence[0].metadata["returncode"] == 0
+    observations = cp.list_observability(layer="worker", limit=20)
+    names = {item.name for item in observations}
+    assert "worker.task_claimed" in names
+    assert "worker.execution.duration_ms" in names
+    assert any(item.subject_id == task.id for item in observations)
 
 
 def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):

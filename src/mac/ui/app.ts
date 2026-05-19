@@ -1,6 +1,6 @@
 // Maintained dashboard source. The browser module is checked in as app.js so
 // mac does not require Node.js/npm to serve or install the UI.
-type ViewKey = "overview" | "agents" | "tasks" | "hermes" | "runtime" | "secrets";
+type ViewKey = "overview" | "agents" | "tasks" | "hermes" | "runtime" | "observability" | "secrets";
 type Tone = "good" | "warn" | "bad" | "info";
 type JsonObject = Record<string, unknown>;
 
@@ -93,6 +93,29 @@ interface HermesStartup {
   logs?: JsonObject;
 }
 
+interface ObservabilityEvent extends ApiRecord {
+  sequence: number;
+  kind: string;
+  layer: string;
+  source: string;
+  level: string;
+  name: string;
+  subject_type?: string | null;
+  subject_id?: string | null;
+  value?: number | null;
+  unit?: string;
+  detail?: JsonObject;
+  created_at: string;
+}
+
+interface ObservabilitySummary {
+  counts: Record<string, number>;
+  levels: Record<string, number>;
+  layers: Record<string, number>;
+  latest: ObservabilityEvent[];
+  latest_metrics: ObservabilityEvent[];
+}
+
 interface DashboardData {
   overview: {
     counts: Record<string, number>;
@@ -117,6 +140,7 @@ interface DashboardData {
   rollouts: RolloutStatus[];
   eval_sets: ApiRecord[];
   eval_runs: ApiRecord[];
+  observability: ObservabilitySummary;
   hermes_startup?: HermesStartup | null;
 }
 
@@ -131,6 +155,9 @@ interface DashboardState {
   agentQuery: string;
   agentFilter: string;
   taskFilter: string;
+  observabilityLive: ObservabilityEvent[];
+  observabilityStream: AbortController | null;
+  observabilityStreamStatus: string;
 }
 
 interface DashboardNodes {
@@ -164,6 +191,7 @@ const VIEW_TITLES: Record<ViewKey, string> = {
   tasks: "Tasks",
   hermes: "Hermes",
   runtime: "Runtime",
+  observability: "Observability",
   secrets: "Secrets",
 };
 
@@ -178,6 +206,9 @@ const state: DashboardState = {
   agentQuery: "",
   agentFilter: "all",
   taskFilter: "all",
+  observabilityLive: [],
+  observabilityStream: null,
+  observabilityStreamStatus: "idle",
 };
 
 const nodes: DashboardNodes = {
@@ -279,11 +310,14 @@ function render(): void {
           ? renderHermes()
           : state.activeView === "runtime"
             ? renderRuntime()
-            : state.activeView === "secrets"
-              ? renderSecrets()
-              : renderOverview();
+            : state.activeView === "observability"
+              ? renderObservability()
+              : state.activeView === "secrets"
+                ? renderSecrets()
+                : renderOverview();
   nodes.content.innerHTML = `${action}${body}`;
   bindViewControls();
+  syncObservabilitySubscription();
 }
 
 function renderSyncState(): void {
@@ -483,6 +517,53 @@ function renderSecrets(): string {
         <div class="record-list">
           ${data.secret_audits.length ? data.secret_audits.map(secretAuditRecord).join("") : `<div class="empty-state">No audit records</div>`}
         </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderObservability(): string {
+  const data = mustData();
+  const observability = data.observability || {
+    counts: {},
+    levels: {},
+    layers: {},
+    latest: [],
+    latest_metrics: [],
+  };
+  const counts = observability.counts || {};
+  const live = uniqueObservations([...state.observabilityLive, ...(observability.latest || [])]);
+  const layerTotal = Object.values(observability.layers || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  const levelTotal = Object.values(observability.levels || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  return `
+    <section class="metric-grid">
+      ${metric("Observations", counts.events || 0, `${counts.logs || 0} logs, ${counts.metrics || 0} metrics`)}
+      ${metric("Warnings", counts.warnings || 0, "warning observations")}
+      ${metric("Errors", counts.errors || 0, "error observations")}
+      ${metric("Stream", state.observabilityStreamStatus, `${state.observabilityLive.length} live item(s)`)}
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Metric Snapshot</h2>
+        <div class="metric-list">
+          ${(observability.latest_metrics || []).length
+            ? observability.latest_metrics.map(observationMetric).join("")
+            : `<div class="empty-state">No metrics</div>`}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>Distribution</h2>
+        ${stateBars(Object.keys(observability.layers || {}).sort(), observability.layers || {}, layerTotal, "No layers")}
+        ${stateBars(Object.keys(observability.levels || {}).sort(), observability.levels || {}, levelTotal, "No levels")}
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Live Stream</h2>
+        ${chip(state.observabilityStreamStatus, state.observabilityStreamStatus === "connected" ? "good" : state.observabilityStreamStatus === "error" ? "bad" : "info")}
+      </div>
+      <div class="observability-feed">
+        ${live.length ? live.slice(0, 80).map(observationRecord).join("") : `<div class="empty-state">No observations</div>`}
       </div>
     </section>
   `;
@@ -744,6 +825,78 @@ function bindViewControls(): void {
   });
 }
 
+function syncObservabilitySubscription(): void {
+  if (state.activeView === "observability" && state.data) {
+    startObservabilityStream();
+  } else {
+    stopObservabilityStream();
+  }
+}
+
+function startObservabilityStream(): void {
+  if (state.observabilityStream) return;
+  const controller = new AbortController();
+  state.observabilityStream = controller;
+  state.observabilityStreamStatus = "connecting";
+  const latest = uniqueObservations([
+    ...state.observabilityLive,
+    ...((state.data?.observability.latest || []) as ObservabilityEvent[]),
+  ]);
+  const after = latest.length ? latest[0].sequence : 0;
+  const headers: Record<string, string> = { Accept: "application/x-ndjson" };
+  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  fetch(`/observability/stream?after_sequence=${encodeURIComponent(after)}&timeout_seconds=60&poll_interval_seconds=0.5`, {
+    headers,
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      state.observabilityStreamStatus = "connected";
+      renderSyncState();
+      const reader = response.body?.getReader();
+      if (!reader) return;
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          const text = line.trim();
+          if (!text) continue;
+          state.observabilityLive = uniqueObservations([
+            JSON.parse(text) as ObservabilityEvent,
+            ...state.observabilityLive,
+          ]).slice(0, 120);
+        }
+        if (state.activeView === "observability") render();
+      }
+    })
+    .catch((error) => {
+      if (!controller.signal.aborted) {
+        state.observabilityStreamStatus = "error";
+        state.actionMessage = `Observability stream failed: ${error instanceof Error ? error.message : String(error)}`;
+        if (state.activeView === "observability") render();
+      }
+    })
+    .finally(() => {
+      if (state.observabilityStream === controller) state.observabilityStream = null;
+      if (!controller.signal.aborted && state.activeView === "observability") {
+        state.observabilityStreamStatus = "reconnecting";
+        window.setTimeout(startObservabilityStream, 1000);
+      }
+    });
+}
+
+function stopObservabilityStream(): void {
+  if (!state.observabilityStream) return;
+  state.observabilityStream.abort();
+  state.observabilityStream = null;
+  state.observabilityStreamStatus = "idle";
+}
+
 async function handleActionSubmit(event: SubmitEvent): Promise<void> {
   const form = (event.target as Element | null)?.closest<HTMLFormElement>("form[data-action]");
   if (!form) return;
@@ -865,13 +1018,52 @@ function metric(label: string, value: unknown, note: string): string {
   return `<div class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${escapeHtml(value)}</div><p class="metric-note">${escapeHtml(note)}</p></div>`;
 }
 
-function stateBars(states: string[], counts: Record<string, number>, total: number): string {
-  if (!total) return `<div class="empty-state">No tasks</div>`;
+function stateBars(states: string[], counts: Record<string, number>, total: number, emptyLabel = "No tasks"): string {
+  if (!total) return `<div class="empty-state">${escapeHtml(emptyLabel)}</div>`;
   return `<div class="state-bar">${states.map((name) => {
     const count = counts[name] || 0;
     const width = Math.max(2, Math.round((count / total) * 100));
     return `<div class="state-row"><span>${escapeHtml(labelize(name))}</span><span class="bar-track"><span class="bar-fill" style="width:${width}%"></span></span><span class="mono small">${count}</span></div>`;
   }).join("")}</div>`;
+}
+
+function observationMetric(item: ObservabilityEvent): string {
+  return `
+    <article class="metric-observation">
+      <div>
+        <strong>${escapeHtml(item.name)}</strong>
+        <p class="muted small">${escapeHtml(item.layer)} / ${escapeHtml(item.source)} · ${escapeHtml(formatAge(item.created_at))}</p>
+      </div>
+      <div class="metric-observation-value">${escapeHtml(formatMetricValue(item))}</div>
+    </article>
+  `;
+}
+
+function observationRecord(item: ObservabilityEvent): string {
+  const subject = item.subject_type && item.subject_id ? `${item.subject_type}:${item.subject_id}` : "";
+  return `
+    <article class="observation-row tone-left-${observationTone(item.level)}">
+      <div class="observation-main">
+        <span class="mono small">#${escapeHtml(item.sequence)}</span>
+        ${chip(item.kind, item.kind === "metric" ? "info" : observationTone(item.level))}
+        ${chip(item.level, observationTone(item.level))}
+        <strong>${escapeHtml(item.name)}</strong>
+      </div>
+      <div class="muted small">${escapeHtml(item.layer)} / ${escapeHtml(item.source)} ${subject ? `· ${escapeHtml(subject)}` : ""} · ${escapeHtml(formatAge(item.created_at))}</div>
+      <div class="observation-detail">${escapeHtml(item.kind === "metric" ? formatMetricValue(item) : jsonSummary(item.detail))}</div>
+    </article>
+  `;
+}
+
+function uniqueObservations(items: ObservabilityEvent[]): ObservabilityEvent[] {
+  const seen = new Set<number>();
+  const unique: ObservabilityEvent[] = [];
+  for (const item of items.sort((a, b) => Number(b.sequence || 0) - Number(a.sequence || 0))) {
+    if (seen.has(item.sequence)) continue;
+    seen.add(item.sequence);
+    unique.push(item);
+  }
+  return unique;
 }
 
 function attentionList(data: DashboardData): string {
@@ -994,6 +1186,19 @@ function healthTone(status: string): Tone {
   if (status === "healthy") return "good";
   if (status === "degraded") return "warn";
   return "bad";
+}
+
+function observationTone(level: string): Tone {
+  if (level === "critical" || level === "error") return "bad";
+  if (level === "warning") return "warn";
+  if (level === "debug") return "info";
+  return "good";
+}
+
+function formatMetricValue(item: ObservabilityEvent): string {
+  if (item.value == null) return "none";
+  const value = Math.abs(item.value) >= 100 ? Math.round(item.value) : Math.round(item.value * 100) / 100;
+  return `${value}${item.unit ? ` ${item.unit}` : ""}`;
 }
 
 function rolloutTone(status: string): Tone {

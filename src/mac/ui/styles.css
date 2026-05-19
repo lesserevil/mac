@@ -278,6 +278,13 @@ h3 {
   padding: 18px;
 }
 
+.surface-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .split {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -377,7 +384,9 @@ details.action-box summary {
 .agent-list,
 .record-list,
 .runtime-list,
-.rollout-list {
+.rollout-list,
+.metric-list,
+.observability-feed {
   display: grid;
   gap: 12px;
 }
@@ -385,12 +394,69 @@ details.action-box summary {
 .agent-card,
 .record,
 .runtime-record,
-.rollout-record {
+.rollout-record,
+.metric-observation,
+.observation-row {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
   box-shadow: var(--shadow);
   padding: 16px;
+}
+
+.metric-observation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.metric-observation p {
+  margin-bottom: 0;
+}
+
+.metric-observation-value {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 1.25rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.observation-row {
+  display: grid;
+  gap: 6px;
+  box-shadow: none;
+}
+
+.observation-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.observation-detail {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.84rem;
+}
+
+.tone-left-good {
+  border-left: 4px solid var(--accent);
+}
+
+.tone-left-warn {
+  border-left: 4px solid var(--warning);
+}
+
+.tone-left-bad {
+  border-left: 4px solid var(--danger);
+}
+
+.tone-left-info {
+  border-left: 4px solid var(--blue);
 }
 
 .agent-card.is-blocked {

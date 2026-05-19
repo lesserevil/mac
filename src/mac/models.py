@@ -243,6 +243,10 @@ class AgentBusStreamStatus(StrEnum):
     ABORTED = "aborted"
 
 
+OBSERVABILITY_KINDS = {"metric", "log"}
+OBSERVABILITY_LEVELS = {"debug", "info", "warning", "error", "critical"}
+
+
 class SecretAuditResult(StrEnum):
     GRANTED = "granted"
     DENIED = "denied"
@@ -523,6 +527,26 @@ class AgentBusChunk:
     payload: Any
     payload_encoding: str
     size_bytes: int
+    created_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class ObservabilityEvent:
+    sequence: int
+    id: str
+    kind: str
+    layer: str
+    source: str
+    level: str
+    name: str
+    subject_type: Optional[str]
+    subject_id: Optional[str]
+    value: Optional[float]
+    unit: str
+    detail: JsonDict
     created_at: str
 
     def to_dict(self) -> JsonDict:

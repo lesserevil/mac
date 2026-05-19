@@ -215,11 +215,18 @@ class MacWorker:
         self._heartbeat()
         assignment = self._claim_next_for_agent()
         if assignment is None:
+            self._observe_log("worker.no_task", level="debug", detail={"agent_id": self.agent_id})
             return WorkerRunResult(status="no_task")
 
         task = assignment["task"]
         lease = assignment["lease"]
         task_id = task["id"]
+        self._observe_log(
+            "worker.task_claimed",
+            subject_type="task",
+            subject_id=task_id,
+            detail={"lease_id": lease["id"], "agent_id": self.agent_id},
+        )
         try:
             self.client.post(
                 "/tasks/%s/start?%s"
@@ -227,7 +234,24 @@ class MacWorker:
                 {},
             )
             task_dir = self._prepare_task_workspace(task, lease)
+            started = time.monotonic()
             execution = self.executor(task, task_dir)
+            duration_ms = (time.monotonic() - started) * 1000.0
+            self._observe_metric(
+                "worker.execution.duration_ms",
+                duration_ms,
+                unit="ms",
+                subject_type="task",
+                subject_id=task_id,
+                detail={"returncode": execution.returncode},
+            )
+            self._observe_log(
+                "worker.execution.completed",
+                level="info" if execution.succeeded else "error",
+                subject_type="task",
+                subject_id=task_id,
+                detail={"returncode": execution.returncode, "summary": execution.summary},
+            )
             evidence = self._record_execution(task_id, task_dir, execution)
             if execution.succeeded:
                 reviewed_task = self.client.post(
@@ -261,6 +285,13 @@ class MacWorker:
                 error=execution.summary,
             )
         except Exception as exc:
+            self._observe_log(
+                "worker.execution.exception",
+                level="error",
+                subject_type="task",
+                subject_id=task_id,
+                detail={"error": str(exc)},
+            )
             try:
                 self.client.post(
                     "/tasks/%s/transition" % quote(task_id, safe=""),
@@ -353,6 +384,56 @@ class MacWorker:
         )
         if self.running_digest and not self._declared_digest:
             self._declared_digest = True
+
+    def _observe_metric(
+        self,
+        name: str,
+        value: float,
+        unit: str = "",
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        detail: Optional[JsonDict] = None,
+    ) -> None:
+        self._post_observation(
+            "/observability/metrics",
+            {
+                "name": name,
+                "value": value,
+                "unit": unit,
+                "layer": "worker",
+                "source": self.agent_id,
+                "subject_type": subject_type,
+                "subject_id": subject_id,
+                "detail": detail or {},
+            },
+        )
+
+    def _observe_log(
+        self,
+        name: str,
+        level: str = "info",
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        detail: Optional[JsonDict] = None,
+    ) -> None:
+        self._post_observation(
+            "/observability/logs",
+            {
+                "name": name,
+                "level": level,
+                "layer": "worker",
+                "source": self.agent_id,
+                "subject_type": subject_type,
+                "subject_id": subject_id,
+                "detail": detail or {},
+            },
+        )
+
+    def _post_observation(self, path: str, payload: JsonDict) -> None:
+        try:
+            self.client.post(path, payload)
+        except Exception:
+            pass
 
 
 def _summary_from_output(returncode: int, stdout: str, stderr: str) -> str:

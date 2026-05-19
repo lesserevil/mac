@@ -1470,6 +1470,50 @@ def test_events_rejects_unknown_subject_type(cp):
         cp.list_events(subject_type="not-a-real-subject")
 
 
+def test_observability_records_metrics_logs_and_control_plane_events(cp):
+    metric = cp.record_metric(
+        "worker.loop.duration_ms",
+        12.5,
+        unit="ms",
+        layer="worker",
+        source="rocky",
+        detail={"iteration": 1},
+    )
+    log = cp.record_log(
+        "worker.claim.empty",
+        level="warning",
+        layer="worker",
+        source="rocky",
+        detail={"queue": "default"},
+    )
+    task = cp.create_task("observed", actor="tester")
+
+    worker_metrics = cp.list_observability(kind="metric", layer="worker")
+    assert worker_metrics[0].id == metric.id
+    assert worker_metrics[0].value == pytest.approx(12.5)
+    assert worker_metrics[0].unit == "ms"
+
+    streamed = cp.list_observability(after_sequence=metric.sequence - 1, limit=10)
+    assert [item.id for item in streamed[:2]] == [metric.id, log.id]
+    assert any(item.name == "task.created" and item.subject_id == task.id for item in streamed)
+
+    summary = cp.observability_summary()
+    assert summary["counts"]["metrics"] >= 1
+    assert summary["counts"]["logs"] >= 2
+    assert summary["counts"]["warnings"] >= 1
+    assert summary["layers"]["worker"] >= 2
+    assert any(item["name"] == "worker.loop.duration_ms" for item in summary["latest_metrics"])
+
+
+def test_observability_rejects_invalid_metric_contract(cp):
+    with pytest.raises(ValidationError):
+        cp.record_metric("bad metric name", 1, layer="worker")
+    with pytest.raises(ValidationError):
+        cp.record_metric("worker.bad", float("inf"), layer="worker")
+    with pytest.raises(ValidationError):
+        cp.record_observation("metric", "worker.missing_value", layer="worker")
+
+
 def test_heartbeat_accepts_running_digest_only_for_known_runtime(cp):
     worker = register_agent(cp, "fleet-worker", ["python"])
     runtime = create_runtime(cp, "fleet-runtime")
