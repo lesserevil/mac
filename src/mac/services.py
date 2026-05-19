@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import os
 import re
 from datetime import timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -37,7 +36,6 @@ from mac.models import (
     HealthStatus,
     HistoryEvent,
     HermesInstance,
-    HermesInstanceStatus,
     JsonDict,
     Lease,
     LeaseStatus,
@@ -84,20 +82,15 @@ from mac.models import (
 )
 from mac.agent_state_service import AgentStateService
 from mac.agentbus_service import AgentBusService
+from mac.deploy_service import DeployService
 from mac.eval_service import EvalService
+from mac.identity_service import IdentityService
 from mac.memory_service import MemoryService
 from mac.messaging_service import MessagingService
 from mac.observability_service import ObservabilityService
 from mac.review_service import ReviewService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
-
-
-SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
-
-
-def _hash_manifest(manifest: JsonDict) -> str:
-    return hashlib.sha256(json_dumps(manifest).encode("utf-8")).hexdigest()
 
 
 def _state_value(state: Any) -> str:
@@ -148,6 +141,7 @@ class ControlPlane:
         self._fernet = Fernet(base64.urlsafe_b64encode(fernet_key))
         # Domain sub-services. New domains should land here as their own
         # service classes rather than as more methods on ControlPlane.
+        self.identity = IdentityService(self.store)
         self.observability = ObservabilityService(self.store)
         self.agentbus = AgentBusService(self.store, self.observability)
         self.secrets = SecretsService(
@@ -192,6 +186,14 @@ class ControlPlane:
             get_evidence=self.get_evidence,
             agent_has_active_lease=self._agent_has_active_lease,
         )
+        self.deploy = DeployService(
+            self.store,
+            self.observability,
+            get_tenant=self.get_tenant,
+            get_task=self.get_task,
+            get_agent=self.get_agent,
+            get_evidence=self.get_evidence,
+        )
 
     @classmethod
     def in_memory(cls) -> "ControlPlane":
@@ -220,364 +222,56 @@ class ControlPlane:
             return json_dumps({})
         return row["value"]
 
-    # Human-facing identity and Hermes boundary
+    # Human-facing identity + Hermes boundary: thin facade over
+    # ``self.identity``. New code should call ``cp.identity.<method>``.
 
-    def register_tenant(
-        self,
-        name: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        tenant_id: Optional[str] = None,
-    ) -> Tenant:
-        name = name.strip()
-        if not name:
-            raise ValidationError("tenant name is required")
-        existing = self.store.query_one("SELECT id FROM tenants WHERE name = ?", (name,))
-        if existing is not None and tenant_id is None:
-            tenant_id = existing["id"]
-        now = utcnow()
-        tid = tenant_id or new_id("tenant")
-        metadata_json = self._resolved_json_column("tenants", "metadata", tid, metadata)
-        self.store.execute(
-            """
-            INSERT INTO tenants (id, name, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (tid, name, metadata_json, now, now),
-        )
-        return self.get_tenant(tid)
+    def register_tenant(self, *args: Any, **kwargs: Any) -> Tenant:
+        return self.identity.register_tenant(*args, **kwargs)
 
     def get_tenant(self, tenant_id_or_name: str) -> Tenant:
-        row = self.store.query_one(
-            "SELECT * FROM tenants WHERE id = ? OR name = ?",
-            (tenant_id_or_name, tenant_id_or_name),
-        )
-        if row is None:
-            raise NotFoundError("tenant not found: %s" % tenant_id_or_name)
-        return self._tenant_from_row(row)
+        return self.identity.get_tenant(tenant_id_or_name)
 
     def list_tenants(self) -> List[Tenant]:
-        rows = self.store.query_all("SELECT * FROM tenants ORDER BY name")
-        return [self._tenant_from_row(row) for row in rows]
+        return self.identity.list_tenants()
 
-    def register_user(
-        self,
-        tenant_id: str,
-        handle: str,
-        display_name: str = "",
-        metadata: Optional[Dict[str, Any]] = None,
-        user_id: Optional[str] = None,
-    ) -> User:
-        self.get_tenant(tenant_id)
-        handle = handle.strip()
-        if not handle:
-            raise ValidationError("user handle is required")
-        existing = self.store.query_one(
-            "SELECT id FROM users WHERE tenant_id = ? AND handle = ?",
-            (tenant_id, handle),
-        )
-        if existing is not None and user_id is None:
-            user_id = existing["id"]
-        now = utcnow()
-        uid = user_id or new_id("user")
-        metadata_json = self._resolved_json_column("users", "metadata", uid, metadata)
-        self.store.execute(
-            """
-            INSERT INTO users (id, tenant_id, handle, display_name, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                tenant_id = excluded.tenant_id,
-                handle = excluded.handle,
-                display_name = excluded.display_name,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (
-                uid,
-                tenant_id,
-                handle,
-                display_name or handle,
-                metadata_json,
-                now,
-                now,
-            ),
-        )
-        return self.get_user(uid)
+    def register_user(self, *args: Any, **kwargs: Any) -> User:
+        return self.identity.register_user(*args, **kwargs)
 
     def get_user(self, user_id: str) -> User:
-        row = self.store.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
-        if row is None:
-            raise NotFoundError("user not found: %s" % user_id)
-        return self._user_from_row(row)
+        return self.identity.get_user(user_id)
 
-    def list_users(self, tenant_id: Optional[str] = None) -> List[User]:
-        if tenant_id:
-            rows = self.store.query_all(
-                "SELECT * FROM users WHERE tenant_id = ? ORDER BY handle",
-                (tenant_id,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM users ORDER BY tenant_id, handle")
-        return [self._user_from_row(row) for row in rows]
+    def list_users(self, *args: Any, **kwargs: Any) -> List[User]:
+        return self.identity.list_users(*args, **kwargs)
 
-    def register_persona(
-        self,
-        tenant_id: str,
-        name: str,
-        soul_ref: str,
-        memory_scope: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        persona_id: Optional[str] = None,
-    ) -> Persona:
-        self.get_tenant(tenant_id)
-        if not name.strip():
-            raise ValidationError("persona name is required")
-        if not soul_ref.strip():
-            raise ValidationError("persona soul_ref is required")
-        if not memory_scope.strip():
-            raise ValidationError("persona memory_scope is required")
-        name = name.strip()
-        existing = self.store.query_one(
-            "SELECT id FROM personas WHERE tenant_id = ? AND name = ?",
-            (tenant_id, name),
-        )
-        if existing is not None and persona_id is None:
-            persona_id = existing["id"]
-        now = utcnow()
-        pid = persona_id or new_id("persona")
-        metadata_json = self._resolved_json_column("personas", "metadata", pid, metadata)
-        self.store.execute(
-            """
-            INSERT INTO personas (
-                id, tenant_id, name, soul_ref, memory_scope, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                tenant_id = excluded.tenant_id,
-                name = excluded.name,
-                soul_ref = excluded.soul_ref,
-                memory_scope = excluded.memory_scope,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (
-                pid,
-                tenant_id,
-                name,
-                soul_ref.strip(),
-                memory_scope.strip(),
-                metadata_json,
-                now,
-                now,
-            ),
-        )
-        return self.get_persona(pid)
+    def register_persona(self, *args: Any, **kwargs: Any) -> Persona:
+        return self.identity.register_persona(*args, **kwargs)
 
     def get_persona(self, persona_id: str) -> Persona:
-        row = self.store.query_one("SELECT * FROM personas WHERE id = ?", (persona_id,))
-        if row is None:
-            raise NotFoundError("persona not found: %s" % persona_id)
-        return self._persona_from_row(row)
+        return self.identity.get_persona(persona_id)
 
-    def list_personas(self, tenant_id: Optional[str] = None) -> List[Persona]:
-        if tenant_id:
-            rows = self.store.query_all(
-                "SELECT * FROM personas WHERE tenant_id = ? ORDER BY name",
-                (tenant_id,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM personas ORDER BY tenant_id, name")
-        return [self._persona_from_row(row) for row in rows]
+    def list_personas(self, *args: Any, **kwargs: Any) -> List[Persona]:
+        return self.identity.list_personas(*args, **kwargs)
 
-    def register_hermes_instance(
-        self,
-        tenant_id: str,
-        name: str,
-        persona_id: Optional[str] = None,
-        home_ref: str = "",
-        status: str = HermesInstanceStatus.ACTIVE.value,
-        metadata: Optional[Dict[str, Any]] = None,
-        instance_id: Optional[str] = None,
-    ) -> HermesInstance:
-        self.get_tenant(tenant_id)
-        if persona_id:
-            persona = self.get_persona(persona_id)
-            if persona.tenant_id != tenant_id:
-                raise ValidationError("persona must belong to hermes instance tenant")
-        name = name.strip()
-        if not name:
-            raise ValidationError("hermes instance name is required")
-        existing = self.store.query_one(
-            "SELECT id FROM hermes_instances WHERE tenant_id = ? AND name = ?",
-            (tenant_id, name),
-        )
-        if existing is not None and instance_id is None:
-            instance_id = existing["id"]
-        status_value = _state_value(status)
-        try:
-            HermesInstanceStatus(status_value)
-        except ValueError:
-            raise ValidationError("unsupported hermes instance status: %s" % status_value)
-        now = utcnow()
-        hid = instance_id or new_id("hermes")
-        metadata_json = self._resolved_json_column("hermes_instances", "metadata", hid, metadata)
-        self.store.execute(
-            """
-            INSERT INTO hermes_instances (
-                id, tenant_id, name, persona_id, home_ref, status,
-                metadata, created_at, updated_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                tenant_id = excluded.tenant_id,
-                name = excluded.name,
-                persona_id = excluded.persona_id,
-                home_ref = excluded.home_ref,
-                status = excluded.status,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at,
-                last_seen_at = excluded.last_seen_at
-            """,
-            (
-                hid,
-                tenant_id,
-                name,
-                persona_id,
-                home_ref,
-                status_value,
-                metadata_json,
-                now,
-                now,
-                now,
-            ),
-        )
-        return self.get_hermes_instance(hid)
+    def register_hermes_instance(self, *args: Any, **kwargs: Any) -> HermesInstance:
+        return self.identity.register_hermes_instance(*args, **kwargs)
 
     def get_hermes_instance(self, instance_id: str) -> HermesInstance:
-        row = self.store.query_one("SELECT * FROM hermes_instances WHERE id = ?", (instance_id,))
-        if row is None:
-            raise NotFoundError("hermes instance not found: %s" % instance_id)
-        return self._hermes_instance_from_row(row)
+        return self.identity.get_hermes_instance(instance_id)
 
-    def list_hermes_instances(self, tenant_id: Optional[str] = None) -> List[HermesInstance]:
-        if tenant_id:
-            rows = self.store.query_all(
-                "SELECT * FROM hermes_instances WHERE tenant_id = ? ORDER BY name",
-                (tenant_id,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM hermes_instances ORDER BY tenant_id, name")
-        return [self._hermes_instance_from_row(row) for row in rows]
+    def list_hermes_instances(self, *args: Any, **kwargs: Any) -> List[HermesInstance]:
+        return self.identity.list_hermes_instances(*args, **kwargs)
 
-    def register_platform_binding(
-        self,
-        tenant_id: str,
-        hermes_instance_id: str,
-        platform: str,
-        external_id: str,
-        display_name: str = "",
-        scopes: Optional[Dict[str, Any]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        binding_id: Optional[str] = None,
-    ) -> PlatformBinding:
-        self.get_tenant(tenant_id)
-        instance = self.get_hermes_instance(hermes_instance_id)
-        if instance.tenant_id != tenant_id:
-            raise ValidationError("platform binding must belong to hermes instance tenant")
-        if not platform.strip() or not external_id.strip():
-            raise ValidationError("platform and external_id are required")
-        platform = platform.strip()
-        external_id = external_id.strip()
-        existing = self.store.query_one(
-            "SELECT id FROM platform_bindings WHERE tenant_id = ? AND platform = ? AND external_id = ?",
-            (tenant_id, platform, external_id),
-        )
-        if existing is not None and binding_id is None:
-            binding_id = existing["id"]
-        now = utcnow()
-        bid = binding_id or new_id("binding")
-        scopes_json = self._resolved_json_column("platform_bindings", "scopes", bid, scopes)
-        metadata_json = self._resolved_json_column("platform_bindings", "metadata", bid, metadata)
-        self.store.execute(
-            """
-            INSERT INTO platform_bindings (
-                id, tenant_id, hermes_instance_id, platform, external_id,
-                display_name, scopes, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                tenant_id = excluded.tenant_id,
-                hermes_instance_id = excluded.hermes_instance_id,
-                platform = excluded.platform,
-                external_id = excluded.external_id,
-                display_name = excluded.display_name,
-                scopes = excluded.scopes,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (
-                bid,
-                tenant_id,
-                hermes_instance_id,
-                platform,
-                external_id,
-                display_name or external_id,
-                scopes_json,
-                metadata_json,
-                now,
-                now,
-            ),
-        )
-        return self.get_platform_binding(bid)
+    def register_platform_binding(self, *args: Any, **kwargs: Any) -> PlatformBinding:
+        return self.identity.register_platform_binding(*args, **kwargs)
 
     def get_platform_binding(self, binding_id: str) -> PlatformBinding:
-        row = self.store.query_one("SELECT * FROM platform_bindings WHERE id = ?", (binding_id,))
-        if row is None:
-            raise NotFoundError("platform binding not found: %s" % binding_id)
-        return self._platform_binding_from_row(row)
+        return self.identity.get_platform_binding(binding_id)
 
-    def list_platform_bindings(
-        self,
-        tenant_id: Optional[str] = None,
-        hermes_instance_id: Optional[str] = None,
-    ) -> List[PlatformBinding]:
-        clauses = []
-        params: List[Any] = []
-        if tenant_id:
-            clauses.append("tenant_id = ?")
-            params.append(tenant_id)
-        if hermes_instance_id:
-            clauses.append("hermes_instance_id = ?")
-            params.append(hermes_instance_id)
-        sql = "SELECT * FROM platform_bindings"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY platform, external_id"
-        rows = self.store.query_all(sql, tuple(params))
-        return [self._platform_binding_from_row(row) for row in rows]
+    def list_platform_bindings(self, *args: Any, **kwargs: Any) -> List[PlatformBinding]:
+        return self.identity.list_platform_bindings(*args, **kwargs)
 
     def hermes_context(self, hermes_instance_id: str) -> JsonDict:
-        instance = self.get_hermes_instance(hermes_instance_id)
-        persona = self.get_persona(instance.persona_id) if instance.persona_id else None
-        return {
-            "tenant": self.get_tenant(instance.tenant_id).to_dict(),
-            "hermes_instance": instance.to_dict(),
-            "persona": persona.to_dict() if persona else None,
-            "platform_bindings": [
-                binding.to_dict()
-                for binding in self.list_platform_bindings(
-                    tenant_id=instance.tenant_id,
-                    hermes_instance_id=instance.id,
-                )
-            ],
-            "memory_contract": {
-                "personality_authority": "hermes",
-                "user_memory_authority": "hermes",
-                "operational_provenance_authority": "mac",
-                "soul_ref": persona.soul_ref if persona else None,
-                "memory_scope": persona.memory_scope if persona else None,
-            },
-        }
+        return self.identity.hermes_context(hermes_instance_id)
 
     def create_interaction_task(
         self,
@@ -1697,432 +1391,59 @@ class ControlPlane:
 
     # Artifact registry
 
-    def register_artifact(
-        self,
-        kind: str,
-        digest: str,
-        uri: str,
-        created_by: str,
-        sbom_uri: Optional[str] = None,
-        signers: Optional[Iterable[str]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> "Artifact":
-        """Canonical record of a deliverable artifact (image, package, tarball, ...).
+    # Artifacts + environments + deployments + runtimes: thin facade over
+    # ``self.deploy``. New code should call ``cp.deploy.<method>`` directly.
 
-        Digest is the unique key. Re-registering the same digest with new
-        sbom_uri/signers/metadata augments the record; uri and kind are pinned
-        on first write.
-        """
-        kind = (kind or "").strip()
-        digest = (digest or "").strip()
-        uri = (uri or "").strip()
-        if not kind:
-            raise ValidationError("artifact kind is required")
-        if not digest:
-            raise ValidationError("artifact digest is required")
-        if not uri:
-            raise ValidationError("artifact uri is required")
-        signer_list = coerce_list(signers)
-        now = utcnow()
-        existing = self.store.query_one(
-            "SELECT * FROM artifacts WHERE digest = ?", (digest,)
-        )
-        if existing is not None:
-            # Augment: merge signers and metadata; sbom_uri sets on first non-null.
-            existing_signers = json_loads(existing["signers"], [])
-            merged_signers = coerce_list(list(existing_signers) + signer_list)
-            existing_meta = json_loads(existing["metadata"], {})
-            merged_meta = dict(existing_meta)
-            if metadata:
-                merged_meta.update(metadata)
-            new_sbom = sbom_uri if sbom_uri is not None else existing["sbom_uri"]
-            self.store.execute(
-                """
-                UPDATE artifacts
-                SET sbom_uri = ?, signers = ?, metadata = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    new_sbom,
-                    json_dumps(merged_signers),
-                    json_dumps(merged_meta),
-                    now,
-                    existing["id"],
-                ),
-            )
-            return self.get_artifact(existing["id"])
-        artifact_id = new_id("art")
-        self.store.execute(
-            """
-            INSERT INTO artifacts (
-                id, kind, digest, uri, sbom_uri, signers, metadata,
-                created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                artifact_id,
-                kind,
-                digest,
-                uri,
-                sbom_uri,
-                json_dumps(signer_list),
-                json_dumps(ensure_json_object(metadata)),
-                created_by,
-                now,
-                now,
-            ),
-        )
-        return self.get_artifact(artifact_id)
+    def register_artifact(self, *args: Any, **kwargs: Any) -> Artifact:
+        return self.deploy.register_artifact(*args, **kwargs)
 
-    def get_artifact(self, artifact_id_or_digest: str) -> "Artifact":
-        row = self.store.query_one(
-            "SELECT * FROM artifacts WHERE id = ? OR digest = ?",
-            (artifact_id_or_digest, artifact_id_or_digest),
-        )
-        if row is None:
-            raise NotFoundError("artifact not found: %s" % artifact_id_or_digest)
-        return self._artifact_from_row(row)
+    def get_artifact(self, artifact_id_or_digest: str) -> Artifact:
+        return self.deploy.get_artifact(artifact_id_or_digest)
 
-    def list_artifacts(self, kind: Optional[str] = None) -> List["Artifact"]:
-        if kind:
-            rows = self.store.query_all(
-                "SELECT * FROM artifacts WHERE kind = ? ORDER BY created_at, id",
-                (kind,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM artifacts ORDER BY created_at, id")
-        return [self._artifact_from_row(row) for row in rows]
+    def list_artifacts(self, *args: Any, **kwargs: Any) -> List[Artifact]:
+        return self.deploy.list_artifacts(*args, **kwargs)
 
-    def _artifact_from_row(self, row: Any) -> "Artifact":
-        return Artifact(
-            row["id"],
-            row["kind"],
-            row["digest"],
-            row["uri"],
-            row["sbom_uri"],
-            json_loads(row["signers"], []),
-            json_loads(row["metadata"], {}),
-            row["created_by"],
-            row["created_at"],
-            row["updated_at"],
-        )
+    def register_environment(self, *args: Any, **kwargs: Any) -> Environment:
+        return self.deploy.register_environment(*args, **kwargs)
 
-    # Environment + deployment edge
+    def get_environment(self, env_id_or_name: str) -> Environment:
+        return self.deploy.get_environment(env_id_or_name)
 
-    def register_environment(
-        self,
-        name: str,
-        tenant_id: Optional[str] = None,
-        channel: str = "fleet",
-        promotes_from: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        created_by: str = "human",
-    ) -> "Environment":
-        name = (name or "").strip()
-        if not name:
-            raise ValidationError("environment name is required")
-        if tenant_id is not None:
-            self.get_tenant(tenant_id)
-        channel = (channel or "fleet").strip() or "fleet"
-        if promotes_from is not None:
-            self.get_environment(promotes_from)
-        now = utcnow()
-        env_id = new_id("env")
-        with self.store.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO environments (
-                    id, name, tenant_id, channel, promotes_from, metadata,
-                    created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    env_id,
-                    name,
-                    tenant_id,
-                    channel,
-                    promotes_from,
-                    json_dumps(ensure_json_object(metadata)),
-                    created_by,
-                    now,
-                    now,
-                ),
-            )
-            self._insert_environment_event(
-                conn,
-                env_id,
-                "environment.created",
-                created_by,
-                {
-                    "name": name,
-                    "tenant_id": tenant_id,
-                    "channel": channel,
-                    "promotes_from": promotes_from,
-                },
-                now,
-            )
-        return self.get_environment(env_id)
+    def list_environments(self, *args: Any, **kwargs: Any) -> List[Environment]:
+        return self.deploy.list_environments(*args, **kwargs)
 
-    def get_environment(self, env_id_or_name: str) -> "Environment":
-        row = self.store.query_one(
-            "SELECT * FROM environments WHERE id = ? OR name = ?",
-            (env_id_or_name, env_id_or_name),
-        )
-        if row is None:
-            raise NotFoundError("environment not found: %s" % env_id_or_name)
-        return self._environment_from_row(row)
+    def deploy_artifact(self, *args: Any, **kwargs: Any) -> Deployment:
+        return self.deploy.deploy_artifact(*args, **kwargs)
 
-    def list_environments(
-        self,
-        tenant_id: Optional[str] = None,
-        channel: Optional[str] = None,
-    ) -> List["Environment"]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if tenant_id is not None:
-            clauses.append("tenant_id = ?")
-            params.append(tenant_id)
-        if channel is not None:
-            clauses.append("channel = ?")
-            params.append(channel)
-        sql = "SELECT * FROM environments"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY channel, name"
-        return [self._environment_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+    def get_deployment(self, deployment_id: str) -> Deployment:
+        return self.deploy.get_deployment(deployment_id)
 
-    def deploy_artifact(
-        self,
-        environment_id: str,
-        artifact_id: str,
-        actor: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> "Deployment":
-        """Atomically retire the current deployment in `environment_id` and
-        record `artifact_id` as the new active deployment. Two writers cannot
-        race because BEGIN IMMEDIATE serializes the retire+insert pair.
-        """
-        environment = self.get_environment(environment_id)
-        artifact = self.get_artifact(artifact_id)
-        now = utcnow()
-        deployment_id = new_id("deploy")
-        with self.store.transaction() as conn:
-            prior = conn.execute(
-                """
-                SELECT id, artifact_id FROM deployments
-                WHERE environment_id = ? AND retired_at IS NULL
-                """,
-                (environment.id,),
-            ).fetchall()
-            for row in prior:
-                conn.execute(
-                    "UPDATE deployments SET status = ?, retired_at = ? WHERE id = ?",
-                    (DeploymentStatus.RETIRED.value, now, row["id"]),
-                )
-                self._insert_environment_event(
-                    conn,
-                    environment.id,
-                    "environment.retired",
-                    actor,
-                    {"deployment_id": row["id"], "artifact_id": row["artifact_id"]},
-                    now,
-                )
-            conn.execute(
-                """
-                INSERT INTO deployments (
-                    id, environment_id, artifact_id, status, deployed_by,
-                    deployed_at, retired_at, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-                """,
-                (
-                    deployment_id,
-                    environment.id,
-                    artifact.id,
-                    DeploymentStatus.ACTIVE.value,
-                    actor,
-                    now,
-                    json_dumps(ensure_json_object(metadata)),
-                ),
-            )
-            self._insert_environment_event(
-                conn,
-                environment.id,
-                "environment.deployed",
-                actor,
-                {
-                    "deployment_id": deployment_id,
-                    "artifact_id": artifact.id,
-                    "artifact_digest": artifact.digest,
-                },
-                now,
-            )
-        return self.get_deployment(deployment_id)
+    def current_deployment(self, environment_id: str) -> Optional[Deployment]:
+        return self.deploy.current_deployment(environment_id)
 
-    def get_deployment(self, deployment_id: str) -> "Deployment":
-        row = self.store.query_one(
-            "SELECT * FROM deployments WHERE id = ?", (deployment_id,)
-        )
-        if row is None:
-            raise NotFoundError("deployment not found: %s" % deployment_id)
-        return self._deployment_from_row(row)
+    def list_deployments(self, environment_id: str) -> List[Deployment]:
+        return self.deploy.list_deployments(environment_id)
 
-    def current_deployment(self, environment_id: str) -> Optional["Deployment"]:
-        env = self.get_environment(environment_id)
-        row = self.store.query_one(
-            """
-            SELECT * FROM deployments
-            WHERE environment_id = ? AND retired_at IS NULL
-            ORDER BY deployed_at DESC, id DESC
-            LIMIT 1
-            """,
-            (env.id,),
-        )
-        return self._deployment_from_row(row) if row is not None else None
-
-    def list_deployments(self, environment_id: str) -> List["Deployment"]:
-        env = self.get_environment(environment_id)
-        rows = self.store.query_all(
-            "SELECT * FROM deployments WHERE environment_id = ? ORDER BY deployed_at, id",
-            (env.id,),
-        )
-        return [self._deployment_from_row(row) for row in rows]
-
-    def _environment_from_row(self, row: Any) -> "Environment":
-        return Environment(
-            row["id"],
-            row["name"],
-            row["tenant_id"],
-            row["channel"],
-            row["promotes_from"],
-            json_loads(row["metadata"], {}),
-            row["created_by"],
-            row["created_at"],
-            row["updated_at"],
-        )
-
-    def _deployment_from_row(self, row: Any) -> "Deployment":
-        return Deployment(
-            row["id"],
-            row["environment_id"],
-            row["artifact_id"],
-            row["status"],
-            row["deployed_by"],
-            row["deployed_at"],
-            row["retired_at"],
-            json_loads(row["metadata"], {}),
-        )
-
-    def _insert_environment_event(
-        self,
-        conn: Any,
-        environment_id: str,
-        event_type: str,
-        actor: str,
-        detail: Dict[str, Any],
-        when: str,
-    ) -> None:
-        conn.execute(
-            """
-            INSERT INTO environment_events (id, environment_id, event_type, actor, detail, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (new_id("envevt"), environment_id, event_type, actor, json_dumps(detail), when),
-        )
-        self.observability.insert_observation(
-            conn,
-            "log",
-            event_type,
-            "control_plane",
-            "environment",
-            "info",
-            None,
-            "",
-            "environment",
-            environment_id,
-            {"actor": actor, **detail},
-            when,
-        )
-
-    # Runtime boundary
-
-    def create_runtime(self, name: str, manifest: Dict[str, Any], created_by: str) -> RuntimeEnvironment:
-        if not name:
-            raise ValidationError("runtime name is required")
-        manifest_dict = ensure_json_object(manifest)
-        self._validate_runtime_manifest(manifest_dict)
-        now = utcnow()
-        runtime_id = new_id("runtime")
-        digest = _hash_manifest(manifest_dict)
-        self.store.execute(
-            """
-            INSERT INTO runtime_environments (id, name, manifest, digest, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (runtime_id, name, json_dumps(manifest_dict), digest, created_by, now),
-        )
-        return self.get_runtime(runtime_id)
+    def create_runtime(self, *args: Any, **kwargs: Any) -> RuntimeEnvironment:
+        return self.deploy.create_runtime(*args, **kwargs)
 
     def get_runtime(self, runtime_id_or_name: str) -> RuntimeEnvironment:
-        row = self.store.query_one(
-            "SELECT * FROM runtime_environments WHERE id = ? OR name = ?",
-            (runtime_id_or_name, runtime_id_or_name),
-        )
-        if row is None:
-            raise NotFoundError("runtime not found: %s" % runtime_id_or_name)
-        return self._runtime_from_row(row)
+        return self.deploy.get_runtime(runtime_id_or_name)
 
     def list_runtimes(self) -> List[RuntimeEnvironment]:
-        rows = self.store.query_all("SELECT * FROM runtime_environments ORDER BY name")
-        return [self._runtime_from_row(row) for row in rows]
+        return self.deploy.list_runtimes()
 
-    def create_runtime_run(self, task_id: str, agent_id: str, environment_id: str) -> RuntimeRun:
-        self.get_task(task_id)
-        self.get_agent(agent_id)
-        runtime = self.get_runtime(environment_id)
-        now = utcnow()
-        run_id = new_id("run")
-        self.store.execute(
-            """
-            INSERT INTO runtime_runs (id, task_id, agent_id, environment_id, status, evidence_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
-            """,
-            (run_id, task_id, agent_id, runtime.id, RuntimeRunStatus.RUNNING.value, now, now),
-        )
-        return self.get_runtime_run(run_id)
+    def create_runtime_run(self, *args: Any, **kwargs: Any) -> RuntimeRun:
+        return self.deploy.create_runtime_run(*args, **kwargs)
 
-    def complete_runtime_run(
-        self,
-        run_id: str,
-        evidence_id: str,
-        status: str = RuntimeRunStatus.COMPLETED.value,
-    ) -> RuntimeRun:
-        status_value = _state_value(status)
-        try:
-            RuntimeRunStatus(status_value)
-        except ValueError:
-            raise ValidationError("unsupported runtime_run status: %s" % status_value)
-        if status_value == RuntimeRunStatus.RUNNING.value:
-            raise ValidationError("complete_runtime_run cannot transition back to running")
-        run = self.get_runtime_run(run_id)
-        evidence = self.get_evidence(evidence_id)
-        if evidence.task_id != run.task_id:
-            raise ValidationError("runtime evidence must belong to run task")
-        now = utcnow()
-        self.store.execute(
-            "UPDATE runtime_runs SET status = ?, evidence_id = ?, updated_at = ? WHERE id = ?",
-            (status_value, evidence_id, now, run_id),
-        )
-        return self.get_runtime_run(run_id)
+    def complete_runtime_run(self, *args: Any, **kwargs: Any) -> RuntimeRun:
+        return self.deploy.complete_runtime_run(*args, **kwargs)
 
     def get_runtime_run(self, run_id: str) -> RuntimeRun:
-        row = self.store.query_one("SELECT * FROM runtime_runs WHERE id = ?", (run_id,))
-        if row is None:
-            raise NotFoundError("runtime run not found: %s" % run_id)
-        return self._runtime_run_from_row(row)
+        return self.deploy.get_runtime_run(run_id)
 
     def list_runtime_runs(self) -> List[RuntimeRun]:
-        rows = self.store.query_all("SELECT * FROM runtime_runs ORDER BY created_at, id")
-        return [self._runtime_run_from_row(row) for row in rows]
+        return self.deploy.list_runtime_runs()
 
     # Project bridge
 
@@ -2636,66 +1957,6 @@ class ControlPlane:
 
     # Row mapping
 
-    def _tenant_from_row(self, row: Any) -> Tenant:
-        return Tenant(
-            row["id"],
-            row["name"],
-            json_loads(row["metadata"], {}),
-            row["created_at"],
-            row["updated_at"],
-        )
-
-    def _user_from_row(self, row: Any) -> User:
-        return User(
-            row["id"],
-            row["tenant_id"],
-            row["handle"],
-            row["display_name"],
-            json_loads(row["metadata"], {}),
-            row["created_at"],
-            row["updated_at"],
-        )
-
-    def _persona_from_row(self, row: Any) -> Persona:
-        return Persona(
-            row["id"],
-            row["tenant_id"],
-            row["name"],
-            row["soul_ref"],
-            row["memory_scope"],
-            json_loads(row["metadata"], {}),
-            row["created_at"],
-            row["updated_at"],
-        )
-
-    def _hermes_instance_from_row(self, row: Any) -> HermesInstance:
-        return HermesInstance(
-            row["id"],
-            row["tenant_id"],
-            row["name"],
-            row["persona_id"],
-            row["home_ref"],
-            row["status"],
-            json_loads(row["metadata"], {}),
-            row["created_at"],
-            row["updated_at"],
-            row["last_seen_at"],
-        )
-
-    def _platform_binding_from_row(self, row: Any) -> PlatformBinding:
-        return PlatformBinding(
-            row["id"],
-            row["tenant_id"],
-            row["hermes_instance_id"],
-            row["platform"],
-            row["external_id"],
-            row["display_name"],
-            json_loads(row["scopes"], {}),
-            json_loads(row["metadata"], {}),
-            row["created_at"],
-            row["updated_at"],
-        )
-
     def _task_from_row(self, row: Any) -> Task:
         return Task(
             id=row["id"],
@@ -2772,28 +2033,6 @@ class ControlPlane:
             row["created_at"],
             row["updated_at"],
             row["last_seen_at"],
-        )
-
-    def _runtime_from_row(self, row: Any) -> RuntimeEnvironment:
-        return RuntimeEnvironment(
-            row["id"],
-            row["name"],
-            json_loads(row["manifest"], {}),
-            row["digest"],
-            row["created_by"],
-            row["created_at"],
-        )
-
-    def _runtime_run_from_row(self, row: Any) -> RuntimeRun:
-        return RuntimeRun(
-            row["id"],
-            row["task_id"],
-            row["agent_id"],
-            row["environment_id"],
-            row["status"],
-            row["evidence_id"],
-            row["created_at"],
-            row["updated_at"],
         )
 
     def _project_item_from_row(self, row: Any) -> ProjectItem:
@@ -3201,45 +2440,3 @@ class ControlPlane:
                     timestamp,
                 )
 
-    def _validate_runtime_manifest(self, manifest: JsonDict) -> None:
-        self._scan_runtime_manifest(manifest, ())
-
-    def _scan_runtime_manifest(self, value: Any, path: Sequence[str]) -> None:
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                key_str = str(key)
-                key_lower = key_str.lower()
-                if any(hint in key_lower for hint in SECRET_FIELD_HINTS) and key_lower not in {
-                    "secret_refs",
-                    "secret_ref",
-                }:
-                    raise ValidationError(
-                        "runtime manifest cannot include raw secret field: %s"
-                        % ".".join(path + (key_str,))
-                    )
-                self._scan_runtime_manifest(nested, path + (key_str,))
-            return
-        if isinstance(value, list):
-            # Top-level "dependencies" list must be pinned. Nested lists (e.g.
-            # inside an entrypoint) are not version specs.
-            in_dependencies = path and path[-1].lower() == "dependencies"
-            for index, nested in enumerate(value):
-                if in_dependencies and isinstance(nested, str) and nested.strip().endswith("*"):
-                    raise ValidationError("runtime dependencies must be pinned")
-                self._scan_runtime_manifest(nested, path + (str(index),))
-            return
-        if isinstance(value, str):
-            # Image references appear at any depth — e.g. multi-stage manifests,
-            # init containers, sidecars. Reject :latest anywhere a string ends
-            # with it; false positives are an acceptable cost for the guarantee.
-            stripped = value.strip()
-            if stripped.endswith(":latest"):
-                raise ValidationError(
-                    "runtime manifest field at %s pins :latest; pin a digest"
-                    % (".".join(path) or "(root)")
-                )
-            if path and path[-1].lower() in {"image", "container_image"} and "@sha256:" not in stripped:
-                raise ValidationError(
-                    "runtime manifest image at %s must include a sha256 digest"
-                    % ".".join(path)
-                )
