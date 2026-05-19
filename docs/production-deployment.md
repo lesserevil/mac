@@ -168,8 +168,19 @@ mac-agent --url http://100.125.137.89:8789 --register \
 Use `--heartbeat-only` during deploy validation when you want fleet visibility
 without claiming migrated ACC work. Start the `--loop` form only after the
 executor command is the intended production worker. Successful executions write
-log evidence and move tasks to `needs_review`; failed executions fail the task
-with evidence attached.
+log evidence, move tasks to `needs_review`, and ask the control plane to run
+the default review workflow. The default workflow assigns a healthy agent that
+has never owned the task as reviewer, records an approval against successful
+executor evidence, and publishes/completes the task unless the task policy
+requires explicit publication evidence. Failed executions fail the task with
+evidence attached.
+
+For already-migrated or pre-upgrade rows that are stuck in `needs_review`, run
+the backlog tick against Rocky:
+
+```bash
+curl -X POST 'http://100.125.137.89:8789/reviews/default/tick?limit=100&actor=operator'
+```
 
 Before enabling executor-backed claiming, use `dry-run` mode to record routing
 candidates without creating leases:

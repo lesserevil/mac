@@ -502,6 +502,87 @@ def test_task_lifecycle_requires_evidence_review_and_publication(cp):
     assert "task.published" in event_types
 
 
+def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Implement thing", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata={"returncode": 0},
+    )
+
+    cp.submit_for_review(task.id, worker.id)
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "published"
+    completed = cp.get_task(task.id)
+    assert completed.state == TaskState.COMPLETED.value
+    reviews = cp.list_reviews(task.id)
+    assert len(reviews) == 1
+    assert reviews[0].reviewer_agent_id == reviewer.id
+    assert reviews[0].evidence_id == evidence.id
+    assert reviews[0].status == ReviewStatus.APPROVED.value
+    publications = cp.list_publications(task.id)
+    assert len(publications) == 1
+    assert publications[0].target == "mac://tasks/%s" % task.id
+    names = {event.name for event in cp.list_observability(limit=50)}
+    assert "workflow.default_review.assigned" in names
+    assert "workflow.default_review.approved" in names
+    assert "workflow.default_review.published" in names
+
+
+def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
+    worker = register_agent(cp, "worker", ["python", "review"])
+    task = cp.create_task("Implement thing", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata={"returncode": 0},
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer"
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+    assert cp.list_reviews(task.id) == []
+
+
+def test_default_review_tick_processes_backlog(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Backlog item", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata={"returncode": 0},
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    report = cp.advance_default_review_workflows(limit=10)
+
+    assert report["processed"] == 1
+    assert report["results"][0]["status"] == "published"
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+    assert cp.list_reviews(task.id)[0].reviewer_agent_id == reviewer.id
+
+
 def test_dispatcher_matches_capabilities_and_expired_leases_recover(cp):
     python_agent = register_agent(cp, "python", ["python"])
     docs_agent = register_agent(cp, "docs", ["docs"])

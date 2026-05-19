@@ -585,6 +585,7 @@ class ControlPlane:
             "history": [event.to_dict() for event in self.task_history(task_id)],
             "evidence": [item.to_dict() for item in self.list_evidence(task_id)],
             "reviews": [item.to_dict() for item in self.list_reviews(task_id)],
+            "publications": [item.to_dict() for item in self.list_publications(task_id)],
         }
 
     def task_summary(self, task_id: str) -> JsonDict:
@@ -882,7 +883,8 @@ class ControlPlane:
         task = self.get_task(task_id)
         if task.owner_agent_id != agent_id:
             raise AuthorizationError("agent does not own task lease")
-        return self.transition_task(task_id, TaskState.NEEDS_REVIEW.value, agent_id, {})
+        reviewed = self.transition_task(task_id, TaskState.NEEDS_REVIEW.value, agent_id, {})
+        return reviewed
 
     def add_evidence(
         self,
@@ -1493,6 +1495,7 @@ class ControlPlane:
             ]
         expired = [task.to_dict() for task in self.expire_leases()]
         self._unblock_ready_tasks()
+        review_workflows = self.advance_default_review_workflows(limit=limit)
         assignments = []
         served_tenants = set()
         for _ in range(limit):
@@ -1512,6 +1515,7 @@ class ControlPlane:
         return {
             "stale_agents": stale_agents,
             "expired": expired,
+            "review_workflows": review_workflows,
             "assignments": assignments,
             "dead_letters": [task.to_dict() for task in self.list_dead_letters()],
         }
@@ -1602,6 +1606,160 @@ class ControlPlane:
 
     def list_publications(self, *args: Any, **kwargs: Any) -> List[Publication]:
         return self.reviews.list_publications(*args, **kwargs)
+
+    def advance_default_review_workflows(
+        self,
+        limit: int = 100,
+        actor: str = "default-review-workflow",
+    ) -> JsonDict:
+        results = []
+        for task in self.list_tasks():
+            if task.state not in {TaskState.NEEDS_REVIEW.value, TaskState.REVIEWING.value}:
+                continue
+            results.append(self.advance_default_review_workflow(task.id, actor=actor))
+            if len(results) >= max(1, int(limit)):
+                break
+        return {
+            "processed": len(results),
+            "results": results,
+        }
+
+    def advance_default_review_workflow(
+        self,
+        task_id: str,
+        actor: str = "default-review-workflow",
+    ) -> JsonDict:
+        task = self.get_task(task_id)
+        if task.state == TaskState.COMPLETED.value:
+            return {"task_id": task_id, "status": "already_completed"}
+        if task.state not in {TaskState.NEEDS_REVIEW.value, TaskState.REVIEWING.value}:
+            return {"task_id": task_id, "status": "not_reviewable", "state": task.state}
+        existing_publications = self.list_publications(task_id)
+        if existing_publications:
+            return {
+                "task_id": task_id,
+                "status": "already_published",
+                "publication_id": existing_publications[-1].id,
+            }
+        if self._default_review_disabled(task):
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.skipped",
+                "info",
+                {"reason": "disabled_by_task_policy"},
+                actor,
+            )
+            return {"task_id": task_id, "status": "disabled_by_task_policy"}
+
+        evidence = self._default_review_evidence(task_id)
+        if evidence is None:
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.waiting",
+                "warning",
+                {"reason": "no_successful_evidence"},
+                actor,
+            )
+            return {"task_id": task_id, "status": "waiting_for_successful_evidence"}
+
+        review = self._default_review_for_task(task_id)
+        if review is None:
+            reviewer = self._select_default_reviewer(task)
+            if reviewer is None:
+                self._record_default_review_observation(
+                    task_id,
+                    "workflow.default_review.waiting",
+                    "warning",
+                    {"reason": "no_eligible_reviewer"},
+                    actor,
+                )
+                return {"task_id": task_id, "status": "waiting_for_reviewer"}
+            review = self.request_review(task_id, reviewer.id, actor=actor)
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.assigned",
+                "info",
+                {"review_id": review.id, "reviewer_agent_id": reviewer.id},
+                actor,
+            )
+
+        if review.status == ReviewStatus.PENDING.value:
+            review = self.submit_review(
+                review.id,
+                ReviewStatus.APPROVED.value,
+                review.reviewer_agent_id,
+                reason="default workflow approved successful executor evidence",
+                evidence_id=evidence.id,
+            )
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.approved",
+                "info",
+                {
+                    "review_id": review.id,
+                    "reviewer_agent_id": review.reviewer_agent_id,
+                    "evidence_id": evidence.id,
+                },
+                actor,
+            )
+
+        if review.status != ReviewStatus.APPROVED.value:
+            return {
+                "task_id": task_id,
+                "status": "review_not_approved",
+                "review_id": review.id,
+                "review_status": review.status,
+            }
+
+        task = self.get_task(task_id)
+        if task.state != TaskState.REVIEWING.value:
+            return {
+                "task_id": task_id,
+                "status": "approved_not_publishable",
+                "state": task.state,
+                "review_id": review.id,
+            }
+        if self.reviews.task_requires_publication_evidence(task):
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.waiting",
+                "warning",
+                {
+                    "reason": "publication_evidence_required",
+                    "review_id": review.id,
+                    "evidence_id": evidence.id,
+                },
+                actor,
+            )
+            return {
+                "task_id": task_id,
+                "status": "waiting_for_publication_evidence",
+                "review_id": review.id,
+            }
+
+        publication = self.publish_task(
+            task_id,
+            self._default_publication_target(task),
+            review.reviewer_agent_id,
+            evidence_id=evidence.id,
+        )
+        self._record_default_review_observation(
+            task_id,
+            "workflow.default_review.published",
+            "info",
+            {
+                "review_id": review.id,
+                "publication_id": publication.id,
+                "target": publication.target,
+            },
+            actor,
+        )
+        return {
+            "task_id": task_id,
+            "status": "published",
+            "review_id": review.id,
+            "publication_id": publication.id,
+        }
 
     # Secrets boundary: thin facade over ``self.secrets``. New code should
     # call ``cp.secrets.<method>`` directly.
@@ -2089,6 +2247,114 @@ class ControlPlane:
         capabilities = set(agent.capabilities)
         required = set(task.required_capabilities) | role_required_caps
         return required.issubset(capabilities)
+
+    def _default_review_disabled(self, task: Task) -> bool:
+        policy = task.metadata.get("review") or task.metadata.get("default_review") or {}
+        if not isinstance(policy, dict):
+            return False
+        mode = str(policy.get("mode") or policy.get("workflow") or "").strip().lower()
+        return (
+            mode == "manual"
+            or policy.get("manual") is True
+            or policy.get("auto") is False
+            or policy.get("enabled") is False
+        )
+
+    def _default_review_evidence(self, task_id: str) -> Optional[Evidence]:
+        evidence = self.list_evidence(task_id)
+        if not evidence:
+            return None
+        successful = [
+            item
+            for item in evidence
+            if self._evidence_returncode(item) == 0
+        ]
+        if successful:
+            return successful[-1]
+        no_returncode = [
+            item
+            for item in evidence
+            if self._evidence_returncode(item) is None
+            and item.kind in {"test", "review", "artifact", "eval"}
+        ]
+        return no_returncode[-1] if no_returncode else None
+
+    def _evidence_returncode(self, evidence: Evidence) -> Optional[int]:
+        value = evidence.metadata.get("returncode")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _default_review_for_task(self, task_id: str) -> Optional[Review]:
+        reviews = self.list_reviews(task_id)
+        if not reviews:
+            return None
+        pending = [review for review in reviews if review.status == ReviewStatus.PENDING.value]
+        if pending:
+            return pending[-1]
+        approved = [review for review in reviews if review.status == ReviewStatus.APPROVED.value]
+        if approved:
+            return approved[-1]
+        return reviews[-1]
+
+    def _select_default_reviewer(self, task: Task) -> Optional[Agent]:
+        candidates = [
+            agent
+            for agent in self.list_agents()
+            if agent.health_status == HealthStatus.HEALTHY.value
+            and agent.status != AgentStatus.OFFLINE.value
+            and not self.reviews.agent_has_owned_task(task.id, agent.id)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda agent: (
+                0 if "review" in set(agent.capabilities) else 1,
+                0 if agent.status == AgentStatus.IDLE.value else 1,
+                agent.name,
+                agent.id,
+            )
+        )
+        return candidates[0]
+
+    def _default_publication_target(self, task: Task) -> str:
+        metadata = task.metadata
+        for key in ("publication_target", "publish_target"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        publication = metadata.get("publication")
+        if isinstance(publication, dict):
+            target = publication.get("target")
+            if isinstance(target, str) and target.strip():
+                return target.strip()
+        acc_metadata = metadata.get("acc_metadata")
+        if isinstance(acc_metadata, dict):
+            beads_id = acc_metadata.get("beads_id")
+            if isinstance(beads_id, str) and beads_id.strip():
+                return "beads://%s" % beads_id.strip()
+        return "mac://tasks/%s" % task.id
+
+    def _record_default_review_observation(
+        self,
+        task_id: str,
+        name: str,
+        level: str,
+        detail: JsonDict,
+        actor: str,
+    ) -> None:
+        self.observability.record_log(
+            name,
+            level=level,
+            layer="control_plane",
+            source="default-review-workflow",
+            subject_type="task",
+            subject_id=task_id,
+            detail={"actor": actor, **detail},
+        )
 
     def _set_agent_idle(self, agent_id: str, conn: Any = None) -> None:
         now = utcnow()

@@ -274,7 +274,15 @@ class MacWorker:
             if execution.succeeded:
                 reviewed_task = self.client.post(
                     "/tasks/%s/submit-for-review?%s"
-                    % (quote(task_id, safe=""), urlencode({"agent_id": self.agent_id})),
+                    % (
+                        quote(task_id, safe=""),
+                        urlencode(
+                            {
+                                "agent_id": self.agent_id,
+                                "advance_default_workflow": "true",
+                            }
+                        ),
+                    ),
                     {},
                 )
                 return WorkerRunResult(

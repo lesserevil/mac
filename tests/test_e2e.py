@@ -97,39 +97,11 @@ def test_e2e_full_task_lifecycle_via_http_and_disk(tmp_path: Path):
     assert result.status == "submitted_for_review"
     assert result.task["id"] == task["id"]
 
-    # Reviewer requests + approves with task evidence.
-    evidence_list = client.get(
-        "/dashboard/tasks/%s/timeline" % task["id"]
-    ).json()["evidence"]
-    assert evidence_list, "worker must have produced evidence before review"
-    evidence_id = evidence_list[0]["id"]
-    review = client.post(
-        "/tasks/%s/reviews" % task["id"],
-        json={"reviewer_agent_id": reviewer["id"], "actor": "human"},
-    ).json()
-    decision = client.post(
-        "/reviews/%s/decision" % review["id"],
-        json={
-            "status": "approved",
-            "reviewer_agent_id": reviewer["id"],
-            "evidence_id": evidence_id,
-        },
-    ).json()
-    assert decision["status"] == "approved"
-
-    publication = client.post(
-        "/publications",
-        json={
-            "task_id": task["id"],
-            "target": "stdout",
-            "created_by": "human",
-            "evidence_id": evidence_id,
-        },
-    ).json()
-    assert publication["status"] == "published"
-
     final = client.get("/tasks/%s" % task["id"]).json()
     assert final["task"]["state"] == TaskState.COMPLETED.value
+    assert final["reviews"][0]["reviewer_agent_id"] == reviewer["id"]
+    assert final["reviews"][0]["status"] == "approved"
+    assert final["publications"][0]["status"] == "published"
 
     # History shows every transition.
     history_events = {h["event_type"] for h in final["history"]}
@@ -195,12 +167,12 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
     assert statuses == ["no_task", "submitted_for_review"], statuses
 
     final = client.get("/tasks/%s" % task["id"]).json()
-    assert final["task"]["state"] == TaskState.NEEDS_REVIEW.value
+    assert final["task"]["state"] == TaskState.COMPLETED.value
     # NEEDS_REVIEW releases the lease + clears owner_agent_id on the task,
-    # but exactly one worker must have led it there. Exactly one
-    # transition row of `running -> needs_review` proves the race
-    # serialized: the losing worker never claimed, so it never
-    # transitioned the task.
+    # then the default review workflow can complete it. Exactly one
+    # transition row of `running -> needs_review` still proves the race
+    # serialized: the losing worker never claimed, so it never transitioned
+    # the task.
     needs_review_transitions = [
         h
         for h in final["history"]
@@ -210,6 +182,10 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
     assert len(needs_review_transitions) == 1
     assert needs_review_transitions[0]["from_state"] == TaskState.RUNNING.value
     assert needs_review_transitions[0]["actor"] in {a1["id"], a2["id"]}
+    assert len(final["reviews"]) == 1
+    assert final["reviews"][0]["reviewer_agent_id"] in {a1["id"], a2["id"]}
+    assert final["reviews"][0]["reviewer_agent_id"] != needs_review_transitions[0]["actor"]
+    assert len(final["publications"]) == 1
 
 
 # ---------------------------------------------------------------------------

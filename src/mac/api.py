@@ -1261,8 +1261,16 @@ def create_app(
         return cp.start_task(task_id, agent_id).to_dict()
 
     @app.post("/tasks/{task_id}/submit-for-review")
-    def submit_for_review(task_id: str, agent_id: str) -> Dict[str, Any]:
-        return cp.submit_for_review(task_id, agent_id).to_dict()
+    def submit_for_review(
+        task_id: str,
+        agent_id: str,
+        advance_default_workflow: bool = Query(default=False),
+    ) -> Dict[str, Any]:
+        task = cp.submit_for_review(task_id, agent_id)
+        if advance_default_workflow:
+            cp.advance_default_review_workflow(task_id, actor=agent_id)
+            task = cp.get_task(task_id)
+        return task.to_dict()
 
     @app.post("/tasks/{task_id}/evidence")
     def add_evidence(task_id: str, body: EvidenceCreate) -> Dict[str, Any]:
@@ -1836,6 +1844,13 @@ def create_app(
     @app.post("/reviews/{review_id}/decision")
     def submit_review(review_id: str, body: ReviewDecision) -> Dict[str, Any]:
         return cp.submit_review(review_id, **_data(body)).to_dict()
+
+    @app.post("/reviews/default/tick")
+    def default_review_tick(
+        limit: int = Query(default=100),
+        actor: str = Query(default="operator"),
+    ) -> Dict[str, Any]:
+        return cp.advance_default_review_workflows(limit=limit, actor=actor)
 
     @app.post("/publications")
     def publish(body: PublicationCreate) -> Dict[str, Any]:
