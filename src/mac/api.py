@@ -280,6 +280,39 @@ class RoleSeed(BaseModel):
     replace: bool = False
 
 
+class WorkflowCreate(BaseModel):
+    slug: str
+    name: str
+    description: str = ""
+    workflow_type: str
+    definition: Dict[str, Any]
+    created_by: str = "human"
+    tenant_id: Optional[str] = None
+    is_default: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    workflow_type: Optional[str] = None
+    definition: Optional[Dict[str, Any]] = None
+    is_default: Optional[bool] = None
+    enabled: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class WorkflowImportYaml(BaseModel):
+    yaml: str
+    tenant_id: Optional[str] = None
+    is_default: bool = False
+    created_by: str = "human"
+
+
+class WorkflowSeed(BaseModel):
+    pass
+
+
 class HeartbeatRequest(BaseModel):
     status: Optional[str] = None
     health_status: Optional[str] = None
@@ -1310,6 +1343,76 @@ def create_app(
         principal: TokenPrincipal = Depends(_get_principal),
     ) -> Dict[str, Any]:
         return cp.roles.unassign_role(agent_id).to_dict()
+
+    # Workflows (data-driven, definable) -----------------------------
+
+    @app.post("/workflows")
+    def create_workflow(
+        body: WorkflowCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.workflows.create_workflow(**_data(body)).to_dict()
+
+    @app.get("/workflows")
+    def list_workflows(
+        tenant_id: Optional[str] = Query(default=None),
+        workflow_type: Optional[str] = Query(default=None),
+        enabled: Optional[bool] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [
+            wf.to_dict()
+            for wf in cp.workflows.list_workflows(
+                tenant_id=tenant_id,
+                workflow_type=workflow_type,
+                enabled=enabled,
+            )
+        ]
+
+    @app.get("/workflows/{workflow_id_or_slug}")
+    def get_workflow(workflow_id_or_slug: str) -> Dict[str, Any]:
+        return cp.workflows.get_workflow(workflow_id_or_slug).to_dict()
+
+    @app.put("/workflows/{workflow_id}")
+    def update_workflow(
+        workflow_id: str,
+        body: WorkflowUpdate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        wf = cp.workflows.get_workflow(workflow_id)
+        principal.assert_tenant(wf.tenant_id)
+        return cp.workflows.update_workflow(workflow_id, **_data(body)).to_dict()
+
+    @app.delete("/workflows/{workflow_id}")
+    def delete_workflow(
+        workflow_id: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        wf = cp.workflows.get_workflow(workflow_id)
+        principal.assert_tenant(wf.tenant_id)
+        cp.workflows.delete_workflow(workflow_id)
+        return {"deleted": workflow_id}
+
+    @app.post("/workflows/import-yaml")
+    def import_workflow_yaml(
+        body: WorkflowImportYaml,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.workflows.import_yaml(
+            body.yaml,
+            created_by=body.created_by,
+            tenant_id=body.tenant_id,
+            is_default=body.is_default,
+        ).to_dict()
+
+    @app.post("/workflows/seed")
+    def seed_workflows(
+        body: WorkflowSeed,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> List[Dict[str, Any]]:
+        principal.require_global_fleet()
+        return [wf.to_dict() for wf in cp.workflows.seed_defaults()]
 
     @app.get("/fleet/build-distribution")
     def fleet_build_distribution() -> Dict[str, Any]:

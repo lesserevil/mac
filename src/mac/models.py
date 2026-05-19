@@ -530,6 +530,119 @@ ROLE_LEVELS = {value.value for value in RoleLevel}
 
 
 @dataclass
+class Workflow:
+    """Versioned, data-driven workflow definition.
+
+    Workflows are DAGs of typed nodes (each with a required role) and
+    edges that match on terminal conditions. Definitions are immutable
+    per ``version`` — updating ``definition`` bumps the version so
+    in-flight runs (which snapshot the definition at start) keep their
+    deterministic shape.
+    """
+
+    id: str
+    slug: str
+    name: str
+    description: str
+    workflow_type: str
+    is_default: bool
+    version: int
+    definition: JsonDict
+    tenant_id: Optional[str]
+    enabled: bool
+    metadata: JsonDict
+    created_by: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class WorkflowRun:
+    """One execution of a workflow.
+
+    ``definition_snapshot`` is captured at start time so updates to the
+    parent workflow don't surprise an in-flight run. ``context`` is a
+    free-form bag that accumulates per-node output for later nodes to
+    consume.
+    """
+
+    id: str
+    workflow_id: str
+    workflow_version: int
+    definition_snapshot: JsonDict
+    state: str
+    current_node_key: Optional[str]
+    current_task_id: Optional[str]
+    input: JsonDict
+    context: JsonDict
+    tenant_id: Optional[str]
+    started_by: str
+    created_at: str
+    updated_at: str
+    completed_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class WorkflowRunHistory:
+    """Append-only transition log for a workflow run."""
+
+    id: str
+    run_id: str
+    seq: int
+    from_node_key: Optional[str]
+    to_node_key: Optional[str]
+    condition: str
+    task_id: Optional[str]
+    actor: str
+    attempt_number: int
+    detail: JsonDict
+    created_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+class WorkflowState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    ESCALATED = "escalated"
+
+
+class NodeType(StrEnum):
+    TASK = "task"
+    APPROVAL = "approval"
+    COMMIT = "commit"
+    VERIFY = "verify"
+
+
+class EdgeCondition(StrEnum):
+    SUCCESS = "success"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+    ESCALATED = "escalated"
+    CANCELLED = "cancelled"
+
+
+WORKFLOW_TERMINAL_STATES = {
+    WorkflowState.COMPLETED.value,
+    WorkflowState.FAILED.value,
+    WorkflowState.CANCELLED.value,
+}
+
+
+@dataclass
 class AgentMessage:
     id: str
     sender_agent_id: str

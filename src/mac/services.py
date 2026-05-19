@@ -13,6 +13,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from mac.models import (
     Agent,
     AgentRole,
+    Workflow,
+    WorkflowRun,
     AgentBusChunk,
     AgentBusStream,
     AgentBusStreamStatus,
@@ -94,6 +96,7 @@ from mac.roles_service import RolesService
 from mac.rollout_service import RolloutService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
+from mac.workflow_service import WorkflowService
 
 
 def _state_value(state: Any) -> str:
@@ -153,6 +156,12 @@ class ControlPlane:
             get_tenant=self.get_tenant,
             get_agent=self.get_agent,
             get_machine=self.get_machine,
+        )
+        self.workflows = WorkflowService(
+            self.store,
+            self.observability,
+            get_role=self.roles.get_role,
+            get_tenant=self.get_tenant,
         )
         self.secrets = SecretsService(
             self.store,
@@ -318,6 +327,29 @@ class ControlPlane:
 
     def seed_default_roles(self, *args: Any, **kwargs: Any) -> List[AgentRole]:
         return self.roles.seed_defaults(*args, **kwargs)
+
+    # Workflows: thin facade over ``self.workflows``.
+
+    def create_workflow(self, *args: Any, **kwargs: Any) -> Workflow:
+        return self.workflows.create_workflow(*args, **kwargs)
+
+    def get_workflow(self, *args: Any, **kwargs: Any) -> Workflow:
+        return self.workflows.get_workflow(*args, **kwargs)
+
+    def list_workflows(self, *args: Any, **kwargs: Any) -> List[Workflow]:
+        return self.workflows.list_workflows(*args, **kwargs)
+
+    def update_workflow(self, *args: Any, **kwargs: Any) -> Workflow:
+        return self.workflows.update_workflow(*args, **kwargs)
+
+    def delete_workflow(self, workflow_id: str) -> None:
+        return self.workflows.delete_workflow(workflow_id)
+
+    def import_workflow_yaml(self, *args: Any, **kwargs: Any) -> Workflow:
+        return self.workflows.import_yaml(*args, **kwargs)
+
+    def seed_default_workflows(self, *args: Any, **kwargs: Any) -> List[Workflow]:
+        return self.workflows.seed_defaults(*args, **kwargs)
 
     def create_interaction_task(
         self,
