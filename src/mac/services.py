@@ -1878,8 +1878,32 @@ class ControlPlane:
             return False
         if not self._agent_resources_satisfy(agent, machine, task):
             return False
+        # Role + hardware gates. Both no-op when neither the agent nor the
+        # task carry role/hardware metadata, so the legacy capability path
+        # below stays the dominant matcher for un-roled fleets.
+        required_role = task.metadata.get("required_role") if isinstance(task.metadata, dict) else None
+        if required_role:
+            if agent.role_id is None:
+                return False
+            try:
+                role = self.roles.get_role(agent.role_id)
+            except NotFoundError:
+                return False
+            if role.slug != required_role:
+                return False
+        role_required_caps: set = set()
+        if agent.role_id is not None:
+            try:
+                role = self.roles.get_role(agent.role_id)
+            except NotFoundError:
+                role = None
+            if role is not None:
+                ok, _reasons = self.roles.validate_hardware(role, machine)
+                if not ok:
+                    return False
+                role_required_caps = set(role.required_capabilities)
         capabilities = set(agent.capabilities)
-        required = set(task.required_capabilities)
+        required = set(task.required_capabilities) | role_required_caps
         return required.issubset(capabilities)
 
     def _set_agent_idle(self, agent_id: str, conn: Any = None) -> None:
@@ -1952,19 +1976,29 @@ class ControlPlane:
 
     def _agent_resources_satisfy(self, agent: Agent, machine: Machine, task: Task) -> bool:
         required = task.metadata.get("resources") or task.metadata.get("required_resources") or {}
-        if not isinstance(required, dict):
-            return True
-        available = dict(machine.resources)
-        available.update(agent.resources)
-        for key, needed in required.items():
-            current = available.get(key)
-            if isinstance(needed, (int, float)):
-                if current is None or float(current) < float(needed):
+        if isinstance(required, dict):
+            available = dict(machine.resources)
+            available.update(agent.resources)
+            for key, needed in required.items():
+                current = available.get(key)
+                if isinstance(needed, (int, float)):
+                    if current is None or float(current) < float(needed):
+                        return False
+                elif isinstance(needed, list):
+                    if not set(needed).issubset(set(current or [])):
+                        return False
+                elif needed is not None and current != needed:
                     return False
-            elif isinstance(needed, list):
-                if not set(needed).issubset(set(current or [])):
-                    return False
-            elif needed is not None and current != needed:
+        # Structured hardware constraints on the task (set by the workflow
+        # runtime when spawning a role-bound node task). Falls through the
+        # shared matcher so the role-required-hardware vocabulary stays in
+        # one place.
+        hw_required = task.metadata.get("hardware") if isinstance(task.metadata, dict) else None
+        if isinstance(hw_required, dict) and hw_required:
+            from mac.roles_service import machine_hardware_satisfies
+
+            ok, _reasons = machine_hardware_satisfies(hw_required, machine.hardware)
+            if not ok:
                 return False
         return True
 
