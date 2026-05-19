@@ -43,7 +43,18 @@ class TokenPrincipal:
         return "admin" in self.scopes
 
     def has_scope(self, scope: str) -> bool:
-        return self.is_admin or scope in self.scopes
+        # ``admin`` is the catch-all; ``write`` is the broad authoring
+        # bucket that historically covered everything not specifically
+        # carved out. New domain scopes (``roles``, ``workflow``) are
+        # *additive* — operators with pre-existing ``write`` tokens keep
+        # working without having to mint narrower tokens immediately.
+        if self.is_admin:
+            return True
+        if scope in self.scopes:
+            return True
+        if scope in {"roles", "workflow"} and "write" in self.scopes:
+            return True
+        return False
 
     def assert_tenant(self, target_tenant_id: Optional[str]) -> None:
         if self.is_admin or self.tenant_id is None:
@@ -219,6 +230,7 @@ class MachineRegister(BaseModel):
     resources: Dict[str, Any] = Field(default_factory=dict)
     trusted: bool = True
     machine_id: Optional[str] = None
+    hardware: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRegister(BaseModel):
@@ -227,6 +239,45 @@ class AgentRegister(BaseModel):
     capabilities: List[str] = Field(default_factory=list)
     resources: Dict[str, Any] = Field(default_factory=dict)
     agent_id: Optional[str] = None
+
+
+class RoleCreate(BaseModel):
+    slug: str
+    name: str
+    description: str
+    system_prompt: str
+    level: str
+    display_name: Optional[str] = None
+    reports_to: Optional[str] = None
+    specialties: List[str] = Field(default_factory=list)
+    default_capabilities: List[str] = Field(default_factory=list)
+    required_capabilities: List[str] = Field(default_factory=list)
+    hardware_requirements: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    tenant_id: Optional[str] = None
+    role_id: Optional[str] = None
+
+
+class RoleUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    system_prompt: Optional[str] = None
+    level: Optional[str] = None
+    display_name: Optional[str] = None
+    reports_to: Optional[str] = None
+    specialties: Optional[List[str]] = None
+    default_capabilities: Optional[List[str]] = None
+    required_capabilities: Optional[List[str]] = None
+    hardware_requirements: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class RoleAssign(BaseModel):
+    role_id_or_slug: str
+
+
+class RoleSeed(BaseModel):
+    replace: bool = False
 
 
 class HeartbeatRequest(BaseModel):
@@ -565,6 +616,10 @@ def _required_scope(method: str, path: str) -> Optional[str]:
         or path.startswith("/rollouts")
     ):
         return "deploy"
+    if path.startswith("/roles") or path.endswith("/role"):
+        return "roles"
+    if path.startswith("/workflows"):
+        return "workflow"
     return "write"
 
 
@@ -1184,6 +1239,77 @@ def create_app(
     @app.get("/agents")
     def list_agents() -> List[Dict[str, Any]]:
         return [agent.to_dict() for agent in cp.list_agents()]
+
+    # Agent roles (persona catalog) ---------------------------------
+
+    @app.post("/roles")
+    def create_role(
+        body: RoleCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.roles.create_role(**_data(body)).to_dict()
+
+    @app.get("/roles")
+    def list_roles(
+        tenant_id: Optional[str] = Query(default=None),
+        level: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [
+            role.to_dict()
+            for role in cp.roles.list_roles(tenant_id=tenant_id, level=level)
+        ]
+
+    @app.get("/roles/{role_id_or_slug}")
+    def get_role(role_id_or_slug: str) -> Dict[str, Any]:
+        return cp.roles.get_role(role_id_or_slug).to_dict()
+
+    @app.put("/roles/{role_id}")
+    def update_role(
+        role_id: str,
+        body: RoleUpdate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        role = cp.roles.get_role(role_id)
+        principal.assert_tenant(role.tenant_id)
+        return cp.roles.update_role(role_id, **_data(body)).to_dict()
+
+    @app.delete("/roles/{role_id}")
+    def delete_role(
+        role_id: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        role = cp.roles.get_role(role_id)
+        principal.assert_tenant(role.tenant_id)
+        cp.roles.delete_role(role_id)
+        return {"deleted": role_id}
+
+    @app.post("/roles/seed")
+    def seed_roles(
+        body: RoleSeed,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> List[Dict[str, Any]]:
+        # Global catalog seeding is admin-only (the dispatch in
+        # _required_scope already enforces this, but we double-check the
+        # principal isn't tenant-bound to avoid stamping global rows from a
+        # tenant token if scopes are ever relaxed).
+        principal.require_global_fleet()
+        return [role.to_dict() for role in cp.roles.seed_defaults(replace=body.replace)]
+
+    @app.post("/agents/{agent_id}/role")
+    def assign_role(
+        agent_id: str,
+        body: RoleAssign,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        return cp.roles.assign_role(agent_id, body.role_id_or_slug).to_dict()
+
+    @app.delete("/agents/{agent_id}/role")
+    def unassign_role(
+        agent_id: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        return cp.roles.unassign_role(agent_id).to_dict()
 
     @app.get("/fleet/build-distribution")
     def fleet_build_distribution() -> Dict[str, Any]:

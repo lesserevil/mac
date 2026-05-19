@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from mac.models import (
     Agent,
+    AgentRole,
     AgentBusChunk,
     AgentBusStream,
     AgentBusStreamStatus,
@@ -89,6 +90,7 @@ from mac.memory_service import MemoryService
 from mac.messaging_service import MessagingService
 from mac.observability_service import ObservabilityService
 from mac.review_service import ReviewService
+from mac.roles_service import RolesService
 from mac.rollout_service import RolloutService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
@@ -145,6 +147,13 @@ class ControlPlane:
         self.identity = IdentityService(self.store)
         self.observability = ObservabilityService(self.store)
         self.agentbus = AgentBusService(self.store, self.observability)
+        self.roles = RolesService(
+            self.store,
+            self.observability,
+            get_tenant=self.get_tenant,
+            get_agent=self.get_agent,
+            get_machine=self.get_machine,
+        )
         self.secrets = SecretsService(
             self.store,
             self.observability,
@@ -283,6 +292,32 @@ class ControlPlane:
 
     def hermes_context(self, hermes_instance_id: str) -> JsonDict:
         return self.identity.hermes_context(hermes_instance_id)
+
+    # Agent roles: thin facade over ``self.roles``.
+
+    def create_role(self, *args: Any, **kwargs: Any) -> AgentRole:
+        return self.roles.create_role(*args, **kwargs)
+
+    def get_role(self, *args: Any, **kwargs: Any) -> AgentRole:
+        return self.roles.get_role(*args, **kwargs)
+
+    def list_roles(self, *args: Any, **kwargs: Any) -> List[AgentRole]:
+        return self.roles.list_roles(*args, **kwargs)
+
+    def update_role(self, *args: Any, **kwargs: Any) -> AgentRole:
+        return self.roles.update_role(*args, **kwargs)
+
+    def delete_role(self, *args: Any, **kwargs: Any) -> None:
+        return self.roles.delete_role(*args, **kwargs)
+
+    def assign_role(self, agent_id: str, role_id_or_slug: str) -> Agent:
+        return self.roles.assign_role(agent_id, role_id_or_slug)
+
+    def unassign_role(self, agent_id: str) -> Agent:
+        return self.roles.unassign_role(agent_id)
+
+    def seed_default_roles(self, *args: Any, **kwargs: Any) -> List[AgentRole]:
+        return self.roles.seed_defaults(*args, **kwargs)
 
     def create_interaction_task(
         self,
@@ -876,6 +911,7 @@ class ControlPlane:
         resources: Optional[Dict[str, Any]] = None,
         trusted: bool = True,
         machine_id: Optional[str] = None,
+        hardware: Optional[Dict[str, Any]] = None,
     ) -> Machine:
         if not hostname:
             raise ValidationError("hostname is required")
@@ -883,17 +919,19 @@ class ControlPlane:
         mid = machine_id or new_id("machine")
         labels_json = self._resolved_json_column("machines", "labels", mid, labels)
         resources_json = self._resolved_json_column("machines", "resources", mid, resources)
+        hardware_json = self._resolved_json_column("machines", "hardware", mid, hardware)
         self.store.execute(
             """
-            INSERT INTO machines (id, hostname, labels, resources, trusted, created_at, updated_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO machines (id, hostname, labels, resources, trusted, created_at, updated_at, last_seen_at, hardware)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 hostname = excluded.hostname,
                 labels = excluded.labels,
                 resources = excluded.resources,
                 trusted = excluded.trusted,
                 updated_at = excluded.updated_at,
-                last_seen_at = excluded.last_seen_at
+                last_seen_at = excluded.last_seen_at,
+                hardware = excluded.hardware
             """,
             (
                 mid,
@@ -904,6 +942,7 @@ class ControlPlane:
                 now,
                 now,
                 now,
+                hardware_json,
             ),
         )
         return self.get_machine(mid)
@@ -1664,6 +1703,8 @@ class ControlPlane:
         return Lease(row["id"], row["task_id"], row["agent_id"], row["expires_at"], row["status"], row["created_at"], row["updated_at"])
 
     def _machine_from_row(self, row: Any) -> Machine:
+        keys = row.keys() if hasattr(row, "keys") else []
+        hardware = json_loads(row["hardware"], {}) if "hardware" in keys else {}
         return Machine(
             row["id"],
             row["hostname"],
@@ -1673,11 +1714,13 @@ class ControlPlane:
             row["created_at"],
             row["updated_at"],
             row["last_seen_at"],
+            hardware,
         )
 
     def _agent_from_row(self, row: Any) -> Agent:
         keys = row.keys() if hasattr(row, "keys") else []
         running_digest = row["running_digest"] if "running_digest" in keys else None
+        role_id = row["role_id"] if "role_id" in keys else None
         return Agent(
             row["id"],
             row["machine_id"],
@@ -1691,6 +1734,7 @@ class ControlPlane:
             row["created_at"],
             row["updated_at"],
             row["last_seen_at"],
+            role_id,
         )
 
     def _project_item_from_row(self, row: Any) -> ProjectItem:

@@ -620,6 +620,91 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_eval_set_events_set
                     ON eval_set_events (eval_set_id, created_at);
 
+                CREATE TABLE IF NOT EXISTS agent_roles (
+                    id TEXT PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    display_name TEXT,
+                    description TEXT NOT NULL,
+                    system_prompt TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    reports_to TEXT REFERENCES agent_roles(id) ON DELETE SET NULL,
+                    specialties TEXT NOT NULL DEFAULT '[]',
+                    default_capabilities TEXT NOT NULL DEFAULT '[]',
+                    required_capabilities TEXT NOT NULL DEFAULT '[]',
+                    hardware_requirements TEXT NOT NULL DEFAULT '{}',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(slug, tenant_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_roles_slug_tenant
+                    ON agent_roles (slug, tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_roles_reports_to
+                    ON agent_roles (reports_to);
+
+                CREATE TABLE IF NOT EXISTS workflows (
+                    id TEXT PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    workflow_type TEXT NOT NULL,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    definition TEXT NOT NULL,
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(slug, tenant_id, version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_workflows_type_enabled
+                    ON workflows (workflow_type, enabled);
+
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+                    workflow_version INTEGER NOT NULL,
+                    definition_snapshot TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    current_node_key TEXT,
+                    current_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                    input TEXT NOT NULL DEFAULT '{}',
+                    context TEXT NOT NULL DEFAULT '{}',
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+                    started_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_workflow_runs_state
+                    ON workflow_runs (state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_runs_current_task
+                    ON workflow_runs (current_task_id);
+                CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow
+                    ON workflow_runs (workflow_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS workflow_run_history (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    from_node_key TEXT,
+                    to_node_key TEXT,
+                    condition TEXT NOT NULL,
+                    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                    actor TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL DEFAULT 1,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_workflow_run_history_run
+                    ON workflow_run_history (run_id, seq);
+
                 -- Unified audit stream. Operators query one surface instead of
                 -- joining four per-resource tables. The view is read-only; each
                 -- write still goes to its owning table inside the originating
@@ -718,6 +803,10 @@ class SQLiteStore:
         self._ensure_column("rollouts", "health_policy", "health_policy TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("rollouts", "required_eval_set_id", "required_eval_set_id TEXT")
         self._ensure_column("agents", "running_digest", "running_digest TEXT")
+        self._ensure_column("agents", "role_id", "role_id TEXT")
+        self._ensure_column("machines", "hardware", "hardware TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("tasks", "workflow_run_id", "workflow_run_id TEXT")
+        self._ensure_column("tasks", "workflow_node_key", "workflow_node_key TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(%s)" % table)}

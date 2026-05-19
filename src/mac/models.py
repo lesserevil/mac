@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -459,6 +459,7 @@ class Machine:
     created_at: str
     updated_at: str
     last_seen_at: str
+    hardware: JsonDict = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -478,9 +479,54 @@ class Agent:
     created_at: str
     updated_at: str
     last_seen_at: str
+    role_id: Optional[str] = None
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
+
+
+@dataclass
+class AgentRole:
+    """Persona template assignable to an agent.
+
+    Roles bundle a system prompt, capability defaults, and optional
+    hardware requirements. An agent's ``role_id`` points at one of these
+    rows; capabilities the role declares as ``required`` are stacked onto
+    the agent's effective requirement set at dispatch time. Hardware
+    requirements gate role assignment and dispatch.
+    """
+
+    id: str
+    slug: str
+    name: str
+    display_name: Optional[str]
+    description: str
+    system_prompt: str
+    level: str
+    reports_to: Optional[str]
+    specialties: List[str]
+    default_capabilities: List[str]
+    required_capabilities: List[str]
+    hardware_requirements: JsonDict
+    metadata: JsonDict
+    is_default: bool
+    tenant_id: Optional[str]
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+class RoleLevel(StrEnum):
+    EXEC = "exec"
+    MANAGER = "manager"
+    STAFF = "staff"
+    IC = "ic"
+    BOT = "bot"
+
+
+ROLE_LEVELS = {value.value for value in RoleLevel}
 
 
 @dataclass
