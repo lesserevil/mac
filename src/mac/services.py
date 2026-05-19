@@ -2134,6 +2134,38 @@ class ControlPlane:
                 return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
         return None
 
+    def claim_next_for_agent(
+        self,
+        agent_id: str,
+        lease_seconds: int = 900,
+    ) -> Optional[JsonDict]:
+        """Claim the next dispatch-eligible task for one worker.
+
+        This is the worker-side counterpart to dispatch_once(). It preserves
+        the same capability, capacity, tenant, trust, and health checks while
+        allowing a worker daemon to pull only work assigned to its own durable
+        identity.
+        """
+        self.expire_leases()
+        self._unblock_ready_tasks()
+        agent = self.get_agent(agent_id)
+        for task in self._dispatch_ordered_tasks():
+            if not self._agent_available_for(agent, task):
+                continue
+            try:
+                claimed, lease = self.claim_task(task.id, agent.id, lease_seconds=lease_seconds)
+            except (TransitionError, ValidationError):
+                continue
+            self.send_message(
+                "dispatcher",
+                agent.id,
+                MessageType.NUDGE.value,
+                {"task_id": claimed.id, "lease_id": lease.id, "reason": "worker_claimed"},
+                task_id=claimed.id,
+            )
+            return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
+        return None
+
     def tick(
         self,
         lease_seconds: int = 900,

@@ -7,6 +7,8 @@ TMPDIR_LOCAL="${TMPDIR:-/tmp}/mac-fleet-deploy-${TS}.$$"
 ARCHIVE="${TMPDIR_LOCAL}/mac.tar.gz"
 GIT_REV="$(git -C "$ROOT" rev-parse HEAD)"
 AGENT_CONFIG_DIR="${MAC_DEPLOY_AGENT_CONFIG_DIR:-$ROOT/deploy/agents}"
+MAC_DEPLOY_HUB_AGENT="${MAC_DEPLOY_HUB_AGENT:-rocky}"
+MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
 
 DEFAULT_HOSTS=(
   "rocky|jkh@100.125.137.89|linux"
@@ -26,12 +28,16 @@ default. Each host gets:
   - the minimal Hermes multi-Slack patch
   - preinstalled configured Hermes messaging dependencies
   - enforced Hermes secret redaction
-  - a local mac service on 127.0.0.1:8789
+  - a host-local mac service, with Rocky exposed as the hub
+  - a mac-agent service that registers against the Rocky hub
   - rollback script and structured deploy manifests under ~/.mac/logs
   - one-time ACC SQLite dry-run and import reports under ~/.mac/logs
 
 Arguments may be agent names: rocky, natasha, bullwinkle.
 Per-agent defaults are read from deploy/agents/<agent>/config.env when present.
+Rocky is the default hub at http://100.125.137.89:8789. Spokes keep their
+local control plane for host-local state and register their mac-agent service
+against the hub.
 USAGE
 }
 
@@ -56,6 +62,10 @@ agent_spec() {
 $legacy
 EOF
     MAC_HERMES_SLACK_HOME_CHANNEL_NAME=""
+    MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
+    MAC_DEPLOY_CONTROL_BIND_HOST=""
+    MAC_DEPLOY_WORKER_MODE="heartbeat"
+    MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes"
     if [ -f "$config" ]; then
       # shellcheck source=/dev/null
       . "$config"
@@ -63,11 +73,22 @@ EOF
     : "${MAC_DEPLOY_AGENT:=$requested}"
     : "${MAC_DEPLOY_TARGET:?agent config must set MAC_DEPLOY_TARGET}"
     : "${MAC_DEPLOY_OS:?agent config must set MAC_DEPLOY_OS}"
-    printf '%s|%s|%s|%s\n' \
+    if [ -z "$MAC_DEPLOY_CONTROL_BIND_HOST" ]; then
+      if [ "$MAC_DEPLOY_AGENT" = "${MAC_DEPLOY_HUB_AGENT:-rocky}" ]; then
+        MAC_DEPLOY_CONTROL_BIND_HOST="0.0.0.0"
+      else
+        MAC_DEPLOY_CONTROL_BIND_HOST="127.0.0.1"
+      fi
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
       "$MAC_DEPLOY_AGENT" \
       "$MAC_DEPLOY_TARGET" \
       "$MAC_DEPLOY_OS" \
-      "${MAC_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
+      "${MAC_HERMES_SLACK_HOME_CHANNEL_NAME:-}" \
+      "$MAC_DEPLOY_HUB_URL" \
+      "$MAC_DEPLOY_CONTROL_BIND_HOST" \
+      "$MAC_DEPLOY_WORKER_MODE" \
+      "$MAC_DEPLOY_WORKER_CAPABILITIES"
   )
 }
 
@@ -101,8 +122,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" agent target os home_channel remote_archive
-  IFS='|' read -r agent target os home_channel <<<"$spec"
+  local spec="$1" hub_token="${2:-}" agent target os home_channel hub_url bind_host worker_mode worker_capabilities remote_archive
+  IFS='|' read -r agent target os home_channel hub_url bind_host worker_mode worker_capabilities <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
@@ -110,7 +131,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -119,6 +140,11 @@ ARCHIVE="${MAC_DEPLOY_ARCHIVE:?}"
 DEPLOY_TS="${MAC_DEPLOY_TS:?}"
 DEPLOY_REV="${MAC_DEPLOY_GIT_REV:?}"
 HERMES_SLACK_HOME_CHANNEL_NAME="${MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
+HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
+HUB_TOKEN="${MAC_DEPLOY_HUB_TOKEN:-}"
+CONTROL_BIND_HOST="${MAC_DEPLOY_CONTROL_BIND_HOST:-127.0.0.1}"
+WORKER_MODE="${MAC_DEPLOY_WORKER_MODE:-heartbeat}"
+WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes}"
 MAC_HOME="${MAC_HOME:-$HOME/.mac}"
 MAC_PORT="${MAC_PORT:-8789}"
 SRC_DIR="$MAC_HOME/src/mac"
@@ -134,15 +160,19 @@ MANIFEST_PRE="$LOG_DIR/deploy-manifest-${DEPLOY_TS}-pre.json"
 MANIFEST_POST="$LOG_DIR/deploy-manifest-${DEPLOY_TS}-post.json"
 MAC_SERVICE_NAME="mac.service"
 HERMES_SERVICE_NAME="mac-hermes-gateway.service"
+MAC_AGENT_SERVICE_NAME="mac-agent.service"
 MAC_LAUNCHD_LABEL="com.mac.control-plane"
 HERMES_LAUNCHD_LABEL="com.mac.hermes-gateway"
+MAC_AGENT_LAUNCHD_LABEL="com.mac.agent"
 SRC_BACKUP=""
 VENV_BACKUP=""
 HERMES_BACKUP=""
 MAC_UNIT_BACKUP=""
 HERMES_UNIT_BACKUP=""
+MAC_AGENT_UNIT_BACKUP=""
 MAC_PLIST_BACKUP=""
 HERMES_PLIST_BACKUP=""
+MAC_AGENT_PLIST_BACKUP=""
 
 mkdir -p "$LOG_DIR" "$MAC_HOME/backups"
 exec > >(tee -a "$DEPLOY_LOG") 2>&1
@@ -173,7 +203,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -224,7 +254,9 @@ write_deploy_manifest() {
   local stage="$1" path="$2"
   SRC_BACKUP="$SRC_BACKUP" VENV_BACKUP="$VENV_BACKUP" HERMES_BACKUP="$HERMES_BACKUP" \
   MAC_UNIT_BACKUP="$MAC_UNIT_BACKUP" HERMES_UNIT_BACKUP="$HERMES_UNIT_BACKUP" \
+  MAC_AGENT_UNIT_BACKUP="$MAC_AGENT_UNIT_BACKUP" \
   MAC_PLIST_BACKUP="$MAC_PLIST_BACKUP" HERMES_PLIST_BACKUP="$HERMES_PLIST_BACKUP" \
+  MAC_AGENT_PLIST_BACKUP="$MAC_AGENT_PLIST_BACKUP" \
   "$PY" - "$stage" "$path" <<'PY'
 import json
 import os
@@ -286,6 +318,7 @@ def service_summary():
                 "show",
                 "mac.service",
                 "mac-hermes-gateway.service",
+                "mac-agent.service",
                 "-p",
                 "Id",
                 "-p",
@@ -307,6 +340,7 @@ def service_summary():
         "manager": "launchd",
         "control_plane": run(["launchctl", "list", "com.mac.control-plane"]),
         "hermes_gateway": run(["launchctl", "list", "com.mac.hermes-gateway"]),
+        "mac_agent": run(["launchctl", "list", "com.mac.agent"]),
     }
 
 
@@ -335,6 +369,14 @@ manifest = {
         "mac_git_rev": os.environ["DEPLOY_REV"],
         "log": os.environ["DEPLOY_LOG"],
         "hermes_slack_home_channel_name": os.environ.get("HERMES_SLACK_HOME_CHANNEL_NAME") or None,
+        "hub_url": os.environ.get("HUB_URL") or None,
+        "control_bind_host": os.environ.get("CONTROL_BIND_HOST") or None,
+        "worker_mode": os.environ.get("WORKER_MODE") or None,
+        "worker_capabilities": [
+            item.strip()
+            for item in (os.environ.get("WORKER_CAPABILITIES") or "").split(",")
+            if item.strip()
+        ],
     },
     "paths": {
         "mac_home": str(mac_home),
@@ -379,8 +421,10 @@ manifest = {
         "hermes_agent": os.environ.get("HERMES_BACKUP") or None,
         "mac_unit": os.environ.get("MAC_UNIT_BACKUP") or None,
         "hermes_unit": os.environ.get("HERMES_UNIT_BACKUP") or None,
+        "mac_agent_unit": os.environ.get("MAC_AGENT_UNIT_BACKUP") or None,
         "mac_plist": os.environ.get("MAC_PLIST_BACKUP") or None,
         "hermes_plist": os.environ.get("HERMES_PLIST_BACKUP") or None,
+        "mac_agent_plist": os.environ.get("MAC_AGENT_PLIST_BACKUP") or None,
     },
     "rollback": str(Path(os.environ["LOG_DIR"]) / "rollback-latest.sh"),
 }
@@ -403,8 +447,10 @@ VENV_BACKUP='$VENV_BACKUP'
 HERMES_BACKUP='$HERMES_BACKUP'
 MAC_UNIT_BACKUP='$MAC_UNIT_BACKUP'
 HERMES_UNIT_BACKUP='$HERMES_UNIT_BACKUP'
+MAC_AGENT_UNIT_BACKUP='$MAC_AGENT_UNIT_BACKUP'
 MAC_PLIST_BACKUP='$MAC_PLIST_BACKUP'
 HERMES_PLIST_BACKUP='$HERMES_PLIST_BACKUP'
+MAC_AGENT_PLIST_BACKUP='$MAC_AGENT_PLIST_BACKUP'
 ROLLBACK_TS="\$(date -u +%Y%m%dT%H%M%SZ)"
 
 restore_dir() {
@@ -420,10 +466,11 @@ restore_dir() {
 
 case "\$OS_KIND" in
   linux)
-    sudo systemctl stop mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
+    sudo systemctl stop mac-agent.service mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
     ;;
   darwin)
     uid="\$(id -u)"
+    launchctl bootout "gui/\$uid/com.mac.agent" >/dev/null 2>&1 || true
     launchctl bootout "gui/\$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
     launchctl bootout "gui/\$uid/com.mac.control-plane" >/dev/null 2>&1 || true
     ;;
@@ -437,16 +484,19 @@ case "\$OS_KIND" in
   linux)
     [ -n "\$MAC_UNIT_BACKUP" ] && [ -f "\$MAC_UNIT_BACKUP" ] && sudo cp -f "\$MAC_UNIT_BACKUP" /etc/systemd/system/mac.service
     [ -n "\$HERMES_UNIT_BACKUP" ] && [ -f "\$HERMES_UNIT_BACKUP" ] && sudo cp -f "\$HERMES_UNIT_BACKUP" /etc/systemd/system/mac-hermes-gateway.service
+    [ -n "\$MAC_AGENT_UNIT_BACKUP" ] && [ -f "\$MAC_AGENT_UNIT_BACKUP" ] && sudo cp -f "\$MAC_AGENT_UNIT_BACKUP" /etc/systemd/system/mac-agent.service
     sudo systemctl daemon-reload
-    sudo systemctl restart mac.service mac-hermes-gateway.service
+    sudo systemctl restart mac.service mac-hermes-gateway.service mac-agent.service
     ;;
   darwin)
     mkdir -p "\$HOME/Library/LaunchAgents"
     [ -n "\$MAC_PLIST_BACKUP" ] && [ -f "\$MAC_PLIST_BACKUP" ] && cp -f "\$MAC_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.control-plane.plist"
     [ -n "\$HERMES_PLIST_BACKUP" ] && [ -f "\$HERMES_PLIST_BACKUP" ] && cp -f "\$HERMES_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist"
+    [ -n "\$MAC_AGENT_PLIST_BACKUP" ] && [ -f "\$MAC_AGENT_PLIST_BACKUP" ] && cp -f "\$MAC_AGENT_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.agent.plist"
     uid="\$(id -u)"
     launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/com.mac.control-plane.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/com.mac.control-plane"
     launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/com.mac.hermes-gateway"
+    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/com.mac.agent.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/com.mac.agent"
     ;;
 esac
 
@@ -668,7 +718,7 @@ mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$AGENT" <<'PY'
 from pathlib import Path
 import secrets
 import sys
@@ -678,6 +728,12 @@ mac_home = Path(sys.argv[2])
 home = Path(sys.argv[3])
 port = sys.argv[4]
 configured_home_channel = sys.argv[5].strip().lstrip("#")
+configured_hub_url = sys.argv[6].strip()
+configured_hub_token = sys.argv[7].strip()
+configured_bind_host = sys.argv[8].strip() or "127.0.0.1"
+configured_worker_mode = sys.argv[9].strip() or "heartbeat"
+configured_worker_capabilities = sys.argv[10].strip() or "ops,python,hermes"
+agent_name = sys.argv[11].strip()
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -690,6 +746,8 @@ values.setdefault("MAC_SECRET_KEY", secrets.token_urlsafe(48))
 values.setdefault("MAC_API_TOKEN", secrets.token_urlsafe(32))
 values["MAC_DB"] = str(mac_home / "mac.db")
 values["MAC_PORT"] = port
+values["MAC_BIND_HOST"] = configured_bind_host
+values["MAC_HUB_URL"] = configured_hub_url or values.get("MAC_HUB_URL", "http://127.0.0.1:8789")
 values["HERMES_HOME"] = str(home / ".hermes")
 values["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 values["HERMES_REDACT_SECRETS"] = "true"
@@ -698,6 +756,19 @@ values["MAC_HERMES_AGENT_DIR"] = str(mac_home / "hermes-agent")
 values["MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM"] = "1"
 values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
+if configured_hub_token:
+    values["MAC_WORKER_TOKEN"] = configured_hub_token
+else:
+    values.setdefault("MAC_WORKER_TOKEN", values["MAC_API_TOKEN"])
+values["MAC_WORKER_AGENT_NAME"] = agent_name
+values["MAC_WORKER_HOSTNAME"] = agent_name
+values["MAC_WORKER_MODE"] = configured_worker_mode
+values["MAC_WORKER_CAPABILITIES"] = configured_worker_capabilities
+values.setdefault("MAC_WORKER_WORKSPACE", str(mac_home / "agent-workspaces"))
+values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
+values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
+values.setdefault("MAC_WORKER_LEASE_SECONDS", "900")
+values.setdefault("MAC_WORKER_EXECUTOR", str(mac_home / "bin" / "mac-hermes-task-executor"))
 home_channel = (
     configured_home_channel
     or values.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
@@ -848,6 +919,7 @@ install_linux_service() {
   local unit="/etc/systemd/system/mac.service"
   log "installing systemd service $unit"
   install_hermes_gateway_wrapper
+  install_mac_agent_wrapper
   if sudo test -f "$unit"; then
     MAC_UNIT_BACKUP="$MAC_HOME/backups/mac.service.${AGENT}.${DEPLOY_TS}"
     sudo cp -f "$unit" "$MAC_UNIT_BACKUP"
@@ -865,7 +937,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$MAC_HOME
 EnvironmentFile=$ENV_FILE
-ExecStart=$VENV/bin/uvicorn mac.api:create_app --factory --host 127.0.0.1 --port $MAC_PORT --workers 1 --log-level info
+ExecStart=$VENV/bin/uvicorn mac.api:create_app --factory --host $MAC_BIND_HOST --port $MAC_PORT --workers 1 --log-level info
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
@@ -902,6 +974,119 @@ export HERMES_REDACT_SECRETS=true
 exec "$HOME/.mac/hermes-agent/.venv/bin/python" "$HOME/.mac/hermes-agent/hermes" gateway run --replace
 EOF
   chmod 700 "$wrapper"
+}
+
+install_mac_agent_wrapper() {
+  local wrapper="$MAC_HOME/bin/mac-agent-service"
+  local executor="$MAC_HOME/bin/mac-hermes-task-executor"
+  local executor_py="$MAC_HOME/bin/mac-hermes-task-executor.py"
+  mkdir -p "$MAC_HOME/bin"
+  cat > "$wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+. "$HOME/.mac/mac.env"
+set +a
+
+: "${MAC_HUB_URL:?MAC_HUB_URL is required}"
+: "${MAC_WORKER_TOKEN:?MAC_WORKER_TOKEN is required}"
+
+agent_name="${MAC_WORKER_AGENT_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+host_name="${MAC_WORKER_HOSTNAME:-$agent_name}"
+workspace="${MAC_WORKER_WORKSPACE:-$HOME/.mac/agent-workspaces}"
+mode="${MAC_WORKER_MODE:-heartbeat}"
+capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes}"
+mkdir -p "$workspace"
+
+common=(
+  "$HOME/.mac/venv/bin/mac-agent"
+  --url "$MAC_HUB_URL"
+  --token "$MAC_WORKER_TOKEN"
+  --register
+  --agent-name "$agent_name"
+  --hostname "$host_name"
+  --capabilities "$capabilities"
+  --workspace "$workspace"
+  --lease-seconds "${MAC_WORKER_LEASE_SECONDS:-900}"
+  --poll-interval "${MAC_WORKER_POLL_INTERVAL:-2}"
+)
+if [ -n "${MAC_WORKER_RESOURCES:-}" ]; then
+  common+=(--resources "$MAC_WORKER_RESOURCES")
+fi
+
+case "$mode" in
+  heartbeat)
+    interval="${MAC_WORKER_HEARTBEAT_INTERVAL:-30}"
+    while :; do
+      "${common[@]}" --heartbeat-only
+      sleep "$interval"
+    done
+    ;;
+  loop)
+    exec "${common[@]}" --loop --executor -- "${MAC_WORKER_EXECUTOR:-$HOME/.mac/bin/mac-hermes-task-executor}"
+    ;;
+  *)
+    echo "unsupported MAC_WORKER_MODE=$mode" >&2
+    exit 2
+    ;;
+esac
+EOF
+  chmod 700 "$wrapper"
+
+  cat > "$executor" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+. "$HOME/.mac/mac.env"
+set +a
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+export HERMES_DISABLE_LAZY_INSTALLS=1
+export HERMES_REDACT_SECRETS=true
+exec "$HOME/.mac/venv/bin/python" "$HOME/.mac/bin/mac-hermes-task-executor.py"
+EOF
+  chmod 700 "$executor"
+
+  cat > "$executor_py" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    task_file = Path(os.environ["MAC_TASK_FILE"])
+    task_workspace = Path(os.environ["MAC_TASK_WORKSPACE"])
+    task_payload = json.loads(task_file.read_text(encoding="utf-8"))
+    task = task_payload.get("task", task_payload)
+    prompt = "\n\n".join(
+        [
+            "You are running as a MAC fleet worker. Complete the assigned task from first principles.",
+            "Use the task JSON as the source of truth. Preserve secrets and do not print bearer tokens.",
+            "When you finish, report the exact outcome, files changed, tests run, and any blockers.",
+            "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
+        ]
+    )
+    hermes_py = Path.home() / ".mac" / "hermes-agent" / ".venv" / "bin" / "python"
+    hermes = Path.home() / ".mac" / "hermes-agent" / "hermes"
+    result = subprocess.run(
+        [str(hermes_py), str(hermes), "--accept-hooks", "--oneshot", prompt],
+        cwd=str(task_workspace),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+  chmod 600 "$executor_py"
 }
 
 install_linux_hermes_service() {
@@ -947,6 +1132,47 @@ EOF
   sleep 5
   sudo systemctl --no-pager -l status mac-hermes-gateway.service || true
   sudo journalctl -u mac-hermes-gateway.service --since "$DEPLOY_STARTED_ISO" --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
+  install_linux_agent_service
+}
+
+install_linux_agent_service() {
+  local unit="/etc/systemd/system/mac-agent.service"
+  log "installing systemd service $unit"
+  if sudo test -f "$unit"; then
+    MAC_AGENT_UNIT_BACKUP="$MAC_HOME/backups/mac-agent.service.${AGENT}.${DEPLOY_TS}"
+    sudo cp -f "$unit" "$MAC_AGENT_UNIT_BACKUP"
+    sudo chown "$USER" "$MAC_AGENT_UNIT_BACKUP" || true
+    write_rollback_script
+  fi
+  sudo tee "$unit" >/dev/null <<EOF
+[Unit]
+Description=mac worker agent registration loop
+After=network-online.target mac.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$MAC_HOME
+EnvironmentFile=$ENV_FILE
+ExecStart=$MAC_HOME/bin/mac-agent-service
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable mac-agent.service
+  sudo systemctl restart mac-agent.service
+  sleep 3
+  sudo systemctl --no-pager -l status mac-agent.service || true
+  sudo journalctl -u mac-agent.service --since "$DEPLOY_STARTED_ISO" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
 install_darwin_service() {
@@ -955,6 +1181,7 @@ install_darwin_service() {
   plist="$HOME/Library/LaunchAgents/com.mac.control-plane.plist"
   wrapper="$MAC_HOME/bin/mac-service"
   install_hermes_gateway_wrapper
+  install_mac_agent_wrapper
   mkdir -p "$MAC_HOME/bin" "$HOME/Library/LaunchAgents"
   if [ -f "$plist" ]; then
     MAC_PLIST_BACKUP="$MAC_HOME/backups/com.mac.control-plane.${AGENT}.${DEPLOY_TS}.plist"
@@ -968,7 +1195,7 @@ set -a
 . "$HOME/.mac/mac.env"
 set +a
 export HERMES_REDACT_SECRETS=true
-exec "$HOME/.mac/venv/bin/uvicorn" mac.api:create_app --factory --host 127.0.0.1 --port "${MAC_PORT:-8789}" --workers 1 --log-level info
+exec "$HOME/.mac/venv/bin/uvicorn" mac.api:create_app --factory --host "${MAC_BIND_HOST:-127.0.0.1}" --port "${MAC_PORT:-8789}" --workers 1 --log-level info
 EOF
   chmod 700 "$wrapper"
   cat > "$plist" <<EOF
@@ -1001,6 +1228,7 @@ EOF
   sleep 3
   launchctl list com.mac.control-plane || true
   install_darwin_hermes_service "$uid"
+  install_darwin_agent_service "$uid"
 }
 
 install_darwin_hermes_service() {
@@ -1039,6 +1267,45 @@ EOF
   fi
   sleep 5
   launchctl list com.mac.hermes-gateway || true
+}
+
+install_darwin_agent_service() {
+  local uid="$1" plist="$HOME/Library/LaunchAgents/com.mac.agent.plist"
+  log "installing launchd agent $plist"
+  if [ -f "$plist" ]; then
+    MAC_AGENT_PLIST_BACKUP="$MAC_HOME/backups/com.mac.agent.${AGENT}.${DEPLOY_TS}.plist"
+    cp -f "$plist" "$MAC_AGENT_PLIST_BACKUP"
+    write_rollback_script
+  fi
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mac.agent</string>
+  <key>ProgramArguments</key>
+  <array><string>$MAC_HOME/bin/mac-agent-service</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>WorkingDirectory</key><string>$MAC_HOME</string>
+  <key>StandardOutPath</key><string>$LOG_DIR/mac-agent.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/mac-agent.log</string>
+</dict>
+</plist>
+EOF
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$plist"
+  fi
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$uid/com.mac.agent" >/dev/null 2>&1 || true
+  : > "$LOG_DIR/mac-agent.log"
+  launchctl enable "gui/$uid/com.mac.agent"
+  if ! launchctl bootstrap "gui/$uid" "$plist"; then
+    launchctl kickstart -k "gui/$uid/com.mac.agent"
+  fi
+  sleep 3
+  launchctl list com.mac.agent || true
 }
 
 classify_gateway_logs() {
@@ -1102,6 +1369,44 @@ if summary["actionable_count"]:
 PY
 }
 
+verify_hub_registration() {
+  log "verifying mac-agent registration with hub ${MAC_HUB_URL:-$HUB_URL}"
+  local attempt
+  for attempt in $(seq 1 10); do
+    if curl -fsS -H "Authorization: Bearer $MAC_WORKER_TOKEN" \
+      "${MAC_HUB_URL:-$HUB_URL}/agents" > "$LOG_DIR/hub-agents.json"; then
+      if "$PY" - "$LOG_DIR/hub-agents.json" "${MAC_WORKER_AGENT_NAME:-$AGENT}" <<'PY'; then
+import json
+import sys
+
+agents_path, expected_name = sys.argv[1], sys.argv[2]
+with open(agents_path, "r", encoding="utf-8") as handle:
+    agents = json.load(handle)
+for agent in agents:
+    if agent.get("name") == expected_name:
+        print(
+            "hub registration: agent=%s id=%s status=%s health=%s last_seen=%s"
+            % (
+                agent.get("name"),
+                agent.get("id"),
+                agent.get("status"),
+                agent.get("health_status"),
+                agent.get("last_seen_at"),
+            )
+        )
+        raise SystemExit(0)
+print("hub registration: agent %s not present yet among %d agents" % (expected_name, len(agents)))
+raise SystemExit(1)
+PY
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  log "ERROR: mac-agent did not register with hub ${MAC_HUB_URL:-$HUB_URL}"
+  return 1
+}
+
 case "$OS_KIND" in
   linux) install_linux_service ;;
   darwin) install_darwin_service ;;
@@ -1150,10 +1455,26 @@ if data.get("warnings"):
         print("startup warning: %s" % warning)
 PY
 
+verify_hub_registration
+
 write_deploy_manifest "post" "$MANIFEST_POST"
 cp -f "$MANIFEST_POST" "$LOG_DIR/deploy-manifest-latest.json"
 log "deploy complete"
 REMOTE
+}
+
+hub_target() {
+  local spec agent target
+  spec="$(agent_spec "$MAC_DEPLOY_HUB_AGENT")"
+  IFS='|' read -r agent target _ <<<"$spec"
+  printf '%s\n' "$target"
+}
+
+read_hub_token() {
+  local target
+  target="$(hub_target)"
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+    'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${MAC_API_TOKEN:?}"'
 }
 
 main() {
@@ -1162,9 +1483,17 @@ main() {
     exit 0
   fi
   make_archive
-  local spec
+  local spec agent hub_token
+  hub_token="${MAC_DEPLOY_HUB_TOKEN:-}"
   while IFS= read -r spec; do
-    deploy_host "$spec"
+    IFS='|' read -r agent _ <<<"$spec"
+    if [ "$agent" != "$MAC_DEPLOY_HUB_AGENT" ] && [ -z "$hub_token" ]; then
+      hub_token="$(read_hub_token)"
+    fi
+    deploy_host "$spec" "$hub_token"
+    if [ "$agent" = "$MAC_DEPLOY_HUB_AGENT" ] && [ -z "$hub_token" ]; then
+      hub_token="$(read_hub_token)"
+    fi
   done < <(selected_hosts "$@")
   rm -rf "$TMPDIR_LOCAL"
 }

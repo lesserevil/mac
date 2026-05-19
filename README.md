@@ -192,14 +192,14 @@ mac --db mac.db migrate acc ~/.acc/data/acc.db --mode import \
 
 # Minimal worker harness: register/heartbeat first without claiming, then run
 # an executor-backed claim/start/evidence/submit loop.
-mac-agent --url http://127.0.0.1:8000 --register --agent-name rocky \
+mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
     --hostname rocky.local --capabilities python,ops \
     --resources '{"capacity":2}' --heartbeat-only
-mac-agent --url http://127.0.0.1:8000 --agent-id agent_... \
-    --workspace ~/.mac-agent/workspaces --executor -- hermes run-once
-mac-agent --url http://127.0.0.1:8000 --register --agent-name rocky \
+mac-agent --url http://100.125.137.89:8789 --agent-id agent_... \
+    --workspace ~/.mac-agent/workspaces --executor -- ~/.mac/bin/mac-hermes-task-executor
+mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
     --capabilities python,ops --loop --workspace ~/.mac-agent/workspaces \
-    --executor -- hermes run-once
+    --executor -- ~/.mac/bin/mac-hermes-task-executor
 
 # Typed AgentBus: durable ordered content chunks; this is transport, not exec.
 mac --db mac.db agentbus publish agent_sender --recipient-agent-id agent_recipient \

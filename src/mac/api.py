@@ -1062,6 +1062,10 @@ def create_app(
     def heartbeat_agent(agent_id: str, body: HeartbeatRequest) -> Dict[str, Any]:
         return cp.heartbeat_agent(agent_id, **_data(body)).to_dict()
 
+    @app.post("/agents/{agent_id}/claim-next")
+    def claim_next_for_agent(agent_id: str, body: DispatchRequest) -> Optional[Dict[str, Any]]:
+        return cp.claim_next_for_agent(agent_id, body.lease_seconds)
+
     @app.post("/dispatch/assign")
     def dispatch_once(body: DispatchRequest) -> Optional[Dict[str, Any]]:
         return cp.dispatch_once(body.lease_seconds)

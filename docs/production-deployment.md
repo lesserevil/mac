@@ -95,10 +95,18 @@ redeploys upstream `NousResearch/hermes-agent` into `~/.mac/hermes-agent`,
 applies the minimal multi-Slack Hermes patch, preinstalls configured Hermes
 messaging dependencies before service start, runs the ACC SQLite migration
 dry-run and import from `~/.acc/data/fleet.db` or `~/.acc/data/acc.db`, and
-starts a local `mac` service on `127.0.0.1:8789`. Linux hosts get
-`mac.service`; macOS hosts get `com.mac.control-plane`. The same deployment
-also starts a mac-managed Hermes gateway from the upstream checkout:
-`mac-hermes-gateway.service` on Linux and `com.mac.hermes-gateway` on macOS.
+starts a local `mac` service. Linux hosts get `mac.service`; macOS hosts get
+`com.mac.control-plane`. The same deployment also starts a mac-managed Hermes
+gateway from the upstream checkout: `mac-hermes-gateway.service` on Linux and
+`com.mac.hermes-gateway` on macOS. It also installs a persistent `mac-agent`
+registration service: `mac-agent.service` on Linux and `com.mac.agent` on
+macOS.
+
+The fleet topology is hub-and-spoke, matching ACC. Rocky is the default hub at
+`http://100.125.137.89:8789`; Natasha, Bullwinkle, and other spokes keep a
+host-local control plane for local state and Hermes startup checks, but their
+`mac-agent` service registers and heartbeats against Rocky. By default the hub
+binds `0.0.0.0` and spokes bind `127.0.0.1`.
 Runtime lazy dependency installs are disabled after the preinstall step, and
 `HERMES_REDACT_SECRETS=false` in inherited Hermes env files is corrected to
 `true` because disabled redaction is treated as state drift.
@@ -120,6 +128,8 @@ host:
 - `hermes-log-summary.json`
 - `mac-service-journal.txt` on Linux, or `mac-service.log` on macOS
 - `hermes-gateway-journal.txt` on Linux, or `hermes-gateway.log` on macOS
+- `mac-agent-journal.txt` on Linux, or `mac-agent.log` on macOS
+- `hub-agents.json`
 
 The activation shim for `slack_accounts.json` is intentionally applied by
 `mac` startup, not by the deploy script, so this path exercises the startup
@@ -139,18 +149,20 @@ deploy pass, then restarts the mac-managed services.
 
 The control-plane service does not execute tasks by itself. Each execution host
 must run a worker process that registers or refreshes its machine/agent row,
-heartbeats, then claims eligible open work with a real executor:
+heartbeats, then claims eligible open work with a real executor. Fleet deploy
+installs that process as a service in `heartbeat` mode by default so hosts are
+visible in Rocky's registry without claiming imported ACC work prematurely:
 
 ```bash
-mac-agent --url http://127.0.0.1:8789 --register \
+mac-agent --url http://100.125.137.89:8789 --register \
   --agent-name rocky --hostname rocky.local \
   --capabilities python,ops --resources '{"capacity":2}' \
   --heartbeat-only
 
-mac-agent --url http://127.0.0.1:8789 --register \
+mac-agent --url http://100.125.137.89:8789 --register \
   --agent-name rocky --capabilities python,ops \
   --workspace ~/.mac-agent/workspaces --loop \
-  --executor -- hermes run-once
+  --executor -- ~/.mac/bin/mac-hermes-task-executor
 ```
 
 Use `--heartbeat-only` during deploy validation when you want fleet visibility
@@ -158,6 +170,18 @@ without claiming migrated ACC work. Start the `--loop` form only after the
 executor command is the intended production worker. Successful executions write
 log evidence and move tasks to `needs_review`; failed executions fail the task
 with evidence attached.
+
+To enable executor-backed claiming from deploy config, set:
+
+```bash
+MAC_DEPLOY_WORKER_MODE=loop
+MAC_DEPLOY_WORKER_CAPABILITIES=ops,python,hermes
+```
+
+The generated service then runs `mac-agent --register --loop` against
+`MAC_HUB_URL`, using `MAC_WORKER_TOKEN` from `~/.mac/mac.env`. The default
+executor wrapper is `~/.mac/bin/mac-hermes-task-executor`, which calls the
+deployed upstream Hermes checkout in one-shot mode.
 
 ## AgentBus
 

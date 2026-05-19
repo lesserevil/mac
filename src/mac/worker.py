@@ -306,25 +306,10 @@ class MacWorker:
             raise
 
     def _claim_next_for_agent(self) -> Optional[JsonDict]:
-        tasks = self.client.get("/tasks?state=open")
-        for task in tasks:
-            try:
-                return self.client.post(
-                    "/tasks/%s/claim?%s"
-                    % (
-                        quote(task["id"], safe=""),
-                        urlencode(
-                            {
-                                "agent_id": self.agent_id,
-                                "lease_seconds": self.lease_seconds,
-                            }
-                        ),
-                    ),
-                    {},
-                )
-            except MacApiError:
-                continue
-        return None
+        return self.client.post(
+            "/agents/%s/claim-next" % quote(self.agent_id, safe=""),
+            {"lease_seconds": self.lease_seconds},
+        )
 
     def _prepare_task_workspace(self, task: JsonDict, lease: JsonDict) -> Path:
         task_dir = self.workspace / _safe_path_component(task["id"])
