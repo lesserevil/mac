@@ -964,6 +964,7 @@ def _dashboard_state(
         "eval_sets": [eval_set.to_dict() for eval_set in cp.list_eval_sets()],
         "eval_runs": [run.to_dict() for run in cp.list_eval_runs()],
         "observability": cp.observability_summary(),
+        "workflow_runs": cp.workflow_runs_summary(),
         "hermes_startup": hermes_startup,
     }
 
@@ -1466,6 +1467,12 @@ def create_app(
         return cp.workflow_runtime.cancel_run(
             run_id, reason=body.reason, actor=body.actor
         ).to_dict()
+
+    @app.post("/workflows/runs/tick")
+    def tick_workflow_runs(
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> List[Dict[str, Any]]:
+        return [run.to_dict() for run in cp.workflow_runtime.tick()]
 
     @app.get("/fleet/build-distribution")
     def fleet_build_distribution() -> Dict[str, Any]:

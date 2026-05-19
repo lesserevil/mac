@@ -374,6 +374,27 @@ class ControlPlane:
     def cancel_workflow_run(self, *args: Any, **kwargs: Any) -> WorkflowRun:
         return self.workflow_runtime.cancel_run(*args, **kwargs)
 
+    def tick_workflow_runs(self, *args: Any, **kwargs: Any) -> List[WorkflowRun]:
+        return self.workflow_runtime.tick(*args, **kwargs)
+
+    def workflow_runs_summary(self) -> JsonDict:
+        """Counts grouped by state plus the 20 most recent runs for the
+        dashboard. Designed to be inlined into /dashboard/state without
+        adding a separate read query path."""
+        rows = self.store.query_all(
+            "SELECT state, COUNT(*) AS count FROM workflow_runs GROUP BY state"
+        )
+        by_state = {row["state"]: int(row["count"]) for row in rows}
+        latest = [
+            run.to_dict()
+            for run in self.workflow_runtime.list_runs(limit=20)
+        ]
+        return {
+            "counts": by_state,
+            "total": sum(by_state.values()),
+            "latest": latest,
+        }
+
     def create_interaction_task(
         self,
         hermes_instance_id: str,

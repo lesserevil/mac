@@ -170,3 +170,41 @@ def test_disabled_workflow_cannot_be_started(cp):
     cp.workflows.disable_workflow(wf.id)
     with pytest.raises(ValidationError):
         cp.workflow_runtime.start_run("bug-disabled", started_by="ops")
+
+
+def test_tick_times_out_stuck_node_and_advances_via_failure_edge(cp):
+    # Workflow whose first node has a 1-minute timeout and a failure
+    # edge to the terminal sink.
+    cp.workflows.create_workflow(
+        slug="bug-timeout",
+        name="b",
+        description="d",
+        workflow_type="bug",
+        definition={
+            "nodes": [
+                {
+                    "node_key": "investigate",
+                    "node_type": "task",
+                    "role_required": "qa",
+                    "max_attempts": 1,
+                    "timeout_minutes": 1,
+                }
+            ],
+            "edges": [
+                {"from_node_key": "", "to_node_key": "investigate", "condition": "success", "priority": 100},
+                {"from_node_key": "investigate", "to_node_key": "", "condition": "cancelled", "priority": 100},
+            ],
+        },
+        created_by="human",
+    )
+    run = cp.workflow_runtime.start_run("bug-timeout", started_by="ops")
+    task_id = run.current_task_id
+
+    # Backdate the task so it's been "running" past the timeout.
+    cp.store.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", task_id),
+    )
+    advanced = cp.workflow_runtime.tick()
+    assert any(r.id == run.id for r in advanced)
+    assert cp.workflow_runtime.get_run(run.id).state in {"failed", "cancelled"}

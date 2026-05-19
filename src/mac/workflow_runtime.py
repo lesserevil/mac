@@ -177,6 +177,72 @@ class WorkflowRuntime:
         params.append(max(1, min(int(limit), 1000)))
         return [self._run_from_row(r) for r in self.store.query_all(sql, tuple(params))]
 
+    def tick(self, *, actor: str = "workflow_runtime.tick") -> List[WorkflowRun]:
+        """Sweep runs whose current task has exceeded the node's timeout.
+
+        Cancels the stuck task (which the on_task_completed hook then
+        sees as a CANCELLED terminal state) and lets normal edge
+        selection take it through whatever ``timeout`` / ``cancelled``
+        edge the workflow defined. Idempotent — runs whose current task
+        is already terminal are skipped.
+
+        Phase-5 ergonomic surface. Operators drive ticks via
+        ``POST /workflows/runs/tick`` (or a future worker hook).
+        """
+        from datetime import datetime, timezone
+
+        rows = self.store.query_all(
+            """
+            SELECT id, current_node_key, current_task_id, definition_snapshot, updated_at
+            FROM workflow_runs
+            WHERE state = ? AND current_task_id IS NOT NULL
+            """,
+            (WorkflowState.RUNNING.value,),
+        )
+        advanced: List[WorkflowRun] = []
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            definition = json_loads(row["definition_snapshot"], {})
+            node = self._node_by_key(definition, row["current_node_key"])
+            if node is None:
+                continue
+            timeout_min = int(node.get("timeout_minutes") or 0)
+            if timeout_min <= 0:
+                continue
+            try:
+                task = self._get_task(row["current_task_id"])
+            except NotFoundError:
+                continue
+            if task.state in {
+                TaskState.COMPLETED.value,
+                TaskState.FAILED.value,
+                TaskState.CANCELLED.value,
+            }:
+                continue
+            try:
+                started = datetime.fromisoformat(task.updated_at)
+            except (TypeError, ValueError):
+                continue
+            elapsed_min = (now - started).total_seconds() / 60.0
+            if elapsed_min < timeout_min:
+                continue
+            try:
+                self._transition_task(
+                    task.id,
+                    TaskState.CANCELLED.value,
+                    actor,
+                    {
+                        "reason": "workflow_runtime.tick timeout",
+                        "elapsed_minutes": elapsed_min,
+                        "timeout_minutes": timeout_min,
+                        "workflow_run_id": row["id"],
+                    },
+                )
+            except (TransitionError, ValidationError):
+                continue
+            advanced.append(self.get_run(row["id"]))
+        return advanced
+
     def cancel_run(self, run_id: str, *, reason: str, actor: str) -> WorkflowRun:
         run = self.get_run(run_id)
         if run.state in WORKFLOW_TERMINAL_STATES:
