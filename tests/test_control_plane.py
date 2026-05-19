@@ -1589,6 +1589,57 @@ def test_observability_prune_drops_old_or_excess_rows(cp):
         cp.prune_observability()
 
 
+def test_transition_to_terminal_state_is_atomic_across_task_agent_and_history(cp):
+    agent = register_agent(cp, "alpha", ["python"])
+    task = cp.create_task("transactional", required_capabilities=["python"])
+    cp.claim_task(task.id, agent.id)
+    cp.start_task(task.id, agent.id)
+
+    # Force the history write to fail and prove the task + agent updates roll
+    # back with it — the whole transition_task must be all-or-nothing.
+    original = cp._record_history
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated history failure")
+
+    cp._record_history = boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError):
+            cp.transition_task(task.id, TaskState.FAILED.value, "tester")
+    finally:
+        cp._record_history = original  # type: ignore[assignment]
+
+    # Task is still claimed by the agent; agent still references the task.
+    same_task = cp.get_task(task.id)
+    assert same_task.state == TaskState.RUNNING.value
+    assert same_task.owner_agent_id == agent.id
+    assert cp.get_agent(agent.id).current_task_id == task.id
+
+    # Now succeed: all three writes commit together.
+    cp.transition_task(task.id, TaskState.FAILED.value, "tester")
+    final = cp.get_task(task.id)
+    assert final.state == TaskState.FAILED.value
+    assert final.owner_agent_id is None
+    assert cp.get_agent(agent.id).current_task_id is None
+    assert any(h.event_type == "task.transitioned" for h in cp.task_history(task.id))
+
+
+def test_add_evidence_rolls_back_if_history_write_fails(cp):
+    cp.create_task("with-evidence", required_capabilities=["python"])
+    task_id = cp.list_tasks()[0].id
+
+    original = cp._record_history
+    cp._record_history = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("history boom"))  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError):
+            cp.add_evidence(task_id, "log", "file://x", "summary", "tester")
+    finally:
+        cp._record_history = original  # type: ignore[assignment]
+
+    # Evidence row should NOT exist — the transaction rolled back.
+    assert cp.list_evidence(task_id) == []
+
+
 def test_heartbeat_accepts_running_digest_only_for_known_runtime(cp):
     worker = register_agent(cp, "fleet-worker", ["python"])
     runtime = create_runtime(cp, "fleet-runtime")

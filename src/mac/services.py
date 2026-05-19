@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -52,8 +51,6 @@ from mac.models import (
     MessageStatus,
     MessageType,
     NotFoundError,
-    OBSERVABILITY_KINDS,
-    OBSERVABILITY_LEVELS,
     ObservabilityEvent,
     Persona,
     PlatformBinding,
@@ -90,6 +87,7 @@ from mac.models import (
     utcnow,
     validate_transition,
 )
+from mac.observability_service import ObservabilityService
 from mac.store import SQLiteStore
 
 
@@ -122,7 +120,6 @@ AGENTBUS_TYPED_CONTENT_RE = re.compile(
 AGENTBUS_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 AGENTBUS_TOPIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,127}$")
 AGENTBUS_MAX_CHUNK_BYTES = 256 * 1024
-OBSERVABILITY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,127}$")
 
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
 
@@ -178,6 +175,9 @@ class ControlPlane:
             info=b"fernet-key",
         ).derive(raw_key.encode("utf-8"))
         self._fernet = Fernet(base64.urlsafe_b64encode(fernet_key))
+        # Domain sub-services. New domains should land here as their own
+        # service classes rather than as more methods on ControlPlane.
+        self.observability = ObservabilityService(self.store)
 
     @classmethod
     def in_memory(cls) -> "ControlPlane":
@@ -833,215 +833,27 @@ class ControlPlane:
             for row in rows
         ]
 
-    # Observability: coherent metrics/logs across API, control-plane, workers,
-    # deployment shims, and external agents.
+    # Observability: thin facade over ``self.observability`` so existing
+    # callers keep working. New code should call ``cp.observability.<method>``
+    # directly.
 
-    def record_observation(
-        self,
-        kind: str,
-        name: str,
-        layer: str = "control_plane",
-        source: str = "mac",
-        level: str = "info",
-        value: Optional[float] = None,
-        unit: str = "",
-        subject_type: Optional[str] = None,
-        subject_id: Optional[str] = None,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> ObservabilityEvent:
-        return self._insert_observation(
-            self.store,
-            kind,
-            name,
-            layer,
-            source,
-            level,
-            value,
-            unit,
-            subject_type,
-            subject_id,
-            detail or {},
-            utcnow(),
-        )
+    def record_observation(self, *args: Any, **kwargs: Any) -> ObservabilityEvent:
+        return self.observability.record_observation(*args, **kwargs)
 
-    def record_metric(
-        self,
-        name: str,
-        value: float,
-        unit: str = "",
-        layer: str = "control_plane",
-        source: str = "mac",
-        level: str = "info",
-        subject_type: Optional[str] = None,
-        subject_id: Optional[str] = None,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> ObservabilityEvent:
-        return self.record_observation(
-            "metric",
-            name,
-            layer,
-            source,
-            level,
-            value,
-            unit,
-            subject_type,
-            subject_id,
-            detail,
-        )
+    def record_metric(self, *args: Any, **kwargs: Any) -> ObservabilityEvent:
+        return self.observability.record_metric(*args, **kwargs)
 
-    def record_log(
-        self,
-        name: str,
-        level: str = "info",
-        layer: str = "control_plane",
-        source: str = "mac",
-        subject_type: Optional[str] = None,
-        subject_id: Optional[str] = None,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> ObservabilityEvent:
-        return self.record_observation(
-            "log",
-            name,
-            layer,
-            source,
-            level,
-            None,
-            "",
-            subject_type,
-            subject_id,
-            detail,
-        )
+    def record_log(self, *args: Any, **kwargs: Any) -> ObservabilityEvent:
+        return self.observability.record_log(*args, **kwargs)
 
-    def list_observability(
-        self,
-        kind: Optional[str] = None,
-        layer: Optional[str] = None,
-        level: Optional[str] = None,
-        name: Optional[str] = None,
-        subject_type: Optional[str] = None,
-        subject_id: Optional[str] = None,
-        since: Optional[str] = None,
-        until: Optional[str] = None,
-        after_sequence: Optional[int] = None,
-        limit: int = 100,
-    ) -> List[ObservabilityEvent]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if kind is not None:
-            clauses.append("kind = ?")
-            params.append(self._normalize_observability_kind(kind))
-        if layer is not None:
-            clauses.append("layer = ?")
-            params.append(self._validate_observability_name(layer, "layer"))
-        if level is not None:
-            clauses.append("level = ?")
-            params.append(self._normalize_observability_level(level))
-        if name is not None:
-            clauses.append("name = ?")
-            params.append(self._validate_observability_name(name, "name"))
-        if subject_type is not None:
-            clauses.append("subject_type = ?")
-            params.append(subject_type)
-        if subject_id is not None:
-            clauses.append("subject_id = ?")
-            params.append(subject_id)
-        if since is not None:
-            clauses.append("created_at >= ?")
-            params.append(since)
-        if until is not None:
-            clauses.append("created_at <= ?")
-            params.append(until)
-        if after_sequence is not None:
-            clauses.append("sequence > ?")
-            params.append(max(0, int(after_sequence)))
-        sql = "SELECT * FROM observability_events"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        if after_sequence is not None:
-            sql += " ORDER BY sequence ASC LIMIT ?"
-        else:
-            sql += " ORDER BY sequence DESC LIMIT ?"
-        params.append(min(max(1, int(limit)), 1000))
-        return [
-            self._observability_from_row(row)
-            for row in self.store.query_all(sql, tuple(params))
-        ]
+    def list_observability(self, *args: Any, **kwargs: Any) -> List[ObservabilityEvent]:
+        return self.observability.list_observability(*args, **kwargs)
 
-    def prune_observability(
-        self,
-        older_than: Optional[str] = None,
-        keep_last: Optional[int] = None,
-    ) -> int:
-        """Delete observability rows older than ``older_than`` (ISO timestamp) or
-        keep only the most recent ``keep_last`` rows. Returns the number of rows
-        removed. Operators are expected to invoke this on a schedule; the
-        control plane does not prune automatically."""
-        if older_than is None and keep_last is None:
-            raise ValidationError("prune_observability requires older_than or keep_last")
-        with self.store.transaction() as conn:
-            removed = 0
-            if older_than is not None:
-                cursor = conn.execute(
-                    "DELETE FROM observability_events WHERE created_at < ?",
-                    (older_than,),
-                )
-                removed += int(cursor.rowcount or 0)
-            if keep_last is not None:
-                kept = max(0, int(keep_last))
-                cursor = conn.execute(
-                    """
-                    DELETE FROM observability_events
-                    WHERE sequence <= COALESCE(
-                        (SELECT sequence FROM observability_events
-                         ORDER BY sequence DESC LIMIT 1 OFFSET ?), 0
-                    )
-                    """,
-                    (kept,),
-                )
-                removed += int(cursor.rowcount or 0)
-        return removed
+    def prune_observability(self, *args: Any, **kwargs: Any) -> int:
+        return self.observability.prune(*args, **kwargs)
 
-    def observability_summary(self, limit: int = 80) -> JsonDict:
-        latest = self.list_observability(limit=limit)
-        levels: Dict[str, int] = {}
-        layers: Dict[str, int] = {}
-        for item in latest:
-            levels[item.level] = levels.get(item.level, 0) + 1
-            layers[item.layer] = layers.get(item.layer, 0) + 1
-        metric_rows = self.store.query_all(
-            """
-            SELECT * FROM observability_events
-            WHERE kind = 'metric'
-            ORDER BY sequence DESC
-            LIMIT 500
-            """
-        )
-        seen = set()
-        latest_metrics: List[JsonDict] = []
-        for row in metric_rows:
-            item = self._observability_from_row(row)
-            key = (item.layer, item.source, item.name, item.unit)
-            if key in seen:
-                continue
-            seen.add(key)
-            latest_metrics.append(item.to_dict())
-            if len(latest_metrics) >= 24:
-                break
-        counts = {
-            "events": self._observability_count(),
-            "metrics": self._observability_count(kind="metric"),
-            "logs": self._observability_count(kind="log"),
-            "warnings": self._observability_count(level="warning"),
-            "errors": self._observability_count(level="error")
-            + self._observability_count(level="critical"),
-        }
-        return {
-            "counts": counts,
-            "levels": levels,
-            "layers": layers,
-            "latest": [item.to_dict() for item in latest],
-            "latest_metrics": latest_metrics,
-        }
+    def observability_summary(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.observability.summary(*args, **kwargs)
 
     def list_dead_letters(self, tenant_id: Optional[str] = None) -> List[Task]:
         rows = self.store.query_all(
@@ -1081,17 +893,20 @@ class ControlPlane:
             owner_agent_id = None
             lease_id = None
             leased_until = None
-        self.store.execute(
-            """
-            UPDATE tasks
-            SET state = ?, owner_agent_id = ?, lease_id = ?, leased_until = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (target, owner_agent_id, lease_id, leased_until, now, task_id),
-        )
-        if task.owner_agent_id and target in TERMINAL_TASK_STATES.union({TaskState.OPEN.value}):
-            self._set_agent_idle(task.owner_agent_id)
-        self._record_history(task_id, "task.transitioned", actor, task.state, target, detail or {})
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET state = ?, owner_agent_id = ?, lease_id = ?, leased_until = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (target, owner_agent_id, lease_id, leased_until, now, task_id),
+            )
+            if task.owner_agent_id and target in TERMINAL_TASK_STATES.union({TaskState.OPEN.value}):
+                self._set_agent_idle(task.owner_agent_id, conn=conn)
+            self._record_history(
+                task_id, "task.transitioned", actor, task.state, target, detail or {}, conn=conn
+            )
         return self.get_task(task_id)
 
     def claim_task(self, task_id: str, agent_id: str, lease_seconds: int = 900) -> Tuple[Task, Lease]:
@@ -1187,31 +1002,33 @@ class ControlPlane:
             raise ValidationError("publication evidence requires a checksum")
         now = utcnow()
         evidence_id = new_id("ev")
-        self.store.execute(
-            """
-            INSERT INTO evidence (id, task_id, kind, uri, summary, checksum, metadata, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                evidence_id,
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO evidence (id, task_id, kind, uri, summary, checksum, metadata, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    task_id,
+                    kind,
+                    uri,
+                    summary,
+                    checksum,
+                    json_dumps(ensure_json_object(metadata)),
+                    created_by,
+                    now,
+                ),
+            )
+            self._record_history(
                 task_id,
-                kind,
-                uri,
-                summary,
-                checksum,
-                json_dumps(ensure_json_object(metadata)),
+                "task.evidence_added",
                 created_by,
-                now,
-            ),
-        )
-        self._record_history(
-            task_id,
-            "task.evidence_added",
-            created_by,
-            None,
-            None,
-            {"evidence_id": evidence_id, "kind": kind, "uri": uri},
-        )
+                None,
+                None,
+                {"evidence_id": evidence_id, "kind": kind, "uri": uri},
+                conn=conn,
+            )
         return self.get_evidence(evidence_id)
 
     def get_evidence(self, evidence_id: str) -> Evidence:
@@ -1710,7 +1527,7 @@ class ControlPlane:
             """,
             (new_id("aevt"), agent_id, event_type, actor, json_dumps(detail), when),
         )
-        self._insert_observation(
+        self.observability.insert_observation(
             conn,
             "log",
             event_type,
@@ -2839,7 +2656,7 @@ class ControlPlane:
                     now,
                 ),
             )
-            self._insert_observation(
+            self.observability.insert_observation(
                 conn,
                 "log",
                 "task.published",
@@ -2869,7 +2686,7 @@ class ControlPlane:
                     now,
                 ),
             )
-            self._insert_observation(
+            self.observability.insert_observation(
                 conn,
                 "log",
                 "task.transitioned",
@@ -3388,7 +3205,7 @@ class ControlPlane:
             """,
             (new_id("envevt"), environment_id, event_type, actor, json_dumps(detail), when),
         )
-        self._insert_observation(
+        self.observability.insert_observation(
             conn,
             "log",
             event_type,
@@ -4308,7 +4125,7 @@ class ControlPlane:
                 """,
                 (new_id("revt"), rollout_id, "rollout.%s" % action, actor, json_dumps(detail), now),
             )
-            self._insert_observation(
+            self.observability.insert_observation(
                 conn,
                 "log",
                 "rollout.%s" % action,
@@ -4775,144 +4592,6 @@ class ControlPlane:
 
     # Internal helpers
 
-    def _normalize_observability_kind(self, kind: str) -> str:
-        value = str(kind or "").strip().lower()
-        if value not in OBSERVABILITY_KINDS:
-            raise ValidationError(
-                "unsupported observability kind: %s (allowed: %s)"
-                % (kind, ", ".join(sorted(OBSERVABILITY_KINDS)))
-            )
-        return value
-
-    def _normalize_observability_level(self, level: str) -> str:
-        value = str(level or "info").strip().lower()
-        if value == "warn":
-            value = "warning"
-        if value not in OBSERVABILITY_LEVELS:
-            raise ValidationError(
-                "unsupported observability level: %s (allowed: %s)"
-                % (level, ", ".join(sorted(OBSERVABILITY_LEVELS)))
-            )
-        return value
-
-    def _validate_observability_name(self, value: str, field: str) -> str:
-        text = str(value or "").strip()
-        if not OBSERVABILITY_NAME_RE.match(text):
-            raise ValidationError("invalid observability %s: %s" % (field, value))
-        return text
-
-    def _normalize_observability_value(
-        self,
-        kind: str,
-        value: Optional[float],
-    ) -> Optional[float]:
-        if value is None:
-            if kind == "metric":
-                raise ValidationError("metric observations require a numeric value")
-            return None
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValidationError("observability value must be finite")
-        return number
-
-    def _insert_observation(
-        self,
-        conn: Any,
-        kind: str,
-        name: str,
-        layer: str,
-        source: str,
-        level: str,
-        value: Optional[float],
-        unit: str,
-        subject_type: Optional[str],
-        subject_id: Optional[str],
-        detail: Dict[str, Any],
-        when: str,
-    ) -> ObservabilityEvent:
-        kind_value = self._normalize_observability_kind(kind)
-        level_value = self._normalize_observability_level(level)
-        layer_value = self._validate_observability_name(layer or "control_plane", "layer")
-        source_value = self._validate_observability_name(source or "mac", "source")
-        name_value = self._validate_observability_name(name, "name")
-        value_float = self._normalize_observability_value(kind_value, value)
-        obs_id = new_id("obs")
-        unit_value = str(unit or "")
-        detail_json = json_dumps(ensure_json_object(detail))
-        cursor = conn.execute(
-            """
-            INSERT INTO observability_events (
-                id, kind, layer, source, level, name, subject_type, subject_id,
-                value, unit, detail, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                obs_id,
-                kind_value,
-                layer_value,
-                source_value,
-                level_value,
-                name_value,
-                subject_type,
-                subject_id,
-                value_float,
-                unit_value,
-                detail_json,
-                when,
-            ),
-        )
-        return ObservabilityEvent(
-            int(cursor.lastrowid),
-            obs_id,
-            kind_value,
-            layer_value,
-            source_value,
-            level_value,
-            name_value,
-            subject_type,
-            subject_id,
-            value_float,
-            unit_value,
-            json_loads(detail_json, {}),
-            when,
-        )
-
-    def _observability_from_row(self, row: Any) -> ObservabilityEvent:
-        return ObservabilityEvent(
-            int(row["sequence"]),
-            row["id"],
-            row["kind"],
-            row["layer"],
-            row["source"],
-            row["level"],
-            row["name"],
-            row["subject_type"],
-            row["subject_id"],
-            row["value"],
-            row["unit"],
-            json_loads(row["detail"], {}),
-            row["created_at"],
-        )
-
-    def _observability_count(
-        self,
-        kind: Optional[str] = None,
-        level: Optional[str] = None,
-    ) -> int:
-        clauses = []
-        params: List[Any] = []
-        if kind is not None:
-            clauses.append("kind = ?")
-            params.append(kind)
-        if level is not None:
-            clauses.append("level = ?")
-            params.append(level)
-        sql = "SELECT COUNT(*) AS count FROM observability_events"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        row = self.store.query_one(sql, tuple(params))
-        return int(row["count"]) if row is not None else 0
-
     def _record_history(
         self,
         task_id: str,
@@ -4921,17 +4600,19 @@ class ControlPlane:
         from_state: Optional[str],
         to_state: Optional[str],
         detail: Dict[str, Any],
+        conn: Any = None,
     ) -> None:
         when = utcnow()
-        self.store.execute(
+        writer = conn if conn is not None else self.store
+        writer.execute(
             """
             INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (new_id("hist"), task_id, event_type, actor, from_state, to_state, json_dumps(detail), when),
         )
-        self._insert_observation(
-            self.store,
+        self.observability.insert_observation(
+            writer,
             "log",
             event_type,
             "control_plane",
@@ -4954,7 +4635,7 @@ class ControlPlane:
             """,
             (new_id("revt"), rollout_id, event_type, actor, json_dumps(detail), when),
         )
-        self._insert_observation(
+        self.observability.insert_observation(
             self.store,
             "log",
             event_type,
@@ -4988,7 +4669,7 @@ class ControlPlane:
             """,
             (new_id("eevt"), eval_set_id, event_type, actor, json_dumps(detail), when),
         )
-        self._insert_observation(
+        self.observability.insert_observation(
             conn,
             "log",
             event_type,
@@ -5170,9 +4851,10 @@ class ControlPlane:
         required = set(task.required_capabilities)
         return required.issubset(capabilities)
 
-    def _set_agent_idle(self, agent_id: str) -> None:
+    def _set_agent_idle(self, agent_id: str, conn: Any = None) -> None:
         now = utcnow()
-        self.store.execute(
+        writer = conn if conn is not None else self.store
+        writer.execute(
             "UPDATE agents SET status = ?, current_task_id = NULL, updated_at = ? WHERE id = ?",
             (AgentStatus.IDLE.value, now, agent_id),
         )
@@ -5325,7 +5007,7 @@ class ControlPlane:
                         timestamp,
                     ),
                 )
-                self._insert_observation(
+                self.observability.insert_observation(
                     conn,
                     "log",
                     "task.lease_expired",
@@ -5449,7 +5131,7 @@ class ControlPlane:
                 when,
             ),
         )
-        self._insert_observation(
+        self.observability.insert_observation(
             self.store,
             "log",
             "secret.%s" % result,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -7,10 +8,27 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 
+def default_db_path() -> str:
+    """Resolve the canonical SQLite path.
+
+    Prefer ``MAC_DB`` (explicit operator intent), otherwise use
+    ``~/.mac/mac.db`` so a stray run from any cwd doesn't drop a fresh
+    ``mac.db`` next to the source tree.
+    """
+    env = os.environ.get("MAC_DB")
+    if env:
+        return env
+    home = Path.home() / ".mac"
+    home.mkdir(parents=True, exist_ok=True)
+    return str(home / "mac.db")
+
+
 class SQLiteStore:
     """Durable SQLite backing store for the control plane."""
 
-    def __init__(self, path: str = "mac.db") -> None:
+    def __init__(self, path: Optional[str] = None) -> None:
+        if path is None:
+            path = default_db_path()
         self.path = path
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)

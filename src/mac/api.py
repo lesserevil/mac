@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Union
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -17,9 +19,98 @@ from pydantic import BaseModel, Field
 from mac.hermes_startup import build_hermes_startup_report
 from mac.models import AuthorizationError, MACError, NotFoundError, ValidationError
 from mac.services import ControlPlane
-from mac.store import SQLiteStore
+from mac.store import SQLiteStore, default_db_path
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TokenPrincipal:
+    """Authenticated bearer principal.
+
+    ``scopes`` is the set of scope strings the token may use; ``"admin"``
+    implicitly grants every scope. ``tenant_id`` is the tenant binding; ``None``
+    means cross-tenant (admin-like) and any other value means the token may
+    only write resources scoped to that tenant. Reads currently ignore the
+    tenant binding — that surface returns full fleet state by design today.
+    """
+
+    scopes: frozenset = field(default_factory=frozenset)
+    tenant_id: Optional[str] = None
+
+    @property
+    def is_admin(self) -> bool:
+        return "admin" in self.scopes
+
+    def has_scope(self, scope: str) -> bool:
+        return self.is_admin or scope in self.scopes
+
+    def assert_tenant(self, target_tenant_id: Optional[str]) -> None:
+        if self.is_admin or self.tenant_id is None:
+            return
+        if target_tenant_id is None or target_tenant_id != self.tenant_id:
+            raise AuthorizationError(
+                "token is bound to a tenant and cannot write to a different tenant"
+            )
+
+    def require_global_fleet(self) -> None:
+        """Refuse the call for tenant-bound, non-admin tokens.
+
+        Machines, agents, runtimes, environments, and rollouts are part of the
+        shared fleet today. A tenant-bound token has no business reaching them
+        until we extend the schema to be tenant-aware.
+        """
+        if self.is_admin or self.tenant_id is None:
+            return
+        raise AuthorizationError(
+            "token is bound to a tenant and cannot operate on global fleet resources"
+        )
+
+
+AuthTokenMapping = Mapping[str, Union[List[str], Dict[str, Any], TokenPrincipal]]
+
+
+def _coerce_principal(value: Union[List[str], Dict[str, Any], TokenPrincipal]) -> TokenPrincipal:
+    if isinstance(value, TokenPrincipal):
+        return value
+    if isinstance(value, dict):
+        scopes = frozenset(str(s) for s in value.get("scopes", []))
+        tenant = value.get("tenant_id")
+        return TokenPrincipal(scopes=scopes, tenant_id=tenant)
+    return TokenPrincipal(scopes=frozenset(str(s) for s in value))
+
+
+def _normalize_auth_tokens(
+    raw: Optional[AuthTokenMapping],
+) -> Dict[str, TokenPrincipal]:
+    if not raw:
+        return {}
+    return {str(token): _coerce_principal(value) for token, value in raw.items()}
+
+
+def _resolve_principal(
+    token: str, tokens: Mapping[str, TokenPrincipal]
+) -> Optional[TokenPrincipal]:
+    """Constant-time lookup over the registered tokens.
+
+    Iterates every registered token so timing does not leak which prefix
+    matched; ``hmac.compare_digest`` short-circuits in constant time within
+    each pair.
+    """
+    candidate_bytes = token.encode("utf-8")
+    matched: Optional[TokenPrincipal] = None
+    for registered, principal in tokens.items():
+        if hmac.compare_digest(candidate_bytes, registered.encode("utf-8")):
+            matched = principal
+    return matched
+
+
+def _get_principal(request: Request) -> TokenPrincipal:
+    principal = getattr(request.state, "principal", None)
+    if principal is None:
+        # No auth tokens configured — treat as admin to keep dev mode working.
+        return TokenPrincipal(scopes=frozenset({"admin"}))
+    return principal
 
 
 def _data(model: BaseModel) -> Dict[str, Any]:
@@ -432,11 +523,11 @@ class RolloutHealthReport(BaseModel):
     checks: Dict[str, Any]
 
 
-def _load_auth_tokens_from_env() -> Dict[str, List[str]]:
+def _load_auth_tokens_from_env() -> Dict[str, TokenPrincipal]:
     raw = os.environ.get("MAC_API_TOKENS")
     if raw:
         loaded = json.loads(raw)
-        return {str(token): [str(scope) for scope in scopes] for token, scopes in loaded.items()}
+        return _normalize_auth_tokens(loaded)
     single = os.environ.get("MAC_API_TOKEN")
     if single is None:
         return {}
@@ -446,7 +537,7 @@ def _load_auth_tokens_from_env() -> Dict[str, List[str]]:
         raise ValueError(
             "MAC_API_TOKEN is set but empty; unset it to leave the API open, or provide a non-empty token"
         )
-    return {single: ["admin"]}
+    return {single: TokenPrincipal(scopes=frozenset({"admin"}))}
 
 
 def _required_scope(method: str, path: str) -> Optional[str]:
@@ -468,6 +559,12 @@ def _required_scope(method: str, path: str) -> Optional[str]:
         return "dispatch"
     if path.startswith("/secrets") or path.startswith("/secret-audits"):
         return "secret"
+    if (
+        path.startswith("/runtimes")
+        or path.startswith("/environments")
+        or path.startswith("/rollouts")
+    ):
+        return "deploy"
     return "write"
 
 
@@ -475,19 +572,20 @@ def _authorize_request(
     method: str,
     path: str,
     authorization: Optional[str],
-    auth_tokens: Dict[str, List[str]],
-) -> None:
+    auth_tokens: Mapping[str, TokenPrincipal],
+) -> Optional[TokenPrincipal]:
     required = _required_scope(method, path)
     if required is None or not auth_tokens:
-        return
+        return None
     if not authorization or not authorization.startswith("Bearer "):
         raise AuthorizationError("missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    scopes = set(auth_tokens.get(token) or [])
-    if not scopes:
+    principal = _resolve_principal(token, auth_tokens)
+    if principal is None:
         raise AuthorizationError("unknown bearer token")
-    if "admin" not in scopes and required not in scopes:
+    if not principal.has_scope(required):
         raise AuthorizationError("token lacks required scope: %s" % required)
+    return principal
 
 
 def _should_record_http_observation(path: str) -> bool:
@@ -503,6 +601,31 @@ def _resolve_record_http_observations(flag: Optional[bool]) -> bool:
         return flag
     raw = os.environ.get("MAC_RECORD_HTTP_OBSERVATIONS", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+MAX_REGISTRATION_PAYLOAD_BYTES = 64 * 1024
+
+
+def _ensure_payload_bounded(value: Any, field: str) -> None:
+    """Cap registration-style metadata/labels/resources dicts.
+
+    The control plane stores these as JSON blobs in SQLite forever, so an
+    unbounded dict from a single client becomes permanent table bloat. 64 KB
+    after JSON encoding is well above any legitimate label/metadata payload
+    and well below the body-size limit that protects the HTTP layer.
+    """
+    if value is None:
+        return
+    try:
+        encoded = json.dumps(value, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("%s must be JSON serializable" % field) from exc
+    if len(encoded.encode("utf-8")) > MAX_REGISTRATION_PAYLOAD_BYTES:
+        raise ValidationError(
+            "%s exceeds %d-byte limit" % (field, MAX_REGISTRATION_PAYLOAD_BYTES)
+        )
+
+
 
 
 TERMINAL_DASHBOARD_STATES = {"completed", "failed", "cancelled"}
@@ -749,13 +872,17 @@ def _dashboard_state(
 def create_app(
     db_path: Optional[str] = None,
     control_plane: Optional[ControlPlane] = None,
-    auth_tokens: Optional[Dict[str, List[str]]] = None,
+    auth_tokens: Optional[AuthTokenMapping] = None,
     record_http_observations: Optional[bool] = None,
 ) -> FastAPI:
     cp = control_plane or ControlPlane(
-        SQLiteStore(db_path or os.environ.get("MAC_DB") or "mac.db")
+        SQLiteStore(db_path or default_db_path())
     )
-    tokens = auth_tokens if auth_tokens is not None else _load_auth_tokens_from_env()
+    tokens: Dict[str, TokenPrincipal] = (
+        _normalize_auth_tokens(auth_tokens)
+        if auth_tokens is not None
+        else _load_auth_tokens_from_env()
+    )
     record_http_obs = _resolve_record_http_observations(record_http_observations)
     app = FastAPI(title="MAC Control Plane", version="0.1.0")
     app.state.control_plane = cp
@@ -816,12 +943,13 @@ def create_app(
         status_code = 500
         error_name = ""
         try:
-            _authorize_request(
+            principal = _authorize_request(
                 request.method,
                 request.url.path,
                 request.headers.get("authorization"),
                 tokens,
             )
+            request.state.principal = principal
         except AuthorizationError as exc:
             status_code = 403
             error_name = exc.__class__.__name__
@@ -887,7 +1015,13 @@ def create_app(
         return _dashboard_rollout_status(cp, rollout_id)
 
     @app.post("/tenants")
-    def register_tenant(body: TenantRegister) -> Dict[str, Any]:
+    def register_tenant(
+        body: TenantRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        # Creating tenants is a cross-tenant operation; only admin/unbound
+        # principals can perform it.
+        principal.require_global_fleet()
         return cp.register_tenant(**_data(body)).to_dict()
 
     @app.get("/tenants")
@@ -895,7 +1029,11 @@ def create_app(
         return [tenant.to_dict() for tenant in cp.list_tenants()]
 
     @app.post("/users")
-    def register_user(body: UserRegister) -> Dict[str, Any]:
+    def register_user(
+        body: UserRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
         return cp.register_user(**_data(body)).to_dict()
 
     @app.get("/users")
@@ -903,7 +1041,11 @@ def create_app(
         return [user.to_dict() for user in cp.list_users(tenant_id)]
 
     @app.post("/personas")
-    def register_persona(body: PersonaRegister) -> Dict[str, Any]:
+    def register_persona(
+        body: PersonaRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
         return cp.register_persona(**_data(body)).to_dict()
 
     @app.get("/personas")
@@ -911,7 +1053,11 @@ def create_app(
         return [persona.to_dict() for persona in cp.list_personas(tenant_id)]
 
     @app.post("/hermes-instances")
-    def register_hermes_instance(body: HermesInstanceRegister) -> Dict[str, Any]:
+    def register_hermes_instance(
+        body: HermesInstanceRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
         return cp.register_hermes_instance(**_data(body)).to_dict()
 
     @app.get("/hermes-instances")
@@ -923,13 +1069,23 @@ def create_app(
         return cp.hermes_context(instance_id)
 
     @app.post("/hermes-instances/{instance_id}/tasks")
-    def create_interaction_task(instance_id: str, body: InteractionTaskCreate) -> Dict[str, Any]:
+    def create_interaction_task(
+        instance_id: str,
+        body: InteractionTaskCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        instance = cp.get_hermes_instance(instance_id)
+        principal.assert_tenant(instance.tenant_id)
         data = _data(body)
         actor = data.pop("actor", "hermes")
         return cp.create_interaction_task(instance_id, actor=actor, **data).to_dict()
 
     @app.post("/platform-bindings")
-    def register_platform_binding(body: PlatformBindingRegister) -> Dict[str, Any]:
+    def register_platform_binding(
+        body: PlatformBindingRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
         return cp.register_platform_binding(**_data(body)).to_dict()
 
     @app.get("/platform-bindings")
@@ -946,9 +1102,24 @@ def create_app(
         ]
 
     @app.post("/tasks")
-    def create_task(body: TaskCreate) -> Dict[str, Any]:
+    def create_task(
+        body: TaskCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        _ensure_payload_bounded(body.metadata, "task.metadata")
         data = _data(body)
         actor = data.pop("actor", "human")
+        metadata = dict(data.get("metadata") or {})
+        origin = dict(metadata.get("origin") or {}) if isinstance(metadata.get("origin"), dict) else {}
+        existing_tenant = origin.get("tenant_id") or metadata.get("tenant_id")
+        if principal.tenant_id is not None and not principal.is_admin:
+            if existing_tenant is not None and existing_tenant != principal.tenant_id:
+                principal.assert_tenant(existing_tenant)
+            # Stamp the principal's tenant onto the task so downstream filters
+            # see it even when the caller forgot to set it explicitly.
+            origin["tenant_id"] = principal.tenant_id
+            metadata["origin"] = origin
+            data["metadata"] = metadata
         return cp.create_task(actor=actor, **data).to_dict()
 
     @app.get("/tasks")
@@ -988,7 +1159,13 @@ def create_app(
         return cp.add_evidence(task_id=task_id, **_data(body)).to_dict()
 
     @app.post("/machines")
-    def register_machine(body: MachineRegister) -> Dict[str, Any]:
+    def register_machine(
+        body: MachineRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        _ensure_payload_bounded(body.labels, "machine.labels")
+        _ensure_payload_bounded(body.resources, "machine.resources")
         return cp.register_machine(**_data(body)).to_dict()
 
     @app.get("/machines")
@@ -996,7 +1173,12 @@ def create_app(
         return [machine.to_dict() for machine in cp.list_machines()]
 
     @app.post("/agents")
-    def register_agent(body: AgentRegister) -> Dict[str, Any]:
+    def register_agent(
+        body: AgentRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        _ensure_payload_bounded(body.resources, "agent.resources")
         return cp.register_agent(**_data(body)).to_dict()
 
     @app.get("/agents")
@@ -1426,7 +1608,11 @@ def create_app(
         ]
 
     @app.post("/environments")
-    def register_environment(body: EnvironmentRegister) -> Dict[str, Any]:
+    def register_environment(
+        body: EnvironmentRegister,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
         return cp.register_environment(**_data(body)).to_dict()
 
     @app.get("/environments")
@@ -1454,7 +1640,11 @@ def create_app(
         return [d.to_dict() for d in cp.list_deployments(env_id)]
 
     @app.post("/runtimes")
-    def create_runtime(body: RuntimeCreate) -> Dict[str, Any]:
+    def create_runtime(
+        body: RuntimeCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
         return cp.create_runtime(**_data(body)).to_dict()
 
     @app.get("/runtimes")
@@ -1525,7 +1715,11 @@ def create_app(
         return [run.to_dict() for run in cp.list_eval_runs(eval_set_id, target_id)]
 
     @app.post("/rollouts")
-    def create_rollout(body: RolloutCreate) -> Dict[str, Any]:
+    def create_rollout(
+        body: RolloutCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
         return cp.create_rollout(**_data(body)).to_dict()
 
     @app.get("/rollouts")

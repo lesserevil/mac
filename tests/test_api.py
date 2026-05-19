@@ -133,6 +133,152 @@ def test_fastapi_can_require_scoped_bearer_tokens():
     assert client.get("/machines", headers={"Authorization": "Bearer reader"}).status_code == 200
 
 
+def test_deploy_scope_is_required_for_runtimes_environments_and_rollouts():
+    cp = ControlPlane.in_memory()
+    client = TestClient(
+        create_app(
+            control_plane=cp,
+            auth_tokens={
+                "writer": ["write"],
+                "deployer": ["write", "deploy"],
+            },
+        )
+    )
+
+    # /runtimes requires deploy scope, not write.
+    assert client.post(
+        "/runtimes",
+        headers={"Authorization": "Bearer writer"},
+        json={"name": "rt", "manifest": {"image": "python:3.12@sha256:abc123"}, "created_by": "ops"},
+    ).status_code == 403
+    assert client.post(
+        "/runtimes",
+        headers={"Authorization": "Bearer deployer"},
+        json={"name": "rt", "manifest": {"image": "python:3.12@sha256:abc123"}, "created_by": "ops"},
+    ).status_code == 200
+
+    # /environments also requires deploy.
+    tenant = cp.register_tenant("team-a")
+    assert client.post(
+        "/environments",
+        headers={"Authorization": "Bearer writer"},
+        json={"name": "prod", "tenant_id": tenant.id},
+    ).status_code == 403
+    assert client.post(
+        "/environments",
+        headers={"Authorization": "Bearer deployer"},
+        json={"name": "prod", "tenant_id": tenant.id},
+    ).status_code == 200
+
+
+def test_tenant_bound_token_cannot_cross_tenants_or_touch_global_fleet():
+    cp = ControlPlane.in_memory()
+    tenant_a = cp.register_tenant("alpha")
+    tenant_b = cp.register_tenant("beta")
+    client = TestClient(
+        create_app(
+            control_plane=cp,
+            auth_tokens={
+                "alpha-writer": {
+                    "scopes": ["write", "deploy"],
+                    "tenant_id": tenant_a.id,
+                },
+                "admin": ["admin"],
+            },
+        )
+    )
+
+    # Same-tenant write succeeds.
+    persona_ok = client.post(
+        "/personas",
+        headers={"Authorization": "Bearer alpha-writer"},
+        json={
+            "tenant_id": tenant_a.id,
+            "name": "Rocky",
+            "soul_ref": "h://a/r/SOUL.md",
+            "memory_scope": "h://a/r/mem",
+        },
+    )
+    assert persona_ok.status_code == 200
+
+    # Cross-tenant write is refused.
+    persona_xtenant = client.post(
+        "/personas",
+        headers={"Authorization": "Bearer alpha-writer"},
+        json={
+            "tenant_id": tenant_b.id,
+            "name": "Boris",
+            "soul_ref": "h://b/r/SOUL.md",
+            "memory_scope": "h://b/r/mem",
+        },
+    )
+    assert persona_xtenant.status_code == 403
+
+    # Tenant-bound principal cannot create a new tenant.
+    assert client.post(
+        "/tenants",
+        headers={"Authorization": "Bearer alpha-writer"},
+        json={"name": "gamma"},
+    ).status_code == 403
+
+    # Tenant-bound principal cannot register a global-fleet machine.
+    assert client.post(
+        "/machines",
+        headers={"Authorization": "Bearer alpha-writer"},
+        json={"hostname": "host-1"},
+    ).status_code == 403
+
+    # Admin still can.
+    assert client.post(
+        "/machines",
+        headers={"Authorization": "Bearer admin"},
+        json={"hostname": "host-1"},
+    ).status_code == 200
+
+    # Tasks created by the tenant-bound principal get tenant_id stamped.
+    task = client.post(
+        "/tasks",
+        headers={"Authorization": "Bearer alpha-writer"},
+        json={"title": "scoped task"},
+    ).json()
+    assert task["metadata"]["origin"]["tenant_id"] == tenant_a.id
+
+
+def test_unknown_bearer_token_is_rejected_with_constant_time_compare():
+    # We can't assert timing directly, but we can verify the wrong-token path
+    # returns 403 and that a token that differs only in the final byte is
+    # still rejected (rather than partially matched).
+    client = TestClient(
+        create_app(
+            control_plane=ControlPlane.in_memory(),
+            auth_tokens={"correct-token-32chars-xxxxxxxxx": ["admin"]},
+        )
+    )
+    assert client.post(
+        "/machines",
+        headers={"Authorization": "Bearer correct-token-32chars-xxxxxxxxy"},
+        json={"hostname": "h"},
+    ).status_code == 403
+    assert client.post(
+        "/machines",
+        headers={"Authorization": "Bearer correct-token-32chars-xxxxxxxxx"},
+        json={"hostname": "h"},
+    ).status_code == 200
+
+
+def test_registration_payloads_are_size_capped():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+
+    huge_labels = {"k": "x" * (64 * 1024 + 1)}
+    response = client.post("/machines", json={"hostname": "h", "labels": huge_labels})
+    assert response.status_code == 400
+    assert "machine.labels exceeds" in response.json()["detail"]
+
+    huge_metadata = {"blob": "y" * (64 * 1024 + 1)}
+    task_response = client.post("/tasks", json={"title": "t", "metadata": huge_metadata})
+    assert task_response.status_code == 400
+
+
 def test_fastapi_serves_dashboard_shell_without_api_token():
     client = TestClient(
         create_app(
