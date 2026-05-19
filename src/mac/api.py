@@ -24,6 +24,22 @@ def _data(model: BaseModel) -> Dict[str, Any]:
     return model.dict(exclude_unset=True)
 
 
+AGENTBUS_MAX_EVENT_TIMEOUT_SECONDS = 60.0
+AGENTBUS_MIN_EVENT_POLL_SECONDS = 0.25
+AGENTBUS_MAX_EVENT_POLL_SECONDS = 5.0
+
+
+def _agentbus_clamp_timeout(value: float) -> float:
+    return min(AGENTBUS_MAX_EVENT_TIMEOUT_SECONDS, max(0.0, float(value)))
+
+
+def _agentbus_clamp_poll_interval(value: float) -> float:
+    return min(
+        AGENTBUS_MAX_EVENT_POLL_SECONDS,
+        max(AGENTBUS_MIN_EVENT_POLL_SECONDS, float(value)),
+    )
+
+
 class TaskCreate(BaseModel):
     title: str
     description: str = ""
@@ -141,7 +157,7 @@ class MessageCreate(BaseModel):
 
 class AgentBusOpen(BaseModel):
     sender_agent_id: str
-    recipient_agent_id: Optional[str] = None
+    recipient_agent_id: str
     task_id: Optional[str] = None
     topic: str = "content"
     content_type: str = "application/json"
@@ -159,7 +175,7 @@ class AgentBusAppend(BaseModel):
 
 class AgentBusPublish(BaseModel):
     sender_agent_id: str
-    recipient_agent_id: Optional[str] = None
+    recipient_agent_id: str
     task_id: Optional[str] = None
     topic: str = "content"
     content_type: str = "application/json"
@@ -1057,13 +1073,12 @@ def create_app(
     ) -> StreamingResponse:
         # Authorize before we start streaming so denials surface as proper HTTP
         # errors rather than a half-open response.
-        cp.read_agentbus_chunks(agent_id, stream_id, 0, limit=1)
+        cp.assert_agentbus_authorized(agent_id, stream_id)
 
         async def iter_events() -> Any:
             cursor = max(0, int(after_sequence))
-            timeout = min(60.0, max(0.0, float(timeout_seconds)))
-            deadline = time.monotonic() + timeout
-            poll_interval = min(5.0, max(0.25, float(poll_interval_seconds)))
+            deadline = time.monotonic() + _agentbus_clamp_timeout(timeout_seconds)
+            poll_interval = _agentbus_clamp_poll_interval(poll_interval_seconds)
             while True:
                 chunks = cp.read_agentbus_chunks(agent_id, stream_id, cursor, limit=100)
                 for chunk in chunks:
@@ -1072,6 +1087,9 @@ def create_app(
                 if chunks:
                     if time.monotonic() >= deadline:
                         break
+                    # Yield control between batches so we don't starve the event
+                    # loop while draining a backlog.
+                    await asyncio.sleep(0)
                     continue
                 if cp.get_agentbus_stream(stream_id).status != "open":
                     break

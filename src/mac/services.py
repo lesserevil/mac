@@ -116,6 +116,7 @@ AGENTBUS_TYPED_CONTENT_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9.+_/-]*(;[A-Za-z0-9_.+-]+=[A-Za-z0-9_.+-]+)*$"
 )
 AGENTBUS_STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+AGENTBUS_TOPIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,127}$")
 AGENTBUS_MAX_CHUNK_BYTES = 256 * 1024
 
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential", "api_key", "auth")
@@ -2213,6 +2214,13 @@ class ControlPlane:
         )
         return [self._agentbus_stream_from_row(row) for row in rows]
 
+    def assert_agentbus_authorized(self, agent_id: str, stream_id: str) -> AgentBusStream:
+        self.get_agent(agent_id)
+        stream = self.get_agentbus_stream(stream_id)
+        if not self._agentbus_authorized(stream, agent_id):
+            raise AuthorizationError("agent is not authorized for agentbus stream")
+        return stream
+
     def read_agentbus_chunks(
         self,
         agent_id: str,
@@ -2220,10 +2228,7 @@ class ControlPlane:
         after_sequence: int = 0,
         limit: int = 100,
     ) -> List[AgentBusChunk]:
-        self.get_agent(agent_id)
-        stream = self.get_agentbus_stream(stream_id)
-        if not self._agentbus_authorized(stream, agent_id):
-            raise AuthorizationError("agent is not authorized for agentbus stream")
+        self.assert_agentbus_authorized(agent_id, stream_id)
         rows = self.store.query_all(
             """
             SELECT * FROM agentbus_chunks
@@ -4664,7 +4669,7 @@ class ControlPlane:
         if not isinstance(topic, str) or not topic.strip():
             raise ValidationError("agentbus topic is required")
         topic_value = topic.strip()
-        if len(topic_value) > 128 or any(ord(ch) < 32 for ch in topic_value):
+        if not AGENTBUS_TOPIC_RE.match(topic_value):
             raise ValidationError("invalid agentbus topic: %s" % topic)
         return topic_value
 

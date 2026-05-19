@@ -380,7 +380,7 @@ def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():
     no_recipient = client.post(
         "/agentbus/streams", json={"sender_agent_id": sender["id"]}
     )
-    assert no_recipient.status_code == 400
+    assert no_recipient.status_code == 422
 
     stream = client.post(
         "/agentbus/streams",
@@ -426,3 +426,68 @@ def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():
     # asked for a 10-minute timeout — proves the server isn't honoring the
     # client-controlled value verbatim.
     assert elapsed < 5
+
+
+def test_agentbus_event_clamps_have_correct_bounds():
+    from mac.api import (
+        AGENTBUS_MAX_EVENT_POLL_SECONDS,
+        AGENTBUS_MAX_EVENT_TIMEOUT_SECONDS,
+        AGENTBUS_MIN_EVENT_POLL_SECONDS,
+        _agentbus_clamp_poll_interval,
+        _agentbus_clamp_timeout,
+    )
+
+    assert _agentbus_clamp_timeout(-1) == 0.0
+    assert _agentbus_clamp_timeout(0.5) == 0.5
+    assert _agentbus_clamp_timeout(600) == AGENTBUS_MAX_EVENT_TIMEOUT_SECONDS
+    assert _agentbus_clamp_poll_interval(0.0) == AGENTBUS_MIN_EVENT_POLL_SECONDS
+    assert _agentbus_clamp_poll_interval(0.5) == 0.5
+    assert _agentbus_clamp_poll_interval(100) == AGENTBUS_MAX_EVENT_POLL_SECONDS
+
+
+def test_agentbus_events_delivers_chunks_appended_after_request_starts():
+    import threading
+    import time as _time
+
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "bus-host"}).json()
+    sender = client.post(
+        "/agents", json={"machine_id": machine["id"], "name": "sender"}
+    ).json()
+    recipient = client.post(
+        "/agents", json={"machine_id": machine["id"], "name": "recipient"}
+    ).json()
+    stream = client.post(
+        "/agentbus/streams",
+        json={"sender_agent_id": sender["id"], "recipient_agent_id": recipient["id"]},
+    ).json()
+
+    def appender() -> None:
+        _time.sleep(0.4)
+        client.post(
+            "/agentbus/streams/%s/chunks" % stream["id"],
+            json={"sender_agent_id": sender["id"], "payload": {"seq": 1}, "final": True},
+        )
+
+    thread = threading.Thread(target=appender)
+    thread.start()
+    try:
+        started = _time.monotonic()
+        events = client.get(
+            "/agentbus/streams/%s/events" % stream["id"],
+            params={
+                "agent_id": recipient["id"],
+                "timeout_seconds": 5,
+                "poll_interval_seconds": 0.25,
+            },
+        )
+        elapsed = _time.monotonic() - started
+    finally:
+        thread.join()
+
+    assert events.status_code == 200
+    lines = [line for line in events.text.splitlines() if line]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["payload"] == {"seq": 1}
+    # Should observe the chunk well before the 5s deadline.
+    assert elapsed < 3
