@@ -602,11 +602,23 @@ class ControlPlane:
         owner_agent_id = task.owner_agent_id
         lease_id = task.lease_id
         leased_until = task.leased_until
-        if target in {TaskState.OPEN.value, TaskState.FAILED.value, TaskState.CANCELLED.value}:
+        release_lease_id = None
+        if target in {
+            TaskState.OPEN.value,
+            TaskState.NEEDS_REVIEW.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        }:
+            release_lease_id = lease_id
             owner_agent_id = None
             lease_id = None
             leased_until = None
         with self.store.transaction() as conn:
+            if release_lease_id:
+                conn.execute(
+                    "UPDATE leases SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                    (LeaseStatus.RELEASED.value, now, release_lease_id, LeaseStatus.ACTIVE.value),
+                )
             conn.execute(
                 """
                 UPDATE tasks
@@ -615,7 +627,9 @@ class ControlPlane:
                 """,
                 (target, owner_agent_id, lease_id, leased_until, now, task_id),
             )
-            if task.owner_agent_id and target in TERMINAL_TASK_STATES.union({TaskState.OPEN.value}):
+            if task.owner_agent_id and target in TERMINAL_TASK_STATES.union(
+                {TaskState.OPEN.value, TaskState.NEEDS_REVIEW.value}
+            ):
                 self._set_agent_idle(task.owner_agent_id, conn=conn)
             self._record_history(
                 task_id, "task.transitioned", actor, task.state, target, detail or {}, conn=conn
@@ -1992,4 +2006,3 @@ class ControlPlane:
                     },
                     timestamp,
                 )
-

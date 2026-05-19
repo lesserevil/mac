@@ -53,7 +53,10 @@ def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: P
 
     assert result.status == "submitted_for_review"
     assert result.task["id"] == task.id
-    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+    reviewed = cp.get_task(task.id)
+    assert reviewed.state == TaskState.NEEDS_REVIEW.value
+    assert reviewed.owner_agent_id is None
+    assert reviewed.lease_id is None
     assert cp.get_task(skipped.id).state == TaskState.OPEN.value
     evidence = cp.list_evidence(task.id)
     assert evidence[0].summary == "tests passed"
@@ -92,8 +95,8 @@ def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):
 
 def test_mac_worker_run_forever_drains_queue_then_reports_offline(tmp_path: Path):
     cp = ControlPlane.in_memory()
-    # Worker with capacity 3 so it can hold multiple leases-in-review at once
-    # without waiting for the reviewer to publish (which is a separate role).
+    # Capacity is above one so the loop can drain several assignments in a
+    # single bounded run; submitted tasks release their executor lease at review.
     machine = cp.register_machine("worker-host")
     agent = cp.register_agent(
         machine.id, "worker", capabilities=["python"], resources={"capacity": 3}
