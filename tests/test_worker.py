@@ -247,3 +247,32 @@ def test_register_worker_creates_identity_then_worker_claims_tasks(tmp_path: Pat
     assert cp.get_agent(registered["id"]).name == "rocky"
     assert cp.get_agent(registered["id"]).capabilities == ["python"]
     assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
+def test_mac_worker_completes_task_even_if_observability_writes_fail(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    task = cp.create_task("Python task", required_capabilities=["python"])
+    client = TestClient(create_app(control_plane=cp))
+
+    api = MacApiClient("http://mac.test", transport=api_transport(client))
+    original_post = api.post
+
+    def broken_post(path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        if path.startswith("/observability/"):
+            raise MacApiError("observability sink is down")
+        return original_post(path, payload)
+
+    api.post = broken_post  # type: ignore[assignment]
+
+    worker = MacWorker(
+        api,
+        agent.id,
+        tmp_path,
+        lambda _t, _d: WorkerExecution(0, "ok", stdout="ok\n"),
+    )
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    assert result.task["id"] == task.id
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value

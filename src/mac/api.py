@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,6 +18,8 @@ from mac.hermes_startup import build_hermes_startup_report
 from mac.models import AuthorizationError, MACError, NotFoundError, ValidationError
 from mac.services import ControlPlane
 from mac.store import SQLiteStore
+
+_log = logging.getLogger(__name__)
 
 
 def _data(model: BaseModel) -> Dict[str, Any]:
@@ -482,8 +486,15 @@ def _should_record_http_observation(path: str) -> bool:
     return not (
         path == "/health"
         or path.startswith("/ui/assets")
-        or path.startswith("/observability/stream")
+        or path.startswith("/observability")
     )
+
+
+def _resolve_record_http_observations(flag: Optional[bool]) -> bool:
+    if flag is not None:
+        return flag
+    raw = os.environ.get("MAC_RECORD_HTTP_OBSERVATIONS", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 TERMINAL_DASHBOARD_STATES = {"completed", "failed", "cancelled"}
@@ -731,11 +742,13 @@ def create_app(
     db_path: Optional[str] = None,
     control_plane: Optional[ControlPlane] = None,
     auth_tokens: Optional[Dict[str, List[str]]] = None,
+    record_http_observations: Optional[bool] = None,
 ) -> FastAPI:
     cp = control_plane or ControlPlane(
         SQLiteStore(db_path or os.environ.get("MAC_DB") or "mac.db")
     )
     tokens = auth_tokens if auth_tokens is not None else _load_auth_tokens_from_env()
+    record_http_obs = _resolve_record_http_observations(record_http_observations)
     app = FastAPI(title="MAC Control Plane", version="0.1.0")
     app.state.control_plane = cp
     app.state.auth_tokens = tokens
@@ -761,12 +774,39 @@ def create_app(
             return JSONResponse(status_code=403, content={"detail": str(exc)})
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    def _emit_http_observation(
+        request: Request, status_code: int, started: float, error_name: str
+    ) -> None:
+        if not record_http_obs or not _should_record_http_observation(request.url.path):
+            return
+        duration_ms = (time.monotonic() - started) * 1000.0
+        level = "error" if status_code >= 500 else "warning" if status_code >= 400 else "info"
+        detail = {
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": status_code,
+            "duration_ms": round(duration_ms, 3),
+        }
+        if error_name:
+            detail["error"] = error_name
+        try:
+            cp.record_metric(
+                "http.request.duration_ms",
+                duration_ms,
+                unit="ms",
+                layer="api",
+                source="http",
+                level=level,
+                detail=detail,
+            )
+        except (MACError, sqlite3.Error):
+            _log.warning("failed to record http observation for %s", request.url.path, exc_info=True)
+
     @app.middleware("http")
     async def authenticate(request: Request, call_next: Any) -> Any:
         started = time.monotonic()
         status_code = 500
         error_name = ""
-        response: Any = None
         try:
             _authorize_request(
                 request.method,
@@ -777,74 +817,17 @@ def create_app(
         except AuthorizationError as exc:
             status_code = 403
             error_name = exc.__class__.__name__
-            response = JSONResponse(status_code=status_code, content={"detail": str(exc)})
-        if response is None:
-            try:
-                response = await call_next(request)
-                status_code = int(getattr(response, "status_code", 500))
-            except Exception as exc:
-                error_name = exc.__class__.__name__
-                raise
-            finally:
-                duration_ms = (time.monotonic() - started) * 1000.0
-                if _should_record_http_observation(request.url.path):
-                    level = "error" if status_code >= 500 else "warning" if status_code >= 400 else "info"
-                    detail = {
-                        "method": request.method,
-                        "path": request.url.path,
-                        "status_code": status_code,
-                        "duration_ms": round(duration_ms, 3),
-                    }
-                    if error_name:
-                        detail["error"] = error_name
-                    try:
-                        cp.record_metric(
-                            "http.request.duration_ms",
-                            duration_ms,
-                            unit="ms",
-                            layer="api",
-                            source="http",
-                            level=level,
-                            detail=detail,
-                        )
-                        cp.record_log(
-                            "http.request",
-                            level=level,
-                            layer="api",
-                            source="http",
-                            detail=detail,
-                        )
-                    except Exception:
-                        pass
-        elif _should_record_http_observation(request.url.path):
-            duration_ms = (time.monotonic() - started) * 1000.0
-            detail = {
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": status_code,
-                "duration_ms": round(duration_ms, 3),
-                "error": error_name,
-            }
-            try:
-                cp.record_metric(
-                    "http.request.duration_ms",
-                    duration_ms,
-                    unit="ms",
-                    layer="api",
-                    source="http",
-                    level="warning",
-                    detail=detail,
-                )
-                cp.record_log(
-                    "http.request",
-                    level="warning",
-                    layer="api",
-                    source="http",
-                    detail=detail,
-                )
-            except Exception:
-                pass
-        return response
+            _emit_http_observation(request, status_code, started, error_name)
+            return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+        try:
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 500))
+            return response
+        except Exception as exc:
+            error_name = exc.__class__.__name__
+            raise
+        finally:
+            _emit_http_observation(request, status_code, started, error_name)
 
     @app.get("/health")
     def health() -> Dict[str, str]:

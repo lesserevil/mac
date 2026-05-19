@@ -967,6 +967,40 @@ class ControlPlane:
             for row in self.store.query_all(sql, tuple(params))
         ]
 
+    def prune_observability(
+        self,
+        older_than: Optional[str] = None,
+        keep_last: Optional[int] = None,
+    ) -> int:
+        """Delete observability rows older than ``older_than`` (ISO timestamp) or
+        keep only the most recent ``keep_last`` rows. Returns the number of rows
+        removed. Operators are expected to invoke this on a schedule; the
+        control plane does not prune automatically."""
+        if older_than is None and keep_last is None:
+            raise ValidationError("prune_observability requires older_than or keep_last")
+        with self.store.transaction() as conn:
+            removed = 0
+            if older_than is not None:
+                cursor = conn.execute(
+                    "DELETE FROM observability_events WHERE created_at < ?",
+                    (older_than,),
+                )
+                removed += int(cursor.rowcount or 0)
+            if keep_last is not None:
+                kept = max(0, int(keep_last))
+                cursor = conn.execute(
+                    """
+                    DELETE FROM observability_events
+                    WHERE sequence <= COALESCE(
+                        (SELECT sequence FROM observability_events
+                         ORDER BY sequence DESC LIMIT 1 OFFSET ?), 0
+                    )
+                    """,
+                    (kept,),
+                )
+                removed += int(cursor.rowcount or 0)
+        return removed
+
     def observability_summary(self, limit: int = 80) -> JsonDict:
         latest = self.list_observability(limit=limit)
         levels: Dict[str, int] = {}
@@ -4632,7 +4666,9 @@ class ControlPlane:
         name_value = self._validate_observability_name(name, "name")
         value_float = self._normalize_observability_value(kind_value, value)
         obs_id = new_id("obs")
-        conn.execute(
+        unit_value = str(unit or "")
+        detail_json = json_dumps(ensure_json_object(detail))
+        cursor = conn.execute(
             """
             INSERT INTO observability_events (
                 id, kind, layer, source, level, name, subject_type, subject_id,
@@ -4649,15 +4685,26 @@ class ControlPlane:
                 subject_type,
                 subject_id,
                 value_float,
-                str(unit or ""),
-                json_dumps(ensure_json_object(detail)),
+                unit_value,
+                detail_json,
                 when,
             ),
         )
-        row = self.store.query_one("SELECT * FROM observability_events WHERE id = ?", (obs_id,))
-        if row is None:
-            raise NotFoundError("observability event not found: %s" % obs_id)
-        return self._observability_from_row(row)
+        return ObservabilityEvent(
+            int(cursor.lastrowid),
+            obs_id,
+            kind_value,
+            layer_value,
+            source_value,
+            level_value,
+            name_value,
+            subject_type,
+            subject_id,
+            value_float,
+            unit_value,
+            json_loads(detail_json, {}),
+            when,
+        )
 
     def _observability_from_row(self, row: Any) -> ObservabilityEvent:
         return ObservabilityEvent(

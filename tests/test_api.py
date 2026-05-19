@@ -303,6 +303,37 @@ def test_observability_api_records_lists_and_streams_metrics_and_logs():
     assert [line["id"] for line in lines[:2]] == [metric["id"], log["id"]]
 
 
+def test_http_observation_middleware_is_off_by_default_and_writes_one_row_when_on():
+    off_cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=off_cp))
+    assert client.get("/agents").status_code == 200
+    assert client.post("/machines", json={"hostname": "h"}).status_code == 200
+    assert not any(item.layer == "api" for item in off_cp.list_observability(limit=50))
+
+    on_cp = ControlPlane.in_memory()
+    on_client = TestClient(
+        create_app(control_plane=on_cp, record_http_observations=True)
+    )
+    assert on_client.get("/agents").status_code == 200
+    api_rows = [item for item in on_cp.list_observability(limit=50) if item.layer == "api"]
+    # Exactly one row per non-excluded request (the GET /agents above), no log+metric pair.
+    assert len(api_rows) == 1
+    assert api_rows[0].kind == "metric"
+    assert api_rows[0].name == "http.request.duration_ms"
+    assert api_rows[0].detail["path"] == "/agents"
+
+
+def test_observability_write_endpoints_are_not_self_observed():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp, record_http_observations=True))
+    client.post(
+        "/observability/logs",
+        json={"name": "worker.heartbeat", "layer": "worker", "source": "rocky"},
+    )
+    api_rows = [item for item in cp.list_observability(limit=20) if item.layer == "api"]
+    assert api_rows == []
+
+
 def test_observability_write_requires_agent_scope_when_auth_enabled():
     client = TestClient(
         create_app(

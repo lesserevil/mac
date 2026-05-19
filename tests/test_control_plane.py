@@ -1511,7 +1511,30 @@ def test_observability_rejects_invalid_metric_contract(cp):
     with pytest.raises(ValidationError):
         cp.record_metric("worker.bad", float("inf"), layer="worker")
     with pytest.raises(ValidationError):
+        cp.record_metric("worker.bad_nan", float("nan"), layer="worker")
+    with pytest.raises(ValidationError):
         cp.record_observation("metric", "worker.missing_value", layer="worker")
+
+
+def test_observability_prune_drops_old_or_excess_rows(cp):
+    for index in range(5):
+        cp.record_metric(
+            "worker.heartbeat",
+            float(index),
+            layer="worker",
+            source="rocky",
+        )
+    all_rows = cp.list_observability(layer="worker", limit=20)
+    assert len(all_rows) == 5
+
+    # keep_last=2 retains the two newest worker rows.
+    removed = cp.prune_observability(keep_last=2)
+    assert removed >= 3
+    remaining = cp.list_observability(layer="worker", limit=20)
+    assert [item.value for item in remaining] == [4.0, 3.0]
+
+    with pytest.raises(ValidationError):
+        cp.prune_observability()
 
 
 def test_heartbeat_accepts_running_digest_only_for_known_runtime(cp):
