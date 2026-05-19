@@ -412,14 +412,40 @@ def test_e2e_workflow_runtime_drives_task_via_http(tmp_path: Path):
     assert workflow["slug"] == "smoke"
 
     machine = client.post("/machines", json={"hostname": "host-wf"}).json()
+    # Bind a soul before role assignment — soul takes precedence over role.
+    tenant = client.post("/tenants", json={"name": "wf-team"}).json()
+    persona = client.post(
+        "/personas",
+        json={
+            "tenant_id": tenant["id"],
+            "name": "QA Soul",
+            "soul_ref": "h://wf/qa/SOUL.md",
+            "memory_scope": "h://wf/qa/mem",
+            "metadata": {"role_slugs": ["qa"]},
+        },
+    ).json()
+    instance = client.post(
+        "/hermes-instances",
+        json={
+            "tenant_id": tenant["id"],
+            "name": "qa-instance",
+            "persona_id": persona["id"],
+        },
+    ).json()
     agent = client.post(
         "/agents",
-        json={"machine_id": machine["id"], "name": "wf-runner", "capabilities": ["python"]},
+        json={
+            "machine_id": machine["id"],
+            "name": "wf-runner",
+            "capabilities": ["python"],
+            "hermes_instance_id": instance["id"],
+        },
     ).json()
     # Assign role so dispatcher accepts the workflow's required_role pin.
-    client.post(
+    resp = client.post(
         "/agents/%s/role" % agent["id"], json={"role_id_or_slug": "qa"}
     )
+    assert resp.status_code == 200, resp.text
 
     run = client.post(
         "/workflows/smoke/start", json={"started_by": "ops"}

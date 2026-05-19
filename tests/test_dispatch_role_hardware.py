@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from mac.services import ControlPlane
+from tests.conftest import bind_soul
 
 
 @pytest.fixture()
@@ -59,7 +60,12 @@ def test_agent_with_required_role_matches(cp):
         default_capabilities=["review"],
         required_capabilities=["review"],
     )
-    agent = cp.register_agent(machine.id, "rocky", capabilities=["python"])
+    soul = bind_soul(
+        cp, persona_name="Reviewer Soul", allowed_role_slugs=["code-reviewer"]
+    )
+    agent = cp.register_agent(
+        machine.id, "rocky", capabilities=["python"], hermes_instance_id=soul
+    )
     cp.roles.assign_role(agent.id, "code-reviewer")
     task = cp.create_task(
         "needs-reviewer",
@@ -85,14 +91,21 @@ def test_role_required_capabilities_stack_onto_task_set(cp):
     # python, the role's required_capabilities stack on top — the agent
     # is ineligible until sudo lands on its set too.
     machine = _machine(cp)
-    agent = cp.register_agent(machine.id, "rocky", capabilities=["python"])
+    soul = bind_soul(cp, persona_name="Ops Soul", allowed_role_slugs=["ops"])
+    agent = cp.register_agent(
+        machine.id, "rocky", capabilities=["python"], hermes_instance_id=soul
+    )
     cp.roles.assign_role(agent.id, "ops")
     cp.create_task("py-task", required_capabilities=["python"])
     assert cp.dispatch_once(lease_seconds=300) is None
 
     # Re-register adding `sudo` to the agent's capability set.
     cp.register_agent(
-        machine.id, "rocky", capabilities=["python", "sudo"], agent_id=agent.id
+        machine.id,
+        "rocky",
+        capabilities=["python", "sudo"],
+        agent_id=agent.id,
+        hermes_instance_id=soul,
     )
     cp.roles.assign_role(agent.id, "ops")
     assignment = cp.dispatch_once(lease_seconds=300)
@@ -109,8 +122,9 @@ def test_agent_hardware_mismatch_filters_out(cp):
         level="ic",
         hardware_requirements={"cpu_arch": ["arm64"]},
     )
+    soul = bind_soul(cp, persona_name="GPU Soul", allowed_role_slugs=["gpu-runner"])
     arm = _machine(cp, hostname="arm", hardware={"cpu_arch": "arm64"})
-    arm_agent = cp.register_agent(arm.id, "arm-runner")
+    arm_agent = cp.register_agent(arm.id, "arm-runner", hermes_instance_id=soul)
     cp.roles.assign_role(arm_agent.id, "gpu-runner")
 
     cp.create_task("compile", metadata={"required_role": "gpu-runner"})

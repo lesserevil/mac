@@ -480,6 +480,7 @@ class Agent:
     updated_at: str
     last_seen_at: str
     role_id: Optional[str] = None
+    hermes_instance_id: Optional[str] = None
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

@@ -804,6 +804,7 @@ class SQLiteStore:
         self._ensure_column("rollouts", "required_eval_set_id", "required_eval_set_id TEXT")
         self._ensure_column("agents", "running_digest", "running_digest TEXT")
         self._ensure_column("agents", "role_id", "role_id TEXT")
+        self._ensure_column("agents", "hermes_instance_id", "hermes_instance_id TEXT")
         self._ensure_column("machines", "hardware", "hardware TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("tasks", "workflow_run_id", "workflow_run_id TEXT")
         self._ensure_column("tasks", "workflow_node_key", "workflow_node_key TEXT")

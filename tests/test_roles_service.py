@@ -3,6 +3,7 @@ import pytest
 from mac.models import NotFoundError, ValidationError
 from mac.roles_service import machine_hardware_satisfies
 from mac.services import ControlPlane
+from tests.conftest import bind_soul
 
 
 @pytest.fixture()
@@ -67,7 +68,8 @@ def test_delete_role_refuses_when_agent_assigned(cp):
         default_capabilities=["ops"],
     )
     machine = _register_machine(cp)
-    agent = cp.register_agent(machine.id, "worker")
+    soul = bind_soul(cp, persona_name="Ops Soul", allowed_role_slugs=["ops"])
+    agent = cp.register_agent(machine.id, "worker", hermes_instance_id=soul)
     cp.roles.assign_role(agent.id, role.id)
     with pytest.raises(ValidationError):
         cp.roles.delete_role(role.id)
@@ -88,7 +90,10 @@ def test_assign_role_merges_default_capabilities_into_agent(cp):
         default_capabilities=["ops", "ci"],
     )
     machine = _register_machine(cp)
-    agent = cp.register_agent(machine.id, "rocky", capabilities=["python"])
+    soul = bind_soul(cp, persona_name="DevOps Soul", allowed_role_slugs=["devops"])
+    agent = cp.register_agent(
+        machine.id, "rocky", capabilities=["python"], hermes_instance_id=soul
+    )
     refreshed = cp.roles.assign_role(agent.id, "devops")
     assert refreshed.role_id == role.id
     assert set(refreshed.capabilities) == {"python", "ops", "ci"}
@@ -103,12 +108,13 @@ def test_assign_role_rejects_when_hardware_mismatch(cp):
         level="ic",
         hardware_requirements={"cpu_arch": ["arm64"], "memory_gb_min": 32},
     )
+    soul = bind_soul(cp, persona_name="GPU Soul", allowed_role_slugs=["gpu-runner"])
     cpu_only = _register_machine(
         cp,
         hostname="cpu-only",
         hardware={"cpu_arch": "x86_64", "memory_gb": 16},
     )
-    agent = cp.register_agent(cpu_only.id, "wrong-host")
+    agent = cp.register_agent(cpu_only.id, "wrong-host", hermes_instance_id=soul)
     with pytest.raises(ValidationError) as exc:
         cp.roles.assign_role(agent.id, role.id)
     assert "cpu_arch" in str(exc.value) or "memory_gb" in str(exc.value)
@@ -118,7 +124,7 @@ def test_assign_role_rejects_when_hardware_mismatch(cp):
         hostname="arm-big",
         hardware={"cpu_arch": "arm64", "memory_gb": 64},
     )
-    agent2 = cp.register_agent(fit.id, "right-host")
+    agent2 = cp.register_agent(fit.id, "right-host", hermes_instance_id=soul)
     cp.roles.assign_role(agent2.id, role.id)  # no error
 
 
@@ -163,6 +169,128 @@ def test_seed_defaults_loads_thirteen_loom_roles_idempotent(cp):
 
     listed = cp.roles.list_roles(include_defaults=True)
     assert len(listed) == 13
+
+
+def test_soulless_agent_refuses_any_role_assignment(cp):
+    """Agents without a hermes_instance_id have no soul. Per the
+    layering rule (soul takes precedence over role), they cannot take
+    any role — the work waits for an agent whose soul accepts it."""
+    cp.roles.create_role(
+        slug="qa",
+        name="QA",
+        description="d",
+        system_prompt="p",
+        level="ic",
+    )
+    machine = _register_machine(cp)
+    agent = cp.register_agent(machine.id, "soulless")
+    assert agent.hermes_instance_id is None
+    with pytest.raises(ValidationError) as exc:
+        cp.roles.assign_role(agent.id, "qa")
+    assert "no soul" in str(exc.value).lower()
+
+
+def test_designer_souled_agent_refuses_qa_role(cp):
+    """The user's concrete example: a designer soul cannot take a QA
+    role. The task is simply left unclaimed for a QA-souled agent to
+    pick up later."""
+    cp.roles.create_role(slug="qa", name="QA", description="d", system_prompt="p", level="ic")
+    cp.roles.create_role(slug="design", name="Design", description="d", system_prompt="p", level="ic")
+    machine = _register_machine(cp)
+    designer_soul = bind_soul(
+        cp,
+        persona_name="Web Designer Soul",
+        allowed_role_slugs=["design"],
+    )
+    agent = cp.register_agent(machine.id, "designer", hermes_instance_id=designer_soul)
+    with pytest.raises(ValidationError) as exc:
+        cp.roles.assign_role(agent.id, "qa")
+    assert "soul does not accept" in str(exc.value).lower()
+    # Same agent CAN take its on-soul role.
+    refreshed = cp.roles.assign_role(agent.id, "design")
+    assert refreshed.role_id is not None
+
+
+def test_persona_role_slugs_defaults_from_persona_name(cp):
+    """When ``metadata.role_slugs`` is absent, the persona's name
+    (slugified) is the default — loom personas map 1-to-1 to roles by
+    name, so the default is exactly right for the seeded fleet."""
+    cp.roles.create_role(
+        slug="code-reviewer",
+        name="Code Reviewer",
+        description="d",
+        system_prompt="p",
+        level="ic",
+    )
+    machine = _register_machine(cp)
+    # No metadata.role_slugs — default to slugify(persona.name) =
+    # "code-reviewer".
+    soul = bind_soul(cp, persona_name="Code Reviewer")
+    agent = cp.register_agent(machine.id, "rocky", hermes_instance_id=soul)
+    refreshed = cp.roles.assign_role(agent.id, "code-reviewer")
+    assert refreshed.role_id is not None
+
+
+def test_dispatch_skips_agent_whose_soul_no_longer_accepts_role(cp):
+    """Compatibility is re-checked at dispatch time: editing the
+    persona's allowed list immediately stops affected agents from being
+    eligible for required_role tasks (they keep the role assignment
+    until explicitly unassigned, but dispatch refuses them)."""
+    cp.roles.create_role(
+        slug="qa",
+        name="QA",
+        description="d",
+        system_prompt="p",
+        level="ic",
+        default_capabilities=["python"],
+    )
+    machine = _register_machine(cp)
+    soul = bind_soul(cp, persona_name="QA Soul", allowed_role_slugs=["qa"])
+    agent = cp.register_agent(
+        machine.id, "rocky", capabilities=["python"], hermes_instance_id=soul
+    )
+    cp.roles.assign_role(agent.id, "qa")
+
+    # Tighten the persona's allowed list to a different slug — agent
+    # still holds the qa role but is now incompatible.
+    instance = cp.identity.get_hermes_instance(soul)
+    persona = cp.identity.get_persona(instance.persona_id)
+    cp.store.execute(
+        "UPDATE personas SET metadata = ? WHERE id = ?",
+        ('{"role_slugs": ["design"]}', persona.id),
+    )
+
+    cp.create_task("py", required_capabilities=["python"], metadata={"required_role": "qa"})
+    assert cp.dispatch_once(lease_seconds=300) is None
+
+
+def test_agent_identity_returns_layered_view(cp):
+    """The layered identity (soul -> role -> mood -> hardware) is
+    returned as separate fields; callers compose the LLM prompt
+    themselves."""
+    cp.roles.create_role(
+        slug="qa",
+        name="QA",
+        description="d",
+        system_prompt="Run tests.",
+        level="ic",
+        default_capabilities=["python"],
+    )
+    machine = cp.register_machine(
+        "host-id", hardware={"cpu_arch": "arm64", "memory_gb": 32}
+    )
+    soul = bind_soul(cp, persona_name="QA Soul", allowed_role_slugs=["qa"])
+    agent = cp.register_agent(machine.id, "rocky", hermes_instance_id=soul)
+    cp.roles.assign_role(agent.id, "qa")
+    cp.set_mood(agent.id, "cheerful", reason="working")
+
+    identity = cp.agent_identity(agent.id)
+    assert identity["agent"]["id"] == agent.id
+    assert identity["soul"]["persona"]["name"] == "QA Soul"
+    assert identity["allowed_role_slugs"] == ["qa"]
+    assert identity["role"]["slug"] == "qa"
+    assert identity["mood"]["mode"] == "cheerful"
+    assert identity["machine_hardware"]["cpu_arch"] == "arm64"
 
 
 def test_tenant_scoped_role_shadows_global_default(cp):

@@ -157,6 +157,8 @@ class ControlPlane:
             get_tenant=self.get_tenant,
             get_agent=self.get_agent,
             get_machine=self.get_machine,
+            get_hermes_instance=self.identity.get_hermes_instance,
+            get_persona=self.identity.get_persona,
         )
         self.workflows = WorkflowService(
             self.store,
@@ -338,6 +340,49 @@ class ControlPlane:
 
     def seed_default_roles(self, *args: Any, **kwargs: Any) -> List[AgentRole]:
         return self.roles.seed_defaults(*args, **kwargs)
+
+    def agent_identity(self, agent_id: str) -> JsonDict:
+        """Layered identity for an agent: soul → role → mood → hardware.
+
+        The layers are returned separately rather than fused into a
+        single prompt string — callers (worker, Hermes) own the
+        composition. Soul is authoritative for personality; role is the
+        operational hat; mood is the agent's transient self-report;
+        hardware is the machine the agent runs on.
+        """
+        agent = self.get_agent(agent_id)
+        machine = self.get_machine(agent.machine_id)
+        soul: Optional[JsonDict] = None
+        role_slugs: Optional[List[str]] = self.roles._allowed_role_slugs_for(agent)
+        if agent.hermes_instance_id:
+            try:
+                instance = self.identity.get_hermes_instance(agent.hermes_instance_id)
+                persona = (
+                    self.identity.get_persona(instance.persona_id)
+                    if instance.persona_id
+                    else None
+                )
+                soul = {
+                    "hermes_instance": instance.to_dict(),
+                    "persona": persona.to_dict() if persona else None,
+                }
+            except NotFoundError:
+                soul = None
+        role: Optional[JsonDict] = None
+        if agent.role_id:
+            try:
+                role = self.roles.get_role(agent.role_id).to_dict()
+            except NotFoundError:
+                role = None
+        mood_overlay = self.agent_state.get_current_mood(agent.id)
+        return {
+            "agent": agent.to_dict(),
+            "soul": soul,
+            "allowed_role_slugs": role_slugs,
+            "role": role,
+            "mood": mood_overlay.to_dict() if mood_overlay is not None else None,
+            "machine_hardware": machine.hardware,
+        }
 
     # Workflows: thin facade over ``self.workflows``.
 
@@ -1057,10 +1102,15 @@ class ControlPlane:
         capabilities: Optional[Iterable[str]] = None,
         resources: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None,
+        hermes_instance_id: Optional[str] = None,
     ) -> Agent:
         self.get_machine(machine_id)
         if not name:
             raise ValidationError("agent name is required")
+        if hermes_instance_id is not None:
+            # Confirms the soul exists before binding. The identity layer
+            # is what gates role assignment downstream.
+            self.identity.get_hermes_instance(hermes_instance_id)
         now = utcnow()
         aid = agent_id or new_id("agent")
         if capabilities is None:
@@ -1073,19 +1123,30 @@ class ControlPlane:
         else:
             capabilities_json = json_dumps(coerce_list(capabilities))
         resources_json = self._resolved_json_column("agents", "resources", aid, resources)
+        # Preserve hermes_instance_id across re-registrations when the caller
+        # didn't pass one, so an ops re-register doesn't accidentally orphan
+        # the agent from its soul.
+        if hermes_instance_id is None:
+            existing_soul = self.store.query_one(
+                "SELECT hermes_instance_id FROM agents WHERE id = ?", (aid,)
+            )
+            hermes_instance_id = (
+                existing_soul["hermes_instance_id"] if existing_soul is not None else None
+            )
         self.store.execute(
             """
             INSERT INTO agents (
                 id, machine_id, name, capabilities, resources, status, health_status,
-                current_task_id, created_at, updated_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                current_task_id, created_at, updated_at, last_seen_at, hermes_instance_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 machine_id = excluded.machine_id,
                 name = excluded.name,
                 capabilities = excluded.capabilities,
                 resources = excluded.resources,
                 updated_at = excluded.updated_at,
-                last_seen_at = excluded.last_seen_at
+                last_seen_at = excluded.last_seen_at,
+                hermes_instance_id = excluded.hermes_instance_id
             """,
             (
                 aid,
@@ -1098,6 +1159,7 @@ class ControlPlane:
                 now,
                 now,
                 now,
+                hermes_instance_id,
             ),
         )
         return self.get_agent(aid)
@@ -1833,6 +1895,9 @@ class ControlPlane:
         keys = row.keys() if hasattr(row, "keys") else []
         running_digest = row["running_digest"] if "running_digest" in keys else None
         role_id = row["role_id"] if "role_id" in keys else None
+        hermes_instance_id = (
+            row["hermes_instance_id"] if "hermes_instance_id" in keys else None
+        )
         return Agent(
             row["id"],
             row["machine_id"],
@@ -1847,6 +1912,7 @@ class ControlPlane:
             row["updated_at"],
             row["last_seen_at"],
             role_id,
+            hermes_instance_id,
         )
 
     def _project_item_from_row(self, row: Any) -> ProjectItem:
@@ -2012,6 +2078,12 @@ class ControlPlane:
             if role is not None:
                 ok, _reasons = self.roles.validate_hardware(role, machine)
                 if not ok:
+                    return False
+                # Soul-role compatibility is re-checked at dispatch time
+                # rather than only at assignment time, so a persona edit
+                # that narrows the allowed role list immediately stops
+                # affected agents from being eligible.
+                if not self.roles.soul_accepts_role(agent, role):
                     return False
                 role_required_caps = set(role.required_capabilities)
         capabilities = set(agent.capabilities)

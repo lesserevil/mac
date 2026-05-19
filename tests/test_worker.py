@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 from typing import Any, Dict, Optional
 
 from fastapi.testclient import TestClient
@@ -91,6 +92,31 @@ def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):
     assert cp.get_task(task.id).state == TaskState.FAILED.value
     evidence = cp.list_evidence(task.id)
     assert evidence[0].metadata["returncode"] == 2
+
+
+def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    task = cp.create_task("Python task", required_capabilities=["python"])
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(_task_payload: Dict[str, Any], _task_dir: Path) -> WorkerExecution:
+        time.sleep(0.05)
+        return WorkerExecution(0, "tests passed", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path,
+        executor,
+        lease_seconds=60,
+        lease_renew_interval_seconds=0.01,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    assert any(event.event_type == "task.lease_renewed" for event in cp.task_history(task.id))
 
 
 def test_mac_worker_run_forever_drains_queue_then_reports_offline(tmp_path: Path):

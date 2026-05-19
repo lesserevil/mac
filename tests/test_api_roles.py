@@ -60,8 +60,34 @@ def test_role_assignment_routes_through_agents_endpoint():
     cp = ControlPlane.in_memory()
     client = _client(cp=cp)
     machine = client.post("/machines", json={"hostname": "host-1"}).json()
+    # Bind a soul through the HTTP surface so role assignment passes
+    # the soul-precedence check.
+    tenant = client.post("/tenants", json={"name": "team"}).json()
+    persona = client.post(
+        "/personas",
+        json={
+            "tenant_id": tenant["id"],
+            "name": "QA Soul",
+            "soul_ref": "h://team/qa/SOUL.md",
+            "memory_scope": "h://team/qa/mem",
+            "metadata": {"role_slugs": ["qa"]},
+        },
+    ).json()
+    instance = client.post(
+        "/hermes-instances",
+        json={
+            "tenant_id": tenant["id"],
+            "name": "qa-instance",
+            "persona_id": persona["id"],
+        },
+    ).json()
     agent = client.post(
-        "/agents", json={"machine_id": machine["id"], "name": "rocky"}
+        "/agents",
+        json={
+            "machine_id": machine["id"],
+            "name": "rocky",
+            "hermes_instance_id": instance["id"],
+        },
     ).json()
     client.post("/roles", json=_role_body(slug="qa")).json()
 

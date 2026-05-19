@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -139,6 +140,7 @@ class MacWorker:
         allowed_projects: Optional[List[str]] = None,
         required_metadata: Optional[JsonDict] = None,
         require_canary: bool = False,
+        lease_renew_interval_seconds: Optional[float] = None,
     ) -> None:
         if not agent_id:
             raise MacApiError("agent_id is required")
@@ -152,6 +154,7 @@ class MacWorker:
         self.allowed_projects = list(allowed_projects or [])
         self.required_metadata = dict(required_metadata or {})
         self.require_canary = bool(require_canary)
+        self.lease_renew_interval_seconds = lease_renew_interval_seconds
         self._stop = False
         self._declared_digest = False
         self._declared_policy = False
@@ -243,7 +246,7 @@ class MacWorker:
             )
             task_dir = self._prepare_task_workspace(task, lease)
             started = time.monotonic()
-            execution = self.executor(task, task_dir)
+            execution = self._execute_with_lease_renewal(task, lease, task_dir)
             duration_ms = (time.monotonic() - started) * 1000.0
             self._observe_metric(
                 "worker.execution.duration_ms",
@@ -312,6 +315,59 @@ class MacWorker:
             except Exception:
                 pass
             raise
+
+    def _execute_with_lease_renewal(
+        self,
+        task: JsonDict,
+        lease: JsonDict,
+        task_dir: Path,
+    ) -> WorkerExecution:
+        stop = threading.Event()
+        thread: Optional[threading.Thread] = None
+        interval = self.lease_renew_interval_seconds
+        if interval is None:
+            interval = max(1.0, min(60.0, float(self.lease_seconds) / 2.0))
+        if self.lease_seconds > 0 and interval > 0:
+            thread = threading.Thread(
+                target=self._renew_lease_until_stopped,
+                args=(lease["id"], task["id"], stop, interval),
+                daemon=True,
+            )
+            thread.start()
+        try:
+            return self.executor(task, task_dir)
+        finally:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=1.0)
+
+    def _renew_lease_until_stopped(
+        self,
+        lease_id: str,
+        task_id: str,
+        stop: threading.Event,
+        interval_seconds: float,
+    ) -> None:
+        while not stop.wait(interval_seconds):
+            try:
+                lease = self.client.post(
+                    "/leases/%s/renew" % quote(lease_id, safe=""),
+                    {"agent_id": self.agent_id, "lease_seconds": self.lease_seconds},
+                )
+                self._observe_log(
+                    "worker.lease_renewed",
+                    subject_type="task",
+                    subject_id=task_id,
+                    detail={"lease_id": lease_id, "expires_at": lease["expires_at"]},
+                )
+            except Exception as exc:  # noqa: BLE001 - renewal is best-effort telemetry
+                self._observe_log(
+                    "worker.lease_renew_failed",
+                    level="error",
+                    subject_type="task",
+                    subject_id=task_id,
+                    detail={"lease_id": lease_id, "error": str(exc)},
+                )
 
     def _claim_next_for_agent(self) -> Optional[JsonDict]:
         return self.client.post(

@@ -239,6 +239,7 @@ class AgentRegister(BaseModel):
     capabilities: List[str] = Field(default_factory=list)
     resources: Dict[str, Any] = Field(default_factory=dict)
     agent_id: Optional[str] = None
+    hermes_instance_id: Optional[str] = None
 
 
 class RoleCreate(BaseModel):
@@ -329,6 +330,11 @@ class HeartbeatRequest(BaseModel):
     health_status: Optional[str] = None
     resources: Optional[Dict[str, Any]] = None
     running_digest: Optional[str] = None
+
+
+class LeaseRenewRequest(BaseModel):
+    agent_id: str
+    lease_seconds: int = 900
 
 
 class DispatchRequest(BaseModel):
@@ -1246,6 +1252,10 @@ def create_app(
         task, lease = cp.claim_task(task_id, agent_id, lease_seconds)
         return {"task": task.to_dict(), "lease": lease.to_dict()}
 
+    @app.post("/leases/{lease_id}/renew")
+    def renew_lease(lease_id: str, body: LeaseRenewRequest) -> Dict[str, Any]:
+        return cp.renew_lease(lease_id, body.agent_id, body.lease_seconds).to_dict()
+
     @app.post("/tasks/{task_id}/start")
     def start_task(task_id: str, agent_id: str) -> Dict[str, Any]:
         return cp.start_task(task_id, agent_id).to_dict()
@@ -1355,6 +1365,10 @@ def create_app(
         principal: TokenPrincipal = Depends(_get_principal),
     ) -> Dict[str, Any]:
         return cp.roles.unassign_role(agent_id).to_dict()
+
+    @app.get("/agents/{agent_id}/identity")
+    def get_agent_identity(agent_id: str) -> Dict[str, Any]:
+        return cp.agent_identity(agent_id)
 
     # Workflows (data-driven, definable) -----------------------------
 

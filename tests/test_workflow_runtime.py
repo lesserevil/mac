@@ -2,6 +2,7 @@ import pytest
 
 from mac.models import NotFoundError, TaskState, ValidationError
 from mac.services import ControlPlane
+from tests.conftest import bind_soul
 
 
 @pytest.fixture()
@@ -80,7 +81,13 @@ def test_run_advances_on_task_completed_through_to_terminal(cp):
     # Register a worker that satisfies the qa role, claim and run the
     # first task to NEEDS_REVIEW then add evidence and approve.
     machine = cp.register_machine("h1")
-    qa_agent = cp.register_agent(machine.id, "rocky", capabilities=["python", "qa", "review"])
+    qa_soul = bind_soul(cp, persona_name="QA Soul", allowed_role_slugs=["qa"])
+    qa_agent = cp.register_agent(
+        machine.id,
+        "rocky",
+        capabilities=["python", "qa", "review"],
+        hermes_instance_id=qa_soul,
+    )
     cp.roles.assign_role(qa_agent.id, "qa")
     cp.claim_task(first_task.id, qa_agent.id)
     cp.start_task(first_task.id, qa_agent.id)
@@ -88,6 +95,7 @@ def test_run_advances_on_task_completed_through_to_terminal(cp):
     cp.submit_for_review(first_task.id, qa_agent.id)
 
     # Reviewer registered separately so they can request + approve.
+    # No role assignment so no soul is required.
     reviewer = cp.register_agent(machine.id, "reviewer", capabilities=["review"])
     review = cp.request_review(first_task.id, reviewer.id, "ops")
     evidence = cp.list_evidence(first_task.id)[0]
@@ -113,7 +121,10 @@ def test_failed_task_picks_failure_edge_and_finishes(cp):
     first_task = cp.get_task(run.current_task_id)
 
     machine = cp.register_machine("h1")
-    qa_agent = cp.register_agent(machine.id, "rocky", capabilities=["python", "qa"])
+    soul = bind_soul(cp, persona_name="QA Soul", allowed_role_slugs=["qa"])
+    qa_agent = cp.register_agent(
+        machine.id, "rocky", capabilities=["python", "qa"], hermes_instance_id=soul
+    )
     cp.roles.assign_role(qa_agent.id, "qa")
     cp.claim_task(first_task.id, qa_agent.id)
     cp.start_task(first_task.id, qa_agent.id)

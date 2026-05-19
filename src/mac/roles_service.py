@@ -26,9 +26,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from mac.models import (
     Agent,
     AgentRole,
+    HermesInstance,
     JsonDict,
     Machine,
     NotFoundError,
+    Persona,
     ROLE_LEVELS,
     Tenant,
     ValidationError,
@@ -55,12 +57,20 @@ class RolesService:
         get_tenant: Callable[[str], Tenant],
         get_agent: Callable[[str], Agent],
         get_machine: Callable[[str], Machine],
+        get_hermes_instance: Optional[Callable[[str], HermesInstance]] = None,
+        get_persona: Optional[Callable[[str], Persona]] = None,
     ) -> None:
         self.store = store
         self.observability = observability
         self._get_tenant = get_tenant
         self._get_agent = get_agent
         self._get_machine = get_machine
+        # Injected so RolesService can enforce soul-role compatibility
+        # without depending on IdentityService directly. ControlPlane
+        # wires these in; tests that don't touch souls can leave them
+        # None.
+        self._get_hermes_instance = get_hermes_instance
+        self._get_persona = get_persona
 
     # CRUD ---------------------------------------------------------------
 
@@ -255,6 +265,23 @@ class RolesService:
     def assign_role(self, agent_id: str, role_id_or_slug: str) -> Agent:
         agent = self._get_agent(agent_id)
         role = self.get_role(role_id_or_slug)
+        # Soul takes precedence over role. An agent without a hermes
+        # instance (no soul) cannot take any role — they're free workers
+        # without an identity to attach a persona to. An agent whose
+        # soul's allowed_role_slugs doesn't include this role is also
+        # refused; agents come and go, the task simply waits for one
+        # whose soul accepts the role.
+        allowed = self._allowed_role_slugs_for(agent)
+        if allowed is None:
+            raise ValidationError(
+                "agent %s has no soul (hermes_instance_id); assign one before "
+                "binding a role" % agent.id
+            )
+        if role.slug not in allowed:
+            raise ValidationError(
+                "soul does not accept role %s (allowed: %s)"
+                % (role.slug, ", ".join(sorted(allowed)) or "<none>")
+            )
         machine = self._get_machine(agent.machine_id)
         ok, reasons = self.validate_hardware(role, machine)
         if not ok:
@@ -303,6 +330,49 @@ class RolesService:
             detail={"previous_role_id": agent.role_id},
         )
         return self._get_agent(agent.id)
+
+    # Soul-role compatibility ------------------------------------------
+
+    def _allowed_role_slugs_for(self, agent: Agent) -> Optional[List[str]]:
+        """Return the role slugs an agent's soul accepts.
+
+        ``None`` means the agent has no soul (no ``hermes_instance_id``)
+        and is therefore refused for any role per the layering rule.
+        An empty list means the soul exists but accepts no roles.
+        Otherwise, the persona's ``metadata.role_slugs`` is honored, and
+        if absent the persona's name (slugified) is the default — loom
+        personas map 1-to-1 to roles by name, so the default is exactly
+        right for the seeded fleet.
+        """
+        if not agent.hermes_instance_id:
+            return None
+        if self._get_hermes_instance is None or self._get_persona is None:
+            # No identity wiring (tests, dev). Be permissive when an
+            # operator has gone out of their way to set a soul but the
+            # service wasn't given identity callables.
+            return []  # type: ignore[return-value]
+        try:
+            instance = self._get_hermes_instance(agent.hermes_instance_id)
+        except NotFoundError:
+            return None
+        if not instance.persona_id:
+            return []
+        try:
+            persona = self._get_persona(instance.persona_id)
+        except NotFoundError:
+            return []
+        explicit = persona.metadata.get("role_slugs") if isinstance(persona.metadata, dict) else None
+        if isinstance(explicit, list) and explicit:
+            return [str(s).strip().lower() for s in explicit if str(s).strip()]
+        # Default: derive from persona name (loom seed convention).
+        default = persona.name.strip().lower().replace(" ", "-").replace("_", "-")
+        return [default] if default else []
+
+    def soul_accepts_role(self, agent: Agent, role: AgentRole) -> bool:
+        allowed = self._allowed_role_slugs_for(agent)
+        if allowed is None:
+            return False
+        return role.slug in allowed
 
     # Hardware matcher --------------------------------------------------
 
