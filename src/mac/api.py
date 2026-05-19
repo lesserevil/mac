@@ -313,6 +313,17 @@ class WorkflowSeed(BaseModel):
     pass
 
 
+class WorkflowStart(BaseModel):
+    started_by: str = "human"
+    input: Dict[str, Any] = Field(default_factory=dict)
+    tenant_id: Optional[str] = None
+
+
+class WorkflowCancel(BaseModel):
+    reason: str
+    actor: str = "human"
+
+
 class HeartbeatRequest(BaseModel):
     status: Optional[str] = None
     health_status: Optional[str] = None
@@ -1413,6 +1424,48 @@ def create_app(
     ) -> List[Dict[str, Any]]:
         principal.require_global_fleet()
         return [wf.to_dict() for wf in cp.workflows.seed_defaults()]
+
+    @app.post("/workflows/{workflow_id_or_slug}/start")
+    def start_workflow_run(
+        workflow_id_or_slug: str,
+        body: WorkflowStart,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.workflow_runtime.start_run(
+            workflow_id_or_slug,
+            started_by=body.started_by,
+            input=body.input,
+            tenant_id=body.tenant_id,
+        ).to_dict()
+
+    @app.get("/workflows/runs")
+    def list_workflow_runs(
+        state: Optional[str] = Query(default=None),
+        workflow_id: Optional[str] = Query(default=None),
+        tenant_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            run.to_dict()
+            for run in cp.workflow_runtime.list_runs(
+                state=state, workflow_id=workflow_id, tenant_id=tenant_id, limit=limit
+            )
+        ]
+
+    @app.get("/workflows/runs/{run_id}")
+    def get_workflow_run(run_id: str) -> Dict[str, Any]:
+        return cp.workflow_runtime.get_run(run_id).to_dict()
+
+    @app.post("/workflows/runs/{run_id}/cancel")
+    def cancel_workflow_run(
+        run_id: str,
+        body: WorkflowCancel,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        return cp.workflow_runtime.cancel_run(
+            run_id, reason=body.reason, actor=body.actor
+        ).to_dict()
 
     @app.get("/fleet/build-distribution")
     def fleet_build_distribution() -> Dict[str, Any]:

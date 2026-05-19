@@ -96,6 +96,7 @@ from mac.roles_service import RolesService
 from mac.rollout_service import RolloutService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
+from mac.workflow_runtime import WorkflowRuntime
 from mac.workflow_service import WorkflowService
 
 
@@ -162,6 +163,16 @@ class ControlPlane:
             self.observability,
             get_role=self.roles.get_role,
             get_tenant=self.get_tenant,
+        )
+        self.workflow_runtime = WorkflowRuntime(
+            self.store,
+            self.observability,
+            self.workflows,
+            self.roles,
+            create_task=self.create_task,
+            transition_task=self.transition_task,
+            get_task=self.get_task,
+            record_history=self._record_history,
         )
         self.secrets = SecretsService(
             self.store,
@@ -350,6 +361,18 @@ class ControlPlane:
 
     def seed_default_workflows(self, *args: Any, **kwargs: Any) -> List[Workflow]:
         return self.workflows.seed_defaults(*args, **kwargs)
+
+    def start_workflow(self, *args: Any, **kwargs: Any) -> WorkflowRun:
+        return self.workflow_runtime.start_run(*args, **kwargs)
+
+    def get_workflow_run(self, run_id: str) -> WorkflowRun:
+        return self.workflow_runtime.get_run(run_id)
+
+    def list_workflow_runs(self, *args: Any, **kwargs: Any) -> List[WorkflowRun]:
+        return self.workflow_runtime.list_runs(*args, **kwargs)
+
+    def cancel_workflow_run(self, *args: Any, **kwargs: Any) -> WorkflowRun:
+        return self.workflow_runtime.cancel_run(*args, **kwargs)
 
     def create_interaction_task(
         self,
@@ -701,6 +724,24 @@ class ControlPlane:
             self._record_history(
                 task_id, "task.transitioned", actor, task.state, target, detail or {}, conn=conn
             )
+        # Workflow-runtime hook. The link is the `tasks.workflow_run_id`
+        # *column* (never the caller-supplied metadata), so a forged
+        # `metadata.workflow_run_id` cannot push a free-floating task
+        # into the workflow state machine. Runs in terminal states are
+        # short-circuited inside `on_task_completed`.
+        if target in TERMINAL_TASK_STATES:
+            row = self.store.query_one(
+                "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
+            )
+            if row is not None and row["workflow_run_id"]:
+                try:
+                    self.workflow_runtime.on_task_completed(task_id, target)
+                except Exception:  # noqa: BLE001 - runtime side-effects must not abort the transition
+                    import logging
+
+                    logging.getLogger(__name__).exception(
+                        "workflow runtime failed to advance on task %s", task_id
+                    )
         return self.get_task(task_id)
 
     def claim_task(self, task_id: str, agent_id: str, lease_seconds: int = 900) -> Tuple[Task, Lease]:
@@ -1453,7 +1494,25 @@ class ControlPlane:
         return self.reviews.list_reviews(task_id)
 
     def publish_task(self, *args: Any, **kwargs: Any) -> Publication:
-        return self.reviews.publish_task(*args, **kwargs)
+        publication = self.reviews.publish_task(*args, **kwargs)
+        # publish_task transitions the underlying task to COMPLETED inside
+        # its own transaction (bypassing transition_task), so we run the
+        # workflow runtime hook here so workflow runs advance on publish.
+        row = self.store.query_one(
+            "SELECT workflow_run_id FROM tasks WHERE id = ?", (publication.task_id,)
+        )
+        if row is not None and row["workflow_run_id"]:
+            try:
+                self.workflow_runtime.on_task_completed(
+                    publication.task_id, TaskState.COMPLETED.value
+                )
+            except Exception:  # noqa: BLE001
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "workflow runtime failed to advance after publish_task"
+                )
+        return publication
 
     def get_publication(self, publication_id: str) -> Publication:
         return self.reviews.get_publication(publication_id)
