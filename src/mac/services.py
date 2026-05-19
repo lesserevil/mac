@@ -4,7 +4,7 @@ import base64
 import hashlib
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from cryptography.fernet import Fernet
@@ -20,11 +20,8 @@ from mac.models import (
     AgentStatus,
     Artifact,
     AuthorizationError,
-    MOOD_MODES,
     MoodMode,
     MoodOverlay,
-    NAP_DEFAULT_DURATION_MINUTES,
-    NAP_WINDOW_MINUTES,
     NapRun,
     NapSchedule,
     NapStatus,
@@ -34,7 +31,6 @@ from mac.models import (
     Environment,
     EVIDENCE_KINDS,
     EvalRun,
-    EvalScoringDirection,
     EvalSet,
     EvalTargetKind,
     Evidence,
@@ -86,10 +82,13 @@ from mac.models import (
     utcnow,
     validate_transition,
 )
+from mac.agent_state_service import AgentStateService
 from mac.agentbus_service import AgentBusService
+from mac.eval_service import EvalService
 from mac.memory_service import MemoryService
 from mac.messaging_service import MessagingService
 from mac.observability_service import ObservabilityService
+from mac.review_service import ReviewService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
 
@@ -170,6 +169,28 @@ class ControlPlane:
             self.store,
             get_agent=self.get_agent,
             get_task=self.get_task,
+        )
+        self.evaluations = EvalService(
+            self.store,
+            self.observability,
+            get_evidence=self.get_evidence,
+        )
+        self.reviews = ReviewService(
+            self.store,
+            self.observability,
+            self.messaging,
+            get_task=self.get_task,
+            get_agent=self.get_agent,
+            get_evidence=self.get_evidence,
+            transition_task=self.transition_task,
+            record_history=self._record_history,
+        )
+        self.agent_state = AgentStateService(
+            self.store,
+            self.observability,
+            get_agent=self.get_agent,
+            get_evidence=self.get_evidence,
+            agent_has_active_lease=self._agent_has_active_lease,
         )
 
     @classmethod
@@ -711,13 +732,7 @@ class ControlPlane:
         evidence = detail["evidence"]
         reviews = detail["reviews"]
         approved_reviews = [review for review in reviews if review["status"] == ReviewStatus.APPROVED.value]
-        publications = [
-            self._publication_from_row(row).to_dict()
-            for row in self.store.query_all(
-                "SELECT * FROM publications WHERE task_id = ? ORDER BY created_at, id",
-                (task_id,),
-            )
-        ]
+        publications = [pub.to_dict() for pub in self.reviews.list_publications(task_id)]
         parts = ["%s is %s" % (task["title"], task["state"])]
         if task["owner_agent_id"]:
             parts.append("owner=%s" % task["owner_agent_id"])
@@ -876,7 +891,7 @@ class ControlPlane:
         validate_transition(task.state, target)
         if target == TaskState.NEEDS_REVIEW.value and not self.list_evidence(task_id):
             raise ValidationError("task needs evidence before review")
-        if target == TaskState.COMPLETED.value and not self._completion_authorized(task_id):
+        if target == TaskState.COMPLETED.value and not self.reviews.completion_authorized(task_id):
             raise ValidationError("task completion requires approved review and evidence")
         now = utcnow()
         owner_agent_id = task.owner_agent_id
@@ -1340,200 +1355,22 @@ class ControlPlane:
     # the agent's behalf. Operators can read, but the authoritative caller is
     # the agent itself.
 
-    def set_mood(
-        self,
-        agent_id: str,
-        mode: str,
-        set_by: Optional[str] = None,
-        reason: Optional[str] = None,
-        ttl_seconds: Optional[int] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> MoodOverlay:
-        """Record a mood transition for `agent_id`.
+    # Moods: thin facade over ``self.agent_state``.
 
-        Replaces any prior active overlay atomically: clears the prior row's
-        `cleared_at` in the same transaction as the new insert. `set_by`
-        defaults to `agent_id` — moods are self-reported.
-        """
-        agent = self.get_agent(agent_id)
-        mode_value = _state_value(mode)
-        if mode_value not in MOOD_MODES:
-            raise ValidationError(
-                "unsupported mood mode: %s (allowed: %s)"
-                % (mode_value, ", ".join(sorted(MOOD_MODES)))
-            )
-        actor = (set_by or agent.id).strip() or agent.id
-        now = utcnow()
-        expires_at = None
-        if ttl_seconds is not None:
-            if int(ttl_seconds) <= 0:
-                raise ValidationError("mood ttl_seconds must be > 0 when provided")
-            expires_at = (
-                parse_time(now) + timedelta(seconds=int(ttl_seconds))
-            ).isoformat(timespec="microseconds")
-        overlay_id = new_id("mood")
-        metadata_json = json_dumps(ensure_json_object(metadata))
-        with self.store.transaction() as conn:
-            # End any prior active overlay so reads of "current mood" stay
-            # single-rowed without a partial index.
-            conn.execute(
-                """
-                UPDATE mood_overlays
-                SET cleared_at = ?, cleared_by = ?, cleared_reason = ?
-                WHERE agent_id = ? AND cleared_at IS NULL
-                """,
-                (now, actor, "replaced", agent.id),
-            )
-            conn.execute(
-                """
-                INSERT INTO mood_overlays (
-                    id, agent_id, mode, reason, metadata,
-                    set_by, set_at, expires_at,
-                    cleared_at, cleared_by, cleared_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
-                """,
-                (overlay_id, agent.id, mode_value, reason, metadata_json, actor, now, expires_at),
-            )
-            self._insert_agent_event(
-                conn,
-                agent.id,
-                "agent.mood_set",
-                actor,
-                {
-                    "overlay_id": overlay_id,
-                    "mode": mode_value,
-                    "reason": reason,
-                    "expires_at": expires_at,
-                },
-                now,
-            )
-        return self.get_mood_overlay(overlay_id)
+    def set_mood(self, *args: Any, **kwargs: Any) -> MoodOverlay:
+        return self.agent_state.set_mood(*args, **kwargs)
 
     def get_current_mood(self, agent_id: str) -> Optional[MoodOverlay]:
-        """Return the agent's current mood, or None if no active overlay."""
-        agent = self.get_agent(agent_id)
-        now = utcnow()
-        row = self.store.query_one(
-            """
-            SELECT * FROM mood_overlays
-            WHERE agent_id = ?
-              AND cleared_at IS NULL
-              AND (expires_at IS NULL OR expires_at > ?)
-            ORDER BY set_at DESC, id DESC
-            LIMIT 1
-            """,
-            (agent.id, now),
-        )
-        return self._mood_overlay_from_row(row) if row is not None else None
+        return self.agent_state.get_current_mood(agent_id)
 
-    def clear_mood(
-        self,
-        agent_id: str,
-        cleared_by: Optional[str] = None,
-        reason: Optional[str] = None,
-    ) -> Optional[MoodOverlay]:
-        """End the agent's active overlay if any. Returns the cleared overlay
-        (post-update) or None if nothing was active."""
-        agent = self.get_agent(agent_id)
-        actor = (cleared_by or agent.id).strip() or agent.id
-        now = utcnow()
-        with self.store.transaction() as conn:
-            row = conn.execute(
-                """
-                SELECT id FROM mood_overlays
-                WHERE agent_id = ? AND cleared_at IS NULL
-                ORDER BY set_at DESC, id DESC
-                LIMIT 1
-                """,
-                (agent.id,),
-            ).fetchone()
-            if row is None:
-                return None
-            overlay_id = row["id"]
-            conn.execute(
-                """
-                UPDATE mood_overlays
-                SET cleared_at = ?, cleared_by = ?, cleared_reason = ?
-                WHERE id = ?
-                """,
-                (now, actor, reason, overlay_id),
-            )
-            self._insert_agent_event(
-                conn,
-                agent.id,
-                "agent.mood_cleared",
-                actor,
-                {"overlay_id": overlay_id, "reason": reason},
-                now,
-            )
-        return self.get_mood_overlay(overlay_id)
+    def clear_mood(self, *args: Any, **kwargs: Any) -> Optional[MoodOverlay]:
+        return self.agent_state.clear_mood(*args, **kwargs)
 
     def get_mood_overlay(self, overlay_id: str) -> MoodOverlay:
-        row = self.store.query_one(
-            "SELECT * FROM mood_overlays WHERE id = ?", (overlay_id,)
-        )
-        if row is None:
-            raise NotFoundError("mood overlay not found: %s" % overlay_id)
-        return self._mood_overlay_from_row(row)
+        return self.agent_state.get_mood_overlay(overlay_id)
 
-    def list_mood_history(self, agent_id: str, limit: int = 50) -> List[MoodOverlay]:
-        agent = self.get_agent(agent_id)
-        rows = self.store.query_all(
-            """
-            SELECT * FROM mood_overlays
-            WHERE agent_id = ?
-            ORDER BY set_at DESC, id DESC
-            LIMIT ?
-            """,
-            (agent.id, min(max(1, int(limit)), 500)),
-        )
-        return [self._mood_overlay_from_row(row) for row in rows]
-
-    def _mood_overlay_from_row(self, row: Any) -> MoodOverlay:
-        return MoodOverlay(
-            row["id"],
-            row["agent_id"],
-            row["mode"],
-            row["reason"],
-            json_loads(row["metadata"], {}),
-            row["set_by"],
-            row["set_at"],
-            row["expires_at"],
-            row["cleared_at"],
-            row["cleared_by"],
-            row["cleared_reason"],
-        )
-
-    def _insert_agent_event(
-        self,
-        conn: Any,
-        agent_id: str,
-        event_type: str,
-        actor: str,
-        detail: Dict[str, Any],
-        when: str,
-    ) -> None:
-        conn.execute(
-            """
-            INSERT INTO agent_events (id, agent_id, event_type, actor, detail, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (new_id("aevt"), agent_id, event_type, actor, json_dumps(detail), when),
-        )
-        self.observability.insert_observation(
-            conn,
-            "log",
-            event_type,
-            "control_plane",
-            "agent",
-            "info",
-            None,
-            "",
-            "agent",
-            agent_id,
-            {"actor": actor, **detail},
-            when,
-        )
+    def list_mood_history(self, *args: Any, **kwargs: Any) -> List[MoodOverlay]:
+        return self.agent_state.list_mood_history(*args, **kwargs)
 
     # Nap schedule + lifecycle
     #
@@ -1544,351 +1381,34 @@ class ControlPlane:
     # summarize and where to store it. mac records begin/complete events and
     # links to the produced summary evidence + vector refs.
 
-    @staticmethod
-    def _deterministic_nap_offset(agent_name: str) -> int:
-        """MD5-derived UTC-midnight offset in minutes, in [0, NAP_WINDOW_MINUTES).
+    # Nap schedule + lifecycle: thin facade over ``self.agent_state``.
 
-        Matches ACC's spec so existing fleet schedules round-trip identically
-        when migrated.
-        """
-        digest = hashlib.md5(agent_name.encode("utf-8")).digest()
-        # Take first 8 bytes as little-endian u64, matching md5_u64 convention.
-        value = int.from_bytes(digest[:8], byteorder="little", signed=False)
-        return int(value % NAP_WINDOW_MINUTES)
-
-    def configure_nap(
-        self,
-        agent_id: str,
-        offset_minutes: Optional[int] = None,
-        window_minutes: int = NAP_DEFAULT_DURATION_MINUTES,
-        enabled: bool = True,
-        actor: Optional[str] = None,
-    ) -> NapSchedule:
-        agent = self.get_agent(agent_id)
-        if offset_minutes is None:
-            offset_minutes = self._deterministic_nap_offset(agent.name)
-        offset_minutes = int(offset_minutes)
-        if not 0 <= offset_minutes < NAP_WINDOW_MINUTES:
-            raise ValidationError(
-                "nap offset_minutes must be in [0, %d)" % NAP_WINDOW_MINUTES
-            )
-        window_minutes = int(window_minutes)
-        if window_minutes <= 0 or window_minutes > 120:
-            raise ValidationError("nap window_minutes must be in (0, 120]")
-        now = utcnow()
-        actor_value = (actor or agent.id).strip() or agent.id
-        with self.store.transaction() as conn:
-            existing = conn.execute(
-                "SELECT enabled, offset_minutes, window_minutes FROM nap_schedules WHERE agent_id = ?",
-                (agent.id,),
-            ).fetchone()
-            conn.execute(
-                """
-                INSERT INTO nap_schedules (
-                    agent_id, offset_minutes, window_minutes, enabled,
-                    last_completed_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, ?)
-                ON CONFLICT(agent_id) DO UPDATE SET
-                    offset_minutes = excluded.offset_minutes,
-                    window_minutes = excluded.window_minutes,
-                    enabled = excluded.enabled,
-                    updated_at = excluded.updated_at
-                """,
-                (agent.id, offset_minutes, window_minutes, 1 if enabled else 0, now),
-            )
-            self._insert_agent_event(
-                conn,
-                agent.id,
-                "agent.nap_configured",
-                actor_value,
-                {
-                    "offset_minutes": offset_minutes,
-                    "window_minutes": window_minutes,
-                    "enabled": bool(enabled),
-                    "previous": (
-                        {
-                            "offset_minutes": existing["offset_minutes"],
-                            "window_minutes": existing["window_minutes"],
-                            "enabled": bool(existing["enabled"]),
-                        }
-                        if existing is not None
-                        else None
-                    ),
-                },
-                now,
-            )
-        return self.get_nap_schedule(agent.id)
+    def configure_nap(self, *args: Any, **kwargs: Any) -> NapSchedule:
+        return self.agent_state.configure_nap(*args, **kwargs)
 
     def get_nap_schedule(self, agent_id: str) -> Optional[NapSchedule]:
-        agent = self.get_agent(agent_id)
-        row = self.store.query_one(
-            "SELECT * FROM nap_schedules WHERE agent_id = ?", (agent.id,)
-        )
-        return self._nap_schedule_from_row(row) if row is not None else None
+        return self.agent_state.get_nap_schedule(agent_id)
 
     def list_nap_schedules(self) -> List[NapSchedule]:
-        rows = self.store.query_all(
-            "SELECT * FROM nap_schedules ORDER BY offset_minutes, agent_id"
-        )
-        return [self._nap_schedule_from_row(row) for row in rows]
+        return self.agent_state.list_nap_schedules()
 
-    def next_nap_window(
-        self,
-        agent_id: str,
-        now: Optional[datetime] = None,
-    ) -> Optional[Dict[str, str]]:
-        """Compute the next UTC nap window for `agent_id`, or None if the
-        schedule is disabled. The window is `[start, start + window)` where
-        start is the next future occurrence of `offset_minutes after 00:00 UTC`.
-        """
-        schedule = self.get_nap_schedule(agent_id)
-        if schedule is None or not schedule.enabled:
-            return None
-        reference = now if now is not None else datetime.now(timezone.utc)
-        midnight = reference.replace(hour=0, minute=0, second=0, microsecond=0)
-        candidate = midnight + timedelta(minutes=schedule.offset_minutes)
-        if candidate <= reference:
-            candidate = candidate + timedelta(days=1)
-        end = candidate + timedelta(minutes=schedule.window_minutes)
-        return {
-            "agent_id": schedule.agent_id,
-            "start": candidate.isoformat(timespec="microseconds"),
-            "end": end.isoformat(timespec="microseconds"),
-            "offset_minutes": schedule.offset_minutes,
-            "window_minutes": schedule.window_minutes,
-        }
+    def next_nap_window(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, str]]:
+        return self.agent_state.next_nap_window(*args, **kwargs)
 
-    def begin_nap(
-        self,
-        agent_id: str,
-        actor: Optional[str] = None,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> NapRun:
-        """Start a nap. Transitions the agent to DRAINING so the dispatcher
-        will not assign new work. Refuses if the agent currently holds an
-        active lease — call `release_lease` or wait for completion first.
-        """
-        agent = self.get_agent(agent_id)
-        if self._agent_has_active_lease(agent.id):
-            raise ValidationError(
-                "agent %s holds an active lease; release it before napping" % agent.id
-            )
-        actor_value = (actor or agent.id).strip() or agent.id
-        now = utcnow()
-        run_id = new_id("nap")
-        with self.store.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE agents
-                SET status = ?, current_task_id = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                (AgentStatus.DRAINING.value, now, agent.id),
-            )
-            conn.execute(
-                """
-                INSERT INTO nap_runs (
-                    id, agent_id, status, started_at, completed_at,
-                    summary_evidence_id, detail, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    agent.id,
-                    NapStatus.RUNNING.value,
-                    now,
-                    json_dumps(ensure_json_object(detail)),
-                    now,
-                    now,
-                ),
-            )
-            self._insert_agent_event(
-                conn,
-                agent.id,
-                "agent.nap_started",
-                actor_value,
-                {"nap_run_id": run_id},
-                now,
-            )
-        return self.get_nap_run(run_id)
+    def begin_nap(self, *args: Any, **kwargs: Any) -> NapRun:
+        return self.agent_state.begin_nap(*args, **kwargs)
 
-    def complete_nap(
-        self,
-        run_id: str,
-        summary_evidence_id: Optional[str] = None,
-        detail: Optional[Dict[str, Any]] = None,
-        actor: Optional[str] = None,
-    ) -> NapRun:
-        """Mark the nap complete, restore the agent to IDLE, and update the
-        schedule's last_completed_at. If `summary_evidence_id` is provided, the
-        evidence row must be `kind='log'` and belong to no task (nap output is
-        an agent artifact, not a task artifact) — enforced by inspecting the
-        row before linking.
-        """
-        run = self.get_nap_run(run_id)
-        if run.status != NapStatus.RUNNING.value:
-            raise TransitionError(
-                "nap_run %s is %s, not running" % (run_id, run.status)
-            )
-        if summary_evidence_id is not None:
-            # The summary lives in `evidence` so it shows up in audit queries
-            # alongside task evidence. We accept `log` (the natural kind for an
-            # agent-produced summary) — operators wanting tighter typing can
-            # add a future "memory" kind.
-            evidence = self.get_evidence(summary_evidence_id)
-            if evidence.kind != "log":
-                raise ValidationError(
-                    "nap summary evidence must have kind='log' (got %r)" % evidence.kind
-                )
-        agent = self.get_agent(run.agent_id)
-        actor_value = (actor or agent.id).strip() or agent.id
-        now = utcnow()
-        with self.store.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE nap_runs
-                SET status = ?, completed_at = ?, summary_evidence_id = ?,
-                    detail = COALESCE(?, detail), updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    NapStatus.COMPLETED.value,
-                    now,
-                    summary_evidence_id,
-                    json_dumps(ensure_json_object(detail)) if detail is not None else None,
-                    now,
-                    run_id,
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE nap_schedules
-                SET last_completed_at = ?, updated_at = ?
-                WHERE agent_id = ?
-                """,
-                (now, now, agent.id),
-            )
-            # Only restore the agent if it is still DRAINING — an offline
-            # transition during the nap (operator intervention, heartbeat
-            # offline) wins.
-            conn.execute(
-                """
-                UPDATE agents
-                SET status = ?, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (AgentStatus.IDLE.value, now, agent.id, AgentStatus.DRAINING.value),
-            )
-            self._insert_agent_event(
-                conn,
-                agent.id,
-                "agent.nap_completed",
-                actor_value,
-                {
-                    "nap_run_id": run_id,
-                    "summary_evidence_id": summary_evidence_id,
-                },
-                now,
-            )
-        return self.get_nap_run(run_id)
+    def complete_nap(self, *args: Any, **kwargs: Any) -> NapRun:
+        return self.agent_state.complete_nap(*args, **kwargs)
 
-    def fail_nap(
-        self,
-        run_id: str,
-        reason: str,
-        actor: Optional[str] = None,
-    ) -> NapRun:
-        """Mark the nap failed and restore the agent. The reason lands in the
-        nap_run.detail and in the agent event for audit. Schedule's
-        last_completed_at is NOT advanced — a failed nap doesn't count."""
-        run = self.get_nap_run(run_id)
-        if run.status != NapStatus.RUNNING.value:
-            raise TransitionError(
-                "nap_run %s is %s, not running" % (run_id, run.status)
-            )
-        agent = self.get_agent(run.agent_id)
-        actor_value = (actor or agent.id).strip() or agent.id
-        if not reason:
-            raise ValidationError("fail_nap requires a reason")
-        now = utcnow()
-        merged_detail = dict(run.detail)
-        merged_detail["failure_reason"] = reason
-        with self.store.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE nap_runs
-                SET status = ?, completed_at = ?, detail = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    NapStatus.FAILED.value,
-                    now,
-                    json_dumps(merged_detail),
-                    now,
-                    run_id,
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE agents
-                SET status = ?, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (AgentStatus.IDLE.value, now, agent.id, AgentStatus.DRAINING.value),
-            )
-            self._insert_agent_event(
-                conn,
-                agent.id,
-                "agent.nap_failed",
-                actor_value,
-                {"nap_run_id": run_id, "reason": reason},
-                now,
-            )
-        return self.get_nap_run(run_id)
+    def fail_nap(self, *args: Any, **kwargs: Any) -> NapRun:
+        return self.agent_state.fail_nap(*args, **kwargs)
 
     def get_nap_run(self, run_id: str) -> NapRun:
-        row = self.store.query_one(
-            "SELECT * FROM nap_runs WHERE id = ?", (run_id,)
-        )
-        if row is None:
-            raise NotFoundError("nap_run not found: %s" % run_id)
-        return self._nap_run_from_row(row)
+        return self.agent_state.get_nap_run(run_id)
 
-    def list_nap_runs(self, agent_id: Optional[str] = None) -> List[NapRun]:
-        if agent_id is not None:
-            agent = self.get_agent(agent_id)
-            rows = self.store.query_all(
-                "SELECT * FROM nap_runs WHERE agent_id = ? ORDER BY started_at DESC, id DESC",
-                (agent.id,),
-            )
-        else:
-            rows = self.store.query_all(
-                "SELECT * FROM nap_runs ORDER BY started_at DESC, id DESC"
-            )
-        return [self._nap_run_from_row(row) for row in rows]
-
-    def _nap_schedule_from_row(self, row: Any) -> NapSchedule:
-        return NapSchedule(
-            row["agent_id"],
-            int(row["offset_minutes"]),
-            int(row["window_minutes"]),
-            bool(row["enabled"]),
-            row["last_completed_at"],
-            row["updated_at"],
-        )
-
-    def _nap_run_from_row(self, row: Any) -> NapRun:
-        return NapRun(
-            row["id"],
-            row["agent_id"],
-            row["status"],
-            row["started_at"],
-            row["completed_at"],
-            row["summary_evidence_id"],
-            json_loads(row["detail"], {}),
-            row["created_at"],
-            row["updated_at"],
-        )
+    def list_nap_runs(self, *args: Any, **kwargs: Any) -> List[NapRun]:
+        return self.agent_state.list_nap_runs(*args, **kwargs)
 
     def mark_stale_agents_offline(self, stale_after_seconds: int) -> List[Agent]:
         cutoff = (
@@ -2128,241 +1648,28 @@ class ControlPlane:
     def publish_agentbus_content(self, *args: Any, **kwargs: Any) -> JsonDict:
         return self.agentbus.publish(*args, **kwargs)
 
-    # Reviews and publication
+    # Reviews + publication: thin facade over ``self.reviews``.
 
-    def request_review(self, task_id: str, reviewer_agent_id: str, actor: str = "dispatcher") -> Review:
-        task = self.get_task(task_id)
-        self.get_agent(reviewer_agent_id)
-        if self._agent_has_owned_task(task_id, reviewer_agent_id):
-            raise AuthorizationError(
-                "reviewer cannot be a prior or current owner of the reviewed task"
-            )
-        if task.state == TaskState.NEEDS_REVIEW.value:
-            self.transition_task(task_id, TaskState.REVIEWING.value, actor, {"reviewer_agent_id": reviewer_agent_id})
-        elif task.state != TaskState.REVIEWING.value:
-            raise TransitionError("task must need review before requesting review")
-        now = utcnow()
-        review_id = new_id("review")
-        self.store.execute(
-            """
-            INSERT INTO reviews (id, task_id, reviewer_agent_id, status, reason, evidence_id, created_at, completed_at)
-            VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
-            """,
-            (review_id, task_id, reviewer_agent_id, ReviewStatus.PENDING.value, now),
-        )
-        self.send_message(
-            "dispatcher",
-            reviewer_agent_id,
-            MessageType.REVIEW_REQUEST.value,
-            {"task_id": task_id, "review_id": review_id},
-            task_id=task_id,
-        )
-        self._record_history(task_id, "task.review_requested", actor, None, None, {"review_id": review_id})
-        return self.get_review(review_id)
+    def request_review(self, *args: Any, **kwargs: Any) -> Review:
+        return self.reviews.request_review(*args, **kwargs)
 
-    def submit_review(
-        self,
-        review_id: str,
-        status: str,
-        reviewer_agent_id: str,
-        reason: Optional[str] = None,
-        evidence_id: Optional[str] = None,
-    ) -> Review:
-        review = self.get_review(review_id)
-        if review.reviewer_agent_id != reviewer_agent_id:
-            raise AuthorizationError("reviewer does not own review")
-        if review.status != ReviewStatus.PENDING.value:
-            raise ValidationError("review is already completed")
-        status_value = _state_value(status)
-        if status_value not in {
-            ReviewStatus.APPROVED.value,
-            ReviewStatus.CHANGES_REQUESTED.value,
-            ReviewStatus.REJECTED.value,
-        }:
-            raise ValidationError("unsupported review decision: %s" % status_value)
-        if status_value == ReviewStatus.APPROVED.value and evidence_id is None:
-            raise ValidationError("approving a review requires an evidence_id")
-        if evidence_id is not None:
-            evidence = self.get_evidence(evidence_id)
-            if evidence.task_id != review.task_id:
-                raise ValidationError("review evidence must belong to reviewed task")
-        now = utcnow()
-        self.store.execute(
-            """
-            UPDATE reviews
-            SET status = ?, reason = ?, evidence_id = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (status_value, reason, evidence_id, now, review_id),
-        )
-        self._record_history(
-            review.task_id,
-            "task.review_completed",
-            reviewer_agent_id,
-            None,
-            None,
-            {"review_id": review_id, "status": status_value, "reason": reason},
-        )
-        if status_value in {ReviewStatus.CHANGES_REQUESTED.value, ReviewStatus.REJECTED.value}:
-            self.transition_task(review.task_id, TaskState.RUNNING.value, reviewer_agent_id, {"review_id": review_id})
-        return self.get_review(review_id)
+    def submit_review(self, *args: Any, **kwargs: Any) -> Review:
+        return self.reviews.submit_review(*args, **kwargs)
 
     def get_review(self, review_id: str) -> Review:
-        row = self.store.query_one("SELECT * FROM reviews WHERE id = ?", (review_id,))
-        if row is None:
-            raise NotFoundError("review not found: %s" % review_id)
-        return self._review_from_row(row)
+        return self.reviews.get_review(review_id)
 
     def list_reviews(self, task_id: str) -> List[Review]:
-        rows = self.store.query_all(
-            "SELECT * FROM reviews WHERE task_id = ? ORDER BY created_at, id",
-            (task_id,),
-        )
-        return [self._review_from_row(row) for row in rows]
+        return self.reviews.list_reviews(task_id)
 
-    def publish_task(
-        self,
-        task_id: str,
-        target: str,
-        created_by: str,
-        evidence_id: Optional[str] = None,
-    ) -> Publication:
-        task = self.get_task(task_id)
-        if task.state != TaskState.REVIEWING.value:
-            raise TransitionError("task must be in review before publication")
-        if not self._completion_authorized(task_id):
-            raise ValidationError("publication requires approved review and evidence")
-        content_hash = None
-        if self._task_requires_publication_evidence(task) and evidence_id is None:
-            raise ValidationError("publication policy requires publication evidence")
-        if evidence_id is not None:
-            evidence = self.get_evidence(evidence_id)
-            if evidence.task_id != task_id:
-                raise ValidationError("publication evidence must belong to task")
-            if self._task_requires_publication_evidence(task):
-                if evidence.kind != "publication":
-                    raise ValidationError("publication policy requires publication evidence")
-                if not evidence.checksum:
-                    raise ValidationError("publication evidence requires a checksum")
-            content_hash = evidence.checksum
-        owner_agent_id = task.owner_agent_id
-        now = utcnow()
-        publication_id = new_id("pub")
-        with self.store.transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE tasks
-                SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL, updated_at = ?
-                WHERE id = ? AND state = ?
-                """,
-                (TaskState.COMPLETED.value, now, task_id, TaskState.REVIEWING.value),
-            )
-            if cursor.rowcount != 1:
-                raise TransitionError("task state changed during publish; retry")
-            conn.execute(
-                """
-                INSERT INTO publications (id, task_id, target, status, evidence_id, content_hash, created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    publication_id,
-                    task_id,
-                    target,
-                    PublicationStatus.PUBLISHED.value,
-                    evidence_id,
-                    content_hash,
-                    created_by,
-                    now,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id("hist"),
-                    task_id,
-                    "task.published",
-                    created_by,
-                    None,
-                    None,
-                    json_dumps({"publication_id": publication_id, "target": target}),
-                    now,
-                ),
-            )
-            self.observability.insert_observation(
-                conn,
-                "log",
-                "task.published",
-                "control_plane",
-                "task",
-                "info",
-                None,
-                "",
-                "task",
-                task_id,
-                {"actor": created_by, "publication_id": publication_id, "target": target},
-                now,
-            )
-            conn.execute(
-                """
-                INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id("hist"),
-                    task_id,
-                    "task.transitioned",
-                    created_by,
-                    TaskState.REVIEWING.value,
-                    TaskState.COMPLETED.value,
-                    json_dumps({"publication_id": publication_id}),
-                    now,
-                ),
-            )
-            self.observability.insert_observation(
-                conn,
-                "log",
-                "task.transitioned",
-                "control_plane",
-                "task",
-                "info",
-                None,
-                "",
-                "task",
-                task_id,
-                {
-                    "actor": created_by,
-                    "from_state": TaskState.REVIEWING.value,
-                    "to_state": TaskState.COMPLETED.value,
-                    "publication_id": publication_id,
-                },
-                now,
-            )
-            if owner_agent_id:
-                conn.execute(
-                    "UPDATE agents SET status = ?, current_task_id = NULL, updated_at = ? WHERE id = ?",
-                    (AgentStatus.IDLE.value, now, owner_agent_id),
-                )
-        return self.get_publication(publication_id)
+    def publish_task(self, *args: Any, **kwargs: Any) -> Publication:
+        return self.reviews.publish_task(*args, **kwargs)
 
     def get_publication(self, publication_id: str) -> Publication:
-        row = self.store.query_one("SELECT * FROM publications WHERE id = ?", (publication_id,))
-        if row is None:
-            raise NotFoundError("publication not found: %s" % publication_id)
-        return self._publication_from_row(row)
+        return self.reviews.get_publication(publication_id)
 
-    def list_publications(self, task_id: Optional[str] = None) -> List[Publication]:
-        if task_id is not None:
-            self.get_task(task_id)
-            rows = self.store.query_all(
-                "SELECT * FROM publications WHERE task_id = ? ORDER BY created_at, id",
-                (task_id,),
-            )
-        else:
-            rows = self.store.query_all("SELECT * FROM publications ORDER BY created_at, id")
-        return [self._publication_from_row(row) for row in rows]
+    def list_publications(self, *args: Any, **kwargs: Any) -> List[Publication]:
+        return self.reviews.list_publications(*args, **kwargs)
 
     # Secrets boundary: thin facade over ``self.secrets``. New code should
     # call ``cp.secrets.<method>`` directly.
@@ -2902,248 +2209,34 @@ class ControlPlane:
     def list_vector_refs(self, *args: Any, **kwargs: Any) -> List[VectorRef]:
         return self.memory.list_vector_refs(*args, **kwargs)
 
-    # Evaluation
+    # Evaluation: thin facade over ``self.evaluations``.
 
-    def create_eval_set(
-        self,
-        name: str,
-        scoring: str = EvalScoringDirection.HIGHER_IS_BETTER.value,
-        description: str = "",
-        baseline_score: Optional[float] = None,
-        regression_threshold: float = 0.0,
-        metadata: Optional[Dict[str, Any]] = None,
-        created_by: str = "human",
-    ) -> EvalSet:
-        name = (name or "").strip()
-        if not name:
-            raise ValidationError("eval_set name is required")
-        scoring_value = _state_value(scoring)
-        try:
-            EvalScoringDirection(scoring_value)
-        except ValueError:
-            raise ValidationError("unsupported eval scoring direction: %s" % scoring_value)
-        if regression_threshold < 0:
-            raise ValidationError("regression_threshold must be >= 0")
-        now = utcnow()
-        eval_id = new_id("evalset")
-        with self.store.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO eval_sets (
-                    id, name, description, scoring, baseline_score, regression_threshold,
-                    metadata, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    eval_id,
-                    name,
-                    description,
-                    scoring_value,
-                    None if baseline_score is None else float(baseline_score),
-                    float(regression_threshold),
-                    json_dumps(ensure_json_object(metadata)),
-                    created_by,
-                    now,
-                    now,
-                ),
-            )
-            self._insert_eval_set_event(
-                conn,
-                eval_id,
-                "eval_set.created",
-                created_by,
-                {
-                    "scoring": scoring_value,
-                    "baseline_score": baseline_score,
-                    "regression_threshold": float(regression_threshold),
-                },
-                now,
-            )
-        return self.get_eval_set(eval_id)
+    def create_eval_set(self, *args: Any, **kwargs: Any) -> EvalSet:
+        return self.evaluations.create_eval_set(*args, **kwargs)
 
     def get_eval_set(self, eval_set_id_or_name: str) -> EvalSet:
-        row = self.store.query_one(
-            "SELECT * FROM eval_sets WHERE id = ? OR name = ?",
-            (eval_set_id_or_name, eval_set_id_or_name),
-        )
-        if row is None:
-            raise NotFoundError("eval_set not found: %s" % eval_set_id_or_name)
-        return self._eval_set_from_row(row)
+        return self.evaluations.get_eval_set(eval_set_id_or_name)
 
     def list_eval_sets(self) -> List[EvalSet]:
-        rows = self.store.query_all("SELECT * FROM eval_sets ORDER BY name")
-        return [self._eval_set_from_row(row) for row in rows]
+        return self.evaluations.list_eval_sets()
 
-    def update_eval_set_baseline(
-        self,
-        eval_set_id_or_name: str,
-        baseline_score: float,
-        actor: str = "human",
-    ) -> EvalSet:
-        eval_set = self.get_eval_set(eval_set_id_or_name)
-        new_baseline = float(baseline_score)
-        now = utcnow()
-        with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE eval_sets SET baseline_score = ?, updated_at = ? WHERE id = ?",
-                (new_baseline, now, eval_set.id),
-            )
-            # Frozen `passed` on prior runs does NOT auto-recompute. Operators
-            # weakening or tightening the gate need this trail to explain why
-            # historical runs read differently from a re-evaluation.
-            self._insert_eval_set_event(
-                conn,
-                eval_set.id,
-                "eval_set.baseline_changed",
-                actor,
-                {
-                    "previous_baseline_score": eval_set.baseline_score,
-                    "new_baseline_score": new_baseline,
-                },
-                now,
-            )
-        return self.get_eval_set(eval_set.id)
+    def update_eval_set_baseline(self, *args: Any, **kwargs: Any) -> EvalSet:
+        return self.evaluations.update_eval_set_baseline(*args, **kwargs)
 
     def list_eval_set_events(self, eval_set_id_or_name: str) -> List[JsonDict]:
-        eval_set = self.get_eval_set(eval_set_id_or_name)
-        rows = self.store.query_all(
-            "SELECT * FROM eval_set_events WHERE eval_set_id = ? ORDER BY created_at, id",
-            (eval_set.id,),
-        )
-        return [
-            {
-                "id": row["id"],
-                "eval_set_id": row["eval_set_id"],
-                "event_type": row["event_type"],
-                "actor": row["actor"],
-                "detail": json_loads(row["detail"], {}),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
+        return self.evaluations.list_eval_set_events(eval_set_id_or_name)
 
-    def record_eval_run(
-        self,
-        eval_set_id_or_name: str,
-        target_kind: str,
-        target_id: str,
-        score: float,
-        detail: Optional[Dict[str, Any]] = None,
-        evidence_id: Optional[str] = None,
-        created_by: str = "human",
-    ) -> EvalRun:
-        eval_set = self.get_eval_set(eval_set_id_or_name)
-        target_kind_value = _state_value(target_kind)
-        try:
-            EvalTargetKind(target_kind_value)
-        except ValueError:
-            raise ValidationError("unsupported eval target_kind: %s" % target_kind_value)
-        if not target_id:
-            raise ValidationError("eval run target_id is required")
-        if evidence_id is not None:
-            evidence = self.get_evidence(evidence_id)
-            if evidence.kind != "eval":
-                raise ValidationError(
-                    "eval run evidence must have kind='eval' (got '%s')" % evidence.kind
-                )
-        score_f = float(score)
-        baseline = eval_set.baseline_score
-        threshold = eval_set.regression_threshold
-        if baseline is None:
-            delta = None
-            passed = True
-        else:
-            delta = score_f - baseline
-            if eval_set.scoring == EvalScoringDirection.HIGHER_IS_BETTER.value:
-                # passing means the score did not regress past the threshold
-                passed = delta >= -threshold
-            else:
-                # lower is better — score should not exceed baseline by more than threshold
-                passed = delta <= threshold
-        now = utcnow()
-        run_id = new_id("evalrun")
-        with self.store.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO eval_runs (
-                    id, eval_set_id, target_kind, target_id, score, baseline_score,
-                    delta, threshold, passed, detail, evidence_id, created_by, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    eval_set.id,
-                    target_kind_value,
-                    target_id,
-                    score_f,
-                    baseline,
-                    delta,
-                    threshold,
-                    1 if passed else 0,
-                    json_dumps(ensure_json_object(detail)),
-                    evidence_id,
-                    created_by,
-                    now,
-                ),
-            )
-            self._insert_eval_set_event(
-                conn,
-                eval_set.id,
-                "eval_set.run_recorded",
-                created_by,
-                {
-                    "run_id": run_id,
-                    "target_kind": target_kind_value,
-                    "target_id": target_id,
-                    "score": score_f,
-                    "passed": bool(passed),
-                    "evidence_id": evidence_id,
-                },
-                now,
-            )
-        return self.get_eval_run(run_id)
+    def record_eval_run(self, *args: Any, **kwargs: Any) -> EvalRun:
+        return self.evaluations.record_eval_run(*args, **kwargs)
 
     def get_eval_run(self, run_id: str) -> EvalRun:
-        row = self.store.query_one("SELECT * FROM eval_runs WHERE id = ?", (run_id,))
-        if row is None:
-            raise NotFoundError("eval_run not found: %s" % run_id)
-        return self._eval_run_from_row(row)
+        return self.evaluations.get_eval_run(run_id)
 
-    def latest_eval_run(
-        self,
-        eval_set_id: str,
-        target_kind: str,
-        target_id: str,
-    ) -> Optional[EvalRun]:
-        row = self.store.query_one(
-            """
-            SELECT * FROM eval_runs
-            WHERE eval_set_id = ? AND target_kind = ? AND target_id = ?
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (eval_set_id, _state_value(target_kind), target_id),
-        )
-        return self._eval_run_from_row(row) if row is not None else None
+    def latest_eval_run(self, *args: Any, **kwargs: Any) -> Optional[EvalRun]:
+        return self.evaluations.latest_eval_run(*args, **kwargs)
 
-    def list_eval_runs(
-        self,
-        eval_set_id: Optional[str] = None,
-        target_id: Optional[str] = None,
-    ) -> List[EvalRun]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if eval_set_id is not None:
-            clauses.append("eval_set_id = ?")
-            params.append(eval_set_id)
-        if target_id is not None:
-            clauses.append("target_id = ?")
-            params.append(target_id)
-        sql = "SELECT * FROM eval_runs"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at, id"
-        return [self._eval_run_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+    def list_eval_runs(self, *args: Any, **kwargs: Any) -> List[EvalRun]:
+        return self.evaluations.list_eval_runs(*args, **kwargs)
 
     # Rollout and rescue
 
@@ -3681,30 +2774,6 @@ class ControlPlane:
             row["last_seen_at"],
         )
 
-    def _review_from_row(self, row: Any) -> Review:
-        return Review(
-            row["id"],
-            row["task_id"],
-            row["reviewer_agent_id"],
-            row["status"],
-            row["reason"],
-            row["evidence_id"],
-            row["created_at"],
-            row["completed_at"],
-        )
-
-    def _publication_from_row(self, row: Any) -> Publication:
-        return Publication(
-            row["id"],
-            row["task_id"],
-            row["target"],
-            row["status"],
-            row["evidence_id"],
-            row["content_hash"],
-            row["created_by"],
-            row["created_at"],
-        )
-
     def _runtime_from_row(self, row: Any) -> RuntimeEnvironment:
         return RuntimeEnvironment(
             row["id"],
@@ -3759,37 +2828,6 @@ class ControlPlane:
             row["created_by"],
             row["created_at"],
             row["updated_at"],
-        )
-
-    def _eval_set_from_row(self, row: Any) -> "EvalSet":
-        return EvalSet(
-            row["id"],
-            row["name"],
-            row["description"],
-            row["scoring"],
-            row["baseline_score"],
-            row["regression_threshold"],
-            json_loads(row["metadata"], {}),
-            row["created_by"],
-            row["created_at"],
-            row["updated_at"],
-        )
-
-    def _eval_run_from_row(self, row: Any) -> "EvalRun":
-        return EvalRun(
-            row["id"],
-            row["eval_set_id"],
-            row["target_kind"],
-            row["target_id"],
-            row["score"],
-            row["baseline_score"],
-            row["delta"],
-            row["threshold"],
-            bool(row["passed"]),
-            json_loads(row["detail"], {}),
-            row["evidence_id"],
-            row["created_by"],
-            row["created_at"],
         )
 
     # Internal helpers
@@ -3852,40 +2890,6 @@ class ControlPlane:
             when,
         )
 
-    def _insert_eval_set_event(
-        self,
-        conn: Any,
-        eval_set_id: str,
-        event_type: str,
-        actor: str,
-        detail: Dict[str, Any],
-        when: str,
-    ) -> None:
-        # Uses the caller's connection so the event lands in the same transaction
-        # as the originating write (create / baseline change / run record). Audit
-        # trail and durable state must commit together.
-        conn.execute(
-            """
-            INSERT INTO eval_set_events (id, eval_set_id, event_type, actor, detail, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (new_id("eevt"), eval_set_id, event_type, actor, json_dumps(detail), when),
-        )
-        self.observability.insert_observation(
-            conn,
-            "log",
-            event_type,
-            "control_plane",
-            "eval",
-            "info",
-            None,
-            "",
-            "eval_set",
-            eval_set_id,
-            {"actor": actor, **detail},
-            when,
-        )
-
     def _rollout_install_ready(self, rollout: Rollout) -> None:
         if not rollout.runtime_environment_id:
             raise ValidationError("rollout requires a runtime environment before install")
@@ -3931,31 +2935,6 @@ class ControlPlane:
         digest = artifact_hash.removeprefix("sha256:")
         if len(digest) < 6:
             raise ValidationError("artifact_hash digest is too short")
-
-    def _completion_authorized(self, task_id: str) -> bool:
-        # An approved review must reference evidence that belongs to the same
-        # task. This is the contract the README promises: completion requires
-        # not just *some* evidence and *some* approval, but a documented link.
-        approved = self.store.query_one(
-            """
-            SELECT r.id FROM reviews r
-            JOIN evidence e ON e.id = r.evidence_id AND e.task_id = r.task_id
-            WHERE r.task_id = ? AND r.status = ?
-            LIMIT 1
-            """,
-            (task_id, ReviewStatus.APPROVED.value),
-        )
-        return approved is not None
-
-    def _agent_has_owned_task(self, task_id: str, agent_id: str) -> bool:
-        task = self.get_task(task_id)
-        if task.owner_agent_id == agent_id:
-            return True
-        prior = self.store.query_one(
-            "SELECT 1 FROM leases WHERE task_id = ? AND agent_id = ? LIMIT 1",
-            (task_id, agent_id),
-        )
-        return prior is not None
 
     def _dependencies_satisfied(self, task: Task) -> bool:
         for dep_id in task.dependencies:
@@ -4138,15 +3117,6 @@ class ControlPlane:
             elif needed is not None and current != needed:
                 return False
         return True
-
-    def _task_requires_publication_evidence(self, task: Task) -> bool:
-        policy = task.metadata.get("policy") or {}
-        if not isinstance(policy, dict):
-            return False
-        return bool(
-            policy.get("require_publication_evidence")
-            or policy.get("publication_evidence_required")
-        )
 
     def _expire_agent_active_leases(self, agent_id: str, timestamp: str, reason: str) -> None:
         rows = self.store.query_all(
