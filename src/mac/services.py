@@ -89,6 +89,7 @@ from mac.memory_service import MemoryService
 from mac.messaging_service import MessagingService
 from mac.observability_service import ObservabilityService
 from mac.review_service import ReviewService
+from mac.rollout_service import RolloutService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
 
@@ -193,6 +194,16 @@ class ControlPlane:
             get_task=self.get_task,
             get_agent=self.get_agent,
             get_evidence=self.get_evidence,
+        )
+        self.rollouts = RolloutService(
+            self.store,
+            self.observability,
+            get_tenant=self.get_tenant,
+            get_runtime=self.get_runtime,
+            get_eval_set=self.get_eval_set,
+            create_task=self.create_task,
+            add_memory=self.add_memory,
+            task_from_row=self._task_from_row,
         )
 
     @classmethod
@@ -1561,399 +1572,32 @@ class ControlPlane:
 
     # Rollout and rescue
 
-    def create_rollout(
-        self,
-        version: str,
-        strategy: str,
-        target_percent: int,
-        created_by: str,
-        tenant_id: Optional[str] = None,
-        channel: str = "fleet",
-        runtime_environment_id: Optional[str] = None,
-        artifact_uri: Optional[str] = None,
-        artifact_hash: Optional[str] = None,
-        health_policy: Optional[Dict[str, Any]] = None,
-        required_eval_set_id: Optional[str] = None,
-    ) -> Rollout:
-        if not version:
-            raise ValidationError("rollout version is required")
-        if tenant_id is not None:
-            self.get_tenant(tenant_id)
-        channel = (channel or "fleet").strip()
-        if not channel:
-            raise ValidationError("rollout channel is required")
-        strategy_value = _state_value(strategy)
-        try:
-            RolloutStrategy(strategy_value)
-        except ValueError:
-            raise ValidationError("unsupported rollout strategy: %s" % strategy_value)
-        if int(target_percent) < 0 or int(target_percent) > 100:
-            raise ValidationError("rollout target percent must be between 0 and 100")
-        if runtime_environment_id is not None:
-            self.get_runtime(runtime_environment_id)
-        if bool(artifact_uri) != bool(artifact_hash):
-            raise ValidationError("artifact_uri and artifact_hash must be provided together")
-        if artifact_hash is not None:
-            self._validate_artifact_hash(artifact_hash)
-        if required_eval_set_id is not None:
-            self.get_eval_set(required_eval_set_id)
-        policy = ensure_json_object(health_policy)
-        now = utcnow()
-        rollout_id = new_id("rollout")
-        self.store.execute(
-            """
-            INSERT INTO rollouts (
-                id, version, strategy, status, target_percent, tenant_id, channel,
-                runtime_environment_id, artifact_uri, artifact_hash, health_policy,
-                required_eval_set_id, created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                rollout_id,
-                version,
-                strategy_value,
-                RolloutStatus.PLANNED.value,
-                int(target_percent),
-                tenant_id,
-                channel,
-                runtime_environment_id,
-                artifact_uri,
-                artifact_hash,
-                json_dumps(policy),
-                required_eval_set_id,
-                created_by,
-                now,
-                now,
-            ),
-        )
-        self._record_rollout_event(
-            rollout_id,
-            "rollout.created",
-            created_by,
-            {
-                "target_percent": int(target_percent),
-                "tenant_id": tenant_id,
-                "channel": channel,
-                "runtime_environment_id": runtime_environment_id,
-                "artifact_uri": artifact_uri,
-                "artifact_hash": artifact_hash,
-            },
-        )
-        if artifact_uri and artifact_hash:
-            self._record_rollout_event(
-                rollout_id,
-                "rollout.artifact_verified",
-                created_by,
-                {"artifact_uri": artifact_uri, "artifact_hash": artifact_hash},
-            )
-        return self.get_rollout(rollout_id)
+    # Rollouts: thin facade over ``self.rollouts``.
+
+    def create_rollout(self, *args: Any, **kwargs: Any) -> Rollout:
+        return self.rollouts.create_rollout(*args, **kwargs)
 
     def get_rollout(self, rollout_id: str) -> Rollout:
-        row = self.store.query_one("SELECT * FROM rollouts WHERE id = ?", (rollout_id,))
-        if row is None:
-            raise NotFoundError("rollout not found: %s" % rollout_id)
-        return self._rollout_from_row(row)
+        return self.rollouts.get_rollout(rollout_id)
+
+    def list_rollouts(self, *args: Any, **kwargs: Any) -> List[Rollout]:
+        return self.rollouts.list_rollouts(*args, **kwargs)
 
     def list_rollout_events(self, rollout_id: str) -> List[JsonDict]:
-        self.get_rollout(rollout_id)
-        rows = self.store.query_all(
-            "SELECT * FROM rollout_events WHERE rollout_id = ? ORDER BY created_at, id",
-            (rollout_id,),
-        )
-        return [
-            {
-                "id": row["id"],
-                "rollout_id": row["rollout_id"],
-                "event_type": row["event_type"],
-                "actor": row["actor"],
-                "detail": json_loads(row["detail"], {}),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
+        return self.rollouts.list_rollout_events(rollout_id)
 
-    def list_rollouts(
-        self,
-        tenant_id: Optional[str] = None,
-        channel: Optional[str] = None,
-    ) -> List[Rollout]:
-        clauses = []
-        params: List[Any] = []
-        if tenant_id is not None:
-            clauses.append("tenant_id = ?")
-            params.append(tenant_id)
-        if channel is not None:
-            clauses.append("channel = ?")
-            params.append(channel)
-        sql = "SELECT * FROM rollouts"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at, id"
-        return [self._rollout_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+    def verify_rollout_artifact(self, *args: Any, **kwargs: Any) -> Rollout:
+        return self.rollouts.verify_rollout_artifact(*args, **kwargs)
 
-    def verify_rollout_artifact(
-        self,
-        rollout_id: str,
-        artifact_uri: str,
-        artifact_hash: str,
-        actor: str,
-    ) -> Rollout:
-        rollout = self.get_rollout(rollout_id)
-        if rollout.status not in {RolloutStatus.PLANNED.value, RolloutStatus.PAUSED.value}:
-            raise TransitionError("artifact can only be verified before install or while paused")
-        if not artifact_uri:
-            raise ValidationError("artifact_uri is required")
-        self._validate_artifact_hash(artifact_hash)
-        now = utcnow()
-        self.store.execute(
-            """
-            UPDATE rollouts
-            SET artifact_uri = ?, artifact_hash = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (artifact_uri, artifact_hash, now, rollout_id),
-        )
-        self._record_rollout_event(
-            rollout_id,
-            "rollout.artifact_verified",
-            actor,
-            {"artifact_uri": artifact_uri, "artifact_hash": artifact_hash},
-        )
-        return self.get_rollout(rollout_id)
+    def advance_rollout(self, *args: Any, **kwargs: Any) -> Rollout:
+        return self.rollouts.advance_rollout(*args, **kwargs)
 
-    def advance_rollout(
-        self,
-        rollout_id: str,
-        action: str,
-        actor: str,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> Rollout:
-        rollout = self.get_rollout(rollout_id)
-        detail = detail or {}
-        rule = ROLLOUT_ACTIONS.get(action)
-        if rule is None:
-            raise ValidationError("unsupported rollout action: %s" % action)
-        if rollout.status not in rule["from"]:
-            raise TransitionError(
-                "rollout action %s not allowed from status %s" % (action, rollout.status)
-            )
-        if action in {"start_canary", "promote"}:
-            self._rollout_install_ready(rollout)
-        if (
-            action == "promote"
-            and rollout.strategy == RolloutStrategy.CANARY.value
-            and rollout.status == RolloutStatus.PLANNED.value
-        ):
-            raise TransitionError("canary rollout must start canary before promotion")
-        if (
-            action == "promote"
-            and rollout.strategy == RolloutStrategy.CANARY.value
-            and rollout.status in {RolloutStatus.CANARYING.value, RolloutStatus.PAUSED.value}
-            and not self._latest_rollout_health_passed(rollout.id)
-        ):
-            raise ValidationError("canary promotion requires a passing health gate")
-        status = rule["to"]
-        if "target_percent" in rule:
-            detail.setdefault("target_percent", rule["target_percent"])
-        target_percent = int(detail.get("target_percent", rollout.target_percent))
-        now = utcnow()
+    def evaluate_rollout_health(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.rollouts.evaluate_rollout_health(*args, **kwargs)
 
-        # The eval gate is read inside the transaction that commits the rollout
-        # status change. BEGIN IMMEDIATE blocks concurrent writers (including
-        # record_eval_run), so a failing run cannot land between gate-read and
-        # commit. The conditional UPDATE on status ensures no other writer
-        # advanced the rollout out from under us.
-        with self.store.transaction() as conn:
-            if action == "promote" and rollout.required_eval_set_id is not None:
-                eval_set_row = conn.execute(
-                    "SELECT id FROM eval_sets WHERE id = ?",
-                    (rollout.required_eval_set_id,),
-                ).fetchone()
-                if eval_set_row is None:
-                    raise ValidationError(
-                        "rollout promote blocked: required eval_set %s no longer exists"
-                        % rollout.required_eval_set_id
-                    )
-                run_row = conn.execute(
-                    """
-                    SELECT id, score, delta, threshold, passed
-                    FROM eval_runs
-                    WHERE eval_set_id = ? AND target_kind = ? AND target_id = ?
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT 1
-                    """,
-                    (
-                        rollout.required_eval_set_id,
-                        EvalTargetKind.ROLLOUT_VERSION.value,
-                        rollout.version,
-                    ),
-                ).fetchone()
-                if run_row is None:
-                    raise ValidationError(
-                        "rollout promote requires an eval_run against %s for version %s"
-                        % (rollout.required_eval_set_id, rollout.version)
-                    )
-                if not bool(run_row["passed"]):
-                    raise ValidationError(
-                        "rollout promote blocked: latest eval_run %s did not pass (score=%s delta=%s threshold=%s)"
-                        % (run_row["id"], run_row["score"], run_row["delta"], run_row["threshold"])
-                    )
-                detail.setdefault("eval_run_id", run_row["id"])
-                detail.setdefault("eval_score", run_row["score"])
-            cursor = conn.execute(
-                """
-                UPDATE rollouts
-                SET status = ?, target_percent = ?, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (status, target_percent, now, rollout_id, rollout.status),
-            )
-            if cursor.rowcount != 1:
-                raise TransitionError(
-                    "rollout %s status changed during advance; retry" % rollout_id
-                )
-            conn.execute(
-                """
-                INSERT INTO rollout_events (id, rollout_id, event_type, actor, detail, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (new_id("revt"), rollout_id, "rollout.%s" % action, actor, json_dumps(detail), now),
-            )
-            self.observability.insert_observation(
-                conn,
-                "log",
-                "rollout.%s" % action,
-                "control_plane",
-                "rollout",
-                "info",
-                None,
-                "",
-                "rollout",
-                rollout_id,
-                {"actor": actor, **detail},
-                now,
-            )
-        return self.get_rollout(rollout_id)
+    def rescue_rollout(self, *args: Any, **kwargs: Any) -> Tuple[Rollout, Task]:
+        return self.rollouts.rescue_rollout(*args, **kwargs)
 
-    def evaluate_rollout_health(
-        self,
-        rollout_id: str,
-        checks: Dict[str, Any],
-        actor: str,
-    ) -> JsonDict:
-        rollout = self.get_rollout(rollout_id)
-        checks_obj = ensure_json_object(checks)
-        required = self._required_rollout_checks(rollout, checks_obj)
-        failed = [
-            check
-            for check in required
-            if not self._health_check_passed(checks_obj.get(check))
-        ]
-        detail = {
-            "checks": checks_obj,
-            "required_checks": required,
-            "failed_checks": failed,
-            "status": "failed" if failed else "healthy",
-        }
-        self._record_rollout_event(rollout_id, "rollout.health_checked", actor, detail)
-        if failed:
-            # Idempotency: if the rollout is already RESCUING, don't open another
-            # rescue task. Record that the additional failure happened and return
-            # the in-flight rescue task so callers can act on a stable handle.
-            if rollout.status == RolloutStatus.RESCUING.value:
-                self._record_rollout_event(
-                    rollout_id,
-                    "rollout.health_failure_during_rescue",
-                    actor,
-                    {"failed_checks": failed, "checks": checks_obj},
-                )
-                in_flight = self._in_flight_rescue_task(rollout_id)
-                return {
-                    "healthy": False,
-                    "failed_checks": failed,
-                    "rollout": rollout.to_dict(),
-                    "rescue_task": in_flight.to_dict() if in_flight is not None else None,
-                }
-            rescued, task = self.rescue_rollout(
-                rollout_id,
-                actor,
-                "health gate failed: %s" % ", ".join(failed),
-                detail={"failed_checks": failed, "checks": checks_obj},
-            )
-            return {
-                "healthy": False,
-                "failed_checks": failed,
-                "rollout": rescued.to_dict(),
-                "rescue_task": task.to_dict(),
-            }
-        return {
-            "healthy": True,
-            "failed_checks": [],
-            "rollout": self.get_rollout(rollout_id).to_dict(),
-            "rescue_task": None,
-        }
-
-    def _in_flight_rescue_task(self, rollout_id: str) -> Optional[Task]:
-        """Return the most recent non-terminal rescue task for a rollout, if any."""
-        row = self.store.query_one(
-            """
-            SELECT * FROM tasks
-            WHERE project = 'rollout'
-              AND state NOT IN (?, ?, ?)
-              AND json_extract(metadata, '$.rollout_id') = ?
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (
-                TaskState.COMPLETED.value,
-                TaskState.FAILED.value,
-                TaskState.CANCELLED.value,
-                rollout_id,
-            ),
-        )
-        return self._task_from_row(row) if row is not None else None
-
-    def rescue_rollout(
-        self,
-        rollout_id: str,
-        actor: str,
-        reason: str,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Rollout, Task]:
-        rollout = self.get_rollout(rollout_id)
-        now = utcnow()
-        self.store.execute(
-            "UPDATE rollouts SET status = ?, target_percent = ?, updated_at = ? WHERE id = ?",
-            (RolloutStatus.RESCUING.value, 0, now, rollout_id),
-        )
-        rescue_detail = {"reason": reason}
-        rescue_detail.update(ensure_json_object(detail))
-        self._record_rollout_event(rollout_id, "rollout.rescue_started", actor, rescue_detail)
-        task = self.create_task(
-            "Rescue rollout %s" % rollout.version,
-            description=reason,
-            project="rollout",
-            priority=100,
-            required_capabilities=["ops"],
-            metadata={
-                "rollout_id": rollout_id,
-                "rescue": True,
-                "tenant_id": rollout.tenant_id,
-                "channel": rollout.channel,
-                "failed_checks": rescue_detail.get("failed_checks", []),
-            },
-            actor=actor,
-        )
-        self.add_memory(
-            task.id,
-            "rollout",
-            rollout_id,
-            "rescue",
-            "Rescue path opened for rollout %s: %s" % (rollout.version, reason),
-            None,
-            actor,
-        )
-        return self.get_rollout(rollout_id), task
 
     # Row mapping
 
@@ -2048,27 +1692,6 @@ class ControlPlane:
             row["updated_at"],
         )
 
-    def _rollout_from_row(self, row: Any) -> Rollout:
-        keys = row.keys() if hasattr(row, "keys") else []
-        required_eval_set_id = row["required_eval_set_id"] if "required_eval_set_id" in keys else None
-        return Rollout(
-            row["id"],
-            row["version"],
-            row["strategy"],
-            row["status"],
-            row["target_percent"],
-            row["tenant_id"],
-            row["channel"],
-            row["runtime_environment_id"],
-            row["artifact_uri"],
-            row["artifact_hash"],
-            json_loads(row["health_policy"], {}),
-            required_eval_set_id,
-            row["created_by"],
-            row["created_at"],
-            row["updated_at"],
-        )
-
     # Internal helpers
 
     def _record_history(
@@ -2104,76 +1727,6 @@ class ControlPlane:
             {"actor": actor, "from_state": from_state, "to_state": to_state, **detail},
             when,
         )
-
-    def _record_rollout_event(self, rollout_id: str, event_type: str, actor: str, detail: Dict[str, Any]) -> None:
-        when = utcnow()
-        self.store.execute(
-            """
-            INSERT INTO rollout_events (id, rollout_id, event_type, actor, detail, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (new_id("revt"), rollout_id, event_type, actor, json_dumps(detail), when),
-        )
-        self.observability.insert_observation(
-            self.store,
-            "log",
-            event_type,
-            "control_plane",
-            "rollout",
-            "info",
-            None,
-            "",
-            "rollout",
-            rollout_id,
-            {"actor": actor, **detail},
-            when,
-        )
-
-    def _rollout_install_ready(self, rollout: Rollout) -> None:
-        if not rollout.runtime_environment_id:
-            raise ValidationError("rollout requires a runtime environment before install")
-        self.get_runtime(rollout.runtime_environment_id)
-        if not rollout.artifact_uri or not rollout.artifact_hash:
-            raise ValidationError("rollout artifact must be verified before install")
-        self._validate_artifact_hash(rollout.artifact_hash)
-
-    def _latest_rollout_health_passed(self, rollout_id: str) -> bool:
-        row = self.store.query_one(
-            """
-            SELECT detail FROM rollout_events
-            WHERE rollout_id = ? AND event_type = ?
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (rollout_id, "rollout.health_checked"),
-        )
-        if row is None:
-            return False
-        detail = json_loads(row["detail"], {})
-        return detail.get("status") == "healthy"
-
-    def _required_rollout_checks(self, rollout: Rollout, checks: JsonDict) -> List[str]:
-        required = rollout.health_policy.get("required_checks")
-        if required:
-            return [str(check) for check in required]
-        return sorted(str(check) for check in checks)
-
-    def _health_check_passed(self, value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.lower() in {"ok", "pass", "passed", "healthy", "success"}
-        if isinstance(value, dict):
-            status = value.get("status")
-            return self._health_check_passed(status)
-        return False
-
-    def _validate_artifact_hash(self, artifact_hash: str) -> None:
-        if not artifact_hash or not artifact_hash.startswith("sha256:"):
-            raise ValidationError("artifact_hash must be a sha256:<digest> value")
-        digest = artifact_hash.removeprefix("sha256:")
-        if len(digest) < 6:
-            raise ValidationError("artifact_hash digest is too short")
 
     def _dependencies_satisfied(self, task: Task) -> bool:
         for dep_id in task.dependencies:
