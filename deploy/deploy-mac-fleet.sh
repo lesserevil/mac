@@ -541,6 +541,22 @@ backup_existing_artifacts() {
   write_rollback_script
 }
 
+stop_existing_services_for_deploy() {
+  log "stopping existing mac services for artifact replacement"
+  case "$OS_KIND" in
+    linux)
+      sudo systemctl stop mac-agent.service mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
+      ;;
+    darwin)
+      local uid
+      uid="$(id -u)"
+      launchctl bootout "gui/$uid/com.mac.agent" >/dev/null 2>&1 || true
+      launchctl bootout "gui/$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
+      launchctl bootout "gui/$uid/com.mac.control-plane" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
 normalize_hermes_redaction_env() {
   "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" "$HOME/.acc/.env" <<'PY'
 import json
@@ -942,6 +958,7 @@ log "deploy log: $DEPLOY_LOG"
 ensure_dns_resolution
 ensure_venv_support
 write_deploy_manifest "pre" "$MANIFEST_PRE"
+stop_existing_services_for_deploy
 backup_existing_artifacts
 log "installing mac source"
 rm -rf "$SRC_DIR.new"
@@ -1282,7 +1299,12 @@ case "$mode" in
     done
     ;;
   loop)
-    exec "${common[@]}" --loop --executor "${MAC_WORKER_EXECUTOR:-$HOME/.mac/bin/mac-hermes-task-executor}"
+    executor="${MAC_WORKER_EXECUTOR:-$HOME/.mac/bin/mac-hermes-task-executor}"
+    if [ "$executor" = "$HOME/.mac/bin/mac-hermes-task-executor" ]; then
+      test -x "$HOME/.mac/hermes-agent/.venv/bin/python"
+      test -f "$HOME/.mac/hermes-agent/hermes"
+    fi
+    exec "${common[@]}" --loop --executor "$executor"
     ;;
   *)
     echo "unsupported MAC_WORKER_MODE=$mode" >&2

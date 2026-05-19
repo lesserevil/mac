@@ -411,7 +411,7 @@ class MacWorker:
         )
 
     def _heartbeat(self) -> None:
-        payload: JsonDict = {}
+        payload: JsonDict = {"status": "idle"}
         # Declare the build the agent is running. Send the digest at most once
         # per process; subsequent heartbeats are pure liveness pings.
         if self.running_digest and not self._declared_digest:
