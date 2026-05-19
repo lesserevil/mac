@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 import time
 from typing import Any, Dict, Optional
 
@@ -117,6 +118,41 @@ def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
 
     assert result.status == "submitted_for_review"
     assert any(event.event_type == "task.lease_renewed" for event in cp.task_history(task.id))
+
+
+def test_mac_worker_does_not_mutate_task_after_losing_lease(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    first = register_worker_fixture(cp)
+    machine = cp.register_machine("second-worker-host")
+    second = cp.register_agent(machine.id, "second-worker", capabilities=["python"])
+    task = cp.create_task("Python task", required_capabilities=["python"])
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(_task_payload: Dict[str, Any], _task_dir: Path) -> WorkerExecution:
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(
+            timespec="microseconds"
+        )
+        cp.expire_leases(now=future)
+        cp.claim_task(task.id, second.id)
+        cp.start_task(task.id, second.id)
+        return WorkerExecution(0, "late success", stdout="late success\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        first.id,
+        tmp_path,
+        executor,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stale_result"
+    current = cp.get_task(task.id)
+    assert current.state == TaskState.RUNNING.value
+    assert current.owner_agent_id == second.id
+    assert cp.list_evidence(task.id) == []
+    observations = cp.list_observability(layer="worker", limit=20)
+    assert any(item.name == "worker.execution.stale_result" for item in observations)
 
 
 def test_mac_worker_run_forever_drains_queue_then_reports_offline(tmp_path: Path):

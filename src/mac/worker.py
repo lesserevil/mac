@@ -263,6 +263,13 @@ class MacWorker:
                 subject_id=task_id,
                 detail={"returncode": execution.returncode, "summary": execution.summary},
             )
+            if not self._assignment_is_current(task_id, lease["id"]):
+                return self._stale_result(
+                    task_id,
+                    lease,
+                    "assignment no longer current after executor completed",
+                    execution=execution,
+                )
             evidence = self._record_execution(task_id, task_dir, execution)
             if execution.succeeded:
                 reviewed_task = self.client.post(
@@ -296,6 +303,8 @@ class MacWorker:
                 error=execution.summary,
             )
         except Exception as exc:
+            if not self._assignment_is_current(task_id, lease["id"]):
+                return self._stale_result(task_id, lease, str(exc))
             self._observe_log(
                 "worker.execution.exception",
                 level="error",
@@ -315,6 +324,58 @@ class MacWorker:
             except Exception:
                 pass
             raise
+
+    def _assignment_is_current(self, task_id: str, lease_id: str) -> bool:
+        try:
+            current = self.client.get("/tasks/%s" % quote(task_id, safe=""))
+        except Exception:
+            # If the hub is unreachable, preserve the older behavior and let
+            # the concrete API operation surface the failure.
+            return True
+        current_task = current.get("task", current)
+        return (
+            current_task.get("owner_agent_id") == self.agent_id
+            and current_task.get("lease_id") == lease_id
+            and current_task.get("state") in {"claimed", "running"}
+        )
+
+    def _stale_result(
+        self,
+        task_id: str,
+        lease: JsonDict,
+        reason: str,
+        execution: Optional[WorkerExecution] = None,
+    ) -> WorkerRunResult:
+        detail: JsonDict = {
+            "agent_id": self.agent_id,
+            "lease_id": lease["id"],
+            "reason": reason,
+        }
+        if execution is not None:
+            detail.update(
+                {
+                    "returncode": execution.returncode,
+                    "summary": execution.summary,
+                }
+            )
+        self._observe_log(
+            "worker.execution.stale_result",
+            level="warning",
+            subject_type="task",
+            subject_id=task_id,
+            detail=detail,
+        )
+        try:
+            current = self.client.get("/tasks/%s" % quote(task_id, safe=""))
+            current_task: Optional[JsonDict] = current.get("task", current)
+        except Exception:
+            current_task = None
+        return WorkerRunResult(
+            status="stale_result",
+            task=current_task,
+            lease=lease,
+            error=reason,
+        )
 
     def _execute_with_lease_renewal(
         self,
