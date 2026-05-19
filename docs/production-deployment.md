@@ -33,6 +33,8 @@ deploying more than one writer.
 | `MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM` | no | Set `0` to disable startup patching of an explicit `MAC_HERMES_AGENT_DIR`. Default enabled only when the checkout path is explicit. |
 | `MAC_HERMES_STARTUP_CHECK` | no | Set `0` to disable Hermes state and Slack startup checks. Enabled by default. |
 | `MAC_REQUIRE_HERMES_STARTUP_READY` | no | Set `1` to fail `mac` startup when Hermes soul/memory/state references or Slack activation are not ready. |
+| `MAC_HERMES_SLACK_HOME_CHANNEL_NAME` | no | Slack home-channel name, without `#`, used to write `~/.hermes/slack_home_channels.json` from `slack_accounts.json`. Default `rockyandfriends`. |
+| `MAC_HERMES_SYNC_SLACK_HOME_CHANNELS` | no | Set `0` to preserve existing Slack home-channel files without discovery. Default enabled. |
 
 Generate a secret key once:
 
@@ -83,6 +85,11 @@ For the current Rocky/Natasha/Bullwinkle cutover, use the fleet deploy script:
 deploy/deploy-mac-fleet.sh
 ```
 
+Per-agent deploy settings live in `deploy/agents/<agent>/config.env`. The
+committed fleet configs set `MAC_DEPLOY_TARGET`, `MAC_DEPLOY_OS`, and
+`MAC_HERMES_SLACK_HOME_CHANNEL_NAME`; host-local secret env files still own
+tokens. Override `MAC_DEPLOY_AGENT_CONFIG_DIR` to test an alternate config set.
+
 It ships this repository to each host, installs `mac` into `~/.mac/venv`,
 redeploys upstream `NousResearch/hermes-agent` into `~/.mac/hermes-agent`,
 applies the minimal multi-Slack Hermes patch, preinstalls configured Hermes
@@ -108,6 +115,7 @@ host:
 - `acc-migration-status.json`
 - `startup-hermes.json`
 - `hermes-messaging-deps.json`
+- `hermes-home-channel-sync.json`
 - `hermes-redaction-normalization.json`
 - `hermes-log-summary.json`
 - `mac-service-journal.txt` on Linux, or `mac-service.log` on macOS

@@ -229,6 +229,11 @@ mac-hermes --url http://127.0.0.1:8000 reply task_...
 mac-hermes --url http://127.0.0.1:8000 writeback hermes_... task_...
 ```
 
+Fleet deployment reads per-agent config from `deploy/agents/<agent>/config.env`.
+Those files set the SSH target, OS kind, and
+`MAC_HERMES_SLACK_HOME_CHANNEL_NAME`, which mac uses to keep Hermes'
+`slack_home_channels.json` aligned with the deployed agent.
+
 ## Design Docs
 
 - [Hermes Boundary](docs/hermes-boundary.md)

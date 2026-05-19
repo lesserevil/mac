@@ -24,8 +24,11 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_HERMES_LOG_SUMMARY",
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
+        "MAC_HERMES_SLACK_HOME_CHANNEL_NAME",
         "MAC_REQUIRE_HERMES_STARTUP_READY",
+        "ACC_SLACK_HOME_CHANNEL_NAME",
         "SLACK_BOT_TOKEN",
+        "SLACK_HOME_CHANNEL_NAME",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -80,6 +83,62 @@ def test_slack_accounts_file_shim_satisfies_account_file_only_startup(monkeypatc
     assert report["slack"]["activation_source"] == "slack_accounts_file_shim"
     assert report["slack"]["account_file_activation_shim_present"] is True
     assert report["slack"]["needs_account_file_activation_shim"] is False
+
+
+def test_startup_applies_home_channel_shim_for_slack_home_channels(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    run_py = agent_dir / "gateway" / "run.py"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        hermes_home / "slack_home_channels.json",
+        '[{"team_id":"T123","channel_id":"C456","channel_name":"#ops"}]',
+    )
+    _write(
+        run_py,
+        '''import json
+import os
+from typing import Any
+
+_hermes_home = None
+
+
+def _home_target_env_var(platform_name: str) -> str:
+    return f"{platform_name.upper()}_HOME_CHANNEL"
+
+
+def _home_thread_env_var(platform_name: str) -> str:
+    return f"{_home_target_env_var(platform_name)}_THREAD_ID"
+
+
+def needs_home(source, platform_name):
+    env_key = _home_target_env_var(platform_name)
+    if not os.getenv(env_key):
+        return True
+    return False
+''',
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("MAC_HERMES_SLACK_HOME_CHANNEL_NAME", "ops")
+
+    report = build_hermes_startup_report()
+    patched = run_py.read_text(encoding="utf-8")
+
+    assert report["slack"]["home_channel_file_present"] is True
+    assert report["slack"]["configured_home_channel_name"] == "ops"
+    assert report["slack"]["home_channel_shim_patch"]["applied"] is True
+    assert report["slack"]["home_channel_shim_present"] is True
+    assert "_source_has_home_target" in patched
+    assert "slack_home_channels.json" in patched
+    assert "if not _source_has_home_target(source, platform_name, env_key):" in patched
 
 
 def test_startup_applies_slack_accounts_shim_for_explicit_hermes_checkout(

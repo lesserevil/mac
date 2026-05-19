@@ -81,6 +81,10 @@ Relevant environment:
   default only for explicit checkout paths.
 - `MAC_HERMES_STARTUP_CHECK=0`: disable the check.
 - `MAC_REQUIRE_HERMES_STARTUP_READY=1`: fail startup when warnings are present.
+- `MAC_HERMES_SLACK_HOME_CHANNEL_NAME`: Slack home-channel name, without `#`,
+  used by fleet deploy to materialize `slack_home_channels.json`.
+- `MAC_HERMES_SYNC_SLACK_HOME_CHANNELS=0`: preserve existing home-channel files
+  without discovery.
 
 One current deployment caveat matters for an upstream-Hermes-based install:
 upstream `NousResearch/hermes-agent` enables Slack from `SLACK_BOT_TOKEN` or

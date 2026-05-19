@@ -6,6 +6,7 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 TMPDIR_LOCAL="${TMPDIR:-/tmp}/mac-fleet-deploy-${TS}.$$"
 ARCHIVE="${TMPDIR_LOCAL}/mac.tar.gz"
 GIT_REV="$(git -C "$ROOT" rev-parse HEAD)"
+AGENT_CONFIG_DIR="${MAC_DEPLOY_AGENT_CONFIG_DIR:-$ROOT/deploy/agents}"
 
 DEFAULT_HOSTS=(
   "rocky|jkh@100.125.137.89|linux"
@@ -30,31 +31,68 @@ default. Each host gets:
   - one-time ACC SQLite dry-run and import reports under ~/.mac/logs
 
 Arguments may be agent names: rocky, natasha, bullwinkle.
+Per-agent defaults are read from deploy/agents/<agent>/config.env when present.
 USAGE
+}
+
+legacy_host_spec() {
+  local requested="$1" spec name
+  for spec in "${DEFAULT_HOSTS[@]}"; do
+    name="${spec%%|*}"
+    if [ "$name" = "$requested" ]; then
+      printf '%s\n' "$spec"
+      return 0
+    fi
+  done
+  return 1
+}
+
+agent_spec() {
+  local requested="$1" legacy config
+  legacy="$(legacy_host_spec "$requested")" || return 1
+  config="$AGENT_CONFIG_DIR/$requested/config.env"
+  (
+    IFS='|' read -r MAC_DEPLOY_AGENT MAC_DEPLOY_TARGET MAC_DEPLOY_OS <<EOF
+$legacy
+EOF
+    MAC_HERMES_SLACK_HOME_CHANNEL_NAME=""
+    if [ -f "$config" ]; then
+      # shellcheck source=/dev/null
+      . "$config"
+    fi
+    : "${MAC_DEPLOY_AGENT:=$requested}"
+    : "${MAC_DEPLOY_TARGET:?agent config must set MAC_DEPLOY_TARGET}"
+    : "${MAC_DEPLOY_OS:?agent config must set MAC_DEPLOY_OS}"
+    printf '%s|%s|%s|%s\n' \
+      "$MAC_DEPLOY_AGENT" \
+      "$MAC_DEPLOY_TARGET" \
+      "$MAC_DEPLOY_OS" \
+      "${MAC_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
+  )
 }
 
 selected_hosts() {
   if [ "$#" -eq 0 ]; then
-    printf '%s\n' "${DEFAULT_HOSTS[@]}"
-    return
-  fi
-  local requested spec name found
-  for requested in "$@"; do
-    found=""
+    local spec name
     for spec in "${DEFAULT_HOSTS[@]}"; do
       name="${spec%%|*}"
-      if [ "$name" = "$requested" ]; then
-        printf '%s\n' "$spec"
-        found=1
-        break
-      fi
+      agent_spec "$name"
     done
-    if [ -z "$found" ]; then
+    return
+  fi
+  local requested
+  for requested in "$@"; do
+    if ! agent_spec "$requested"; then
       echo "unknown agent: $requested" >&2
       usage >&2
       return 2
     fi
   done
+}
+
+shell_quote() {
+  local value="$1"
+  printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
 }
 
 make_archive() {
@@ -63,8 +101,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" agent target os remote_archive
-  IFS='|' read -r agent target os <<<"$spec"
+  local spec="$1" agent target os home_channel remote_archive
+  IFS='|' read -r agent target os home_channel <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
@@ -72,7 +110,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT='$agent' MAC_DEPLOY_OS='$os' MAC_DEPLOY_ARCHIVE='$remote_archive' MAC_DEPLOY_TS='$TS' MAC_DEPLOY_GIT_REV='$GIT_REV' bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -80,6 +118,7 @@ OS_KIND="${MAC_DEPLOY_OS:?}"
 ARCHIVE="${MAC_DEPLOY_ARCHIVE:?}"
 DEPLOY_TS="${MAC_DEPLOY_TS:?}"
 DEPLOY_REV="${MAC_DEPLOY_GIT_REV:?}"
+HERMES_SLACK_HOME_CHANNEL_NAME="${MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
 MAC_HOME="${MAC_HOME:-$HOME/.mac}"
 MAC_PORT="${MAC_PORT:-8789}"
 SRC_DIR="$MAC_HOME/src/mac"
@@ -134,7 +173,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -295,6 +334,7 @@ manifest = {
         "timestamp": os.environ["DEPLOY_TS"],
         "mac_git_rev": os.environ["DEPLOY_REV"],
         "log": os.environ["DEPLOY_LOG"],
+        "hermes_slack_home_channel_name": os.environ.get("HERMES_SLACK_HOME_CHANNEL_NAME") or None,
     },
     "paths": {
         "mac_home": str(mac_home),
@@ -604,6 +644,17 @@ raise SystemExit(1 if failed else 0)
 PY
 }
 
+sync_hermes_home_channels() {
+  log "syncing Hermes Slack home-channel data"
+  HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" \
+  "$PY" "$SRC_DIR/deploy/sync-hermes-home-channels.py" \
+    "${HERMES_SLACK_ACCOUNTS_FILE:-${HERMES_HOME:-$HOME/.hermes}/slack_accounts.json}" \
+    "${HERMES_SLACK_HOME_CHANNELS_FILE:-${HERMES_HOME:-$HOME/.hermes}/slack_home_channels.json}" \
+    "${HERMES_SLACK_CHANNEL_TEAMS_FILE:-${HERMES_HOME:-$HOME/.hermes}/slack_channel_teams.json}" \
+    "$LOG_DIR/hermes-home-channel-sync.json" || \
+    log "WARNING: Hermes Slack home-channel sync failed; preserving existing home-channel data"
+}
+
 log "deploy log: $DEPLOY_LOG"
 ensure_dns_resolution
 ensure_venv_support
@@ -617,7 +668,7 @@ mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" <<'PY'
 from pathlib import Path
 import secrets
 import sys
@@ -626,6 +677,7 @@ env_path = Path(sys.argv[1])
 mac_home = Path(sys.argv[2])
 home = Path(sys.argv[3])
 port = sys.argv[4]
+configured_home_channel = sys.argv[5].strip().lstrip("#")
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -646,6 +698,17 @@ values["MAC_HERMES_AGENT_DIR"] = str(mac_home / "hermes-agent")
 values["MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM"] = "1"
 values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
+home_channel = (
+    configured_home_channel
+    or values.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
+    or values.get("ACC_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
+    or values.get("SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
+    or "rockyandfriends"
+)
+values["MAC_HERMES_SLACK_HOME_CHANNEL_NAME"] = home_channel
+values["ACC_SLACK_HOME_CHANNEL_NAME"] = home_channel
+values["SLACK_HOME_CHANNEL_NAME"] = home_channel
+values.setdefault("MAC_HERMES_SYNC_SLACK_HOME_CHANNELS", "1")
 
 lines = [
     "# Generated by mac deploy/deploy-mac-fleet.sh.",
@@ -662,6 +725,7 @@ normalize_hermes_redaction_env
 set -a
 . "$ENV_FILE"
 set +a
+sync_hermes_home_channels
 
 log "installing mac Python package"
 "$PY" -m venv "$VENV"

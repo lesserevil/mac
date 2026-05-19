@@ -247,6 +247,23 @@ def _slack_account_shim_present(agent_dir: Optional[Path]) -> bool:
     return "_slack_accounts_file_configured" in text and "slack_accounts.json" in text
 
 
+def _slack_home_channel_name() -> str:
+    return (
+        os.environ.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME")
+        or os.environ.get("ACC_SLACK_HOME_CHANNEL_NAME")
+        or os.environ.get("SLACK_HOME_CHANNEL_NAME")
+        or "rockyandfriends"
+    ).strip().lstrip("#")
+
+
+def _slack_home_channel_shim_present(agent_dir: Optional[Path]) -> bool:
+    if agent_dir is None:
+        return False
+    run_py = agent_dir / "gateway" / "run.py"
+    text = _read_small_text(run_py)
+    return "_source_has_home_target" in text and "slack_home_channels.json" in text
+
+
 def _apply_slack_account_activation_shim(agent_dir: Path) -> Dict[str, Any]:
     config_py = agent_dir / "gateway" / "config.py"
     result = {
@@ -364,6 +381,97 @@ def _slack_accounts_file_configured() -> bool:
     return result
 
 
+def _apply_slack_home_channel_shim(agent_dir: Path) -> Dict[str, Any]:
+    run_py = agent_dir / "gateway" / "run.py"
+    result = {
+        "attempted": True,
+        "applied": False,
+        "path": str(run_py),
+        "error": "",
+    }
+    try:
+        text = run_py.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        result["attempted"] = False
+        return result
+    except OSError as exc:
+        result["error"] = "cannot read Hermes gateway/run.py: %s" % exc
+        return result
+
+    helper = '''\
+
+def _source_has_home_target(source: Any, platform_name: str, env_key: str) -> bool:
+    """Return True when a platform has a configured home target for this source."""
+    if os.getenv(env_key):
+        return True
+    if platform_name.lower() != "slack":
+        return False
+
+    try:
+        path = _hermes_home / "slack_home_channels.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, list):
+        return False
+
+    team_id = str(getattr(source, "guild_id", "") or "")
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        item_team = str(item.get("team_id") or "")
+        item_channel = str(item.get("channel_id") or item.get("chat_id") or "")
+        if chat_id and item_channel == chat_id:
+            return True
+        if team_id and item_team == team_id and item_channel:
+            return True
+    return False
+'''
+    changed = False
+    if "_source_has_home_target" not in text:
+        helper_needle = "\n\ndef _home_thread_env_var(platform_name: str) -> str:\n"
+        if helper_needle not in text:
+            result["error"] = (
+                "cannot patch per-workspace Slack home target helper; "
+                "upstream gateway/run.py changed"
+            )
+            return result
+        text = text.replace(helper_needle, helper + helper_needle, 1)
+        changed = True
+
+    replacements = (
+        (
+            "            if not os.getenv(env_key):\n",
+            "            if not _source_has_home_target(source, platform_name, env_key):\n",
+        ),
+        (
+            "    if not os.getenv(env_key):\n",
+            "    if not _source_has_home_target(source, platform_name, env_key):\n",
+        ),
+    )
+    if not any(new in text for _, new in replacements):
+        for old, new in replacements:
+            if old in text:
+                text = text.replace(old, new, 1)
+                changed = True
+                break
+        else:
+            result["error"] = (
+                "cannot patch home-channel onboarding check; upstream gateway/run.py changed"
+            )
+            return result
+
+    if changed:
+        try:
+            run_py.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            result["error"] = "cannot write Hermes gateway/run.py: %s" % exc
+            return result
+    result["applied"] = changed
+    return result
+
+
 def _maybe_apply_slack_account_activation_shim(
     agent_dir: Optional[Path],
     explicit_agent_dir: bool,
@@ -392,6 +500,32 @@ def _maybe_apply_slack_account_activation_shim(
     }
 
 
+def _maybe_apply_slack_home_channel_shim(
+    agent_dir: Optional[Path],
+    explicit_agent_dir: bool,
+    home_channel_file_present: bool,
+    shim_present: bool,
+) -> Dict[str, Any]:
+    result = {
+        "enabled": explicit_agent_dir and _env_enabled("MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM", True),
+        "attempted": False,
+        "applied": False,
+        "path": str(agent_dir / "gateway" / "run.py") if agent_dir is not None else None,
+        "error": "",
+    }
+    if (
+        not result["enabled"]
+        or agent_dir is None
+        or not home_channel_file_present
+        or shim_present
+    ):
+        return result
+    return {
+        "enabled": True,
+        **_apply_slack_home_channel_shim(agent_dir),
+    }
+
+
 def _slack_activation_report(
     hermes_home: Path,
     hermes_refs: List[Dict[str, Any]],
@@ -399,11 +533,16 @@ def _slack_activation_report(
     account_ref = next(
         ref for ref in hermes_refs if ref["role"] == "slack_accounts"
     )
+    home_channel_ref = next(
+        ref for ref in hermes_refs if ref["role"] == "slack_home_channels"
+    )
     account_file_present = bool(account_ref["exists"])
+    home_channel_file_present = bool(home_channel_ref["exists"])
     env_token_present = bool(os.environ.get("SLACK_BOT_TOKEN"))
     explicit_config = _config_explicitly_enables_slack(hermes_home / "config.yaml")
     agent_dir, explicit_agent_dir = _hermes_agent_dir_info()
     shim_present = _slack_account_shim_present(agent_dir)
+    home_channel_shim_present = _slack_home_channel_shim_present(agent_dir)
     shim_patch = _maybe_apply_slack_account_activation_shim(
         agent_dir,
         explicit_agent_dir,
@@ -414,11 +553,19 @@ def _slack_activation_report(
     )
     if shim_patch["applied"]:
         shim_present = _slack_account_shim_present(agent_dir)
+    home_channel_shim_patch = _maybe_apply_slack_home_channel_shim(
+        agent_dir,
+        explicit_agent_dir,
+        home_channel_file_present,
+        home_channel_shim_present,
+    )
+    if home_channel_shim_patch["applied"]:
+        home_channel_shim_present = _slack_home_channel_shim_present(agent_dir)
 
     activation_source = "not_configured"
     can_activate = False
     needs_shim = False
-    warning = ""
+    warnings = []
     if account_file_present:
         if env_token_present:
             activation_source = "slack_bot_token"
@@ -433,30 +580,46 @@ def _slack_activation_report(
             activation_source = "missing_account_file_activation"
             needs_shim = True
             if shim_patch["error"]:
-                warning = (
+                warnings.append(
                     "slack_accounts.json exists, but mac could not apply the upstream "
                     "Hermes account-file activation shim: %s" % shim_patch["error"]
                 )
             else:
-                warning = (
+                warnings.append(
                     "slack_accounts.json exists, but upstream Hermes will not enable Slack "
                     "from that file unless SLACK_BOT_TOKEN, explicit Slack config, or the "
                     "account-file activation shim is present"
                 )
+    if home_channel_file_present and not home_channel_shim_present:
+        if home_channel_shim_patch["error"]:
+            warnings.append(
+                "slack_home_channels.json exists, but mac could not apply the upstream "
+                "Hermes home-channel shim: %s" % home_channel_shim_patch["error"]
+            )
+        elif explicit_agent_dir:
+            warnings.append(
+                "slack_home_channels.json exists, but upstream Hermes may still ask for "
+                "home-channel setup because the home-channel shim is missing"
+            )
 
     return {
         "account_file": account_ref,
         "account_file_present": account_file_present,
+        "home_channel_file": home_channel_ref,
+        "home_channel_file_present": home_channel_file_present,
+        "configured_home_channel_name": _slack_home_channel_name(),
         "slack_bot_token_present": env_token_present,
         "explicit_config_present": explicit_config,
         "hermes_agent_dir": str(agent_dir) if agent_dir is not None else None,
         "hermes_agent_dir_explicit": explicit_agent_dir,
         "account_file_activation_shim_present": shim_present,
         "account_file_activation_shim_patch": shim_patch,
+        "home_channel_shim_present": home_channel_shim_present,
+        "home_channel_shim_patch": home_channel_shim_patch,
         "needs_account_file_activation_shim": needs_shim,
         "activation_source": activation_source,
         "can_activate": can_activate,
-        "warning": warning,
+        "warning": "; ".join(warnings),
     }
 
 
