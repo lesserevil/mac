@@ -136,6 +136,9 @@ class MacWorker:
         lease_seconds: int = 900,
         running_digest: Optional[str] = None,
         poll_interval_seconds: float = 1.0,
+        allowed_projects: Optional[List[str]] = None,
+        required_metadata: Optional[JsonDict] = None,
+        require_canary: bool = False,
     ) -> None:
         if not agent_id:
             raise MacApiError("agent_id is required")
@@ -146,8 +149,12 @@ class MacWorker:
         self.lease_seconds = lease_seconds
         self.running_digest = running_digest
         self.poll_interval_seconds = float(poll_interval_seconds)
+        self.allowed_projects = list(allowed_projects or [])
+        self.required_metadata = dict(required_metadata or {})
+        self.require_canary = bool(require_canary)
         self._stop = False
         self._declared_digest = False
+        self._declared_policy = False
 
     def stop(self) -> None:
         """Signal the run loop to exit after the current task."""
@@ -213,6 +220,7 @@ class MacWorker:
 
     def run_once(self) -> WorkerRunResult:
         self._heartbeat()
+        self._observe_policy_once()
         assignment = self._claim_next_for_agent()
         if assignment is None:
             self._observe_log("worker.no_task", level="debug", detail={"agent_id": self.agent_id})
@@ -308,7 +316,52 @@ class MacWorker:
     def _claim_next_for_agent(self) -> Optional[JsonDict]:
         return self.client.post(
             "/agents/%s/claim-next" % quote(self.agent_id, safe=""),
-            {"lease_seconds": self.lease_seconds},
+            self._claim_payload(dry_run=False),
+        )
+
+    def dry_run_claim(self) -> Optional[JsonDict]:
+        self._heartbeat()
+        self._observe_policy_once()
+        assignment = self.client.post(
+            "/agents/%s/claim-next" % quote(self.agent_id, safe=""),
+            self._claim_payload(dry_run=True),
+        )
+        self._observe_log(
+            "worker.routing.dry_run_result",
+            level="info" if assignment is not None else "debug",
+            subject_type="task" if assignment else None,
+            subject_id=(assignment.get("task") or {}).get("id") if assignment else None,
+            detail={
+                "agent_id": self.agent_id,
+                "matched": assignment is not None,
+                "policy": self._policy_payload(),
+            },
+        )
+        return assignment
+
+    def _claim_payload(self, dry_run: bool) -> JsonDict:
+        return {
+            "lease_seconds": self.lease_seconds,
+            "allowed_projects": self.allowed_projects,
+            "required_metadata": self.required_metadata,
+            "require_canary": self.require_canary,
+            "dry_run": dry_run,
+        }
+
+    def _policy_payload(self) -> JsonDict:
+        return {
+            "allowed_projects": self.allowed_projects,
+            "required_metadata": self.required_metadata,
+            "require_canary": self.require_canary,
+        }
+
+    def _observe_policy_once(self) -> None:
+        if self._declared_policy:
+            return
+        self._declared_policy = True
+        self._observe_log(
+            "worker.routing.policy",
+            detail={"agent_id": self.agent_id, "policy": self._policy_payload()},
         )
 
     def _prepare_task_workspace(self, task: JsonDict, lease: JsonDict) -> Path:
@@ -452,6 +505,13 @@ def _json_arg(value: Optional[str]) -> JsonDict:
     return loaded
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mac worker harness")
     parser.add_argument("--url", default=os.environ.get("MAC_URL", "http://127.0.0.1:8000"))
@@ -479,6 +539,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-seconds", type=int, default=900)
     parser.add_argument("--timeout", type=float)
     parser.add_argument(
+        "--allowed-projects",
+        default=os.environ.get("MAC_WORKER_ALLOWED_PROJECTS", ""),
+        help="comma-separated projects this worker may claim",
+    )
+    parser.add_argument(
+        "--required-metadata",
+        default=os.environ.get("MAC_WORKER_REQUIRED_METADATA"),
+        help="JSON object of top-level task metadata key/value pairs required before claiming",
+    )
+    parser.add_argument(
+        "--require-canary",
+        action="store_true",
+        default=_env_bool("MAC_WORKER_REQUIRE_CANARY", False),
+        help="claim only tasks with metadata.canary, metadata.mac_canary, or metadata.worker_canary true",
+    )
+    parser.add_argument(
         "--running-digest",
         help="runtime_environments.digest the worker is running (declared at first heartbeat)",
     )
@@ -504,10 +580,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="register/heartbeat once and exit without claiming tasks",
     )
     parser.add_argument(
+        "--dry-run-claim",
+        action="store_true",
+        help="register/heartbeat and ask the hub what this worker would claim without creating a lease",
+    )
+    parser.add_argument(
         "--executor",
         nargs=argparse.REMAINDER,
         default=None,
-        help="executor argv; use '--executor -- command args' if command starts with '-'",
+        help="executor argv; pass this flag last, followed by the command and arguments",
     )
     return parser
 
@@ -544,9 +625,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             )
             return 0
+        required_metadata = _json_arg(args.required_metadata)
+        allowed_projects = _csv_arg(args.allowed_projects)
         executor_argv = list(args.executor or [])
         if executor_argv and executor_argv[0] == "--":
             executor_argv = executor_argv[1:]
+        if args.dry_run_claim:
+            worker = MacWorker(
+                client,
+                agent_id,
+                Path(args.workspace),
+                SubprocessExecutor(["true"]),
+                lease_seconds=args.lease_seconds,
+                running_digest=args.running_digest,
+                poll_interval_seconds=args.poll_interval,
+                allowed_projects=allowed_projects,
+                required_metadata=required_metadata,
+                require_canary=args.require_canary,
+            )
+            print(json.dumps({"status": "dry_run", "assignment": worker.dry_run_claim()}, indent=2, sort_keys=True))
+            return 0
         if not executor_argv:
             raise MacApiError("--executor is required unless --heartbeat-only is set")
         worker = MacWorker(
@@ -557,6 +655,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             lease_seconds=args.lease_seconds,
             running_digest=args.running_digest,
             poll_interval_seconds=args.poll_interval,
+            allowed_projects=allowed_projects,
+            required_metadata=required_metadata,
+            require_canary=args.require_canary,
         )
         if args.loop:
             results = worker.run_forever(max_iterations=args.max_iterations)

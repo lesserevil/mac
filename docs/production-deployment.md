@@ -162,7 +162,7 @@ mac-agent --url http://100.125.137.89:8789 --register \
 mac-agent --url http://100.125.137.89:8789 --register \
   --agent-name rocky --capabilities python,ops \
   --workspace ~/.mac-agent/workspaces --loop \
-  --executor -- ~/.mac/bin/mac-hermes-task-executor
+  --executor ~/.mac/bin/mac-hermes-task-executor
 ```
 
 Use `--heartbeat-only` during deploy validation when you want fleet visibility
@@ -171,17 +171,37 @@ executor command is the intended production worker. Successful executions write
 log evidence and move tasks to `needs_review`; failed executions fail the task
 with evidence attached.
 
+Before enabling executor-backed claiming, use `dry-run` mode to record routing
+candidates without creating leases:
+
+```bash
+MAC_DEPLOY_WORKER_MODE=dry-run
+MAC_DEPLOY_WORKER_REQUIRE_CANARY=1
+MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=mac-canary
+```
+
+Dry-run mode emits `worker.routing.policy`,
+`worker.routing.dry_run_candidate`, or `worker.routing.no_candidate` events
+into `/observability` and `/observability/stream`. It must show only synthetic
+canary work before loop mode is enabled.
+
 To enable executor-backed claiming from deploy config, set:
 
 ```bash
 MAC_DEPLOY_WORKER_MODE=loop
 MAC_DEPLOY_WORKER_CAPABILITIES=ops,python,hermes
+MAC_DEPLOY_WORKER_REQUIRE_CANARY=1
+MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=mac-canary
 ```
 
 The generated service then runs `mac-agent --register --loop` against
 `MAC_HUB_URL`, using `MAC_WORKER_TOKEN` from `~/.mac/mac.env`. The default
 executor wrapper is `~/.mac/bin/mac-hermes-task-executor`, which calls the
 deployed upstream Hermes checkout in one-shot mode.
+
+Loop mode is canary-gated by default. To make a worker eligible for real
+migrated work, explicitly set `MAC_DEPLOY_WORKER_REQUIRE_CANARY=0` and narrow
+the blast radius with project or metadata filters first.
 
 ## AgentBus
 

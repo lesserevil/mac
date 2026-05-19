@@ -195,11 +195,16 @@ mac --db mac.db migrate acc ~/.acc/data/acc.db --mode import \
 mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
     --hostname rocky.local --capabilities python,ops \
     --resources '{"capacity":2}' --heartbeat-only
+mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
+    --capabilities python,ops --allowed-projects mac-canary --require-canary \
+    --dry-run-claim
 mac-agent --url http://100.125.137.89:8789 --agent-id agent_... \
-    --workspace ~/.mac-agent/workspaces --executor -- ~/.mac/bin/mac-hermes-task-executor
+    --workspace ~/.mac-agent/workspaces --allowed-projects mac-canary \
+    --require-canary --executor ~/.mac/bin/mac-hermes-task-executor
 mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
     --capabilities python,ops --loop --workspace ~/.mac-agent/workspaces \
-    --executor -- ~/.mac/bin/mac-hermes-task-executor
+    --allowed-projects mac-canary --require-canary \
+    --executor ~/.mac/bin/mac-hermes-task-executor
 
 # Typed AgentBus: durable ordered content chunks; this is transport, not exec.
 mac --db mac.db agentbus publish agent_sender --recipient-agent-id agent_recipient \

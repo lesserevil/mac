@@ -2138,24 +2138,79 @@ class ControlPlane:
         self,
         agent_id: str,
         lease_seconds: int = 900,
+        allowed_projects: Optional[Iterable[str]] = None,
+        required_metadata: Optional[Dict[str, Any]] = None,
+        require_canary: bool = False,
+        dry_run: bool = False,
     ) -> Optional[JsonDict]:
         """Claim the next dispatch-eligible task for one worker.
 
         This is the worker-side counterpart to dispatch_once(). It preserves
         the same capability, capacity, tenant, trust, and health checks while
         allowing a worker daemon to pull only work assigned to its own durable
-        identity.
+        identity. Worker policy filters provide a quarantine lane for canaries:
+        dry runs can inspect the next eligible task without leasing it, and
+        loop-mode workers can refuse non-canary or out-of-project work before
+        touching production tasks.
         """
         self.expire_leases()
         self._unblock_ready_tasks()
         agent = self.get_agent(agent_id)
+        policy = self._worker_claim_policy(
+            allowed_projects=allowed_projects,
+            required_metadata=required_metadata,
+            require_canary=require_canary,
+            dry_run=dry_run,
+        )
+        rejected_policy: Dict[str, int] = {}
+        rejected_dispatch = 0
+        considered = 0
         for task in self._dispatch_ordered_tasks():
-            if not self._agent_available_for(agent, task):
+            considered += 1
+            allowed, reason = self._task_matches_worker_claim_policy(task, policy)
+            if not allowed:
+                rejected_policy[reason] = rejected_policy.get(reason, 0) + 1
                 continue
+            if not self._agent_available_for(agent, task):
+                rejected_dispatch += 1
+                continue
+            detail = {
+                "agent_id": agent.id,
+                "task_id": task.id,
+                "dry_run": dry_run,
+                "policy": policy,
+                "considered": considered,
+                "rejected_policy": rejected_policy,
+                "rejected_dispatch": rejected_dispatch,
+            }
+            if dry_run:
+                self.record_log(
+                    "worker.routing.dry_run_candidate",
+                    layer="control_plane",
+                    source=agent.id,
+                    subject_type="task",
+                    subject_id=task.id,
+                    detail=detail,
+                )
+                return {
+                    "task": task.to_dict(),
+                    "agent": agent.to_dict(),
+                    "lease": None,
+                    "dry_run": True,
+                    "policy": policy,
+                }
             try:
                 claimed, lease = self.claim_task(task.id, agent.id, lease_seconds=lease_seconds)
             except (TransitionError, ValidationError):
                 continue
+            self.record_log(
+                "worker.routing.claimed",
+                layer="control_plane",
+                source=agent.id,
+                subject_type="task",
+                subject_id=claimed.id,
+                detail={**detail, "lease_id": lease.id},
+            )
             self.send_message(
                 "dispatcher",
                 agent.id,
@@ -2164,6 +2219,20 @@ class ControlPlane:
                 task_id=claimed.id,
             )
             return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
+        self.record_log(
+            "worker.routing.no_candidate",
+            level="debug",
+            layer="control_plane",
+            source=agent.id,
+            detail={
+                "agent_id": agent.id,
+                "dry_run": dry_run,
+                "policy": policy,
+                "considered": considered,
+                "rejected_policy": rejected_policy,
+                "rejected_dispatch": rejected_dispatch,
+            },
+        )
         return None
 
     def tick(
@@ -2335,6 +2404,21 @@ class ControlPlane:
                 now,
             ),
         )
+        self.record_log(
+            "agentbus.stream.opened",
+            layer="agentbus",
+            source=sender_agent_id,
+            subject_type="agentbus_stream",
+            subject_id=sid,
+            detail={
+                "sender_agent_id": sender_agent_id,
+                "recipient_agent_id": recipient_agent_id,
+                "task_id": task_id,
+                "topic": topic_value,
+                "content_type": content_type,
+                "header_keys": sorted(ensure_json_object(headers).keys()),
+            },
+        )
         return self.get_agentbus_stream(sid)
 
     def append_agentbus_chunk(
@@ -2401,7 +2485,24 @@ class ControlPlane:
                     "UPDATE agentbus_streams SET updated_at = ? WHERE id = ?",
                     (now, stream_id),
                 )
-        return self.get_agentbus_chunk(chunk_id)
+        chunk = self.get_agentbus_chunk(chunk_id)
+        self.record_log(
+            "agentbus.chunk.appended",
+            layer="agentbus",
+            source=sender_agent_id,
+            subject_type="agentbus_stream",
+            subject_id=stream_id,
+            detail={
+                "chunk_id": chunk.id,
+                "sequence": chunk.sequence,
+                "sender_agent_id": sender_agent_id,
+                "content_type": chunk.content_type,
+                "payload_encoding": chunk.payload_encoding,
+                "size_bytes": chunk.size_bytes,
+                "final": bool(final),
+            },
+        )
+        return chunk
 
     def close_agentbus_stream(
         self,
@@ -2432,6 +2533,14 @@ class ControlPlane:
             WHERE id = ?
             """,
             (status_value, now, now, stream_id),
+        )
+        self.record_log(
+            "agentbus.stream.closed",
+            layer="agentbus",
+            source=sender_agent_id,
+            subject_type="agentbus_stream",
+            subject_id=stream_id,
+            detail={"sender_agent_id": sender_agent_id, "status": status_value},
         )
         return self.get_agentbus_stream(stream_id)
 
@@ -2503,7 +2612,22 @@ class ControlPlane:
                 max(1, min(int(limit), 1000)),
             ),
         )
-        return [self._agentbus_chunk_from_row(row) for row in rows]
+        chunks = [self._agentbus_chunk_from_row(row) for row in rows]
+        if chunks:
+            self.record_log(
+                "agentbus.chunks.read",
+                layer="agentbus",
+                source=agent_id,
+                subject_type="agentbus_stream",
+                subject_id=stream_id,
+                detail={
+                    "agent_id": agent_id,
+                    "after_sequence": max(0, int(after_sequence)),
+                    "count": len(chunks),
+                    "last_sequence": chunks[-1].sequence,
+                },
+            )
+        return chunks
 
     def publish_agentbus_content(
         self,
@@ -2531,6 +2655,21 @@ class ControlPlane:
             payload=payload,
             payload_encoding=payload_encoding,
             final=True,
+        )
+        self.record_log(
+            "agentbus.content.published",
+            layer="agentbus",
+            source=sender_agent_id,
+            subject_type="agentbus_stream",
+            subject_id=stream.id,
+            detail={
+                "sender_agent_id": sender_agent_id,
+                "recipient_agent_id": recipient_agent_id,
+                "topic": topic,
+                "content_type": content_type,
+                "payload_encoding": payload_encoding,
+                "chunk_id": chunk.id,
+            },
         )
         return {
             "stream": self.get_agentbus_stream(stream.id).to_dict(),
@@ -4964,6 +5103,42 @@ class ControlPlane:
                 if groups[tenant_id]:
                     ordered.append(groups[tenant_id].pop(0))
         return ordered
+
+    def _worker_claim_policy(
+        self,
+        allowed_projects: Optional[Iterable[str]],
+        required_metadata: Optional[Dict[str, Any]],
+        require_canary: bool,
+        dry_run: bool,
+    ) -> JsonDict:
+        return {
+            "allowed_projects": sorted(
+                {
+                    str(project).strip()
+                    for project in (allowed_projects or [])
+                    if str(project).strip()
+                }
+            ),
+            "required_metadata": ensure_json_object(required_metadata or {}),
+            "require_canary": bool(require_canary),
+            "dry_run": bool(dry_run),
+        }
+
+    def _task_matches_worker_claim_policy(self, task: Task, policy: JsonDict) -> Tuple[bool, str]:
+        allowed_projects = set(policy.get("allowed_projects") or [])
+        if allowed_projects and (task.project or "") not in allowed_projects:
+            return False, "project_not_allowed"
+        metadata = ensure_json_object(task.metadata)
+        if policy.get("require_canary") and not (
+            metadata.get("canary") is True
+            or metadata.get("mac_canary") is True
+            or metadata.get("worker_canary") is True
+        ):
+            return False, "not_canary"
+        for key, expected in (policy.get("required_metadata") or {}).items():
+            if metadata.get(key) != expected:
+                return False, "metadata_mismatch"
+        return True, "matched"
 
     def _available_agents(self) -> List[Agent]:
         rows = self.store.query_all(

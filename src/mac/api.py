@@ -151,6 +151,14 @@ class DispatchRequest(BaseModel):
     stale_after_seconds: Optional[int] = None
 
 
+class AgentClaimNextRequest(BaseModel):
+    lease_seconds: int = 900
+    allowed_projects: List[str] = Field(default_factory=list)
+    required_metadata: Dict[str, Any] = Field(default_factory=dict)
+    require_canary: bool = False
+    dry_run: bool = False
+
+
 class MessageCreate(BaseModel):
     sender_agent_id: str
     recipient_agent_id: Optional[str] = None
@@ -1063,8 +1071,15 @@ def create_app(
         return cp.heartbeat_agent(agent_id, **_data(body)).to_dict()
 
     @app.post("/agents/{agent_id}/claim-next")
-    def claim_next_for_agent(agent_id: str, body: DispatchRequest) -> Optional[Dict[str, Any]]:
-        return cp.claim_next_for_agent(agent_id, body.lease_seconds)
+    def claim_next_for_agent(agent_id: str, body: AgentClaimNextRequest) -> Optional[Dict[str, Any]]:
+        return cp.claim_next_for_agent(
+            agent_id,
+            lease_seconds=body.lease_seconds,
+            allowed_projects=body.allowed_projects,
+            required_metadata=body.required_metadata,
+            require_canary=body.require_canary,
+            dry_run=body.dry_run,
+        )
 
     @app.post("/dispatch/assign")
     def dispatch_once(body: DispatchRequest) -> Optional[Dict[str, Any]]:
@@ -1107,6 +1122,60 @@ def create_app(
     @app.post("/observability/logs")
     def record_observability_log(body: ObservabilityLogCreate) -> Dict[str, Any]:
         return cp.record_log(**_data(body)).to_dict()
+
+    @app.get("/observability/metrics")
+    def list_observability_metrics(
+        layer: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        subject_type: Optional[str] = Query(default=None),
+        subject_id: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        after_sequence: Optional[int] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            event.to_dict()
+            for event in cp.list_observability(
+                kind="metric",
+                layer=layer,
+                name=name,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                since=since,
+                until=until,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/observability/logs")
+    def list_observability_logs(
+        layer: Optional[str] = Query(default=None),
+        level: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        subject_type: Optional[str] = Query(default=None),
+        subject_id: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        after_sequence: Optional[int] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            event.to_dict()
+            for event in cp.list_observability(
+                kind="log",
+                layer=layer,
+                level=level,
+                name=name,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                since=since,
+                until=until,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        ]
 
     @app.get("/observability")
     def list_observability(

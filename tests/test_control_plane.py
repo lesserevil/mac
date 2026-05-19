@@ -582,6 +582,58 @@ def test_dispatch_tick_round_robins_between_tenants(cp):
     assert [item["task"]["id"] for item in tick["assignments"]] == [task_a1.id, task_b.id]
 
 
+def test_claim_next_dry_run_and_canary_policy_are_observed(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    normal = cp.create_task(
+        "normal",
+        project="mac-canary",
+        priority=100,
+        required_capabilities=["python"],
+    )
+    canary = cp.create_task(
+        "canary",
+        project="mac-canary",
+        priority=10,
+        required_capabilities=["python"],
+        metadata={"canary": True},
+    )
+
+    dry_run = cp.claim_next_for_agent(
+        worker.id,
+        allowed_projects=["mac-canary"],
+        require_canary=True,
+        dry_run=True,
+    )
+
+    assert dry_run is not None
+    assert dry_run["dry_run"] is True
+    assert dry_run["task"]["id"] == canary.id
+    assert dry_run["lease"] is None
+    assert cp.get_task(canary.id).state == TaskState.OPEN.value
+    assert cp.get_task(normal.id).state == TaskState.OPEN.value
+
+    logs = cp.list_observability(layer="control_plane", limit=20)
+    by_name = {row.name: row for row in logs}
+    assert by_name["worker.routing.dry_run_candidate"].subject_id == canary.id
+    assert by_name["worker.routing.dry_run_candidate"].detail["rejected_policy"] == {
+        "not_canary": 1
+    }
+
+    claimed = cp.claim_next_for_agent(
+        worker.id,
+        allowed_projects=["mac-canary"],
+        require_canary=True,
+    )
+
+    assert claimed is not None
+    assert claimed["task"]["id"] == canary.id
+    assert cp.get_task(canary.id).state == TaskState.CLAIMED.value
+    assert any(
+        row.name == "worker.routing.claimed" and row.subject_id == canary.id
+        for row in cp.list_observability(layer="control_plane", limit=20)
+    )
+
+
 def test_dependencies_block_until_parent_completes(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
@@ -1768,6 +1820,16 @@ def test_agentbus_streams_typed_content_without_weakening_control_messages(cp):
     assert cp.read_agentbus_chunks(sender.id, stream.id, after_sequence=1)[0].payload == {
         "done": True
     }
+    agentbus_logs = cp.list_observability(layer="agentbus", limit=20)
+    names = [row.name for row in agentbus_logs]
+    assert "agentbus.stream.opened" in names
+    assert "agentbus.chunk.appended" in names
+    assert "agentbus.chunks.read" in names
+    opened = next(row for row in agentbus_logs if row.name == "agentbus.stream.opened")
+    assert opened.detail["header_keys"] == ["schema"]
+    appended = next(row for row in agentbus_logs if row.name == "agentbus.chunk.appended")
+    assert "payload" not in appended.detail
+    assert appended.detail["size_bytes"] > 0
     with pytest.raises(AuthorizationError):
         cp.read_agentbus_chunks(outsider.id, stream.id)
     with pytest.raises(ValidationError):

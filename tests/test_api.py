@@ -284,6 +284,14 @@ def test_observability_api_records_lists_and_streams_metrics_and_logs():
         params={"kind": "metric", "layer": "worker"},
     ).json()
     assert [item["name"] for item in listed] == ["worker.queue.depth"]
+    assert [
+        item["name"]
+        for item in client.get("/observability/metrics", params={"layer": "worker"}).json()
+    ] == ["worker.queue.depth"]
+    assert [
+        item["name"]
+        for item in client.get("/observability/logs", params={"layer": "worker"}).json()
+    ] == ["worker.dispatch.waiting"]
 
     summary = client.get("/observability/summary").json()
     assert summary["counts"]["metrics"] >= 1

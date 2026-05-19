@@ -66,6 +66,9 @@ EOF
     MAC_DEPLOY_CONTROL_BIND_HOST=""
     MAC_DEPLOY_WORKER_MODE="heartbeat"
     MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes"
+    MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=""
+    MAC_DEPLOY_WORKER_REQUIRED_METADATA=""
+    MAC_DEPLOY_WORKER_REQUIRE_CANARY="1"
     if [ -f "$config" ]; then
       # shellcheck source=/dev/null
       . "$config"
@@ -80,7 +83,7 @@ EOF
         MAC_DEPLOY_CONTROL_BIND_HOST="127.0.0.1"
       fi
     fi
-    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
       "$MAC_DEPLOY_AGENT" \
       "$MAC_DEPLOY_TARGET" \
       "$MAC_DEPLOY_OS" \
@@ -88,7 +91,10 @@ EOF
       "$MAC_DEPLOY_HUB_URL" \
       "$MAC_DEPLOY_CONTROL_BIND_HOST" \
       "$MAC_DEPLOY_WORKER_MODE" \
-      "$MAC_DEPLOY_WORKER_CAPABILITIES"
+      "$MAC_DEPLOY_WORKER_CAPABILITIES" \
+      "$MAC_DEPLOY_WORKER_ALLOWED_PROJECTS" \
+      "$MAC_DEPLOY_WORKER_REQUIRED_METADATA" \
+      "$MAC_DEPLOY_WORKER_REQUIRE_CANARY"
   )
 }
 
@@ -122,8 +128,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" agent target os home_channel hub_url bind_host worker_mode worker_capabilities remote_archive
-  IFS='|' read -r agent target os home_channel hub_url bind_host worker_mode worker_capabilities <<<"$spec"
+  local spec="$1" hub_token="${2:-}" agent target os home_channel hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary remote_archive
+  IFS='|' read -r agent target os home_channel hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
@@ -131,7 +137,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -145,6 +151,9 @@ HUB_TOKEN="${MAC_DEPLOY_HUB_TOKEN:-}"
 CONTROL_BIND_HOST="${MAC_DEPLOY_CONTROL_BIND_HOST:-127.0.0.1}"
 WORKER_MODE="${MAC_DEPLOY_WORKER_MODE:-heartbeat}"
 WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes}"
+WORKER_ALLOWED_PROJECTS="${MAC_DEPLOY_WORKER_ALLOWED_PROJECTS:-}"
+WORKER_REQUIRED_METADATA="${MAC_DEPLOY_WORKER_REQUIRED_METADATA:-}"
+WORKER_REQUIRE_CANARY="${MAC_DEPLOY_WORKER_REQUIRE_CANARY:-1}"
 MAC_HOME="${MAC_HOME:-$HOME/.mac}"
 MAC_PORT="${MAC_PORT:-8789}"
 SRC_DIR="$MAC_HOME/src/mac"
@@ -203,7 +212,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -377,6 +386,13 @@ manifest = {
             for item in (os.environ.get("WORKER_CAPABILITIES") or "").split(",")
             if item.strip()
         ],
+        "worker_allowed_projects": [
+            item.strip()
+            for item in (os.environ.get("WORKER_ALLOWED_PROJECTS") or "").split(",")
+            if item.strip()
+        ],
+        "worker_required_metadata_configured": bool(os.environ.get("WORKER_REQUIRED_METADATA")),
+        "worker_require_canary": os.environ.get("WORKER_REQUIRE_CANARY") or None,
     },
     "paths": {
         "mac_home": str(mac_home),
@@ -718,7 +734,7 @@ mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$AGENT" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" <<'PY'
 from pathlib import Path
 import secrets
 import sys
@@ -733,7 +749,10 @@ configured_hub_token = sys.argv[7].strip()
 configured_bind_host = sys.argv[8].strip() or "127.0.0.1"
 configured_worker_mode = sys.argv[9].strip() or "heartbeat"
 configured_worker_capabilities = sys.argv[10].strip() or "ops,python,hermes"
-agent_name = sys.argv[11].strip()
+configured_worker_allowed_projects = sys.argv[11].strip()
+configured_worker_required_metadata = sys.argv[12].strip()
+configured_worker_require_canary = sys.argv[13].strip() or "1"
+agent_name = sys.argv[14].strip()
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -764,6 +783,9 @@ values["MAC_WORKER_AGENT_NAME"] = agent_name
 values["MAC_WORKER_HOSTNAME"] = agent_name
 values["MAC_WORKER_MODE"] = configured_worker_mode
 values["MAC_WORKER_CAPABILITIES"] = configured_worker_capabilities
+values["MAC_WORKER_REQUIRE_CANARY"] = configured_worker_require_canary
+values["MAC_WORKER_ALLOWED_PROJECTS"] = configured_worker_allowed_projects
+values["MAC_WORKER_REQUIRED_METADATA"] = configured_worker_required_metadata
 values.setdefault("MAC_WORKER_WORKSPACE", str(mac_home / "agent-workspaces"))
 values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
 values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
@@ -1013,6 +1035,17 @@ common=(
 if [ -n "${MAC_WORKER_RESOURCES:-}" ]; then
   common+=(--resources "$MAC_WORKER_RESOURCES")
 fi
+if [ -n "${MAC_WORKER_ALLOWED_PROJECTS:-}" ]; then
+  common+=(--allowed-projects "$MAC_WORKER_ALLOWED_PROJECTS")
+fi
+if [ -n "${MAC_WORKER_REQUIRED_METADATA:-}" ]; then
+  common+=(--required-metadata "$MAC_WORKER_REQUIRED_METADATA")
+fi
+case "${MAC_WORKER_REQUIRE_CANARY:-}" in
+  1|true|TRUE|yes|YES|on|ON)
+    common+=(--require-canary)
+    ;;
+esac
 
 case "$mode" in
   heartbeat)
@@ -1022,8 +1055,15 @@ case "$mode" in
       sleep "$interval"
     done
     ;;
+  dry-run)
+    interval="${MAC_WORKER_HEARTBEAT_INTERVAL:-30}"
+    while :; do
+      "${common[@]}" --dry-run-claim
+      sleep "$interval"
+    done
+    ;;
   loop)
-    exec "${common[@]}" --loop --executor -- "${MAC_WORKER_EXECUTOR:-$HOME/.mac/bin/mac-hermes-task-executor}"
+    exec "${common[@]}" --loop --executor "${MAC_WORKER_EXECUTOR:-$HOME/.mac/bin/mac-hermes-task-executor}"
     ;;
   *)
     echo "unsupported MAC_WORKER_MODE=$mode" >&2
