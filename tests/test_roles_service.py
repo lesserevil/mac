@@ -264,6 +264,100 @@ def test_dispatch_skips_agent_whose_soul_no_longer_accepts_role(cp):
     assert cp.dispatch_once(lease_seconds=300) is None
 
 
+def test_register_agent_preserves_hermes_instance_id_across_reregistration(cp):
+    """An ops re-register that doesn't pass hermes_instance_id must not
+    orphan the agent from its soul. The column is preserved unless the
+    caller explicitly passes a new value."""
+    machine = _register_machine(cp)
+    soul = bind_soul(cp, persona_name="QA Soul", allowed_role_slugs=["qa"])
+    agent = cp.register_agent(machine.id, "rocky", hermes_instance_id=soul)
+    assert agent.hermes_instance_id == soul
+
+    # Re-register without hermes_instance_id — value preserved.
+    again = cp.register_agent(
+        machine.id, "rocky", capabilities=["python"], agent_id=agent.id
+    )
+    assert again.hermes_instance_id == soul
+
+    # Re-register WITH a new hermes_instance_id — value updated.
+    new_soul = bind_soul(
+        cp,
+        persona_name="Other Soul",
+        tenant_name="other-tenant",
+        allowed_role_slugs=["qa"],
+    )
+    rebound = cp.register_agent(
+        machine.id, "rocky", agent_id=agent.id, hermes_instance_id=new_soul
+    )
+    assert rebound.hermes_instance_id == new_soul
+
+
+def test_hermes_instance_without_persona_refuses_role_assignment(cp):
+    """A hermes_instance with no persona_id has no soul to consult, so
+    no role can be assigned through it. The agent has an instance ref
+    but isn't a complete persona — refused."""
+    cp.roles.create_role(slug="qa", name="QA", description="d", system_prompt="p", level="ic")
+    tenant = cp.register_tenant("empty-tenant")
+    # Hermes instance with no persona attached.
+    instance = cp.register_hermes_instance(tenant.id, "personaless")
+    machine = _register_machine(cp)
+    agent = cp.register_agent(machine.id, "rocky", hermes_instance_id=instance.id)
+    with pytest.raises(ValidationError) as exc:
+        cp.roles.assign_role(agent.id, "qa")
+    assert "soul does not accept" in str(exc.value).lower()
+
+
+def test_explicit_empty_role_slugs_refuses_all_roles(cp):
+    """An empty list ``metadata.role_slugs=[]`` means the soul exists
+    but accepts no roles — different from absence (which defaults to
+    persona-name). Explicit empty refuses every role."""
+    cp.roles.create_role(slug="qa", name="QA", description="d", system_prompt="p", level="ic")
+    cp.roles.create_role(slug="design", name="Design", description="d", system_prompt="p", level="ic")
+    machine = _register_machine(cp)
+    soul = bind_soul(
+        cp,
+        persona_name="No-Roles Soul",
+        allowed_role_slugs=[],  # explicit empty
+    )
+    agent = cp.register_agent(machine.id, "rocky", hermes_instance_id=soul)
+    with pytest.raises(ValidationError):
+        cp.roles.assign_role(agent.id, "qa")
+    with pytest.raises(ValidationError):
+        cp.roles.assign_role(agent.id, "design")
+
+
+def test_dispatch_refuses_role_id_smuggled_in_via_raw_db_write(cp):
+    """Even if a misconfigured operator hand-edits agents.role_id to a
+    role incompatible with the agent's soul, dispatch re-checks
+    compatibility every match — so the agent never claims a task that
+    asks for that role."""
+    cp.roles.create_role(
+        slug="qa",
+        name="QA",
+        description="d",
+        system_prompt="p",
+        level="ic",
+    )
+    role = cp.roles.create_role(
+        slug="design",
+        name="Design",
+        description="d",
+        system_prompt="p",
+        level="ic",
+    )
+    machine = _register_machine(cp)
+    qa_soul = bind_soul(cp, persona_name="QA Soul", allowed_role_slugs=["qa"])
+    agent = cp.register_agent(machine.id, "rocky", hermes_instance_id=qa_soul)
+    # Hand-edit role_id to "design" — bypasses assign_role's compat check.
+    cp.store.execute(
+        "UPDATE agents SET role_id = ? WHERE id = ?", (role.id, agent.id)
+    )
+    cp.create_task("d-work", metadata={"required_role": "design"})
+    # Dispatch's compat re-check refuses the agent even though
+    # agents.role_id literally says "design".
+    assert cp.dispatch_once(lease_seconds=300) is None
+
+
 def test_agent_identity_returns_layered_view(cp):
     """The layered identity (soul -> role -> mood -> hardware) is
     returned as separate fields; callers compose the LLM prompt

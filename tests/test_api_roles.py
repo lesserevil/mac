@@ -101,6 +101,66 @@ def test_role_assignment_routes_through_agents_endpoint():
     assert unassigned["role_id"] is None
 
 
+def test_agent_identity_endpoint_returns_layered_view():
+    """GET /agents/{id}/identity returns soul + role + mood + hardware
+    as separate fields. Callers compose the LLM prompt themselves."""
+    cp = ControlPlane.in_memory()
+    client = _client(cp=cp)
+    machine = client.post(
+        "/machines",
+        json={
+            "hostname": "host-id",
+            "hardware": {"cpu_arch": "arm64", "memory_gb": 32},
+        },
+    ).json()
+    tenant = client.post("/tenants", json={"name": "team"}).json()
+    persona = client.post(
+        "/personas",
+        json={
+            "tenant_id": tenant["id"],
+            "name": "QA Soul",
+            "soul_ref": "h://team/qa/SOUL.md",
+            "memory_scope": "h://team/qa/mem",
+            "metadata": {"role_slugs": ["qa"]},
+        },
+    ).json()
+    instance = client.post(
+        "/hermes-instances",
+        json={
+            "tenant_id": tenant["id"],
+            "name": "qa-instance",
+            "persona_id": persona["id"],
+        },
+    ).json()
+    agent = client.post(
+        "/agents",
+        json={
+            "machine_id": machine["id"],
+            "name": "rocky",
+            "hermes_instance_id": instance["id"],
+        },
+    ).json()
+    client.post("/roles", json=_role_body(slug="qa"))
+    client.post(
+        "/agents/%s/role" % agent["id"], json={"role_id_or_slug": "qa"}
+    )
+    # Mood is self-reported by the agent.
+    client.post(
+        "/agents/%s/mood" % agent["id"],
+        json={"mode": "cheerful", "reason": "tests passing"},
+    )
+
+    identity = client.get("/agents/%s/identity" % agent["id"])
+    assert identity.status_code == 200
+    body = identity.json()
+    assert body["agent"]["id"] == agent["id"]
+    assert body["soul"]["persona"]["name"] == "QA Soul"
+    assert body["allowed_role_slugs"] == ["qa"]
+    assert body["role"]["slug"] == "qa"
+    assert body["mood"]["mode"] == "cheerful"
+    assert body["machine_hardware"] == {"cpu_arch": "arm64", "memory_gb": 32}
+
+
 def test_role_endpoints_respect_scope_admin_or_write_writes():
     cp = ControlPlane.in_memory()
     client = _client(
