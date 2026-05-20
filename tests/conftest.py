@@ -7,6 +7,47 @@ from typing import Iterable, Optional
 from mac.services import ControlPlane
 
 
+def submit_review_verdict(
+    cp: ControlPlane,
+    task_id: str,
+    reviewer_agent_id: str,
+    executor_evidence_id: str,
+    *,
+    verdict: str = "approved",
+) -> str:
+    """Produce the reviewer's signed verdict evidence (mac-jqb).
+
+    The default-review workflow no longer auto-approves; it requires a
+    separate Evidence row authored by the reviewer agent declaring an
+    approve/reject verdict, signed with the reviewer's attestation
+    key. Tests that want the workflow to advance to PUBLISHED must
+    call this after submit_for_review.
+
+    Returns the verdict evidence id.
+    """
+    from mac.services import sign_verification_manifest
+
+    key = cp._agent_attestation_key(reviewer_agent_id)
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "review_verdict",
+        "verdict": verdict,
+        "reviewed_evidence_id": executor_evidence_id,
+    }
+    manifest["signed_by"] = reviewer_agent_id
+    manifest["signature"] = sign_verification_manifest(key, manifest)
+    evidence = cp.add_evidence(
+        task_id,
+        "review",
+        "artifact://verdict",
+        "reviewer verdict: %s" % verdict,
+        reviewer_agent_id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
+    return evidence.id
+
+
 def bind_soul(
     cp: ControlPlane,
     *,

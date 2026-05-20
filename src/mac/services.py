@@ -1931,25 +1931,97 @@ class ControlPlane:
             )
 
         if review.status == ReviewStatus.PENDING.value:
-            review = self.submit_review(
-                review.id,
-                ReviewStatus.APPROVED.value,
-                review.reviewer_agent_id,
-                reason="default workflow approved verified executor evidence",
-                evidence_id=evidence.id,
+            # mac-jqb: the workflow no longer self-approves. It requires
+            # the reviewer agent to have produced a *review verdict*
+            # evidence row — a separate, signed manifest authored by
+            # the reviewer (not the executor) declaring approve/reject.
+            # Until that exists, the review stays pending. This makes
+            # the second-eyes role actually do work; today the workflow
+            # waits for the verdict, and a follow-up review-executor
+            # worker will produce it automatically.
+            verdict_evidence, verdict_problems = self._find_review_verdict_evidence(
+                task_id, review.reviewer_agent_id, executor_evidence_id=evidence.id
             )
-            self._record_default_review_observation(
-                task_id,
-                "workflow.default_review.approved",
-                "info",
-                {
+            if verdict_evidence is None:
+                self._record_default_review_observation(
+                    task_id,
+                    "workflow.default_review.waiting_for_verdict",
+                    "warning",
+                    {
+                        "review_id": review.id,
+                        "reviewer_agent_id": review.reviewer_agent_id,
+                        "evidence_id": evidence.id,
+                        "problems": verdict_problems,
+                    },
+                    actor,
+                )
+                # Nudge the reviewer so an autonomous review-executor
+                # has something to react to.
+                self.send_message(
+                    "dispatcher",
+                    review.reviewer_agent_id,
+                    MessageType.NUDGE.value,
+                    {
+                        "task_id": task_id,
+                        "review_id": review.id,
+                        "executor_evidence_id": evidence.id,
+                        "reason": "produce_review_verdict",
+                    },
+                    task_id=task_id,
+                )
+                return {
+                    "task_id": task_id,
+                    "status": "waiting_for_reviewer_verdict",
                     "review_id": review.id,
                     "reviewer_agent_id": review.reviewer_agent_id,
-                    "evidence_id": evidence.id,
-                    "evidence_type": evidence_assessment.get("evidence_type"),
-                },
-                actor,
-            )
+                    "executor_evidence_id": evidence.id,
+                    "problems": verdict_problems,
+                }
+            verdict_value = self._verdict_value(verdict_evidence)
+            if verdict_value == "rejected":
+                review = self.submit_review(
+                    review.id,
+                    ReviewStatus.REJECTED.value,
+                    review.reviewer_agent_id,
+                    reason="reviewer rejected via signed verdict evidence",
+                    evidence_id=verdict_evidence.id,
+                )
+                self._record_default_review_observation(
+                    task_id,
+                    "workflow.default_review.rejected",
+                    "warning",
+                    {
+                        "review_id": review.id,
+                        "reviewer_agent_id": review.reviewer_agent_id,
+                        "verdict_evidence_id": verdict_evidence.id,
+                    },
+                    actor,
+                )
+            else:
+                review = self.submit_review(
+                    review.id,
+                    ReviewStatus.APPROVED.value,
+                    review.reviewer_agent_id,
+                    reason="reviewer approved via signed verdict evidence",
+                    evidence_id=verdict_evidence.id,
+                )
+                self._record_default_review_observation(
+                    task_id,
+                    "workflow.default_review.approved",
+                    "info",
+                    {
+                        "review_id": review.id,
+                        "reviewer_agent_id": review.reviewer_agent_id,
+                        "verdict_evidence_id": verdict_evidence.id,
+                        "executor_evidence_id": evidence.id,
+                        "evidence_type": evidence_assessment.get("evidence_type"),
+                    },
+                    actor,
+                )
+            # The publication evidence below stays as the executor's
+            # signed work — that's the artifact being published. The
+            # reviewer's verdict was just consumed onto the review row
+            # via submit_review(evidence_id=verdict_evidence.id) above.
 
         if review.status != ReviewStatus.APPROVED.value:
             return {
@@ -2768,6 +2840,79 @@ class ControlPlane:
         if approved:
             return approved[-1]
         return None
+
+    def _find_review_verdict_evidence(
+        self,
+        task_id: str,
+        reviewer_agent_id: str,
+        *,
+        executor_evidence_id: str,
+    ) -> Tuple[Optional[Evidence], List[str]]:
+        """Locate the reviewer's signed verdict evidence row, or return
+        ``(None, problems)`` if it doesn't exist yet (mac-jqb v1).
+
+        The verdict is a separate Evidence row authored by the reviewer
+        (not the executor) with a signed verification manifest of type
+        ``review_verdict`` that names the executor's evidence_id.
+        Without this row the workflow blocks — it will no longer
+        auto-approve in the same process that selected the reviewer.
+
+        Shape required for a valid verdict:
+            evidence.metadata.returncode == 0
+            evidence.metadata.verification:
+                schema = mac.worker_evidence.v1
+                status = complete
+                evidence_type = review_verdict
+                verdict in {approved, rejected}
+                reviewed_evidence_id == executor_evidence_id
+                signed_by = <reviewer_agent_id>
+                signature = <HMAC of manifest under reviewer's key>
+        """
+        problems: List[str] = []
+        for evidence in reversed(self.list_evidence(task_id)):
+            if evidence.created_by != reviewer_agent_id:
+                continue
+            if self._evidence_returncode(evidence) != 0:
+                problems.append("verdict evidence %s has nonzero returncode" % evidence.id)
+                continue
+            manifest = evidence.metadata.get("verification")
+            if not isinstance(manifest, dict):
+                problems.append("verdict evidence %s missing verification manifest" % evidence.id)
+                continue
+            if str(manifest.get("evidence_type") or "").strip().lower() != "review_verdict":
+                continue  # not a verdict evidence row, skip silently
+            if str(manifest.get("schema") or "").strip() != VERIFICATION_SCHEMA:
+                problems.append("verdict %s schema mismatch" % evidence.id)
+                continue
+            if str(manifest.get("status") or "").strip().lower() != "complete":
+                problems.append("verdict %s status not complete" % evidence.id)
+                continue
+            reviewed = str(manifest.get("reviewed_evidence_id") or "").strip()
+            if reviewed != executor_evidence_id:
+                problems.append(
+                    "verdict %s references wrong executor evidence: %s != %s"
+                    % (evidence.id, reviewed, executor_evidence_id)
+                )
+                continue
+            signed_by = str(manifest.get("signed_by") or "").strip()
+            signature = str(manifest.get("signature") or "").strip()
+            if signed_by != reviewer_agent_id:
+                problems.append("verdict %s signed_by != reviewer" % evidence.id)
+                continue
+            key = self._agent_attestation_key(signed_by)
+            if key is None:
+                problems.append("verdict %s signer has no attestation key" % evidence.id)
+                continue
+            if not verify_verification_manifest_signature(key, manifest, signature):
+                problems.append("verdict %s signature does not verify" % evidence.id)
+                continue
+            return evidence, []
+        return None, problems
+
+    def _verdict_value(self, evidence: Evidence) -> str:
+        manifest = evidence.metadata.get("verification") or {}
+        verdict = str(manifest.get("verdict") or "").strip().lower()
+        return verdict if verdict in {"approved", "rejected"} else "approved"
 
     def _select_default_reviewer(self, task: Task) -> Optional[Agent]:
         """Pick a default reviewer for ``task``.

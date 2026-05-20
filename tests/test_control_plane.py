@@ -557,6 +557,8 @@ def test_task_lifecycle_requires_evidence_review_and_publication(cp):
 
 
 def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
+    from tests.conftest import submit_review_verdict
+
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
     task = cp.create_task(
@@ -576,6 +578,12 @@ def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
     )
 
     cp.submit_for_review(task.id, worker.id)
+    # First tick: reviewer is assigned, workflow waits for verdict.
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    # Reviewer produces its signed verdict (mac-jqb).
+    verdict_evidence_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
+    # Second tick: verdict is consumed, task publishes.
     result = cp.advance_default_review_workflow(task.id)
 
     assert result["status"] == "published"
@@ -584,11 +592,12 @@ def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
     reviews = cp.list_reviews(task.id)
     assert len(reviews) == 1
     assert reviews[0].reviewer_agent_id == reviewer.id
-    assert reviews[0].evidence_id == evidence.id
+    assert reviews[0].evidence_id == verdict_evidence_id  # review row links to the verdict
     assert reviews[0].status == ReviewStatus.APPROVED.value
     publications = cp.list_publications(task.id)
     assert len(publications) == 1
     assert publications[0].target == "test://publish"
+    assert publications[0].evidence_id == evidence.id  # publication links to executor work
     names = {event.name for event in cp.list_observability(limit=50)}
     assert "workflow.default_review.assigned" in names
     assert "workflow.default_review.approved" in names
@@ -618,6 +627,8 @@ def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
 
 
 def test_default_review_tick_processes_backlog(cp):
+    from tests.conftest import submit_review_verdict
+
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
     task = cp.create_task(
@@ -627,7 +638,7 @@ def test_default_review_tick_processes_backlog(cp):
     )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
-    cp.add_evidence(
+    evidence = cp.add_evidence(
         task.id,
         "log",
         "artifact://worker-result",
@@ -637,6 +648,11 @@ def test_default_review_tick_processes_backlog(cp):
     )
     cp.submit_for_review(task.id, worker.id)
 
+    # First tick assigns reviewer; reviewer then produces verdict;
+    # second tick publishes (mac-jqb).
+    first_report = cp.advance_default_review_workflows(limit=10)
+    assert first_report["results"][0]["status"] == "waiting_for_reviewer_verdict"
+    submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     report = cp.advance_default_review_workflows(limit=10)
 
     assert report["processed"] == 1
@@ -721,11 +737,16 @@ def test_default_review_workflow_allows_verified_deployment_evidence(cp):
     )
     cp.submit_for_review(task.id, worker.id)
 
+    from tests.conftest import submit_review_verdict
+
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     result = cp.advance_default_review_workflow(task.id)
 
     assert result["status"] == "published"
     assert cp.list_reviews(task.id)[0].reviewer_agent_id == reviewer.id
-    assert cp.list_reviews(task.id)[0].evidence_id == evidence.id
+    assert cp.list_reviews(task.id)[0].evidence_id == verdict_id
 
 
 def test_unsigned_verification_manifest_is_rejected(cp):
@@ -869,12 +890,14 @@ def test_default_review_workflow_refuses_without_publication_target(cp):
     """mac-w29: when no operator-set publication_target exists, the
     workflow approves the review but does NOT publish — refuses to
     invent a target."""
+    from tests.conftest import submit_review_verdict
+
     worker = register_agent(cp, "worker", ["python"])
-    register_agent(cp, "reviewer", ["review"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
     task = cp.create_task("no-target", required_capabilities=["python"])  # no metadata
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
-    cp.add_evidence(
+    evidence = cp.add_evidence(
         task.id,
         "log",
         "artifact://x",
@@ -884,6 +907,11 @@ def test_default_review_workflow_refuses_without_publication_target(cp):
     )
     cp.submit_for_review(task.id, worker.id)
 
+    # Verdict-aware flow: produce the verdict so the workflow reaches
+    # the publish-step gate.
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     result = cp.advance_default_review_workflow(task.id)
     assert result["status"] == "waiting_for_publication_target"
     assert cp.list_publications(task.id) == []
@@ -958,7 +986,7 @@ def test_default_reviewer_requires_review_capability(cp):
     )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
-    cp.add_evidence(
+    evidence = cp.add_evidence(
         task.id, "log", "x", "y", worker.id, metadata=verified_repo_metadata(cp, worker.id)
     )
     cp.submit_for_review(task.id, worker.id)
@@ -968,7 +996,12 @@ def test_default_reviewer_requires_review_capability(cp):
     assert cp.list_reviews(task.id) == []
 
     # Once a `review`-capable agent comes online, the workflow advances.
-    register_agent(cp, "real-reviewer", ["review"])
+    real_reviewer = register_agent(cp, "real-reviewer", ["review"])
+    waiting = cp.advance_default_review_workflow(task.id)
+    assert waiting["status"] == "waiting_for_reviewer_verdict"
+    from tests.conftest import submit_review_verdict
+
+    submit_review_verdict(cp, task.id, real_reviewer.id, evidence.id)
     result = cp.advance_default_review_workflow(task.id)
     assert result["status"] == "published"
 
@@ -1107,6 +1140,8 @@ def test_renew_lease_refuses_on_transitioning_task(cp):
 
 
 def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
+    from tests.conftest import submit_review_verdict
+
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
     task = cp.create_task(
@@ -1116,7 +1151,7 @@ def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
     )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
-    cp.add_evidence(
+    old_evidence = cp.add_evidence(
         task.id,
         "log",
         "artifact://old-result",
@@ -1125,6 +1160,9 @@ def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
         metadata=verified_repo_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
+    waiting = cp.advance_default_review_workflow(task.id)
+    assert waiting["status"] == "waiting_for_reviewer_verdict"
+    submit_review_verdict(cp, task.id, reviewer.id, old_evidence.id)
     first = cp.advance_default_review_workflow(task.id)
     assert first["status"] == "published"
 
@@ -1140,6 +1178,9 @@ def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
         metadata=verified_repo_metadata(cp, worker.id, head_sha="abcdef1234567890"),
     )
 
+    waiting_again = cp.advance_default_review_workflow(task.id)
+    assert waiting_again["status"] == "waiting_for_reviewer_verdict"
+    submit_review_verdict(cp, task.id, reviewer.id, new_evidence.id)
     second = cp.advance_default_review_workflow(task.id)
 
     assert second["status"] == "published"
@@ -1150,7 +1191,9 @@ def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
     assert active_publications[0].evidence_id == new_evidence.id
     approved = [item for item in cp.list_reviews(task.id) if item.status == ReviewStatus.APPROVED.value]
     assert len(approved) == 1
-    assert approved[0].evidence_id == new_evidence.id
+    # The approved review row links to the verdict, not the executor's
+    # evidence — the verdict's evidence_id is what flowed into
+    # submit_review.
     assert approved[0].reviewer_agent_id == reviewer.id
 
 

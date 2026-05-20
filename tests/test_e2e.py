@@ -62,6 +62,46 @@ def _api_transport(client: TestClient):
     return transport
 
 
+def _post_review_verdict(
+    client: TestClient,
+    task_id: str,
+    reviewer_id: str,
+    reviewer_attestation_key: str,
+    executor_evidence_id: str,
+    *,
+    verdict: str = "approved",
+) -> Dict[str, Any]:
+    """Build a signed review_verdict manifest and POST it as evidence.
+
+    mac-jqb: the default-review workflow does not auto-approve. The
+    reviewer agent must publish a verdict evidence row signed with its
+    own attestation key for the workflow to advance to PUBLISHED.
+    """
+    from mac.services import sign_verification_manifest
+
+    manifest: Dict[str, Any] = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "review_verdict",
+        "verdict": verdict,
+        "reviewed_evidence_id": executor_evidence_id,
+    }
+    manifest["signed_by"] = reviewer_id
+    manifest["signature"] = sign_verification_manifest(reviewer_attestation_key, manifest)
+    response = client.post(
+        "/tasks/%s/evidence" % task_id,
+        json={
+            "kind": "review",
+            "uri": "artifact://verdict",
+            "summary": "reviewer verdict: %s" % verdict,
+            "created_by": reviewer_id,
+            "metadata": {"returncode": 0, "verification": manifest},
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def _verified_execution(summary: str = "tests passed") -> WorkerExecution:
     return WorkerExecution(
         0,
@@ -127,6 +167,23 @@ def test_e2e_full_task_lifecycle_via_http_and_disk(tmp_path: Path):
     assert result.status == "submitted_for_review"
     assert result.task["id"] == task["id"]
 
+    # mac-jqb: the default-review workflow needs the reviewer to
+    # produce a signed verdict before it will publish. Tick the
+    # workflow once to register the pending review, then have the
+    # reviewer submit a signed approval, then tick again to publish.
+    pre = client.get("/tasks/%s" % task["id"]).json()
+    executor_evidence_id = pre["evidence"][0]["id"]
+    tick = client.post("/reviews/default/tick").json()
+    assert tick["processed"] >= 1
+    _post_review_verdict(
+        client,
+        task["id"],
+        reviewer["id"],
+        reviewer["attestation_key"],
+        executor_evidence_id,
+    )
+    client.post("/reviews/default/tick")
+
     final = client.get("/tasks/%s" % task["id"]).json()
     assert final["task"]["state"] == TaskState.COMPLETED.value
     assert final["reviews"][0]["reviewer_agent_id"] == reviewer["id"]
@@ -166,14 +223,14 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
     ).json()
     # Reviewer is now a required role (mac-s1a) — register a separate
     # agent that can do the review work for the auto-publish path.
-    client.post(
+    reviewer = client.post(
         "/agents",
         json={
             "machine_id": m1["id"],
             "name": "reviewer",
             "capabilities": ["review"],
         },
-    )
+    ).json()
     task = client.post(
         "/tasks",
         json={
@@ -213,6 +270,19 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
 
     statuses = sorted(r.status for r in results.values())
     assert statuses == ["no_task", "submitted_for_review"], statuses
+
+    # mac-jqb verdict step (see test 1 above for the reasoning).
+    pre = client.get("/tasks/%s" % task["id"]).json()
+    executor_evidence_id = pre["evidence"][0]["id"]
+    client.post("/reviews/default/tick")
+    _post_review_verdict(
+        client,
+        task["id"],
+        reviewer["id"],
+        reviewer["attestation_key"],
+        executor_evidence_id,
+    )
+    client.post("/reviews/default/tick")
 
     final = client.get("/tasks/%s" % task["id"]).json()
     assert final["task"]["state"] == TaskState.COMPLETED.value
