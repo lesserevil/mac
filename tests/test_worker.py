@@ -342,6 +342,40 @@ def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
     assert any(item.name == "worker.repository.worktree_prepared" for item in observations)
 
 
+def test_mac_worker_resolves_hub_repository_path_to_local_self_update_repo(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    metadata = _repository_task_metadata(Path("/home/jkh/.mac/src/mac"))
+    metadata["origin"]["repository_name"] = "mac"
+    metadata["origin"]["source"] = "repo-beads-mac"
+    task = cp.create_task(
+        "Repository task with hub path",
+        required_capabilities=["python"],
+        metadata=metadata,
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], _task_dir: Path) -> WorkerExecution:
+        runtime = task_payload["metadata"]["runtime"]
+        assert runtime["repository_declared_path"] == "/home/jkh/.mac/src/mac"
+        assert runtime["repository_source_path"] == str(repo.resolve())
+        assert Path(runtime["repository_worktree"]).is_dir()
+        return WorkerExecution(0, "repo worktree prepared", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+        self_update_repo=repo,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+
+
 def test_subprocess_executor_exports_repository_worktree_env(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)

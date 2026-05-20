@@ -1062,9 +1062,15 @@ class MacWorker:
         origin = _repository_task_origin(task)
         if origin is None:
             return None
-        source = Path(str(origin["repository_path"])).expanduser()
+        source = self._resolve_repository_source_path(origin)
         if not source.exists():
-            raise RuntimeError("repository source path does not exist: %s" % source)
+            raise RuntimeError(
+                "repository source path does not exist: %s; tried %s"
+                % (
+                    origin.get("repository_path"),
+                    ", ".join(str(candidate) for candidate in _repository_source_candidates(origin, self.self_update_repo)),
+                )
+            )
 
         top_level = _run_git(source, ["rev-parse", "--show-toplevel"])
         if top_level.returncode != 0 or not top_level.stdout.strip():
@@ -1132,6 +1138,7 @@ class MacWorker:
         context: JsonDict = {
             "schema": "mac.repository_task_worktree.v1",
             "checkout_policy": "task_owned_git_worktree",
+            "repository_declared_path": str(origin.get("repository_path") or ""),
             "repository_source_path": str(source_root),
             "repository_worktree": str(worktree_dir),
             "repository_branch": branch,
@@ -1145,6 +1152,12 @@ class MacWorker:
             detail=context,
         )
         return context
+
+    def _resolve_repository_source_path(self, origin: JsonDict) -> Path:
+        for candidate in _repository_source_candidates(origin, self.self_update_repo):
+            if candidate.exists():
+                return candidate
+        return Path(str(origin.get("repository_path") or "")).expanduser()
 
     def _prepare_review_workspace(
         self,
@@ -1537,12 +1550,44 @@ def _repository_task_origin(task: JsonDict) -> Optional[JsonDict]:
     contract = origin.get("repository_contract")
     execution_contract = metadata.get("execution_contract")
     if isinstance(execution_contract, dict) and execution_contract.get("type") == "repository":
-        return {"repository_path": repository_path}
+        return dict(origin)
     if isinstance(contract, dict) and contract.get("schema"):
-        return {"repository_path": repository_path}
+        return dict(origin)
     if str(origin.get("type") or "") in {"beads", "direct_task"}:
-        return {"repository_path": repository_path}
+        return dict(origin)
     return None
+
+
+def _repository_source_candidates(origin: JsonDict, self_update_repo: Path) -> List[Path]:
+    candidates: List[Path] = []
+    raw = str(origin.get("repository_path") or "").strip()
+    if raw:
+        declared = Path(raw).expanduser()
+        candidates.append(declared)
+        parts = declared.parts
+        if ".mac" in parts:
+            idx = parts.index(".mac")
+            suffix = Path(*parts[idx + 1 :]) if idx + 1 < len(parts) else Path()
+            candidates.append(Path.home() / ".mac" / suffix)
+
+    repository_name = str(origin.get("repository_name") or "").strip()
+    if repository_name:
+        candidates.append(Path.home() / ".mac" / "src" / _safe_path_component(repository_name))
+
+    source = str(origin.get("source") or "").strip()
+    contract = origin.get("repository_contract")
+    project = str(contract.get("project") or "").strip() if isinstance(contract, dict) else ""
+    if repository_name == "mac" or source == "repo-beads-mac" or project == "repo-beads-mac":
+        candidates.append(self_update_repo.expanduser())
+
+    seen = set()
+    unique: List[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
 
 
 def _task_worktree_branch(agent_id: str, task_id: str, lease_id: str) -> str:
