@@ -1411,6 +1411,8 @@ class ControlPlane:
                 updates.append("running_digest = NULL")
         if status_value == AgentStatus.IDLE.value and self._agent_has_active_lease(agent_id):
             raise ValidationError("agent cannot report idle while holding an active lease")
+        if status_value == AgentStatus.DRAINING.value and self._agent_has_active_lease(agent_id):
+            updates.append("current_task_id = NULL")
         if status_value == AgentStatus.OFFLINE.value:
             self._expire_agent_active_leases(agent_id, now, "heartbeat_offline")
         if status_value in {AgentStatus.IDLE.value, AgentStatus.OFFLINE.value}:

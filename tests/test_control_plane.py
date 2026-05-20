@@ -1955,6 +1955,36 @@ def test_idle_heartbeat_requires_no_active_lease(cp):
     assert refreshed.current_task_id is None
 
 
+def test_draining_heartbeat_pauses_claims_without_requeueing_active_lease(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    active = cp.create_task("active", required_capabilities=["python"])
+    queued = cp.create_task("queued", required_capabilities=["python"])
+    claimed, lease = cp.claim_task(active.id, worker.id)
+
+    drained = cp.heartbeat_agent(
+        worker.id,
+        status=AgentStatus.DRAINING.value,
+        health_status=HealthStatus.DEGRADED.value,
+    )
+
+    assert drained.status == AgentStatus.DRAINING.value
+    assert drained.current_task_id is None
+    assert cp.get_lease(lease.id).status == LeaseStatus.ACTIVE.value
+    assert cp.get_task(claimed.id).state == TaskState.CLAIMED.value
+    assert cp.claim_next_for_agent(worker.id) is None
+    assert cp.get_task(queued.id).state == TaskState.OPEN.value
+
+    cp.release_lease(lease.id, worker.id)
+    cp.transition_task(active.id, TaskState.FAILED.value, "test", {"reason": "drain-test-finished"})
+    restored = cp.heartbeat_agent(
+        worker.id,
+        status=AgentStatus.IDLE.value,
+        health_status=HealthStatus.HEALTHY.value,
+    )
+    assert restored.status == AgentStatus.IDLE.value
+    assert cp.claim_next_for_agent(worker.id)["task"]["id"] == queued.id
+
+
 def test_lease_renewal_refreshes_busy_agent_liveness(cp):
     worker = register_agent(cp, "worker", ["python"])
     task = cp.create_task("work", required_capabilities=["python"])

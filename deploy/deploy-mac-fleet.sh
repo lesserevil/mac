@@ -175,6 +175,9 @@ WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes}"
 WORKER_ALLOWED_PROJECTS="${MAC_DEPLOY_WORKER_ALLOWED_PROJECTS:-}"
 WORKER_REQUIRED_METADATA="${MAC_DEPLOY_WORKER_REQUIRED_METADATA:-}"
 WORKER_REQUIRE_CANARY="${MAC_DEPLOY_WORKER_REQUIRE_CANARY:-1}"
+DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
+DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
+DRAIN_POLL_SECONDS="${MAC_DEPLOY_DRAIN_POLL_SECONDS:-10}"
 MAC_HOME="${MAC_HOME:-$HOME/.mac}"
 MAC_PORT="${MAC_PORT:-8789}"
 SRC_DIR="$MAC_HOME/src/mac"
@@ -233,7 +236,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -425,6 +428,11 @@ manifest = {
         ],
         "worker_required_metadata_configured": bool(os.environ.get("WORKER_REQUIRED_METADATA")),
         "worker_require_canary": os.environ.get("WORKER_REQUIRE_CANARY") or None,
+        "drain": {
+            "mode": os.environ.get("DRAIN_MODE") or None,
+            "timeout_seconds": int(os.environ.get("DRAIN_TIMEOUT_SECONDS") or 0),
+            "poll_seconds": int(os.environ.get("DRAIN_POLL_SECONDS") or 0),
+        },
     },
     "paths": {
         "mac_home": str(mac_home),
@@ -592,6 +600,165 @@ stop_existing_services_for_deploy() {
       launchctl bootout "gui/$uid/com.mac.control-plane" >/dev/null 2>&1 || true
       ;;
   esac
+}
+
+load_drain_api_env() {
+  DRAIN_API_URL="${MAC_HUB_URL:-${HUB_URL:-http://127.0.0.1:$MAC_PORT}}"
+  DRAIN_API_TOKEN="${MAC_WORKER_TOKEN:-${MAC_API_TOKEN:-}}"
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    set +u
+    # shellcheck source=/dev/null
+    . "$ENV_FILE"
+    set -u
+    set +a
+    DRAIN_API_URL="${MAC_HUB_URL:-${HUB_URL:-$DRAIN_API_URL}}"
+    DRAIN_API_TOKEN="${MAC_WORKER_TOKEN:-${MAC_API_TOKEN:-$DRAIN_API_TOKEN}}"
+  fi
+  DRAIN_API_URL="${DRAIN_API_URL%/}"
+}
+
+mac_api_json() {
+  local method="$1" path="$2" body="${3:-}"
+  [ -n "${DRAIN_API_TOKEN:-}" ] || return 1
+  "$PY" - "$method" "$DRAIN_API_URL$path" "$DRAIN_API_TOKEN" "$body" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+method, url, token, body = sys.argv[1:5]
+data = body.encode("utf-8") if body else None
+request = urllib.request.Request(url, data=data, method=method)
+request.add_header("Authorization", "Bearer " + token)
+if data is not None:
+    request.add_header("Content-Type", "application/json")
+try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+        sys.stdout.write(response.read().decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    sys.stderr.write(exc.read().decode("utf-8", errors="replace"))
+    raise SystemExit(1)
+PY
+}
+
+agent_id_for_drain() {
+  mac_api_json GET "/agents" | "$PY" - "$AGENT" <<'PY'
+import json
+import sys
+
+expected = sys.argv[1]
+agents = json.load(sys.stdin)
+for agent in agents:
+    if agent.get("name") == expected or agent.get("id") == expected:
+        print(agent.get("id"))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+wait_for_agent_active_leases() {
+  local agent_id="$1" deadline now count summary_path="$LOG_DIR/mac-agent-drain.json"
+  deadline=$(( $(date +%s) + ${DRAIN_TIMEOUT_SECONDS:-1800} ))
+  while :; do
+    if mac_api_json GET "/tasks" > "$summary_path.tasks"; then
+      count="$($PY - "$summary_path.tasks" "$agent_id" "$summary_path" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+tasks_path = Path(sys.argv[1])
+agent_id = sys.argv[2]
+summary_path = Path(sys.argv[3])
+tasks = json.loads(tasks_path.read_text(encoding="utf-8"))
+active = [
+    task
+    for task in tasks
+    if task.get("owner_agent_id") == agent_id
+    and task.get("lease_id")
+    and task.get("state") in {"claimed", "running"}
+]
+summary = {
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "agent_id": agent_id,
+    "active_lease_count": len(active),
+    "active_tasks": [
+        {
+            "id": task.get("id"),
+            "state": task.get("state"),
+            "lease_id": task.get("lease_id"),
+            "leased_until": task.get("leased_until"),
+            "title": task.get("title"),
+        }
+        for task in active
+    ],
+}
+summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(len(active))
+PY
+)"
+      if [ "$count" = "0" ]; then
+        log "mac-agent drain complete: no active leases for $agent_id"
+        return 0
+      fi
+      log "mac-agent drain waiting: $count active lease(s) for $agent_id"
+    else
+      log "WARNING: could not query active leases during drain"
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      log "ERROR: drain timed out with active leases for $agent_id"
+      return 1
+    fi
+    sleep "${DRAIN_POLL_SECONDS:-10}"
+  done
+}
+
+drain_mac_agent_before_deploy() {
+  case "${DRAIN_MODE:-wait}" in
+    skip|off|disabled)
+      log "skipping mac-agent drain because MAC_DEPLOY_DRAIN_MODE=$DRAIN_MODE"
+      return 0
+      ;;
+    wait|fail-fast)
+      ;;
+    *)
+      log "ERROR: unsupported MAC_DEPLOY_DRAIN_MODE=$DRAIN_MODE"
+      return 1
+      ;;
+  esac
+  load_drain_api_env
+  if ! mac_api_json GET "/health" >/dev/null 2>&1; then
+    log "existing mac API is not reachable; skipping drain"
+    return 0
+  fi
+  local agent_id
+  if ! agent_id="$(agent_id_for_drain)" || [ -z "$agent_id" ]; then
+    log "existing mac-agent registration for $AGENT not found; skipping drain"
+    return 0
+  fi
+  log "pausing new claims for $agent_id before artifact replacement"
+  mac_api_json POST "/agents/$agent_id/heartbeat" '{"status":"draining","health_status":"degraded"}' >/dev/null
+  if [ "${DRAIN_MODE:-wait}" = "fail-fast" ]; then
+    DRAIN_TIMEOUT_SECONDS=0 wait_for_agent_active_leases "$agent_id"
+  else
+    wait_for_agent_active_leases "$agent_id"
+  fi
+}
+
+clear_mac_agent_drain_after_deploy() {
+  load_drain_api_env
+  if ! mac_api_json GET "/health" >/dev/null 2>&1; then
+    log "WARNING: mac API is not reachable after deploy; cannot clear drain state"
+    return 0
+  fi
+  local agent_id
+  if ! agent_id="$(agent_id_for_drain)" || [ -z "$agent_id" ]; then
+    return 0
+  fi
+  log "clearing drain state for $agent_id"
+  mac_api_json POST "/agents/$agent_id/heartbeat" '{"status":"idle","health_status":"healthy"}' >/dev/null || true
 }
 
 normalize_hermes_redaction_env() {
@@ -1023,6 +1190,7 @@ log "deploy log: $DEPLOY_LOG"
 ensure_dns_resolution
 ensure_venv_support
 write_deploy_manifest "pre" "$MANIFEST_PRE"
+drain_mac_agent_before_deploy
 stop_existing_services_for_deploy
 backup_existing_artifacts
 log "installing mac source"
@@ -1880,6 +2048,7 @@ if data.get("warnings"):
 PY
 
 verify_hub_registration
+clear_mac_agent_drain_after_deploy
 
 write_deploy_manifest "post" "$MANIFEST_POST"
 cp -f "$MANIFEST_POST" "$LOG_DIR/deploy-manifest-latest.json"
