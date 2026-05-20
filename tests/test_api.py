@@ -462,6 +462,65 @@ def test_events_endpoint_returns_unified_stream():
     assert all(event["subject_id"] == task["id"] for event in task_only)
 
 
+def test_command_audit_endpoint_records_short_retention_command_events():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    machine = client.post("/machines", json={"hostname": "host-1"}).json()
+    agent = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={"title": "audited command", "required_capabilities": ["python"]},
+    ).json()
+
+    started = client.post(
+        "/agents/%s/command-audit" % agent["id"],
+        json={
+            "command_id": "cmd-test",
+            "phase": "started",
+            "argv": ["pytest", "tests/test_worker.py"],
+            "cwd": "/repo",
+            "task_id": task["id"],
+            "started_at": "2026-05-20T00:00:00.000000+00:00",
+            "metadata": {"argv_sha256": "sha256:abc"},
+        },
+    ).json()
+    completed = client.post(
+        "/agents/%s/command-audit" % agent["id"],
+        json={
+            "command_id": "cmd-test",
+            "phase": "completed",
+            "argv": ["pytest", "tests/test_worker.py"],
+            "cwd": "/repo",
+            "task_id": task["id"],
+            "started_at": "2026-05-20T00:00:00.000000+00:00",
+            "completed_at": "2026-05-20T00:00:01.000000+00:00",
+            "duration_ms": 1000,
+            "returncode": 0,
+        },
+    ).json()
+
+    assert started["command_id"] == completed["command_id"] == "cmd-test"
+    listed = client.get("/command-audit", params={"agent_id": agent["id"]}).json()
+    assert [item["phase"] for item in listed] == ["completed", "started"]
+    dashboard = client.get("/dashboard/state").json()
+    assert dashboard["command_audit"][0]["command_id"] == "cmd-test"
+    command_events = client.get(
+        "/events",
+        params={
+            "subject_type": "task",
+            "subject_id": task["id"],
+            "event_type_prefix": "command.",
+        },
+    ).json()
+    assert {event["event_type"] for event in command_events} == {
+        "command.started",
+        "command.completed",
+    }
+
+
 def test_observability_api_records_lists_and_streams_metrics_and_logs():
     client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
 

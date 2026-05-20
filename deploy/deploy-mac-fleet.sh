@@ -1764,11 +1764,143 @@ EOF
   cat > "$executor_py" <<'PY'
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def sha256_text(value: str) -> str:
+    return "sha256:%s" % hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def command_audit_id() -> str:
+    seed = "%s:%s" % (time.time_ns(), os.getpid())
+    return "cmd_%s" % hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def audit_safe_argv(argv: list[str]) -> list[str]:
+    safe: list[str] = []
+    redact_next = False
+    for raw in argv:
+        arg = str(raw)
+        lowered = arg.lower()
+        if redact_next:
+            safe.append(redacted_arg(arg))
+            redact_next = False
+            continue
+        if lowered in {"--token", "--api-key", "--key", "--secret", "--password"}:
+            safe.append(arg)
+            redact_next = True
+            continue
+        if any(marker in lowered for marker in ("bearer ", "token=", "api_key=", "apikey=", "password=", "secret=")):
+            safe.append(redacted_arg(arg))
+            continue
+        if len(arg) > 512:
+            safe.append("<truncated:%s:chars=%d>" % (sha256_text(arg), len(arg)))
+            continue
+        safe.append(arg)
+    return safe
+
+
+def redacted_arg(value: str) -> str:
+    return "<redacted:%s:chars=%d>" % (sha256_text(value), len(value))
+
+
+def safe_path_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)[:180]
+
+
+def local_agent_id() -> str:
+    configured = os.environ.get("MAC_AGENT_ID") or os.environ.get("MAC_WORKER_AGENT_ID")
+    if configured:
+        return configured
+    name = os.environ.get("MAC_WORKER_AGENT_NAME") or os.uname().nodename.split(".")[0]
+    return "agent_%s" % (safe_path_component(name.lower()).strip("_") or "default")
+
+
+def post_command_audit(agent_id: str, payload: dict) -> None:
+    base_url = (os.environ.get("MAC_HUB_URL") or os.environ.get("MAC_URL") or "").rstrip("/")
+    token = os.environ.get("MAC_WORKER_TOKEN") or os.environ.get("MAC_TOKEN") or os.environ.get("MAC_API_TOKEN")
+    if not base_url or not token or not agent_id:
+        return
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        "%s/agents/%s/command-audit" % (base_url, agent_id),
+        data=data,
+        headers={
+            "Authorization": "Bearer %s" % token,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5).read()
+    except Exception:
+        pass
+
+
+def run_audited_command(argv: list[str], cwd: Path, task_id, metadata: dict) -> subprocess.CompletedProcess[str]:
+    command_id = command_audit_id()
+    agent_id = local_agent_id()
+    started_at = utcnow()
+    started = time.monotonic()
+    argv_hash = sha256_text(json.dumps(argv, separators=(",", ":")))
+    base = {
+        "command_id": command_id,
+        "argv": audit_safe_argv(argv),
+        "cwd": str(cwd),
+        "task_id": task_id,
+        "started_at": started_at,
+        "metadata": {"component": "mac-hermes-task-executor", "argv_sha256": argv_hash, **metadata},
+    }
+    post_command_audit(agent_id, {**base, "phase": "started"})
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        post_command_audit(
+            agent_id,
+            {
+                **base,
+                "phase": "error",
+                "completed_at": utcnow(),
+                "duration_ms": (time.monotonic() - started) * 1000.0,
+                "metadata": {**base["metadata"], "error": str(exc)},
+            },
+        )
+        raise
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    post_command_audit(
+        agent_id,
+        {
+            **base,
+            "phase": "completed" if result.returncode == 0 else "failed",
+            "completed_at": utcnow(),
+            "duration_ms": (time.monotonic() - started) * 1000.0,
+            "returncode": result.returncode,
+            "stdout_sha256": sha256_text(stdout),
+            "stderr_sha256": sha256_text(stderr),
+            "stdout_bytes": len(stdout.encode("utf-8")),
+            "stderr_bytes": len(stderr.encode("utf-8")),
+        },
+    )
+    return result
 
 
 def repository_contract_section(task: dict) -> str:
@@ -1839,12 +1971,12 @@ def main() -> int:
         )
     hermes_py = Path.home() / ".mac" / "hermes-agent" / ".venv" / "bin" / "python"
     hermes = Path.home() / ".mac" / "hermes-agent" / "hermes"
-    result = subprocess.run(
+    audit_task_id = review_context.get("task_id") if isinstance(review_context, dict) else task.get("id")
+    result = run_audited_command(
         [str(hermes_py), str(hermes), "--accept-hooks", "--oneshot", prompt],
-        cwd=str(task_workspace),
-        text=True,
-        capture_output=True,
-        check=False,
+        task_workspace,
+        str(audit_task_id) if audit_task_id else None,
+        {"execution_kind": "review" if isinstance(review_context, dict) else "task"},
     )
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)

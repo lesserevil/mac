@@ -760,6 +760,40 @@ class ObservabilityEvent:
         return asdict(self)
 
 
+COMMAND_AUDIT_PHASES = {
+    "started",
+    "completed",
+    "failed",
+    "timeout",
+    "error",
+}
+
+
+@dataclass
+class CommandAuditRecord:
+    id: str
+    command_id: str
+    agent_id: str
+    phase: str
+    argv: List[str]
+    cwd: str
+    task_id: Optional[str]
+    lease_id: Optional[str]
+    started_at: Optional[str]
+    completed_at: Optional[str]
+    duration_ms: Optional[float]
+    returncode: Optional[int]
+    stdout_sha256: Optional[str]
+    stderr_sha256: Optional[str]
+    stdout_bytes: Optional[int]
+    stderr_bytes: Optional[int]
+    metadata: JsonDict
+    created_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
 @dataclass
 class Review:
     id: str

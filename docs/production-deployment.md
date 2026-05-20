@@ -201,6 +201,14 @@ has never owned the task as reviewer, then waits for a separate signed
 task only when both executor evidence and reviewer verdict are verifiable.
 Failed executions fail the task with evidence attached.
 
+Every mac-managed subprocess records a short-retention command audit event on
+the hub. The log captures `command_id`, agent, task, sanitized `argv`, `cwd`,
+start/end timestamps, return code, output byte counts, and output hashes. The
+default retention is 24 hours (`MAC_COMMAND_AUDIT_RETENTION_SECONDS`), and the
+latest rows are visible from `/command-audit` and the dashboard Observability
+view. This is operational telemetry for proving agents are doing work; a future
+security audit store can consume the same event shape externally.
+
 Executor success is not completion. A zero return code only means the executor
 reported without crashing. For the default workflow to auto-approve and publish,
 the evidence metadata must include a `mac.worker_evidence.v1` verification

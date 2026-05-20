@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urlencode
@@ -29,6 +30,7 @@ from mac.hermes_adapter import MacApiClient, MacApiError
 
 JsonDict = Dict[str, Any]
 Executor = Callable[[JsonDict, Path], "WorkerExecution"]
+CommandAuditSink = Callable[[JsonDict], None]
 SAFE_GIT_REF_RE = r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$"
 
 
@@ -63,6 +65,8 @@ class SubprocessExecutor:
             raise MacApiError("executor command is required")
         self.argv = argv
         self.timeout = timeout
+        self.audit_sink: Optional[CommandAuditSink] = None
+        self.audit_context: JsonDict = {}
 
     def __call__(self, task: JsonDict, task_dir: Path) -> WorkerExecution:
         env = os.environ.copy()
@@ -73,22 +77,99 @@ class SubprocessExecutor:
                 "MAC_TASK_WORKSPACE": str(task_dir),
             }
         )
-        completed = subprocess.run(
-            self.argv,
-            cwd=str(task_dir),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout,
-            check=False,
+        command_id = _command_audit_id()
+        started_at = _utcnow()
+        started_monotonic = time.monotonic()
+        base_record = {
+            "command_id": command_id,
+            "argv": _audit_safe_argv(self.argv),
+            "cwd": str(task_dir),
+            "task_id": self.audit_context.get("task_id") or task.get("id"),
+            "lease_id": self.audit_context.get("lease_id"),
+            "started_at": started_at,
+            "metadata": {
+                "argv_sha256": _sha256_text(json.dumps(self.argv, separators=(",", ":"))),
+                **ensure_json_object(self.audit_context.get("metadata")),
+            },
+        }
+        self._emit_audit({**base_record, "phase": "started"})
+        try:
+            completed = subprocess.run(
+                self.argv,
+                cwd=str(task_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            completed_at = _utcnow()
+            stdout = _coerce_process_output(exc.stdout)
+            stderr = _coerce_process_output(exc.stderr)
+            self._emit_audit(
+                {
+                    **base_record,
+                    "phase": "timeout",
+                    "completed_at": completed_at,
+                    "duration_ms": (time.monotonic() - started_monotonic) * 1000.0,
+                    "stdout_sha256": _sha256_text(stdout),
+                    "stderr_sha256": _sha256_text(stderr),
+                    "stdout_bytes": len(stdout.encode("utf-8")),
+                    "stderr_bytes": len(stderr.encode("utf-8")),
+                    "metadata": {
+                        **base_record["metadata"],
+                        "timeout_seconds": self.timeout,
+                    },
+                }
+            )
+            raise
+        except OSError as exc:
+            completed_at = _utcnow()
+            self._emit_audit(
+                {
+                    **base_record,
+                    "phase": "error",
+                    "completed_at": completed_at,
+                    "duration_ms": (time.monotonic() - started_monotonic) * 1000.0,
+                    "metadata": {**base_record["metadata"], "error": str(exc)},
+                }
+            )
+            raise
+        completed_at = _utcnow()
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        self._emit_audit(
+            {
+                **base_record,
+                "phase": "completed" if completed.returncode == 0 else "failed",
+                "completed_at": completed_at,
+                "duration_ms": (time.monotonic() - started_monotonic) * 1000.0,
+                "returncode": completed.returncode,
+                "stdout_sha256": _sha256_text(stdout),
+                "stderr_sha256": _sha256_text(stderr),
+                "stdout_bytes": len(stdout.encode("utf-8")),
+                "stderr_bytes": len(stderr.encode("utf-8")),
+            }
         )
         return WorkerExecution(
             returncode=completed.returncode,
-            summary=_summary_from_output(completed.returncode, completed.stdout, completed.stderr),
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            metadata={"executor": self.argv},
+            summary=_summary_from_output(completed.returncode, stdout, stderr),
+            stdout=stdout,
+            stderr=stderr,
+            metadata={
+                "executor": _audit_safe_argv(self.argv),
+                "executor_argv_sha256": base_record["metadata"]["argv_sha256"],
+            },
         )
+
+    def _emit_audit(self, record: JsonDict) -> None:
+        if self.audit_sink is None:
+            return
+        try:
+            self.audit_sink(record)
+        except Exception:
+            pass
 
 
 def register_worker(
@@ -163,6 +244,8 @@ class MacWorker:
         self.agent_id = agent_id
         self.workspace = workspace
         self.executor = executor
+        if isinstance(self.executor, SubprocessExecutor):
+            self.executor.audit_sink = self._record_command_audit
         self.lease_seconds = lease_seconds
         self.running_digest = running_digest
         # Attestation key for signing verification manifests
@@ -448,7 +531,15 @@ class MacWorker:
             )
             thread.start()
         try:
-            return self.executor(task, task_dir)
+            return self._call_executor(
+                task,
+                task_dir,
+                {
+                    "task_id": task["id"],
+                    "lease_id": lease["id"],
+                    "metadata": {"execution_kind": "task"},
+                },
+            )
         finally:
             stop.set()
             if thread is not None:
@@ -561,7 +652,19 @@ class MacWorker:
                 message,
             )
             started = time.monotonic()
-            execution = self.executor(self._review_task_payload(task_dir), task_dir)
+            execution = self._call_executor(
+                self._review_task_payload(task_dir),
+                task_dir,
+                {
+                    "task_id": task_id,
+                    "metadata": {
+                        "execution_kind": "review",
+                        "review_id": review_id,
+                        "executor_evidence_id": executor_evidence_id,
+                        "nudge_message_id": message.get("id"),
+                    },
+                },
+            )
             duration_ms = (time.monotonic() - started) * 1000.0
             self._observe_metric(
                 "worker.review.duration_ms",
@@ -1115,6 +1218,47 @@ class MacWorker:
         loaded.setdefault("sha256", _sha256_file(manifest_path))
         return loaded
 
+    def _call_executor(
+        self,
+        task: JsonDict,
+        task_dir: Path,
+        audit_context: JsonDict,
+    ) -> WorkerExecution:
+        if isinstance(self.executor, SubprocessExecutor):
+            prior_context = self.executor.audit_context
+            self.executor.audit_context = audit_context
+            try:
+                return self.executor(task, task_dir)
+            finally:
+                self.executor.audit_context = prior_context
+        return self.executor(task, task_dir)
+
+    def _record_command_audit(self, record: JsonDict) -> None:
+        payload = {
+            "command_id": record.get("command_id"),
+            "phase": record.get("phase"),
+            "argv": record.get("argv") or [],
+            "cwd": record.get("cwd") or "",
+            "task_id": record.get("task_id"),
+            "lease_id": record.get("lease_id"),
+            "started_at": record.get("started_at"),
+            "completed_at": record.get("completed_at"),
+            "duration_ms": record.get("duration_ms"),
+            "returncode": record.get("returncode"),
+            "stdout_sha256": record.get("stdout_sha256"),
+            "stderr_sha256": record.get("stderr_sha256"),
+            "stdout_bytes": record.get("stdout_bytes"),
+            "stderr_bytes": record.get("stderr_bytes"),
+            "metadata": record.get("metadata") or {},
+        }
+        try:
+            self.client.post(
+                "/agents/%s/command-audit" % quote(self.agent_id, safe=""),
+                payload,
+            )
+        except Exception:
+            pass
+
     def _heartbeat(self) -> None:
         payload: JsonDict = {"status": "idle"}
         # Declare the build the agent is running. Send the digest at most once
@@ -1185,6 +1329,59 @@ def _summary_from_output(returncode: int, stdout: str, stderr: str) -> str:
     if first_line:
         return first_line[:500]
     return "executor completed" if returncode == 0 else "executor failed with returncode %d" % returncode
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _command_audit_id() -> str:
+    seed = "%s:%s:%s" % (time.time_ns(), os.getpid(), threading.get_ident())
+    return "cmd_%s" % hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def _sha256_text(value: str) -> str:
+    return "sha256:%s" % hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def ensure_json_object(value: Any) -> JsonDict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _coerce_process_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _audit_safe_argv(argv: List[str]) -> List[str]:
+    safe: List[str] = []
+    redact_next = False
+    for raw in argv:
+        arg = str(raw)
+        lowered = arg.lower()
+        if redact_next:
+            safe.append(_redacted_arg(arg))
+            redact_next = False
+            continue
+        if lowered in {"--token", "--api-key", "--key", "--secret", "--password"}:
+            safe.append(arg)
+            redact_next = True
+            continue
+        if any(marker in lowered for marker in ("bearer ", "token=", "api_key=", "apikey=", "password=", "secret=")):
+            safe.append(_redacted_arg(arg))
+            continue
+        if len(arg) > 512:
+            safe.append("<truncated:%s:chars=%d>" % (_sha256_text(arg), len(arg)))
+            continue
+        safe.append(arg)
+    return safe
+
+
+def _redacted_arg(value: str) -> str:
+    return "<redacted:%s:chars=%d>" % (_sha256_text(value), len(value))
 
 
 def _safe_path_component(value: str) -> str:

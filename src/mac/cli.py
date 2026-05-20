@@ -746,6 +746,23 @@ def cmd_events_list(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_command_audit_list(args: argparse.Namespace) -> None:
+    _print(
+        [
+            record.to_dict()
+            for record in _plane(args).list_command_audit(
+                agent_id=args.agent_id,
+                task_id=args.task_id,
+                command_id=args.command_id,
+                phase=args.phase,
+                since=args.since,
+                until=args.until,
+                limit=args.limit,
+            )
+        ]
+    )
+
+
 def cmd_rollout_list(args: argparse.Namespace) -> None:
     _print([rollout.to_dict() for rollout in _plane(args).list_rollouts(args.tenant_id, args.channel)])
 
@@ -1337,7 +1354,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     events_list.add_argument(
         "--subject-type",
-        choices=("task", "rollout", "eval_set", "secret", "environment"),
+        choices=("task", "agent", "rollout", "eval_set", "secret", "environment"),
     )
     events_list.add_argument("--subject-id")
     events_list.add_argument("--actor")
@@ -1350,6 +1367,23 @@ def build_parser() -> argparse.ArgumentParser:
     events_list.add_argument("--until", help="ISO timestamp upper bound (inclusive)")
     events_list.add_argument("--limit", type=int, default=100)
     _set(cmd_events_list, events_list)
+
+    command_audit = sub.add_parser(
+        "command-audit", help="short-retention per-agent command log"
+    ).add_subparsers(dest="command_audit_command", required=True)
+    command_audit_list = command_audit.add_parser(
+        "list", help="list audited command start/completion events"
+    )
+    command_audit_list.add_argument("--agent-id")
+    command_audit_list.add_argument("--task-id")
+    command_audit_list.add_argument("--command-id")
+    command_audit_list.add_argument(
+        "--phase", choices=("started", "completed", "failed", "timeout", "error")
+    )
+    command_audit_list.add_argument("--since", help="ISO timestamp lower bound")
+    command_audit_list.add_argument("--until", help="ISO timestamp upper bound")
+    command_audit_list.add_argument("--limit", type=int, default=100)
+    _set(cmd_command_audit_list, command_audit_list)
 
     migrate = sub.add_parser(
         "migrate",

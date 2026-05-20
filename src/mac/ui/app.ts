@@ -116,6 +116,26 @@ interface ObservabilitySummary {
   latest_metrics: ObservabilityEvent[];
 }
 
+interface CommandAuditRecord extends ApiRecord {
+  command_id: string;
+  agent_id: string;
+  phase: string;
+  argv: string[];
+  cwd: string;
+  task_id?: string | null;
+  lease_id?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  returncode?: number | null;
+  stdout_sha256?: string | null;
+  stderr_sha256?: string | null;
+  stdout_bytes?: number | null;
+  stderr_bytes?: number | null;
+  metadata?: JsonObject;
+  created_at: string;
+}
+
 interface DashboardData {
   overview: {
     counts: Record<string, number>;
@@ -133,6 +153,7 @@ interface DashboardData {
   dead_letters: TaskRecord[];
   dispatch: { open_task_count: number; tasks: DispatchTask[] };
   messages: ApiRecord[];
+  command_audit: CommandAuditRecord[];
   secrets: ApiRecord[];
   secret_audits: ApiRecord[];
   runtimes: ApiRecord[];
@@ -532,6 +553,7 @@ function renderObservability(): string {
     latest_metrics: [],
   };
   const counts = observability.counts || {};
+  const commandAudit = data.command_audit || [];
   const live = uniqueObservations([...state.observabilityLive, ...(observability.latest || [])]);
   const layerTotal = Object.values(observability.layers || {}).reduce((sum, value) => sum + Number(value || 0), 0);
   const levelTotal = Object.values(observability.levels || {}).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -555,6 +577,15 @@ function renderObservability(): string {
         <h2>Distribution</h2>
         ${stateBars(Object.keys(observability.layers || {}).sort(), observability.layers || {}, layerTotal, "No layers")}
         ${stateBars(Object.keys(observability.levels || {}).sort(), observability.levels || {}, levelTotal, "No levels")}
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Command Audit</h2>
+        ${chip(`${commandAudit.length}`, commandAudit.length ? "info" : "warn")}
+      </div>
+      <div class="observability-feed">
+        ${commandAudit.length ? commandAudit.slice(0, 80).map(commandAuditRecord).join("") : `<div class="empty-state">No command audit records</div>`}
       </div>
     </section>
     <section class="surface">
@@ -1051,6 +1082,25 @@ function observationRecord(item: ObservabilityEvent): string {
       </div>
       <div class="muted small">${escapeHtml(item.layer)} / ${escapeHtml(item.source)} ${subject ? `· ${escapeHtml(subject)}` : ""} · ${escapeHtml(formatAge(item.created_at))}</div>
       <div class="observation-detail">${escapeHtml(item.kind === "metric" ? formatMetricValue(item) : jsonSummary(item.detail))}</div>
+    </article>
+  `;
+}
+
+function commandAuditRecord(item: CommandAuditRecord): string {
+  const tone = item.phase === "completed" || item.phase === "started" ? "info" : "bad";
+  const subject = item.task_id ? `task:${item.task_id}` : `agent:${item.agent_id}`;
+  const argv = (item.argv || []).join(" ");
+  const result = item.returncode === null || item.returncode === undefined ? "" : ` rc=${item.returncode}`;
+  const duration = item.duration_ms === null || item.duration_ms === undefined ? "" : ` ${Math.round(item.duration_ms)}ms`;
+  return `
+    <article class="observation-row tone-left-${tone}">
+      <div class="observation-main">
+        ${chip(item.phase, tone)}
+        <strong>${escapeHtml(item.command_id)}</strong>
+      </div>
+      <div class="muted small">${escapeHtml(item.agent_id)} · ${escapeHtml(subject)} · ${escapeHtml(formatAge(item.created_at))}${escapeHtml(result)}${escapeHtml(duration)}</div>
+      <div class="observation-detail mono">${escapeHtml(argv)}</div>
+      <div class="muted small">${escapeHtml(item.cwd)}</div>
     </article>
   `;
 }

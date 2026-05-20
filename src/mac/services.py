@@ -28,6 +28,8 @@ from mac.models import (
     Artifact,
     AuthorizationError,
     BeadsRepository,
+    COMMAND_AUDIT_PHASES,
+    CommandAuditRecord,
     MoodMode,
     MoodOverlay,
     NapRun,
@@ -967,6 +969,176 @@ class ControlPlane:
 
     def observability_summary(self, *args: Any, **kwargs: Any) -> JsonDict:
         return self.observability.summary(*args, **kwargs)
+
+    # Short-retention command audit -------------------------------------
+
+    def record_command_audit(
+        self,
+        agent_id: str,
+        phase: str,
+        argv: Iterable[str],
+        cwd: str,
+        command_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        lease_id: Optional[str] = None,
+        started_at: Optional[str] = None,
+        completed_at: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+        returncode: Optional[int] = None,
+        stdout_sha256: Optional[str] = None,
+        stderr_sha256: Optional[str] = None,
+        stdout_bytes: Optional[int] = None,
+        stderr_bytes: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        retention_seconds: Optional[int] = None,
+    ) -> CommandAuditRecord:
+        self.get_agent(agent_id)
+        phase_value = str(phase or "").strip().lower()
+        if phase_value not in COMMAND_AUDIT_PHASES:
+            raise ValidationError("unsupported command audit phase: %s" % phase)
+        argv_list = [str(item) for item in argv]
+        if not argv_list:
+            raise ValidationError("command audit requires argv")
+        cwd_value = str(cwd or "").strip()
+        if not cwd_value:
+            raise ValidationError("command audit requires cwd")
+        if task_id:
+            self.get_task(task_id)
+        audit_id = new_id("cmda")
+        cid = command_id or new_id("cmd")
+        now = utcnow()
+        detail = ensure_json_object(metadata or {})
+        retention = self._command_audit_retention_seconds(retention_seconds)
+        cutoff = (
+            parse_time(now) - timedelta(seconds=retention)
+        ).isoformat(timespec="microseconds")
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO command_audit (
+                    id, command_id, agent_id, phase, argv, cwd, task_id, lease_id,
+                    started_at, completed_at, duration_ms, returncode,
+                    stdout_sha256, stderr_sha256, stdout_bytes, stderr_bytes,
+                    metadata, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit_id,
+                    cid,
+                    agent_id,
+                    phase_value,
+                    json_dumps(argv_list),
+                    cwd_value,
+                    task_id,
+                    lease_id,
+                    started_at,
+                    completed_at,
+                    duration_ms,
+                    returncode,
+                    stdout_sha256,
+                    stderr_sha256,
+                    stdout_bytes,
+                    stderr_bytes,
+                    json_dumps(detail),
+                    now,
+                ),
+            )
+            conn.execute("DELETE FROM command_audit WHERE created_at < ?", (cutoff,))
+            self.observability.insert_observation(
+                conn,
+                "log",
+                "command.%s" % phase_value,
+                "worker",
+                agent_id,
+                "error" if phase_value in {"failed", "timeout", "error"} else "info",
+                None,
+                "",
+                "task" if task_id else "agent",
+                task_id or agent_id,
+                {
+                    "command_id": cid,
+                    "argv": argv_list,
+                    "cwd": cwd_value,
+                    "task_id": task_id,
+                    "lease_id": lease_id,
+                    "duration_ms": duration_ms,
+                    "returncode": returncode,
+                    **detail,
+                },
+                now,
+            )
+        return self.get_command_audit(audit_id)
+
+    def get_command_audit(self, audit_id: str) -> CommandAuditRecord:
+        row = self.store.query_one("SELECT * FROM command_audit WHERE id = ?", (audit_id,))
+        if row is None:
+            raise NotFoundError("command audit record not found: %s" % audit_id)
+        return self._command_audit_from_row(row)
+
+    def list_command_audit(
+        self,
+        agent_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        command_id: Optional[str] = None,
+        phase: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[CommandAuditRecord]:
+        self.prune_command_audit()
+        clauses: List[str] = []
+        params: List[Any] = []
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if command_id is not None:
+            clauses.append("command_id = ?")
+            params.append(command_id)
+        if phase is not None:
+            phase_value = str(phase).strip().lower()
+            if phase_value not in COMMAND_AUDIT_PHASES:
+                raise ValidationError("unsupported command audit phase: %s" % phase)
+            clauses.append("phase = ?")
+            params.append(phase_value)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at <= ?")
+            params.append(until)
+        sql = "SELECT * FROM command_audit"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(min(max(1, int(limit)), 1000))
+        return [
+            self._command_audit_from_row(row)
+            for row in self.store.query_all(sql, tuple(params))
+        ]
+
+    def prune_command_audit(self, older_than: Optional[str] = None) -> int:
+        cutoff = older_than
+        if cutoff is None:
+            now = utcnow()
+            retention = self._command_audit_retention_seconds(None)
+            cutoff = (
+                parse_time(now) - timedelta(seconds=retention)
+            ).isoformat(timespec="microseconds")
+        cursor = self.store.execute(
+            "DELETE FROM command_audit WHERE created_at < ?", (cutoff,)
+        )
+        return int(cursor.rowcount or 0)
+
+    def _command_audit_retention_seconds(self, override: Optional[int]) -> int:
+        if override is not None:
+            return max(60, int(override))
+        raw = os.environ.get("MAC_COMMAND_AUDIT_RETENTION_SECONDS")
+        if raw:
+            return max(60, int(raw))
+        return 24 * 60 * 60
 
     def list_dead_letters(self, tenant_id: Optional[str] = None) -> List[Task]:
         rows = self.store.query_all(
@@ -3202,6 +3374,28 @@ class ControlPlane:
             row["checksum"],
             json_loads(row["metadata"], {}),
             row["created_by"],
+            row["created_at"],
+        )
+
+    def _command_audit_from_row(self, row: Any) -> CommandAuditRecord:
+        return CommandAuditRecord(
+            row["id"],
+            row["command_id"],
+            row["agent_id"],
+            row["phase"],
+            json_loads(row["argv"], []),
+            row["cwd"],
+            row["task_id"],
+            row["lease_id"],
+            row["started_at"],
+            row["completed_at"],
+            row["duration_ms"],
+            row["returncode"],
+            row["stdout_sha256"],
+            row["stderr_sha256"],
+            row["stdout_bytes"],
+            row["stderr_bytes"],
+            json_loads(row["metadata"], {}),
             row["created_at"],
         )
 

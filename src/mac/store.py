@@ -309,6 +309,35 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_observability_events_name_created
                     ON observability_events (name, created_at);
 
+                CREATE TABLE IF NOT EXISTS command_audit (
+                    id TEXT PRIMARY KEY,
+                    command_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    argv TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    task_id TEXT,
+                    lease_id TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    duration_ms REAL,
+                    returncode INTEGER,
+                    stdout_sha256 TEXT,
+                    stderr_sha256 TEXT,
+                    stdout_bytes INTEGER,
+                    stderr_bytes INTEGER,
+                    metadata TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_command_audit_created
+                    ON command_audit (created_at, id);
+                CREATE INDEX IF NOT EXISTS idx_command_audit_agent_created
+                    ON command_audit (agent_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_command_audit_task_created
+                    ON command_audit (task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_command_audit_command
+                    ON command_audit (command_id, created_at);
+
                 -- Per-agent operational events (mood transitions, nap
                 -- lifecycle, future agent-level audit). Flows through the
                 -- unified events view.
@@ -794,6 +823,32 @@ class SQLiteStore:
                     UNION ALL
                     SELECT id, 'agent', agent_id, event_type, actor, detail, created_at
                     FROM agent_events
+                    UNION ALL
+                    SELECT
+                        id,
+                        CASE WHEN task_id IS NOT NULL THEN 'task' ELSE 'agent' END,
+                        COALESCE(task_id, agent_id),
+                        'command.' || phase,
+                        agent_id,
+                        json_object(
+                            'command_id', command_id,
+                            'agent_id', agent_id,
+                            'argv', json(argv),
+                            'cwd', cwd,
+                            'task_id', task_id,
+                            'lease_id', lease_id,
+                            'started_at', started_at,
+                            'completed_at', completed_at,
+                            'duration_ms', duration_ms,
+                            'returncode', returncode,
+                            'stdout_sha256', stdout_sha256,
+                            'stderr_sha256', stderr_sha256,
+                            'stdout_bytes', stdout_bytes,
+                            'stderr_bytes', stderr_bytes,
+                            'metadata', json(metadata)
+                        ),
+                        created_at
+                    FROM command_audit
                     UNION ALL
                     -- Conversation threads project as one event per row: the
                     -- "thread_tracked" observation at last_seen_at. This

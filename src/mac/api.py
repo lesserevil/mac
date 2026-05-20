@@ -374,6 +374,24 @@ class AgentClaimNextRequest(BaseModel):
     dry_run: bool = False
 
 
+class CommandAuditCreate(BaseModel):
+    command_id: Optional[str] = None
+    phase: str
+    argv: List[str]
+    cwd: str
+    task_id: Optional[str] = None
+    lease_id: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_ms: Optional[float] = None
+    returncode: Optional[int] = None
+    stdout_sha256: Optional[str] = None
+    stderr_sha256: Optional[str] = None
+    stdout_bytes: Optional[int] = None
+    stderr_bytes: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class MessageCreate(BaseModel):
     sender_agent_id: str
     recipient_agent_id: Optional[str] = None
@@ -702,6 +720,7 @@ def _required_scope(method: str, path: str) -> Optional[str]:
         return "read"
     if path.startswith("/agents/") and (
         path.endswith("/heartbeat") or path.endswith("/messages/deliver")
+        or path.endswith("/command-audit")
     ):
         return "agent"
     if path.startswith("/agentbus"):
@@ -1025,6 +1044,9 @@ def _dashboard_state(
         "dead_letters": dead_letters,
         "dispatch": _dashboard_dispatch_explain(cp, tasks, agents, machines_by_id),
         "messages": [message.to_dict() for message in cp.list_messages()],
+        "command_audit": [
+            record.to_dict() for record in cp.list_command_audit(limit=120)
+        ],
         "secrets": secrets,
         "secret_audits": secret_audits,
         "runtimes": [runtime.to_dict() for runtime in cp.list_runtimes()],
@@ -1703,6 +1725,53 @@ def create_app(
             require_canary=body.require_canary,
             dry_run=body.dry_run,
         )
+
+    @app.post("/agents/{agent_id}/command-audit")
+    def record_agent_command_audit(
+        agent_id: str,
+        body: CommandAuditCreate,
+    ) -> Dict[str, Any]:
+        return cp.record_command_audit(agent_id=agent_id, **_data(body)).to_dict()
+
+    @app.get("/command-audit")
+    def list_command_audit(
+        agent_id: Optional[str] = Query(default=None),
+        task_id: Optional[str] = Query(default=None),
+        command_id: Optional[str] = Query(default=None),
+        phase: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        limit: int = Query(default=200),
+    ) -> List[Dict[str, Any]]:
+        return [
+            record.to_dict()
+            for record in cp.list_command_audit(
+                agent_id=agent_id,
+                task_id=task_id,
+                command_id=command_id,
+                phase=phase,
+                since=since,
+                until=until,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/agents/{agent_id}/command-audit")
+    def list_agent_command_audit(
+        agent_id: str,
+        task_id: Optional[str] = Query(default=None),
+        phase: Optional[str] = Query(default=None),
+        limit: int = Query(default=200),
+    ) -> List[Dict[str, Any]]:
+        return [
+            record.to_dict()
+            for record in cp.list_command_audit(
+                agent_id=agent_id,
+                task_id=task_id,
+                phase=phase,
+                limit=limit,
+            )
+        ]
 
     @app.post("/dispatch/assign")
     def dispatch_once(body: DispatchRequest) -> Optional[Dict[str, Any]]:

@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
 import subprocess
+import sys
 import time
 from typing import Any, Dict, Optional
 
@@ -19,7 +20,7 @@ from mac.api import create_app
 from mac.hermes_adapter import MacApiClient, MacApiError
 from mac.models import TaskState
 from mac.services import ControlPlane, sign_verification_manifest
-from mac.worker import MacWorker, WorkerExecution, register_worker
+from mac.worker import MacWorker, SubprocessExecutor, WorkerExecution, register_worker
 
 
 def api_transport(client: TestClient):
@@ -226,6 +227,53 @@ def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):
     assert cp.get_task(task.id).state == TaskState.FAILED.value
     evidence = cp.list_evidence(task.id)
     assert evidence[0].metadata["returncode"] == 2
+
+
+def test_mac_worker_audits_subprocess_commands(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    task = cp.create_task("Python task", required_capabilities=["python"])
+    client = TestClient(create_app(control_plane=cp))
+    executor_script = tmp_path / "executor.py"
+    executor_script.write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "import json, os",
+                "workspace = Path(os.environ['MAC_TASK_WORKSPACE'])",
+                "manifest = {'schema': 'mac.worker_evidence.v1', 'status': 'complete', 'evidence_type': 'test'}",
+                "(workspace / 'mac-evidence.json').write_text(json.dumps(manifest), encoding='utf-8')",
+                "print('audited command ran')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        SubprocessExecutor([sys.executable, str(executor_script)]),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    records = cp.list_command_audit(agent_id=agent.id, task_id=task.id, limit=10)
+    phases = [record.phase for record in records]
+    assert "started" in phases
+    assert "completed" in phases
+    completed = next(record for record in records if record.phase == "completed")
+    assert completed.returncode == 0
+    assert completed.stdout_bytes and completed.stdout_sha256
+    assert completed.metadata["argv_sha256"].startswith("sha256:")
+    assert completed.argv[0] == sys.executable
+    events = cp.list_events(
+        subject_type="task",
+        subject_id=task.id,
+        event_type_prefix="command.",
+        limit=10,
+    )
+    assert {event["event_type"] for event in events} >= {"command.started", "command.completed"}
 
 
 def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
