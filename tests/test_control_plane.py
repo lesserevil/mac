@@ -10,6 +10,7 @@ from mac.models import (
     HealthStatus,
     LeaseStatus,
     NotFoundError,
+    PublicationStatus,
     ReviewStatus,
     RolloutStatus,
     TaskState,
@@ -43,7 +44,7 @@ def create_runtime(cp, name="runtime"):
     )
 
 
-def verified_repo_metadata():
+def verified_repo_metadata(head_sha="abcdef1234567890abcdef1234567890abcdef12"):
     return {
         "returncode": 0,
         "verification": {
@@ -51,7 +52,7 @@ def verified_repo_metadata():
             "status": "complete",
             "evidence_type": "repo_change",
             "repo": {
-                "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+                "head_sha": head_sha,
                 "pushed": True,
                 "remote_ref": "refs/heads/task/example",
                 "dirty": False,
@@ -687,6 +688,50 @@ def test_default_review_workflow_allows_verified_deployment_evidence(cp):
     assert result["status"] == "published"
     assert cp.list_reviews(task.id)[0].reviewer_agent_id == reviewer.id
     assert cp.list_reviews(task.id)[0].evidence_id == evidence.id
+
+
+def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Reopened work", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://old-result",
+        "old verified result",
+        worker.id,
+        metadata=verified_repo_metadata(),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "published"
+
+    cp.store.execute("UPDATE reviews SET status = ? WHERE task_id = ?", ("retracted", task.id))
+    cp.store.execute("UPDATE publications SET status = ? WHERE task_id = ?", ("retracted", task.id))
+    cp.store.execute("UPDATE tasks SET state = ? WHERE id = ?", (TaskState.NEEDS_REVIEW.value, task.id))
+    new_evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://new-result",
+        "new verified result",
+        worker.id,
+        metadata=verified_repo_metadata(head_sha="abcdef1234567890"),
+    )
+
+    second = cp.advance_default_review_workflow(task.id)
+
+    assert second["status"] == "published"
+    active_publications = [
+        item for item in cp.list_publications(task.id) if item.status == PublicationStatus.PUBLISHED.value
+    ]
+    assert len(active_publications) == 1
+    assert active_publications[0].evidence_id == new_evidence.id
+    approved = [item for item in cp.list_reviews(task.id) if item.status == ReviewStatus.APPROVED.value]
+    assert len(approved) == 1
+    assert approved[0].evidence_id == new_evidence.id
+    assert approved[0].reviewer_agent_id == reviewer.id
 
 
 def test_dispatcher_matches_capabilities_and_expired_leases_recover(cp):

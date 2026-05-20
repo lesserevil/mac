@@ -602,7 +602,11 @@ class ControlPlane:
         evidence = detail["evidence"]
         reviews = detail["reviews"]
         approved_reviews = [review for review in reviews if review["status"] == ReviewStatus.APPROVED.value]
-        publications = [pub.to_dict() for pub in self.reviews.list_publications(task_id)]
+        publications = [
+            pub.to_dict()
+            for pub in self.reviews.list_publications(task_id)
+            if pub.status == PublicationStatus.PUBLISHED.value
+        ]
         parts = ["%s is %s" % (task["title"], task["state"])]
         if task["owner_agent_id"]:
             parts.append("owner=%s" % task["owner_agent_id"])
@@ -1673,7 +1677,11 @@ class ControlPlane:
             return {"task_id": task_id, "status": "already_completed"}
         if task.state not in {TaskState.NEEDS_REVIEW.value, TaskState.REVIEWING.value}:
             return {"task_id": task_id, "status": "not_reviewable", "state": task.state}
-        existing_publications = self.list_publications(task_id)
+        existing_publications = [
+            publication
+            for publication in self.list_publications(task_id)
+            if publication.status == PublicationStatus.PUBLISHED.value
+        ]
         if existing_publications:
             return {
                 "task_id": task_id,
@@ -2498,7 +2506,7 @@ class ControlPlane:
         approved = [review for review in reviews if review.status == ReviewStatus.APPROVED.value]
         if approved:
             return approved[-1]
-        return reviews[-1]
+        return None
 
     def _select_default_reviewer(self, task: Task) -> Optional[Agent]:
         candidates = [

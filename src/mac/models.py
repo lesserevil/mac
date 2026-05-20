@@ -148,11 +148,13 @@ class ReviewStatus(StrEnum):
     APPROVED = "approved"
     CHANGES_REQUESTED = "changes_requested"
     REJECTED = "rejected"
+    RETRACTED = "retracted"
 
 
 class PublicationStatus(StrEnum):
     PENDING = "pending"
     PUBLISHED = "published"
+    RETRACTED = "retracted"
     FAILED = "failed"
 
 
