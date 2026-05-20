@@ -110,6 +110,18 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     ).read_text(encoding="utf-8")
 
 
+def test_fleet_deploy_applies_hermes_patch_set():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    quench_patch = ROOT / "deploy" / "hermes" / "disable-shutdown-chat-notices.patch"
+
+    assert "multi-slack-mvp.patch" in script
+    assert "disable-shutdown-chat-notices.patch" in script
+    assert "upstream plus mac-managed patches" in script
+    assert "Shutdown chat notifications disabled by MAC deployment policy." in quench_patch.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_executor_prompt_includes_repository_runtime_contract():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 

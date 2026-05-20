@@ -61,6 +61,40 @@ def test_home_channel_static_json_writes_home_and_route_files(monkeypatch, tmp_p
     assert report["home_channel_count"] == 1
 
 
+def test_home_channel_sync_removes_legacy_direct_home_env(monkeypatch, tmp_path):
+    hermes_env = tmp_path / ".env"
+    hermes_env.write_text(
+        "\n".join(
+            [
+                "KEEP_ME=1",
+                "SLACK_HOME_CHANNEL=C123",
+                "SLACK_HOME_CHANNEL_NAME=rockyandfriends",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MAC_HERMES_SLACK_HOME_CHANNELS_JSON", json.dumps([
+        {
+            "name": "omgjkh",
+            "team_id": "T123",
+            "channel_id": "C456",
+            "channel_name": "#ops",
+        }
+    ]))
+
+    result, _home_path, _routes_path, report_path = run_sync(tmp_path, monkeypatch)
+
+    assert result.returncode == 0
+    assert hermes_env.read_text(encoding="utf-8") == "KEEP_ME=1\n"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["legacy_env_normalization"] == "removed"
+    assert report["legacy_env_removed_keys"] == [
+        "SLACK_HOME_CHANNEL",
+        "SLACK_HOME_CHANNEL_NAME",
+    ]
+
+
 class SlackHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return

@@ -35,7 +35,7 @@ default. Each host gets:
   - ~/.mac/src/mac from this repository
   - ~/.mac/venv with mac installed
   - upstream NousResearch/hermes-agent in ~/.mac/hermes-agent
-  - the minimal Hermes multi-Slack patch
+  - the minimal Hermes multi-Slack patch set
   - preinstalled configured Hermes messaging dependencies
   - enforced Hermes secret redaction
   - a host-local mac service, with Rocky exposed as the hub
@@ -1463,21 +1463,26 @@ log "installing mac Python package"
 log "redeploying upstream Hermes agent"
 git clone --quiet https://github.com/NousResearch/hermes-agent.git "$HERMES_DIR"
 git -C "$HERMES_DIR" rev-parse HEAD > "$LOG_DIR/hermes-upstream-rev.txt"
-if git -C "$HERMES_DIR" apply --check "$SRC_DIR/deploy/hermes/multi-slack-mvp.patch"; then
-  git -C "$HERMES_DIR" apply "$SRC_DIR/deploy/hermes/multi-slack-mvp.patch"
-  log "applied Hermes multi-Slack patch"
-else
-  log "ERROR: Hermes multi-Slack patch does not apply to upstream checkout"
-  git -C "$HERMES_DIR" status --short
-  exit 1
-fi
+for patch_path in \
+  "$SRC_DIR/deploy/hermes/multi-slack-mvp.patch" \
+  "$SRC_DIR/deploy/hermes/disable-shutdown-chat-notices.patch"
+do
+  if git -C "$HERMES_DIR" apply --check "$patch_path"; then
+    git -C "$HERMES_DIR" apply "$patch_path"
+    log "applied Hermes patch $(basename "$patch_path")"
+  else
+    log "ERROR: Hermes patch $(basename "$patch_path") does not apply to upstream checkout"
+    git -C "$HERMES_DIR" status --short
+    exit 1
+  fi
+done
 "$PY" -m venv "$HERMES_DIR/.venv"
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$HERMES_DIR/.venv/bin/python" -m pip install -e "$HERMES_DIR" >/dev/null
 apply_hermes_gateway_runtime_shim
 install_hermes_messaging_deps
 repair_hermes_kanban_schema
-log "installed Hermes agent from upstream plus mac-managed patch"
+log "installed Hermes agent from upstream plus mac-managed patches"
 
 log "initializing mac database"
 "$VENV/bin/mac" --db "$MAC_DB" init >/dev/null

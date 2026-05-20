@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
+STALE_HERMES_HOME_ENV_KEYS = {"SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME"}
 
 
 def _env_enabled(name: str, default: bool) -> bool:
@@ -60,6 +61,49 @@ def _write_json(path: Path, data: Any) -> None:
             tmp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _normalize_legacy_hermes_env(path: Path, report: Dict[str, Any]) -> None:
+    """Remove direct Slack home targets from Hermes env files.
+
+    MAC uses slack_home_channels.json for multi-workspace routing. Leaving a
+    legacy SLACK_HOME_CHANNEL in ~/.hermes/.env gives upstream Hermes a single
+    concrete home target and makes lifecycle notices visible in Slack on only
+    that host.
+    """
+    try:
+        original = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        report["legacy_env_normalization"] = "missing"
+        return
+
+    removed: List[str] = []
+    kept: List[str] = []
+    for line in original.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in STALE_HERMES_HOME_ENV_KEYS:
+                removed.append(key)
+                continue
+        kept.append(line)
+
+    if not removed:
+        report["legacy_env_normalization"] = "unchanged"
+        return
+
+    tmp_path = path.with_name(".%s.%d.tmp" % (path.name, os.getpid()))
+    try:
+        tmp_path.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+        tmp_path.chmod(0o600)
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+    report["legacy_env_normalization"] = "removed"
+    report["legacy_env_removed_keys"] = sorted(set(removed))
 
 
 def _load_accounts(path: Path) -> List[Dict[str, str]]:
@@ -192,6 +236,7 @@ def main(argv: List[str]) -> int:
         "workspaces": [],
         "warnings": [],
     }
+    _normalize_legacy_hermes_env(accounts_path.parent / ".env", report)
 
     if not _env_enabled("MAC_HERMES_SYNC_SLACK_HOME_CHANNELS", True) or not _env_enabled(
         "ACC_HERMES_SYNC_SLACK_HOME_CHANNELS", True
