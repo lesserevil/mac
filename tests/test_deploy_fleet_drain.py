@@ -1,12 +1,8 @@
-from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parents[1]
-DEPLOY_SCRIPT = ROOT / "deploy" / "deploy-mac-fleet.sh"
+from tests._deploy_helpers import deploy_script_text
 
 
 def script_text():
-    return DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    return deploy_script_text()
 
 
 def test_deploy_drains_worker_before_stopping_services():

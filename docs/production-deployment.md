@@ -96,6 +96,19 @@ committed fleet configs set `MAC_DEPLOY_TARGET`, `MAC_DEPLOY_OS`,
 own tokens. Override `MAC_DEPLOY_AGENT_CONFIG_DIR` to test an alternate config
 set.
 
+The deploy script is now a thin orchestrator backed by focused modules:
+
+```
+deploy/
+├── deploy-mac-fleet.sh          # entry point: arg parsing + main loop
+└── lib/
+    ├── orchestrator/            # runs locally (arguments, archive, dispatch)
+    └── remote/                  # bash modules concatenated and piped to each host
+```
+
+See `deploy/lib/remote/README.md` for the module catalog. To change deploy
+behaviour, edit the relevant module — not the entry point.
+
 The default fleet intentionally avoids model monoculture:
 
 | Agent | Hermes model |

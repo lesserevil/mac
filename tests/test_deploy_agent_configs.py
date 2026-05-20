@@ -2,8 +2,9 @@ from pathlib import Path
 
 import yaml
 
+from tests._deploy_helpers import deploy_script_text, REPO_ROOT
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = REPO_ROOT
 
 
 def parse_env(path: Path):
@@ -51,7 +52,7 @@ def test_fleet_agent_configs_use_distinct_hermes_models():
 
 
 def test_fleet_agent_configs_enable_review_capability_by_default():
-    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    script = deploy_script_text()
     template = parse_env(ROOT / "deploy" / "agents" / "TEMPLATE" / "config.env")
 
     assert 'MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes,review"' in script
@@ -66,7 +67,7 @@ def test_fleet_agent_configs_enable_review_capability_by_default():
 
 
 def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
-    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    script = deploy_script_text()
 
     assert '--attestation-key-env "$HOME/.mac/mac.env"' in script
     assert "--rotate-missing-attestation-key" in script
@@ -74,7 +75,7 @@ def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
 
 
 def test_fleet_deploy_drain_agent_lookup_does_not_pipe_json_into_python_stdin():
-    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    script = deploy_script_text()
     agent_id_for_drain = script.split("agent_id_for_drain() {", 1)[1].split(
         "wait_for_agent_active_leases() {", 1
     )[0]
@@ -85,7 +86,7 @@ def test_fleet_deploy_drain_agent_lookup_does_not_pipe_json_into_python_stdin():
 
 
 def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
-    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    script = deploy_script_text()
 
     assert "BEADS_REPO_URL=\"${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}\"" in script
     assert "install_beads_cli()" in script
@@ -111,7 +112,7 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
 
 
 def test_fleet_deploy_applies_hermes_patch_set():
-    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    script = deploy_script_text()
     quench_patch = ROOT / "deploy" / "hermes" / "disable-shutdown-chat-notices.patch"
 
     assert "multi-slack-mvp.patch" in script
@@ -123,7 +124,7 @@ def test_fleet_deploy_applies_hermes_patch_set():
 
 
 def test_executor_prompt_includes_repository_runtime_contract():
-    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    script = deploy_script_text()
 
     assert "def repository_contract_section(task: dict) -> str:" in script
     assert "Repository runtime contract:" in script
