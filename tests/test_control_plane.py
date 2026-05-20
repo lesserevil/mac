@@ -1680,6 +1680,59 @@ def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkey
     ]
 
 
+def test_beads_bridge_tolerates_preclaimed_bead_during_reconcile(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-preclaimed",
+                "title": "Preclaimed work",
+                "description": "already assigned before mac claimed it",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    metadata = task.metadata
+    metadata["acc_metadata"]["beads_sync_claim_on_claim"] = False
+    cp.store.execute("UPDATE tasks SET metadata = ? WHERE id = ?", (json.dumps(metadata), task.id))
+    worker = register_agent(cp, "worker", ["python"])
+    cp.claim_task(task.id, worker.id)
+    claimed = cp.get_task(task.id)
+    metadata = claimed.metadata
+    metadata["acc_metadata"]["beads_sync_claim_on_claim"] = True
+    cp.store.execute("UPDATE tasks SET metadata = ? WHERE id = ?", (json.dumps(metadata), task.id))
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
+
+    class Completed:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        if command == [bd_cli, "ready", "--json"]:
+            return Completed(returncode=1, stderr="no beads database")
+        return Completed(returncode=1, stderr="Error claiming mac-preclaimed: issue already claimed by Jordan Hubbard")
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    cp.poll_beads_repositories(force=True)
+
+    names = {event.name for event in cp.list_observability(layer="control_plane", limit=20)}
+    assert "bridge.beads.sync.claim_existing" in names
+    assert "bridge.beads.sync_failed" not in names
+
+
 def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

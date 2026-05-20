@@ -2695,7 +2695,22 @@ class ControlPlane:
                 check=False,
             )
             if completed.returncode != 0:
-                raise ValidationError((completed.stderr or completed.stdout or "").strip())
+                output = (completed.stderr or completed.stdout or "").strip()
+                if action == "claim" and "already claimed" in output.lower():
+                    self.record_log(
+                        "bridge.beads.sync.claim_existing",
+                        layer="control_plane",
+                        source=actor,
+                        subject_type="task",
+                        subject_id=task.id,
+                        detail={
+                            "bead_id": binding["bead_id"],
+                            "repo_path": str(repo_path),
+                            "output": output[:1000],
+                        },
+                    )
+                    return
+                raise ValidationError(output)
             self.record_log(
                 "bridge.beads.sync.%s" % action,
                 layer="control_plane",
