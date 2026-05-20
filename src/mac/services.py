@@ -104,6 +104,14 @@ def _state_value(state: Any) -> str:
     return state.value if hasattr(state, "value") else str(state)
 
 
+def _manifest_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
 class ControlPlane:
     """Application service layer for the multi-agent control plane."""
 
@@ -1682,16 +1690,20 @@ class ControlPlane:
             )
             return {"task_id": task_id, "status": "disabled_by_task_policy"}
 
-        evidence = self._default_review_evidence(task_id)
+        evidence, evidence_assessment = self._default_review_evidence(task)
         if evidence is None:
             self._record_default_review_observation(
                 task_id,
                 "workflow.default_review.waiting",
                 "warning",
-                {"reason": "no_successful_evidence"},
+                evidence_assessment,
                 actor,
             )
-            return {"task_id": task_id, "status": "waiting_for_successful_evidence"}
+            return {
+                "task_id": task_id,
+                "status": "waiting_for_verifiable_evidence",
+                **evidence_assessment,
+            }
 
         review = self._default_review_for_task(task_id)
         if review is None:
@@ -1719,7 +1731,7 @@ class ControlPlane:
                 review.id,
                 ReviewStatus.APPROVED.value,
                 review.reviewer_agent_id,
-                reason="default workflow approved successful executor evidence",
+                reason="default workflow approved verified executor evidence",
                 evidence_id=evidence.id,
             )
             self._record_default_review_observation(
@@ -1730,6 +1742,7 @@ class ControlPlane:
                     "review_id": review.id,
                     "reviewer_agent_id": review.reviewer_agent_id,
                     "evidence_id": evidence.id,
+                    "evidence_type": evidence_assessment.get("evidence_type"),
                 },
                 actor,
             )
@@ -2291,24 +2304,180 @@ class ControlPlane:
             or policy.get("enabled") is False
         )
 
-    def _default_review_evidence(self, task_id: str) -> Optional[Evidence]:
-        evidence = self.list_evidence(task_id)
+    def _default_review_evidence(self, task: Task) -> Tuple[Optional[Evidence], JsonDict]:
+        evidence = self.list_evidence(task.id)
         if not evidence:
-            return None
+            return None, {"reason": "no_evidence"}
         successful = [
             item
             for item in evidence
             if self._evidence_returncode(item) == 0
         ]
-        if successful:
-            return successful[-1]
-        no_returncode = [
-            item
-            for item in evidence
-            if self._evidence_returncode(item) is None
-            and item.kind in {"test", "review", "artifact", "eval"}
-        ]
-        return no_returncode[-1] if no_returncode else None
+        if not successful:
+            return None, {"reason": "no_successful_evidence"}
+        rejected: List[JsonDict] = []
+        for item in reversed(successful):
+            assessment = self._assess_default_review_evidence(task, item)
+            if assessment["valid"]:
+                return item, assessment
+            rejected.append(
+                {
+                    "evidence_id": item.id,
+                    "reason": assessment["reason"],
+                    "problems": assessment.get("problems", []),
+                }
+            )
+        return None, {
+            "reason": "evidence_not_verifiable",
+            "rejected_evidence": rejected[:5],
+        }
+
+    def _assess_default_review_evidence(self, task: Task, evidence: Evidence) -> JsonDict:
+        if self._evidence_returncode(evidence) != 0:
+            return {
+                "valid": False,
+                "reason": "executor_not_successful",
+                "problems": ["evidence returncode is not zero"],
+            }
+        manifest = evidence.metadata.get("verification") or evidence.metadata.get("mac_evidence")
+        if not isinstance(manifest, dict):
+            return {
+                "valid": False,
+                "reason": "missing_verification_manifest",
+                "problems": ["evidence metadata lacks verification manifest"],
+            }
+        problems: List[str] = []
+        schema = str(manifest.get("schema") or "").strip()
+        if schema != VERIFICATION_SCHEMA:
+            problems.append("verification.schema must be %s" % VERIFICATION_SCHEMA)
+        status = str(manifest.get("status") or manifest.get("verdict") or "").strip().lower()
+        if status not in {"complete", "verified", "pass", "passed"}:
+            problems.append("verification.status must be complete/verified/pass")
+        evidence_type = str(manifest.get("evidence_type") or manifest.get("type") or "").strip().lower()
+        if not evidence_type:
+            problems.append("verification.evidence_type is required")
+        if problems:
+            return {
+                "valid": False,
+                "reason": "invalid_verification_manifest",
+                "evidence_type": evidence_type or None,
+                "problems": problems,
+            }
+        type_problems = self._verification_type_problems(task, manifest, evidence_type)
+        if type_problems:
+            return {
+                "valid": False,
+                "reason": "verification_contract_failed",
+                "evidence_type": evidence_type,
+                "problems": type_problems,
+            }
+        return {
+            "valid": True,
+            "reason": "verification_contract_satisfied",
+            "evidence_type": evidence_type,
+            "verified_by": "default-review-evidence-v1",
+        }
+
+    def _verification_type_problems(
+        self,
+        task: Task,
+        manifest: JsonDict,
+        evidence_type: str,
+    ) -> List[str]:
+        if evidence_type in {"repo_change", "code", "git"}:
+            return self._repo_verification_problems(manifest, require_tests=True)
+        if evidence_type in {"documentation", "investigation", "decision_record"}:
+            repo_problems = self._repo_verification_problems(manifest, require_tests=False)
+            if not repo_problems:
+                return []
+            artifacts = _manifest_list(manifest.get("artifacts"))
+            if artifacts and self._passed_verification_check_count(manifest) > 0:
+                return []
+            return [
+                "documentation/investigation evidence requires a pushed repo artifact "
+                "or explicit artifacts plus passing checks"
+            ]
+        if evidence_type == "deployment":
+            problems: List[str] = []
+            if self._passed_verification_check_count(manifest) < 1:
+                problems.append("deployment evidence requires at least one passing check")
+            if not (
+                _manifest_list(manifest.get("targets"))
+                or _manifest_list(manifest.get("services"))
+                or _manifest_list(manifest.get("artifacts"))
+            ):
+                problems.append("deployment evidence requires targets, services, or artifacts")
+            return problems
+        if evidence_type in {"test", "artifact"}:
+            problems = []
+            if self._passed_verification_check_count(manifest) < 1:
+                problems.append("%s evidence requires at least one passing check or test" % evidence_type)
+            if evidence_type == "artifact" and not _manifest_list(manifest.get("artifacts")):
+                problems.append("artifact evidence requires artifacts")
+            return problems
+        if evidence_type == "no_change":
+            if not str(manifest.get("reason") or manifest.get("no_change_reason") or "").strip():
+                return ["no_change evidence requires a reason"]
+            if self._passed_verification_check_count(manifest) < 1:
+                return ["no_change evidence requires at least one passing check"]
+            return []
+        return ["unsupported verification.evidence_type: %s" % evidence_type]
+
+    def _repo_verification_problems(self, manifest: JsonDict, require_tests: bool) -> List[str]:
+        repo = manifest.get("repo") or manifest.get("git")
+        if not isinstance(repo, dict):
+            return ["repo evidence requires verification.repo object"]
+        problems: List[str] = []
+        head_sha = str(
+            repo.get("head_sha")
+            or repo.get("commit")
+            or repo.get("commit_sha")
+            or manifest.get("head_sha")
+            or ""
+        ).strip()
+        if not _GIT_SHA_RE.match(head_sha):
+            problems.append("repo.head_sha must be a git SHA")
+        files_changed = _manifest_list(
+            repo.get("files_changed")
+            or repo.get("changed_files")
+            or manifest.get("files_changed")
+        )
+        if not files_changed:
+            problems.append("repo evidence requires changed files")
+        dirty = repo.get("dirty")
+        if dirty is None:
+            dirty = repo.get("dirty_worktree")
+        if dirty not in {False, "false", "False", 0, "0"}:
+            problems.append("repo evidence must declare dirty=false")
+        pushed = repo.get("pushed") is True or str(repo.get("pushed") or "").lower() == "true"
+        remote_ref = str(repo.get("remote_ref") or repo.get("pushed_ref") or "").strip()
+        pr_url = str(repo.get("pr_url") or repo.get("pull_request_url") or manifest.get("pr_url") or "").strip()
+        if not (pushed and remote_ref) and not pr_url:
+            problems.append("repo evidence requires pushed=true with remote_ref, or pr_url")
+        if require_tests and self._passed_verification_check_count(manifest) < 1:
+            problems.append("repo code evidence requires at least one passing test/check")
+        return problems
+
+    def _passed_verification_check_count(self, manifest: JsonDict) -> int:
+        count = 0
+        for item in _manifest_list(manifest.get("tests") or manifest.get("test_runs")):
+            if self._verification_item_passed(item):
+                count += 1
+        for item in _manifest_list(manifest.get("checks")):
+            if self._verification_item_passed(item):
+                count += 1
+        return count
+
+    def _verification_item_passed(self, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if "returncode" in item:
+            try:
+                return int(item["returncode"]) == 0
+            except (TypeError, ValueError):
+                return False
+        status = str(item.get("status") or item.get("result") or "").strip().lower()
+        return status in {"pass", "passed", "success", "succeeded", "ok"}
 
     def _evidence_returncode(self, evidence: Evidence) -> Optional[int]:
         value = evidence.metadata.get("returncode")

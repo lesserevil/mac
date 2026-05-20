@@ -62,6 +62,29 @@ def _api_transport(client: TestClient):
     return transport
 
 
+def _verified_execution(summary: str = "tests passed") -> WorkerExecution:
+    return WorkerExecution(
+        0,
+        summary,
+        stdout=summary + "\n",
+        metadata={
+            "verification": {
+                "schema": "mac.worker_evidence.v1",
+                "status": "complete",
+                "evidence_type": "repo_change",
+                "repo": {
+                    "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+                    "pushed": True,
+                    "remote_ref": "refs/heads/task/example",
+                    "dirty": False,
+                    "files_changed": ["src/example.py"],
+                },
+                "tests": [{"command": "pytest", "returncode": 0}],
+            }
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 1: full task lifecycle through HTTP against a real on-disk DB
 # ---------------------------------------------------------------------------
@@ -91,7 +114,7 @@ def test_e2e_full_task_lifecycle_via_http_and_disk(tmp_path: Path):
         api,
         worker["id"],
         tmp_path / "workspaces",
-        lambda _t, _d: WorkerExecution(0, "tests passed", stdout="ok\n"),
+        lambda _t, _d: _verified_execution("tests passed"),
     )
     result = macworker.run_once()
     assert result.status == "submitted_for_review"
@@ -145,7 +168,7 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
             api,
             agent_id,
             tmp_path / ("ws-%s" % agent_id),
-            lambda _t, _d: WorkerExecution(0, "ok", stdout="ok\n"),
+            lambda _t, _d: _verified_execution("ok"),
         )
 
     results: Dict[str, Any] = {}

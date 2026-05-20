@@ -95,6 +95,8 @@ Move from prototype gates to production gates:
 - Reviewer independence from current or prior task owners is enforced.
 - Approved reviews must reference task evidence.
 - Evidence kinds are explicit: `test`, `review`, `artifact`, `publication`, `log`.
+- Default auto-review requires a `mac.worker_evidence.v1` verification manifest;
+  returncode `0` without verifiable repo/deployment/artifact facts is not enough.
 - Publications carry `content_hash` from publication evidence when provided.
 - Tasks with `metadata.policy.require_publication_evidence` cannot publish
   without publication evidence and checksum.

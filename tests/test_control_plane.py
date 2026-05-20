@@ -43,6 +43,38 @@ def create_runtime(cp, name="runtime"):
     )
 
 
+def verified_repo_metadata():
+    return {
+        "returncode": 0,
+        "verification": {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "repo_change",
+            "repo": {
+                "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+                "pushed": True,
+                "remote_ref": "refs/heads/task/example",
+                "dirty": False,
+                "files_changed": ["src/example.py"],
+            },
+            "tests": [{"command": "pytest tests/test_example.py", "returncode": 0}],
+        },
+    }
+
+
+def verified_deployment_metadata():
+    return {
+        "returncode": 0,
+        "verification": {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "deployment",
+            "targets": ["rocky"],
+            "checks": [{"name": "systemd status", "status": "pass"}],
+        },
+    }
+
+
 def create_verified_rollout(cp, version="1.0", strategy="canary", tenant_id=None, channel="fleet", health_policy=None):
     runtime = create_runtime(cp, "runtime-%s" % version)
     return cp.create_rollout(
@@ -514,7 +546,7 @@ def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
         "artifact://worker-result",
         "tests passed",
         worker.id,
-        metadata={"returncode": 0},
+        metadata=verified_repo_metadata(),
     )
 
     cp.submit_for_review(task.id, worker.id)
@@ -548,7 +580,7 @@ def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
         "artifact://worker-result",
         "tests passed",
         worker.id,
-        metadata={"returncode": 0},
+        metadata=verified_repo_metadata(),
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -571,7 +603,7 @@ def test_default_review_tick_processes_backlog(cp):
         "artifact://worker-result",
         "tests passed",
         worker.id,
-        metadata={"returncode": 0},
+        metadata=verified_repo_metadata(),
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -581,6 +613,80 @@ def test_default_review_tick_processes_backlog(cp):
     assert report["results"][0]["status"] == "published"
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
     assert cp.list_reviews(task.id)[0].reviewer_agent_id == reviewer.id
+
+
+def test_default_review_workflow_waits_for_verifiable_evidence(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Thin evidence", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "executor says ok",
+        worker.id,
+        metadata={"returncode": 0},
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_verifiable_evidence"
+    assert result["reason"] == "evidence_not_verifiable"
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+    assert cp.list_reviews(task.id) == []
+    assert cp.list_publications(task.id) == []
+
+
+def test_default_review_workflow_rejects_unpushed_repo_manifest(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Local-only code", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    metadata = verified_repo_metadata()
+    metadata["verification"]["repo"]["pushed"] = False
+    metadata["verification"]["repo"].pop("remote_ref")
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "local diff only",
+        worker.id,
+        metadata=metadata,
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_verifiable_evidence"
+    assert "repo evidence requires pushed=true" in result["rejected_evidence"][0]["problems"][-1]
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
+def test_default_review_workflow_allows_verified_deployment_evidence(cp):
+    worker = register_agent(cp, "worker", ["ops"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Deploy thing", required_capabilities=["ops"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://deploy-result",
+        "deployment verified",
+        worker.id,
+        metadata=verified_deployment_metadata(),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "published"
+    assert cp.list_reviews(task.id)[0].reviewer_agent_id == reviewer.id
+    assert cp.list_reviews(task.id)[0].evidence_id == evidence.id
 
 
 def test_dispatcher_matches_capabilities_and_expired_leases_recover(cp):

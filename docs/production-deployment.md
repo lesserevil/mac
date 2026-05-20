@@ -171,9 +171,19 @@ executor command is the intended production worker. Successful executions write
 log evidence, move tasks to `needs_review`, and ask the control plane to run
 the default review workflow. The default workflow assigns a healthy agent that
 has never owned the task as reviewer, records an approval against successful
-executor evidence, and publishes/completes the task unless the task policy
-requires explicit publication evidence. Failed executions fail the task with
-evidence attached.
+executor evidence, and publishes/completes the task only when the evidence is
+verifiable. Failed executions fail the task with evidence attached.
+
+Executor success is not completion. A zero return code only means the executor
+reported without crashing. For the default workflow to auto-approve and publish,
+the evidence metadata must include a `mac.worker_evidence.v1` verification
+manifest. Repo/code work must include a pushed git artifact (`head_sha`,
+`remote_ref` or PR URL, `pushed=true`, `dirty=false`, changed files) plus at
+least one passing test/check. Documentation or investigation work must include a
+pushed repo artifact or explicit artifacts plus passing checks. Deployment work
+must include deployment targets/services and passing checks. Thin reports,
+local-only diffs, missing manifests, failing checks, or unverifiable claims stay
+in `needs_review`/`reviewing` for manual handling.
 
 During execution, the worker renews its active task lease. A successful renewal
 also refreshes the owning agent's `last_seen_at`, keeps it `busy`, and preserves

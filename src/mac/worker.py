@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -512,13 +513,14 @@ class MacWorker:
                 {
                     "returncode": execution.returncode,
                     "summary": execution.summary,
-                    "metadata": execution.metadata,
+                    "metadata": self._execution_metadata(task_dir, execution),
                 },
                 indent=2,
                 sort_keys=True,
             ),
             encoding="utf-8",
         )
+        metadata = self._execution_metadata(task_dir, execution)
         return self.client.post(
             "/tasks/%s/evidence" % quote(task_id, safe=""),
             {
@@ -530,10 +532,51 @@ class MacWorker:
                     "returncode": execution.returncode,
                     "stdout": (task_dir / "stdout.txt").resolve().as_uri(),
                     "stderr": (task_dir / "stderr.txt").resolve().as_uri(),
-                    **execution.metadata,
+                    **metadata,
                 },
             },
         )
+
+    def _execution_metadata(self, task_dir: Path, execution: WorkerExecution) -> JsonDict:
+        metadata = dict(execution.metadata)
+        metadata.setdefault("verification", self._load_verification_manifest(task_dir))
+        metadata.setdefault(
+            "workspace_outputs",
+            {
+                "stdout_sha256": _sha256_file(task_dir / "stdout.txt"),
+                "stderr_sha256": _sha256_file(task_dir / "stderr.txt"),
+            },
+        )
+        return metadata
+
+    def _load_verification_manifest(self, task_dir: Path) -> JsonDict:
+        manifest_path = task_dir / "mac-evidence.json"
+        if not manifest_path.exists():
+            return {
+                "schema": "mac.worker_evidence.v1",
+                "status": "missing",
+                "problems": ["mac-evidence.json was not produced by the executor"],
+            }
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - malformed evidence should be captured, not crash reporting
+            return {
+                "schema": "mac.worker_evidence.v1",
+                "status": "invalid",
+                "problems": ["could not parse mac-evidence.json: %s" % exc],
+                "uri": manifest_path.resolve().as_uri(),
+            }
+        if not isinstance(loaded, dict):
+            return {
+                "schema": "mac.worker_evidence.v1",
+                "status": "invalid",
+                "problems": ["mac-evidence.json must contain a JSON object"],
+                "uri": manifest_path.resolve().as_uri(),
+            }
+        loaded.setdefault("schema", "mac.worker_evidence.v1")
+        loaded.setdefault("uri", manifest_path.resolve().as_uri())
+        loaded.setdefault("sha256", _sha256_file(manifest_path))
+        return loaded
 
     def _heartbeat(self) -> None:
         payload: JsonDict = {"status": "idle"}
@@ -609,6 +652,17 @@ def _summary_from_output(returncode: int, stdout: str, stderr: str) -> str:
 
 def _safe_path_component(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)[:180]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return ""
+    return "sha256:%s" % digest.hexdigest()
 
 
 def _stable_id(prefix: str, value: str) -> str:

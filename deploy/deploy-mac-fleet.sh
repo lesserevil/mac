@@ -1347,6 +1347,9 @@ def main() -> int:
             "You are running as a MAC fleet worker. Complete the assigned task from first principles.",
             "Use the task JSON as the source of truth. Preserve secrets and do not print bearer tokens.",
             "When you finish, report the exact outcome, files changed, tests run, and any blockers.",
+            "Also write a verifiable evidence manifest to $MAC_TASK_WORKSPACE/mac-evidence.json.",
+            "Use schema mac.worker_evidence.v1 with status=complete and evidence_type set to one of repo_change, documentation, investigation, deployment, test, artifact, or no_change.",
+            "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
             "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
         ]
     )
