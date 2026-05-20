@@ -46,3 +46,18 @@ def test_fleet_agent_configs_use_distinct_hermes_models():
         assert values["MAC_HERMES_GATEWAY_PROVIDER"] == "custom"
 
     assert len(set(models)) == len(models)
+
+
+def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert "BEADS_REPO_URL=\"${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}\"" in script
+    assert "install_beads_cli()" in script
+    source_install_block = script.split('mv "$SRC_DIR.new" "$SRC_DIR"', 1)[1].split(
+        'log "creating/updating mac environment file"', 1
+    )[0]
+    assert "install_beads_cli" in source_install_block
+    assert 'values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")' in script
+    assert '[_beads_cli(), "ready", "--json"]' in (
+        ROOT / "src" / "mac" / "services.py"
+    ).read_text(encoding="utf-8")

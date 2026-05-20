@@ -183,6 +183,7 @@ MAC_PORT="${MAC_PORT:-8789}"
 SRC_DIR="$MAC_HOME/src/mac"
 VENV="$MAC_HOME/venv"
 HERMES_DIR="$MAC_HOME/hermes-agent"
+BEADS_DIR="$MAC_HOME/vendor/beads"
 ENV_FILE="$MAC_HOME/mac.env"
 LOG_DIR="$MAC_HOME/logs"
 DEPLOY_LOG="$LOG_DIR/deploy-${DEPLOY_TS}.log"
@@ -206,6 +207,8 @@ MAC_AGENT_UNIT_BACKUP=""
 MAC_PLIST_BACKUP=""
 HERMES_PLIST_BACKUP=""
 MAC_AGENT_PLIST_BACKUP=""
+BEADS_REPO_URL="${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}"
+BEADS_REF="${MAC_DEPLOY_BEADS_REF:-main}"
 
 mkdir -p "$LOG_DIR" "$MAC_HOME/backups"
 exec > >(tee -a "$DEPLOY_LOG") 2>&1
@@ -236,7 +239,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -433,12 +436,16 @@ manifest = {
             "timeout_seconds": int(os.environ.get("DRAIN_TIMEOUT_SECONDS") or 0),
             "poll_seconds": int(os.environ.get("DRAIN_POLL_SECONDS") or 0),
         },
+        "beads_repo_url": os.environ.get("BEADS_REPO_URL") or None,
+        "beads_ref": os.environ.get("BEADS_REF") or None,
     },
     "paths": {
         "mac_home": str(mac_home),
         "source": str(Path(os.environ["SRC_DIR"])),
         "mac_venv": str(Path(os.environ["VENV"])),
         "hermes_agent": str(hermes_dir),
+        "beads_source": str(Path(os.environ["BEADS_DIR"])),
+        "beads_cli": str(mac_home / "bin" / "bd"),
         "env_file": str(Path(os.environ["ENV_FILE"])),
     },
     "python": {
@@ -451,6 +458,7 @@ manifest = {
         "mac_source": file_ref(os.environ["SRC_DIR"]),
         "mac_database": file_ref(mac_home / "mac.db"),
         "hermes_agent": file_ref(hermes_dir),
+        "beads_cli": file_ref(mac_home / "bin" / "bd"),
         "hermes_state": file_ref(Path.home() / ".hermes"),
         "acc_state": file_ref(Path.home() / ".acc"),
     },
@@ -759,6 +767,42 @@ clear_mac_agent_drain_after_deploy() {
   fi
   log "clearing drain state for $agent_id"
   mac_api_json POST "/agents/$agent_id/heartbeat" '{"status":"idle","health_status":"healthy"}' >/dev/null || true
+}
+
+install_beads_cli() {
+  local target="$MAC_HOME/bin/bd" existing
+  mkdir -p "$MAC_HOME/bin" "$(dirname "$BEADS_DIR")"
+  if [ -x "$target" ]; then
+    log "bd CLI already installed at $target"
+    "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
+    return 0
+  fi
+  if existing="$(command -v bd 2>/dev/null)" && [ -x "$existing" ]; then
+    log "copying existing bd CLI from $existing to managed mac bin"
+    if [ "$existing" != "$target" ]; then
+      cp "$existing" "$target"
+      chmod 0755 "$target"
+    fi
+    "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
+    return 0
+  fi
+  for required in git make go; do
+    if ! command -v "$required" >/dev/null 2>&1; then
+      log "ERROR: bd CLI is required for Beads lifecycle sync, but $required is unavailable"
+      exit 1
+    fi
+  done
+  log "building bd CLI from $BEADS_REPO_URL@$BEADS_REF"
+  if [ -d "$BEADS_DIR/.git" ]; then
+    git -C "$BEADS_DIR" fetch --quiet origin "$BEADS_REF"
+  else
+    git clone --quiet "$BEADS_REPO_URL" "$BEADS_DIR"
+    git -C "$BEADS_DIR" fetch --quiet origin "$BEADS_REF"
+  fi
+  git -C "$BEADS_DIR" checkout --quiet FETCH_HEAD
+  make -C "$BEADS_DIR" build
+  install -m 0755 "$BEADS_DIR/bd" "$target"
+  "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
 }
 
 normalize_hermes_redaction_env() {
@@ -1209,6 +1253,8 @@ fi
 mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
+install_beads_cli
+
 log "creating/updating mac environment file"
 "$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" <<'PY'
 from pathlib import Path
@@ -1256,6 +1302,7 @@ values["MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM"] = "1"
 values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
 values["MAC_SELF_UPDATE_REPO"] = str(mac_home / "src" / "mac")
+values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")
 if configured_gateway_model:
     values["MAC_HERMES_GATEWAY_MODEL"] = configured_gateway_model
     values["ACC_HERMES_GATEWAY_MODEL"] = configured_gateway_model

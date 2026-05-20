@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shutil
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -116,6 +117,24 @@ def _manifest_list(value: Any) -> List[Any]:
 def _truthy_env(name: str, default: str = "") -> bool:
     value = os.environ.get(name, default).strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _beads_cli() -> str:
+    configured = os.environ.get("MAC_BEADS_CLI", "").strip()
+    if configured:
+        return str(Path(configured).expanduser())
+    found = shutil.which("bd")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".mac" / "bin" / "bd",
+        Path.home() / ".local" / "bin" / "bd",
+        Path("/usr/local/bin/bd"),
+        Path("/opt/homebrew/bin/bd"),
+    ):
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return "bd"
 
 
 def _safe_slug(value: str) -> str:
@@ -2529,7 +2548,7 @@ class ControlPlane:
             return self._ready_beads_issues_from_jsonl(repo_path)
         try:
             completed = subprocess.run(
-                ["bd", "ready", "--json"],
+                [_beads_cli(), "ready", "--json"],
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
@@ -2668,7 +2687,7 @@ class ControlPlane:
             return
         try:
             completed = subprocess.run(
-                ["bd", "--actor", actor, *args],
+                [_beads_cli(), "--actor", actor, *args],
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,

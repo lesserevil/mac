@@ -1585,6 +1585,8 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     cp.poll_beads_repositories(force=True)
     task = cp.get_task(cp.list_project_items()[0].task_id)
     worker = register_agent(cp, "worker", ["python"])
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
     calls = []
 
     def fake_run(command, cwd, capture_output, text, timeout, check):
@@ -1603,12 +1605,12 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "canary failed"})
 
     assert calls[0] == {
-        "command": ["bd", "--actor", worker.id, "update", "mac-sync", "--claim"],
+        "command": [bd_cli, "--actor", worker.id, "update", "mac-sync", "--claim"],
         "cwd": str(repo),
     }
     assert calls[1]["cwd"] == str(repo)
     assert calls[1]["command"][:7] == [
-        "bd",
+        bd_cli,
         "--actor",
         worker.id,
         "update",
@@ -1650,6 +1652,8 @@ def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkey
     metadata = claimed.metadata
     metadata["acc_metadata"]["beads_sync_claim_on_claim"] = True
     cp.store.execute("UPDATE tasks SET metadata = ? WHERE id = ?", (json.dumps(metadata), task.id))
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
     calls = []
 
     class Completed:
@@ -1659,7 +1663,7 @@ def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkey
             self.stderr = stderr
 
     def fake_run(command, cwd, capture_output, text, timeout, check):
-        if command == ["bd", "ready", "--json"]:
+        if command == [bd_cli, "ready", "--json"]:
             return Completed(returncode=1, stderr="no beads database")
         calls.append({"command": command, "cwd": cwd})
         return Completed()
@@ -1670,7 +1674,7 @@ def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkey
 
     assert calls == [
         {
-            "command": ["bd", "--actor", worker.id, "update", "mac-reconcile", "--claim"],
+            "command": [bd_cli, "--actor", worker.id, "update", "mac-reconcile", "--claim"],
             "cwd": str(repo),
         }
     ]
@@ -1699,6 +1703,8 @@ def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch
     task = cp.get_task(cp.list_project_items()[0].task_id)
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
     calls = []
 
     def fake_run(command, cwd, capture_output, text, timeout, check):
@@ -1722,12 +1728,12 @@ def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch
     cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
 
     assert calls[0] == {
-        "command": ["bd", "--actor", worker.id, "update", "mac-close", "--claim"],
+        "command": [bd_cli, "--actor", worker.id, "update", "mac-close", "--claim"],
         "cwd": str(repo),
     }
     assert calls[1] == {
         "command": [
-            "bd",
+            bd_cli,
             "--actor",
             reviewer.id,
             "close",
