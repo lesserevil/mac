@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -70,6 +71,7 @@ class SubprocessExecutor:
 
     def __call__(self, task: JsonDict, task_dir: Path) -> WorkerExecution:
         env = os.environ.copy()
+        repository_context = _load_repository_context(task_dir)
         env.update(
             {
                 "MAC_TASK_ID": task["id"],
@@ -77,6 +79,8 @@ class SubprocessExecutor:
                 "MAC_TASK_WORKSPACE": str(task_dir),
             }
         )
+        if repository_context:
+            env.update(_repository_context_env(repository_context))
         command_id = _command_audit_id()
         started_at = _utcnow()
         started_monotonic = time.monotonic()
@@ -89,6 +93,7 @@ class SubprocessExecutor:
             "started_at": started_at,
             "metadata": {
                 "argv_sha256": _sha256_text(json.dumps(self.argv, separators=(",", ":"))),
+                **_repository_context_audit_metadata(repository_context),
                 **ensure_json_object(self.audit_context.get("metadata")),
             },
         }
@@ -1031,11 +1036,115 @@ class MacWorker:
     def _prepare_task_workspace(self, task: JsonDict, lease: JsonDict) -> Path:
         task_dir = self.workspace / _safe_path_component(task["id"])
         task_dir.mkdir(parents=True, exist_ok=True)
+        repository_context = self._prepare_repository_worktree(task, lease, task_dir)
+        if repository_context is not None:
+            metadata = task.setdefault("metadata", {})
+            if isinstance(metadata, dict):
+                runtime = metadata.setdefault("runtime", {})
+                if isinstance(runtime, dict):
+                    runtime.update(repository_context)
+            (task_dir / "repository-worktree.json").write_text(
+                json.dumps(repository_context, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
         (task_dir / "task.json").write_text(
             json.dumps({"task": task, "lease": lease}, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         return task_dir
+
+    def _prepare_repository_worktree(
+        self,
+        task: JsonDict,
+        lease: JsonDict,
+        task_dir: Path,
+    ) -> Optional[JsonDict]:
+        origin = _repository_task_origin(task)
+        if origin is None:
+            return None
+        source = Path(str(origin["repository_path"])).expanduser()
+        if not source.exists():
+            raise RuntimeError("repository source path does not exist: %s" % source)
+
+        top_level = _run_git(source, ["rev-parse", "--show-toplevel"])
+        if top_level.returncode != 0 or not top_level.stdout.strip():
+            raise RuntimeError(
+                "repository source path is not a git worktree: %s" % source
+            )
+        source_root = Path(top_level.stdout.strip()).resolve()
+        inside = _run_git(source_root, ["rev-parse", "--is-inside-work-tree"])
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            raise RuntimeError(
+                "repository source path is not a git worktree: %s" % source_root
+            )
+
+        dirty = _run_git(source_root, ["status", "--porcelain"])
+        if dirty.returncode != 0:
+            raise RuntimeError(
+                "could not inspect repository source status: %s"
+                % ((dirty.stderr or dirty.stdout or "").strip() or source_root)
+            )
+        dirty_paths = [line.strip() for line in dirty.stdout.splitlines() if line.strip()]
+        if dirty_paths:
+            self._observe_log(
+                "worker.repository.source_dirty",
+                level="warning",
+                subject_type="task",
+                subject_id=str(task.get("id") or ""),
+                detail={
+                    "repository_path": str(source_root),
+                    "dirty_paths": dirty_paths[:50],
+                    "dirty_path_count": len(dirty_paths),
+                },
+            )
+            raise RuntimeError(
+                "repository source checkout is dirty; refusing to run task outside an isolated clean base: %s"
+                % source_root
+            )
+
+        head = _run_git(source_root, ["rev-parse", "HEAD"])
+        if head.returncode != 0 or not head.stdout.strip():
+            raise RuntimeError(
+                "could not resolve repository source HEAD: %s"
+                % ((head.stderr or head.stdout or "").strip() or source_root)
+            )
+        base_sha = head.stdout.strip()
+        branch = _task_worktree_branch(self.agent_id, str(task.get("id") or ""), str(lease.get("id") or ""))
+        worktree_dir = task_dir / ("repo-" + _safe_path_component(str(lease.get("id") or "lease")))
+        if worktree_dir.exists():
+            existing_head = _run_git(worktree_dir, ["rev-parse", "HEAD"])
+            if existing_head.returncode == 0 and existing_head.stdout.strip():
+                raise RuntimeError(
+                    "repository task worktree already exists for this lease: %s" % worktree_dir
+                )
+            shutil.rmtree(worktree_dir)
+
+        add = _run_git(
+            source_root,
+            ["worktree", "add", "-b", branch, str(worktree_dir), base_sha],
+        )
+        if add.returncode != 0:
+            raise RuntimeError(
+                "could not create repository task worktree: %s"
+                % ((add.stderr or add.stdout or "").strip() or worktree_dir)
+            )
+        remote = _run_git(source_root, ["remote", "get-url", "origin"])
+        context: JsonDict = {
+            "schema": "mac.repository_task_worktree.v1",
+            "checkout_policy": "task_owned_git_worktree",
+            "repository_source_path": str(source_root),
+            "repository_worktree": str(worktree_dir),
+            "repository_branch": branch,
+            "repository_base_sha": base_sha,
+            "repository_origin_remote": remote.stdout.strip() if remote.returncode == 0 else "",
+        }
+        self._observe_log(
+            "worker.repository.worktree_prepared",
+            subject_type="task",
+            subject_id=str(task.get("id") or ""),
+            detail=context,
+        )
+        return context
 
     def _prepare_review_workspace(
         self,
@@ -1404,6 +1513,76 @@ def _default_self_update_repo() -> Path:
     if configured:
         return Path(configured).expanduser()
     return Path(__file__).resolve().parents[2]
+
+
+def _repository_task_origin(task: JsonDict) -> Optional[JsonDict]:
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    origin = metadata.get("origin")
+    if not isinstance(origin, dict):
+        return None
+    repository_path = str(origin.get("repository_path") or "").strip()
+    if not repository_path:
+        return None
+
+    # Dirty-source remediation tasks are the one explicit exception: their
+    # purpose is to repair the registered checkout itself.
+    remediation = metadata.get("remediation")
+    if isinstance(remediation, dict) and remediation.get("type") == "beads_source_refresh":
+        return None
+    if origin.get("type") == "beads_source_remediation":
+        return None
+
+    contract = origin.get("repository_contract")
+    execution_contract = metadata.get("execution_contract")
+    if isinstance(execution_contract, dict) and execution_contract.get("type") == "repository":
+        return {"repository_path": repository_path}
+    if isinstance(contract, dict) and contract.get("schema"):
+        return {"repository_path": repository_path}
+    if str(origin.get("type") or "") in {"beads", "direct_task"}:
+        return {"repository_path": repository_path}
+    return None
+
+
+def _task_worktree_branch(agent_id: str, task_id: str, lease_id: str) -> str:
+    agent = _safe_path_component(agent_id).strip("._-/") or "agent"
+    task = _safe_path_component(task_id).strip("._-/") or "task"
+    lease = _safe_path_component(lease_id).strip("._-/") or "lease"
+    branch = "mac/%s/%s-%s" % (agent[:32], task[:48], lease[:24])
+    return branch[:127].rstrip("./-") or "mac/agent/task"
+
+
+def _load_repository_context(task_dir: Path) -> JsonDict:
+    path = task_dir / "repository-worktree.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _repository_context_env(context: JsonDict) -> Dict[str, str]:
+    mapping = {
+        "MAC_TASK_REPO_WORKTREE": context.get("repository_worktree"),
+        "MAC_TASK_REPO_SOURCE": context.get("repository_source_path"),
+        "MAC_TASK_REPO_BRANCH": context.get("repository_branch"),
+        "MAC_TASK_REPO_BASE_SHA": context.get("repository_base_sha"),
+        "MAC_TASK_REPO_REMOTE": context.get("repository_origin_remote"),
+    }
+    return {key: str(value) for key, value in mapping.items() if value not in {None, ""}}
+
+
+def _repository_context_audit_metadata(context: JsonDict) -> JsonDict:
+    if not context:
+        return {}
+    return {
+        "repository_checkout_policy": context.get("checkout_policy"),
+        "repository_worktree": context.get("repository_worktree"),
+        "repository_source_path": context.get("repository_source_path"),
+        "repository_branch": context.get("repository_branch"),
+        "repository_base_sha": context.get("repository_base_sha"),
+    }
 
 
 def _safe_git_ref(value: str) -> bool:

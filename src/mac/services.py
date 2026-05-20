@@ -3254,7 +3254,7 @@ class ControlPlane:
             self._record_beads_source_state(actor, repo, state, "info")
             return state
         state["upstream"] = upstream["stdout"]
-        dirty = self._git_output(repo_path, ["status", "--porcelain", "--untracked-files=no"])
+        dirty = self._git_output(repo_path, ["status", "--porcelain"])
         if dirty["returncode"] != 0:
             state["status"] = "error"
             state["error"] = dirty.get("stderr") or dirty.get("stdout") or "git status failed"

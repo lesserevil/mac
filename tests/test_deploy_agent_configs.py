@@ -127,6 +127,8 @@ def test_executor_prompt_includes_repository_runtime_contract():
 
     assert "def repository_contract_section(task: dict) -> str:" in script
     assert "Repository runtime contract:" in script
+    assert "metadata.runtime.repository_worktree" in script
+    assert "origin.repository_path / $MAC_TASK_REPO_SOURCE as read-only" in script
     assert "bootstrap.command" in script
     assert "test.command" in script
 

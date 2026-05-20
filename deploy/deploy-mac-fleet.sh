@@ -1930,8 +1930,11 @@ def repository_contract_section(task: dict) -> str:
     return "\n".join(
         [
             json.dumps(summary, indent=2, sort_keys=True),
-            "For repository tasks, locate the local checkout for this project on this host.",
-            "Do not trust a repository_path absolute path if it belongs to a different machine.",
+            "For normal repository tasks, MAC prepares a task-owned git worktree before the executor starts.",
+            "Use $MAC_TASK_REPO_WORKTREE, or metadata.runtime.repository_worktree in task.json, as the only writable checkout.",
+            "Treat origin.repository_path / $MAC_TASK_REPO_SOURCE as read-only registered source state; do not edit it for feature or bug work.",
+            "The registered checkout must remain clean. Commit, test, and publish from the task worktree branch, then report the pushed ref in evidence.",
+            "Only explicit source-remediation tasks may repair origin.repository_path directly.",
             "Before build or test work, run bootstrap.command from the repository root when the declared tools or bootstrap.creates outputs are missing.",
             "Use test.command as the canonical verification command unless the task explicitly narrows the check.",
         ]

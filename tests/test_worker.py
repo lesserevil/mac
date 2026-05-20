@@ -83,6 +83,34 @@ def _commit_fixture_update(seed: Path, text: str) -> str:
     return _git(seed, "rev-parse", "HEAD")
 
 
+def _repository_task_metadata(repo: Path) -> Dict[str, Any]:
+    contract = {
+        "schema": "mac.repository_contract.v1",
+        "project": "repo-beads-mac",
+        "bootstrap": {"command": "true"},
+        "test": {"command": "true"},
+    }
+    return {
+        "origin": {
+            "type": "beads",
+            "repository_id": "repo_test",
+            "repository_name": "repo-test",
+            "repository_path": str(repo),
+            "source": "repo-beads-test",
+            "bead_id": "repo-worktree-test",
+            "repository_contract": contract,
+        },
+        "execution_contract": {
+            "schema": "mac.task_execution_contract.v1",
+            "type": "repository",
+            "quality": "strong",
+            "source": "test",
+            "repository_path": str(repo),
+            "repository_contract": contract,
+        },
+    }
+
+
 def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)
@@ -274,6 +302,162 @@ def test_mac_worker_audits_subprocess_commands(tmp_path: Path):
         limit=10,
     )
     assert {event["event_type"] for event in events} >= {"command.started", "command.completed"}
+
+
+def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    task = cp.create_task(
+        "Repository task",
+        required_capabilities=["python"],
+        metadata=_repository_task_metadata(repo),
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        runtime = task_payload["metadata"]["runtime"]
+        worktree = Path(runtime["repository_worktree"])
+        assert worktree.is_dir()
+        assert worktree.resolve() != repo.resolve()
+        assert runtime["repository_source_path"] == str(repo.resolve())
+        assert runtime["repository_base_sha"] == _git(repo, "rev-parse", "HEAD")
+        assert _git(worktree, "branch", "--show-current").startswith("mac/")
+        assert _git(worktree, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
+        assert _git(repo, "status", "--porcelain") == ""
+        assert (task_dir / "repository-worktree.json").exists()
+        return WorkerExecution(0, "repo worktree prepared", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    observations = cp.list_observability(layer="worker", limit=20)
+    assert any(item.name == "worker.repository.worktree_prepared" for item in observations)
+
+
+def test_subprocess_executor_exports_repository_worktree_env(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    task = cp.create_task(
+        "Repository subprocess task",
+        required_capabilities=["python"],
+        metadata=_repository_task_metadata(repo),
+    )
+    client = TestClient(create_app(control_plane=cp))
+    executor_script = tmp_path / "executor-env.py"
+    executor_script.write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "import json, os",
+                "workspace = Path(os.environ['MAC_TASK_WORKSPACE'])",
+                "payload = {",
+                "  'worktree': os.environ.get('MAC_TASK_REPO_WORKTREE'),",
+                "  'source': os.environ.get('MAC_TASK_REPO_SOURCE'),",
+                "  'branch': os.environ.get('MAC_TASK_REPO_BRANCH'),",
+                "  'base_sha': os.environ.get('MAC_TASK_REPO_BASE_SHA'),",
+                "}",
+                "(workspace / 'env.json').write_text(json.dumps(payload), encoding='utf-8')",
+                "manifest = {'schema': 'mac.worker_evidence.v1', 'status': 'complete', 'evidence_type': 'test'}",
+                "(workspace / 'mac-evidence.json').write_text(json.dumps(manifest), encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        SubprocessExecutor([sys.executable, str(executor_script)]),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    task_dir = tmp_path / "workspaces" / task.id
+    env_record = json.loads((task_dir / "env.json").read_text(encoding="utf-8"))
+    assert env_record["worktree"]
+    assert Path(env_record["worktree"]).is_dir()
+    assert env_record["source"] == str(repo.resolve())
+    assert env_record["branch"].startswith("mac/")
+    assert env_record["base_sha"] == _git(repo, "rev-parse", "HEAD")
+    completed = next(
+        record
+        for record in cp.list_command_audit(agent_id=agent.id, task_id=task.id, limit=10)
+        if record.phase == "completed"
+    )
+    assert completed.metadata["repository_checkout_policy"] == "task_owned_git_worktree"
+
+
+def test_mac_worker_refuses_dirty_repository_source_for_normal_work(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    task = cp.create_task(
+        "Dirty repository task",
+        required_capabilities=["python"],
+        metadata=_repository_task_metadata(repo),
+    )
+    client = TestClient(create_app(control_plane=cp))
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        lambda _task, _task_dir: WorkerExecution(0, "should not run"),
+    )
+
+    with pytest.raises(RuntimeError, match="repository source checkout is dirty"):
+        worker.run_once()
+
+    assert cp.get_task(task.id).state == TaskState.FAILED.value
+    observations = cp.list_observability(layer="worker", limit=20)
+    assert any(item.name == "worker.repository.source_dirty" for item in observations)
+    assert not any((tmp_path / "workspaces" / task.id).glob("repo-*"))
+
+
+def test_source_remediation_task_can_target_dirty_registered_checkout(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    metadata = _repository_task_metadata(repo)
+    metadata["origin"]["type"] = "beads_source_remediation"
+    metadata["remediation"] = {
+        "type": "beads_source_refresh",
+        "repository_path": str(repo),
+        "required_workflow": "git_pull_rebase_then_merge_local_changes",
+    }
+    task = cp.create_task(
+        "Repair dirty source",
+        required_capabilities=["python"],
+        metadata=metadata,
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        assert "runtime" not in task_payload["metadata"]
+        assert not any(task_dir.glob("repo-*"))
+        return WorkerExecution(0, "source repair inspected", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
 
 
 def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
