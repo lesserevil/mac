@@ -1034,6 +1034,26 @@ def test_idle_heartbeat_requires_no_active_lease(cp):
     assert refreshed.current_task_id is None
 
 
+def test_lease_renewal_refreshes_busy_agent_liveness(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("work", required_capabilities=["python"])
+    claimed, lease = cp.claim_task(task.id, worker.id)
+    old_seen = "1970-01-01T00:00:00+00:00"
+    cp.store.execute(
+        "UPDATE agents SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+        (old_seen, old_seen, worker.id),
+    )
+
+    renewed = cp.renew_lease(lease.id, worker.id)
+
+    refreshed = cp.get_agent(worker.id)
+    assert renewed.status == LeaseStatus.ACTIVE.value
+    assert refreshed.status == AgentStatus.BUSY.value
+    assert refreshed.current_task_id == claimed.id
+    assert refreshed.last_seen_at != old_seen
+    assert refreshed.updated_at == refreshed.last_seen_at
+
+
 def test_offline_heartbeat_expires_active_lease_and_requeues_work(cp):
     worker = register_agent(cp, "worker", ["python"])
     task = cp.create_task("work", required_capabilities=["python"])

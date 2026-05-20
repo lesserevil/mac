@@ -175,6 +175,11 @@ executor evidence, and publishes/completes the task unless the task policy
 requires explicit publication evidence. Failed executions fail the task with
 evidence attached.
 
+During execution, the worker renews its active task lease. A successful renewal
+also refreshes the owning agent's `last_seen_at`, keeps it `busy`, and preserves
+`current_task_id`, so long-running work remains visible as live without allowing
+an invalid `idle` heartbeat while the lease is active.
+
 For already-migrated or pre-upgrade rows that are stuck in `needs_review`, run
 the backlog tick against Rocky:
 

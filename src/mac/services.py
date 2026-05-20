@@ -956,13 +956,44 @@ class ControlPlane:
         now = utcnow()
         expires_at = (parse_time(now) + timedelta(seconds=int(lease_seconds))).isoformat(timespec="microseconds")
         with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE leases SET expires_at = ?, status = ?, updated_at = ? WHERE id = ?",
-                (expires_at, LeaseStatus.ACTIVE.value, now, lease_id),
+            lease_cursor = conn.execute(
+                """
+                UPDATE leases
+                SET expires_at = ?, updated_at = ?
+                WHERE id = ? AND agent_id = ? AND status = ?
+                """,
+                (expires_at, now, lease_id, agent_id, LeaseStatus.ACTIVE.value),
             )
+            if lease_cursor.rowcount != 1:
+                raise ValidationError("only active leases can be renewed")
+            task_cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET leased_until = ?, updated_at = ?
+                WHERE id = ?
+                  AND lease_id = ?
+                  AND owner_agent_id = ?
+                  AND state IN (?, ?)
+                """,
+                (
+                    expires_at,
+                    now,
+                    lease.task_id,
+                    lease_id,
+                    agent_id,
+                    TaskState.CLAIMED.value,
+                    TaskState.RUNNING.value,
+                ),
+            )
+            if task_cursor.rowcount != 1:
+                raise ValidationError("lease is no longer attached to an active task")
             conn.execute(
-                "UPDATE tasks SET leased_until = ?, updated_at = ? WHERE lease_id = ?",
-                (expires_at, now, lease_id),
+                """
+                UPDATE agents
+                SET status = ?, current_task_id = ?, updated_at = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (AgentStatus.BUSY.value, lease.task_id, now, now, agent_id),
             )
         self._record_history(lease.task_id, "task.lease_renewed", agent_id, None, None, {"lease_id": lease_id})
         return self.get_lease(lease_id)
