@@ -21,14 +21,29 @@ def _clear_startup_env(monkeypatch) -> None:
         "HERMES_REDACT_SECRETS",
         "HERMES_HOME",
         "MAC_HERMES_AGENT_DIR",
+        "MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM",
+        "MAC_HERMES_GATEWAY_BASE_URL",
+        "MAC_HERMES_GATEWAY_MODEL",
+        "MAC_HERMES_GATEWAY_PROVIDER",
         "MAC_HERMES_LOG_SUMMARY",
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
         "MAC_HERMES_SLACK_HOME_CHANNEL_NAME",
         "MAC_REQUIRE_HERMES_STARTUP_READY",
+        "ACC_HERMES_GATEWAY_BASE_URL",
+        "ACC_HERMES_GATEWAY_MODEL",
+        "ACC_HERMES_GATEWAY_PROVIDER",
+        "ACC_LLM_MODEL",
         "ACC_SLACK_HOME_CHANNEL_NAME",
+        "CUSTOM_BASE_URL",
+        "HERMES_INFERENCE_MODEL",
+        "HERMES_INFERENCE_PROVIDER",
+        "OPENAI_BASE_URL",
         "SLACK_BOT_TOKEN",
         "SLACK_HOME_CHANNEL_NAME",
+        "TOKENHUB_API_KEY",
+        "TOKENHUB_AGENT_KEY",
+        "TOKENHUB_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -139,6 +154,58 @@ def needs_home(source, platform_name):
     assert "_source_has_home_target" in patched
     assert "slack_home_channels.json" in patched
     assert "if not _source_has_home_target(source, platform_name, env_key):" in patched
+
+
+def test_startup_applies_gateway_runtime_model_shim(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    run_py = agent_dir / "gateway" / "run.py"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        run_py,
+        '''import os
+
+
+def _resolve_gateway_model(user_config):
+    return "upstream-default"
+
+
+def _resolve_runtime_agent_kwargs():
+    return {}
+
+
+class GatewayRunner:
+    def _resolve_session_agent_runtime(self, user_config=None):
+        model = _resolve_gateway_model(user_config)
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        return model, runtime_kwargs
+''',
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("MAC_HERMES_GATEWAY_MODEL", "azure/openai/gpt-5.5")
+    monkeypatch.setenv("MAC_HERMES_GATEWAY_PROVIDER", "custom")
+    monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.invalid:8090")
+    monkeypatch.setenv("TOKENHUB_API_KEY", "secret-tokenhub-key")
+
+    report = build_hermes_startup_report()
+    patched = run_py.read_text(encoding="utf-8")
+
+    assert report["ready"] is True
+    assert report["runtime"]["configured_model"] == "azure/openai/gpt-5.5"
+    assert report["runtime"]["provider_override_configured"] is True
+    assert report["runtime"]["base_url_override_configured"] is True
+    assert report["runtime"]["gateway_runtime_shim_patch"]["applied"] is True
+    assert report["runtime"]["gateway_runtime_shim_present"] is True
+    assert report["checks"]["gateway_runtime_override_active"] is True
+    assert "MAC_HERMES_GATEWAY_MODEL" in patched
+    assert "TOKENHUB_URL" in patched
+    assert "resolve_runtime_provider" in patched
+    assert "secret-tokenhub-key" not in str(report)
 
 
 def test_startup_applies_slack_accounts_shim_for_explicit_hermes_checkout(

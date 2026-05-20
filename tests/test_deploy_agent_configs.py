@@ -28,3 +28,21 @@ def test_fleet_agent_configs_include_hermes_home_channel():
         assert values["MAC_DEPLOY_TARGET"] == target
         assert values["MAC_DEPLOY_OS"] == os_kind
         assert values["MAC_HERMES_SLACK_HOME_CHANNEL_NAME"] == "rockyandfriends"
+
+
+def test_fleet_agent_configs_use_distinct_hermes_models():
+    expected_models = {
+        "rocky": "azure/openai/gpt-5.5",
+        "natasha": "azure/anthropic/claude-opus-4-7",
+        "bullwinkle": "gcp/google/gemini-2.5-pro",
+    }
+    models = []
+
+    for agent, expected_model in expected_models.items():
+        values = parse_env(ROOT / "deploy" / "agents" / agent / "config.env")
+        model = values["MAC_HERMES_GATEWAY_MODEL"]
+        models.append(model)
+        assert model == expected_model
+        assert values["MAC_HERMES_GATEWAY_PROVIDER"] == "custom"
+
+    assert len(set(models)) == len(models)

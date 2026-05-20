@@ -79,6 +79,16 @@ Relevant environment:
 - `MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM=0`: disable the startup shim patcher
   when `MAC_HERMES_AGENT_DIR` points at an explicit checkout. It is enabled by
   default only for explicit checkout paths.
+- `MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM=0`: disable startup patching of
+  upstream Hermes gateway model/runtime overrides.
+- `MAC_HERMES_GATEWAY_MODEL`: per-agent model selector. Fleet deploy also
+  mirrors it to `HERMES_INFERENCE_MODEL` so gateway conversations and worker
+  oneshot execution use the same model on that host.
+- `MAC_HERMES_GATEWAY_PROVIDER`: provider selector for the per-agent model.
+  The Rocky/Natasha/Bullwinkle fleet uses `custom` with TokenHub as the shared
+  OpenAI-compatible endpoint.
+- `MAC_HERMES_GATEWAY_BASE_URL`: optional explicit base URL. Usually omitted
+  when `TOKENHUB_URL` is available because mac derives `${TOKENHUB_URL}/v1`.
 - `MAC_HERMES_STARTUP_CHECK=0`: disable the check.
 - `MAC_REQUIRE_HERMES_STARTUP_READY=1`: fail startup when warnings are present.
 - `MAC_HERMES_SLACK_HOME_CHANNEL_NAME`: Slack home-channel name, without `#`,
@@ -93,6 +103,13 @@ explicit Slack config. If a deployed agent relies only on
 ACC's `deploy/setup-hermes-venv.sh` when `MAC_HERMES_AGENT_DIR` explicitly
 points at the Hermes checkout. Without an explicit checkout path, `mac` only
 reports that the shim is missing and marks startup unready.
+
+The same explicit-checkout rule applies to the gateway runtime shim. When a
+per-agent model/provider/base URL is configured, `mac` patches upstream Hermes
+`gateway/run.py` so the gateway resolves runtime credentials from TokenHub or
+host-local secrets while preserving the agent-specific model. This is how mac
+keeps Rocky, Natasha, and Bullwinkle on different model families for review
+diversity without forking Hermes or storing provider secrets in Git.
 
 ## Creating Tasks
 

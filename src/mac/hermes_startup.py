@@ -264,6 +264,142 @@ def _slack_home_channel_shim_present(agent_dir: Optional[Path]) -> bool:
     return "_source_has_home_target" in text and "slack_home_channels.json" in text
 
 
+def _gateway_runtime_shim_present(agent_dir: Optional[Path]) -> bool:
+    if agent_dir is None:
+        return False
+    run_py = agent_dir / "gateway" / "run.py"
+    text = _read_small_text(run_py)
+    return (
+        "MAC_HERMES_GATEWAY_MODEL" in text
+        and "MAC_HERMES_GATEWAY_PROVIDER" in text
+        and "resolve_runtime_provider" in text
+    )
+
+
+def _configured_gateway_model() -> str:
+    return (
+        os.environ.get("MAC_HERMES_GATEWAY_MODEL")
+        or os.environ.get("ACC_HERMES_GATEWAY_MODEL")
+        or os.environ.get("HERMES_INFERENCE_MODEL")
+        or os.environ.get("ACC_LLM_MODEL")
+        or ""
+    ).strip()
+
+
+def _configured_gateway_provider() -> str:
+    return (
+        os.environ.get("MAC_HERMES_GATEWAY_PROVIDER")
+        or os.environ.get("ACC_HERMES_GATEWAY_PROVIDER")
+        or os.environ.get("HERMES_INFERENCE_PROVIDER")
+        or ""
+    ).strip()
+
+
+def _configured_gateway_base_url_present() -> bool:
+    return bool(
+        (
+            os.environ.get("MAC_HERMES_GATEWAY_BASE_URL")
+            or os.environ.get("ACC_HERMES_GATEWAY_BASE_URL")
+            or os.environ.get("TOKENHUB_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("NVIDIA_API_BASE")
+            or ""
+        ).strip()
+    )
+
+
+def _apply_gateway_runtime_shim(agent_dir: Path) -> Dict[str, Any]:
+    run_py = agent_dir / "gateway" / "run.py"
+    result = {
+        "attempted": True,
+        "applied": False,
+        "path": str(run_py),
+        "error": "",
+    }
+    try:
+        text = run_py.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        result["attempted"] = False
+        return result
+    except OSError as exc:
+        result["error"] = "cannot read Hermes gateway/run.py: %s" % exc
+        return result
+
+    if "MAC_HERMES_GATEWAY_MODEL" in text:
+        return result
+
+    model_needle = "        model = _resolve_gateway_model(user_config)\n"
+    model_patch = '''        model = _resolve_gateway_model(user_config)
+        mac_gateway_model = (
+            os.environ.get("MAC_HERMES_GATEWAY_MODEL")
+            or os.environ.get("ACC_HERMES_GATEWAY_MODEL")
+            or os.environ.get("HERMES_INFERENCE_MODEL")
+            or os.environ.get("ACC_LLM_MODEL")
+            or ""
+        ).strip()
+        if mac_gateway_model:
+            logger.info("mac gateway model override active: %s", mac_gateway_model)
+            model = mac_gateway_model
+'''
+    if model_needle not in text:
+        result["error"] = "cannot patch Hermes gateway model override; upstream gateway/run.py changed"
+        return result
+    text = text.replace(model_needle, model_patch, 1)
+
+    runtime_needle = "        runtime_kwargs = _resolve_runtime_agent_kwargs()\n"
+    runtime_patch = '''        mac_gateway_provider = (
+            os.environ.get("MAC_HERMES_GATEWAY_PROVIDER")
+            or os.environ.get("ACC_HERMES_GATEWAY_PROVIDER")
+            or os.environ.get("HERMES_INFERENCE_PROVIDER")
+            or ""
+        ).strip()
+        mac_gateway_base_url = (
+            os.environ.get("MAC_HERMES_GATEWAY_BASE_URL")
+            or os.environ.get("ACC_HERMES_GATEWAY_BASE_URL")
+            or ((os.environ.get("TOKENHUB_URL") or "").rstrip("/") + "/v1" if os.environ.get("TOKENHUB_URL") else "")
+            or os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("NVIDIA_API_BASE")
+            or ""
+        ).strip()
+        mac_gateway_api_key = (
+            os.environ.get("MAC_HERMES_GATEWAY_API_KEY")
+            or os.environ.get("ACC_HERMES_GATEWAY_API_KEY")
+            or os.environ.get("TOKENHUB_API_KEY")
+            or os.environ.get("TOKENHUB_AGENT_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("NVIDIA_API_KEY")
+            or ""
+        ).strip()
+        if mac_gateway_model or mac_gateway_provider or mac_gateway_base_url:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime_kwargs = resolve_runtime_provider(
+                requested=mac_gateway_provider or "custom",
+                explicit_base_url=mac_gateway_base_url or None,
+                explicit_api_key=mac_gateway_api_key or None,
+                target_model=model or None,
+            )
+            logger.info(
+                "mac gateway runtime override active: provider=%s base_url=%s",
+                runtime_kwargs.get("provider"),
+                runtime_kwargs.get("base_url"),
+            )
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+'''
+    if runtime_needle not in text:
+        result["error"] = "cannot patch Hermes gateway runtime override; upstream gateway/run.py changed"
+        return result
+    text = text.replace(runtime_needle, runtime_patch, 1)
+
+    try:
+        run_py.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        result["error"] = "cannot write Hermes gateway/run.py: %s" % exc
+        return result
+    result["applied"] = True
+    return result
+
+
 def _apply_slack_account_activation_shim(agent_dir: Path) -> Dict[str, Any]:
     config_py = agent_dir / "gateway" / "config.py"
     result = {
@@ -526,6 +662,68 @@ def _maybe_apply_slack_home_channel_shim(
     }
 
 
+def _maybe_apply_gateway_runtime_shim(
+    agent_dir: Optional[Path],
+    explicit_agent_dir: bool,
+    shim_present: bool,
+) -> Dict[str, Any]:
+    result = {
+        "enabled": explicit_agent_dir
+        and _env_enabled("MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM", True),
+        "attempted": False,
+        "applied": False,
+        "path": str(agent_dir / "gateway" / "run.py") if agent_dir is not None else None,
+        "error": "",
+    }
+    if not result["enabled"] or agent_dir is None or shim_present:
+        return result
+    return {
+        "enabled": True,
+        **_apply_gateway_runtime_shim(agent_dir),
+    }
+
+
+def apply_hermes_gateway_runtime_shim_report(
+    agent_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if agent_dir is None:
+        agent_dir, explicit_agent_dir = _hermes_agent_dir_info()
+    else:
+        agent_dir = Path(agent_dir).expanduser()
+        explicit_agent_dir = True
+
+    shim_present = _gateway_runtime_shim_present(agent_dir)
+    shim_patch = _maybe_apply_gateway_runtime_shim(
+        agent_dir,
+        explicit_agent_dir,
+        shim_present,
+    )
+    if shim_patch["applied"]:
+        shim_present = _gateway_runtime_shim_present(agent_dir)
+
+    configured_model = _configured_gateway_model()
+    configured_provider = _configured_gateway_provider()
+    base_url_configured = _configured_gateway_base_url_present()
+    warnings = []
+    if (configured_model or configured_provider or base_url_configured) and not shim_present:
+        detail = shim_patch["error"] or "gateway runtime shim is missing"
+        warnings.append(
+            "Hermes gateway model/runtime override is configured but inactive: %s"
+            % detail
+        )
+
+    return {
+        "hermes_agent_dir": str(agent_dir) if agent_dir is not None else None,
+        "hermes_agent_dir_explicit": explicit_agent_dir,
+        "configured_model": configured_model or None,
+        "provider_override_configured": bool(configured_provider),
+        "base_url_override_configured": base_url_configured,
+        "gateway_runtime_shim_present": shim_present,
+        "gateway_runtime_shim_patch": shim_patch,
+        "warnings": warnings,
+    }
+
+
 def _slack_activation_report(
     hermes_home: Path,
     hermes_refs: List[Dict[str, Any]],
@@ -639,6 +837,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "warnings": [],
             "state_refs": [],
             "slack": {"activation_source": "startup_check_disabled"},
+            "runtime": {
+                "configured_model": None,
+                "gateway_runtime_shim_present": False,
+                "warnings": [],
+            },
             "security": {
                 "secret_redaction": {"effective": True, "source": "startup_check_disabled"}
             },
@@ -652,6 +855,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     acc_refs = _refs(acc_dir, ACC_STATE_REF_CANDIDATES)
     state_refs = hermes_refs + acc_refs
     slack = _slack_activation_report(hermes_home, hermes_refs)
+    runtime = apply_hermes_gateway_runtime_shim_report()
     secret_redaction = _secret_redaction_report(hermes_home, acc_dir)
     logs = _log_classification_report()
 
@@ -668,6 +872,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         warnings.append("Hermes state.db is missing")
     if slack["warning"]:
         warnings.append(slack["warning"])
+    warnings.extend(runtime["warnings"])
     warnings.extend(secret_redaction["warnings"])
     warnings.extend(logs["warnings"])
 
@@ -684,6 +889,14 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "secret_redaction_enabled": bool(secret_redaction["effective"])
         and not secret_redaction["drift_detected"],
         "logs_have_no_actionable_classes": not bool(logs["actionable_count"]),
+        "gateway_runtime_override_active": (
+            not (
+                runtime["configured_model"]
+                or runtime["provider_override_configured"]
+                or runtime["base_url_override_configured"]
+            )
+            or bool(runtime["gateway_runtime_shim_present"])
+        ),
     }
     state_refs_existing = sum(1 for ref in state_refs if ref["exists"])
     operator_status = "healthy" if not warnings else "degraded"
@@ -697,12 +910,15 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "warnings": warnings,
         "state_refs": state_refs,
         "slack": slack,
+        "runtime": runtime,
         "security": {"secret_redaction": secret_redaction},
         "logs": logs,
         "operator_health": {
             "status": operator_status,
             "state_refs_existing": state_refs_existing,
             "slack_activation_source": slack["activation_source"],
+            "gateway_model": runtime["configured_model"],
+            "gateway_runtime_shim_present": runtime["gateway_runtime_shim_present"],
             "secret_redaction_effective": secret_redaction["effective"],
             "log_actionable_count": logs["actionable_count"],
         },

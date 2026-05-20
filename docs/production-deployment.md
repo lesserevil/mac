@@ -31,6 +31,10 @@ deploying more than one writer.
 | `ACC_DIR` | no | Legacy ACC data directory checked for migration/state references. Default `~/.acc`. |
 | `MAC_HERMES_AGENT_DIR` | no | Hermes checkout inspected for the `slack_accounts.json` activation shim. Falls back to `HERMES_AGENT_DIR`, then `~/Src/hermes-agent` if present. |
 | `MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM` | no | Set `0` to disable startup patching of an explicit `MAC_HERMES_AGENT_DIR`. Default enabled only when the checkout path is explicit. |
+| `MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM` | no | Set `0` to disable startup patching of Hermes gateway model/runtime overrides. Default enabled for explicit checkout paths. |
+| `MAC_HERMES_GATEWAY_MODEL` | no | Per-agent model used by Hermes gateway conversations and mirrored to `HERMES_INFERENCE_MODEL` for oneshot worker execution. |
+| `MAC_HERMES_GATEWAY_PROVIDER` | no | Runtime provider for the per-agent model. Fleet deploy uses `custom` so TokenHub remains the shared OpenAI-compatible endpoint. |
+| `MAC_HERMES_GATEWAY_BASE_URL` | no | Optional explicit OpenAI-compatible base URL. Usually omitted because deployed hosts derive TokenHub's `/v1` endpoint from `TOKENHUB_URL`. |
 | `MAC_HERMES_STARTUP_CHECK` | no | Set `0` to disable Hermes state and Slack startup checks. Enabled by default. |
 | `MAC_REQUIRE_HERMES_STARTUP_READY` | no | Set `1` to fail `mac` startup when Hermes soul/memory/state references or Slack activation are not ready. |
 | `MAC_HERMES_SLACK_HOME_CHANNEL_NAME` | no | Slack home-channel name, without `#`, used to write `~/.hermes/slack_home_channels.json` from `slack_accounts.json`. Default `rockyandfriends`. |
@@ -86,14 +90,31 @@ deploy/deploy-mac-fleet.sh
 ```
 
 Per-agent deploy settings live in `deploy/agents/<agent>/config.env`. The
-committed fleet configs set `MAC_DEPLOY_TARGET`, `MAC_DEPLOY_OS`, and
-`MAC_HERMES_SLACK_HOME_CHANNEL_NAME`; host-local secret env files still own
-tokens. Override `MAC_DEPLOY_AGENT_CONFIG_DIR` to test an alternate config set.
+committed fleet configs set `MAC_DEPLOY_TARGET`, `MAC_DEPLOY_OS`,
+`MAC_HERMES_SLACK_HOME_CHANNEL_NAME`, and a distinct
+`MAC_HERMES_GATEWAY_MODEL` for each agent. Host-local secret env files still
+own tokens. Override `MAC_DEPLOY_AGENT_CONFIG_DIR` to test an alternate config
+set.
+
+The default fleet intentionally avoids model monoculture:
+
+| Agent | Hermes model |
+|---|---|
+| Rocky | `azure/openai/gpt-5.5` |
+| Natasha | `azure/anthropic/claude-opus-4-7` |
+| Bullwinkle | `gcp/google/gemini-2.5-pro` |
+
+Fleet deploy mirrors each configured model into `ACC_HERMES_GATEWAY_MODEL`,
+`HERMES_INFERENCE_MODEL`, and `ACC_LLM_MODEL` so upstream Hermes gateway turns
+and `mac-hermes-task-executor` oneshot work use the same per-agent identity.
+Credentials remain in TokenHub or inherited host-local env files; mac only
+writes model/provider selectors.
 
 It ships this repository to each host, installs `mac` into `~/.mac/venv`,
 redeploys upstream `NousResearch/hermes-agent` into `~/.mac/hermes-agent`,
 applies the minimal multi-Slack Hermes patch, preinstalls configured Hermes
-messaging dependencies before service start, runs the ACC SQLite migration
+messaging dependencies before service start, applies the Hermes gateway
+model/runtime shim, runs the ACC SQLite migration
 dry-run and import from `~/.acc/data/fleet.db` or `~/.acc/data/acc.db`, and
 starts a local `mac` service. Linux hosts get `mac.service`; macOS hosts get
 `com.mac.control-plane`. The same deployment also starts a mac-managed Hermes

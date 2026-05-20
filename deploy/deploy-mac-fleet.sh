@@ -62,6 +62,9 @@ agent_spec() {
 $legacy
 EOF
     MAC_HERMES_SLACK_HOME_CHANNEL_NAME=""
+    MAC_HERMES_GATEWAY_MODEL=""
+    MAC_HERMES_GATEWAY_PROVIDER="custom"
+    MAC_HERMES_GATEWAY_BASE_URL=""
     MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
     MAC_DEPLOY_CONTROL_BIND_HOST=""
     MAC_DEPLOY_WORKER_MODE="heartbeat"
@@ -83,11 +86,14 @@ EOF
         MAC_DEPLOY_CONTROL_BIND_HOST="127.0.0.1"
       fi
     fi
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
       "$MAC_DEPLOY_AGENT" \
       "$MAC_DEPLOY_TARGET" \
       "$MAC_DEPLOY_OS" \
       "${MAC_HERMES_SLACK_HOME_CHANNEL_NAME:-}" \
+      "${MAC_HERMES_GATEWAY_MODEL:-}" \
+      "${MAC_HERMES_GATEWAY_PROVIDER:-}" \
+      "${MAC_HERMES_GATEWAY_BASE_URL:-}" \
       "$MAC_DEPLOY_HUB_URL" \
       "$MAC_DEPLOY_CONTROL_BIND_HOST" \
       "$MAC_DEPLOY_WORKER_MODE" \
@@ -128,8 +134,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" agent target os home_channel hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary remote_archive
-  IFS='|' read -r agent target os home_channel hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary <<<"$spec"
+  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary remote_archive
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
@@ -137,7 +143,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -146,6 +152,9 @@ ARCHIVE="${MAC_DEPLOY_ARCHIVE:?}"
 DEPLOY_TS="${MAC_DEPLOY_TS:?}"
 DEPLOY_REV="${MAC_DEPLOY_GIT_REV:?}"
 HERMES_SLACK_HOME_CHANNEL_NAME="${MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
+HERMES_GATEWAY_MODEL="${MAC_DEPLOY_HERMES_GATEWAY_MODEL:-}"
+HERMES_GATEWAY_PROVIDER="${MAC_DEPLOY_HERMES_GATEWAY_PROVIDER:-custom}"
+HERMES_GATEWAY_BASE_URL="${MAC_DEPLOY_HERMES_GATEWAY_BASE_URL:-}"
 HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
 HUB_TOKEN="${MAC_DEPLOY_HUB_TOKEN:-}"
 CONTROL_BIND_HOST="${MAC_DEPLOY_CONTROL_BIND_HOST:-127.0.0.1}"
@@ -212,7 +221,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -366,6 +375,12 @@ try:
     hermes_config_text = hermes_config.read_text(encoding="utf-8", errors="ignore")
 except OSError:
     pass
+hermes_run = hermes_dir / "gateway" / "run.py"
+hermes_run_text = ""
+try:
+    hermes_run_text = hermes_run.read_text(encoding="utf-8", errors="ignore")
+except OSError:
+    pass
 
 manifest = {
     "schema_version": 1,
@@ -378,6 +393,9 @@ manifest = {
         "mac_git_rev": os.environ["DEPLOY_REV"],
         "log": os.environ["DEPLOY_LOG"],
         "hermes_slack_home_channel_name": os.environ.get("HERMES_SLACK_HOME_CHANNEL_NAME") or None,
+        "hermes_gateway_model": os.environ.get("HERMES_GATEWAY_MODEL") or None,
+        "hermes_gateway_provider": os.environ.get("HERMES_GATEWAY_PROVIDER") or None,
+        "hermes_gateway_base_url_configured": bool(os.environ.get("HERMES_GATEWAY_BASE_URL")),
         "hub_url": os.environ.get("HUB_URL") or None,
         "control_bind_host": os.environ.get("CONTROL_BIND_HOST") or None,
         "worker_mode": os.environ.get("WORKER_MODE") or None,
@@ -426,6 +444,11 @@ manifest = {
         "slack_account_file_shim_present": (
             "_slack_accounts_file_configured" in hermes_config_text
             and "slack_accounts.json" in hermes_config_text
+        ),
+        "gateway_runtime_shim_present": (
+            "MAC_HERMES_GATEWAY_MODEL" in hermes_run_text
+            and "MAC_HERMES_GATEWAY_PROVIDER" in hermes_run_text
+            and "resolve_runtime_provider" in hermes_run_text
         ),
         "messaging_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-messaging-deps.json"),
         "log_summary": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-log-summary.json"),
@@ -632,6 +655,34 @@ if report["config"].get("changed") or any(item.get("changed") for item in report
     print("redaction: corrected inherited secret-redaction=false drift")
 else:
     print("redaction: no inherited secret-redaction=false drift found")
+PY
+}
+
+apply_hermes_gateway_runtime_shim() {
+  log "applying Hermes gateway runtime/model shim"
+  MAC_HERMES_AGENT_DIR="$HERMES_DIR" "$VENV/bin/python" - <<'PY'
+from mac.hermes_startup import apply_hermes_gateway_runtime_shim_report
+
+report = apply_hermes_gateway_runtime_shim_report()
+patch = report.get("gateway_runtime_shim_patch") or {}
+configured = bool(
+    report.get("configured_model")
+    or report.get("provider_override_configured")
+    or report.get("base_url_override_configured")
+)
+print(
+    "gateway runtime shim: present=%s applied=%s model=%s provider_override=%s base_url_override=%s error=%s"
+    % (
+        report.get("gateway_runtime_shim_present"),
+        patch.get("applied"),
+        report.get("configured_model") or "",
+        report.get("provider_override_configured"),
+        report.get("base_url_override_configured"),
+        patch.get("error") or "",
+    )
+)
+if configured and (patch.get("error") or not report.get("gateway_runtime_shim_present")):
+    raise SystemExit(1)
 PY
 }
 
@@ -968,7 +1019,7 @@ mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" <<'PY'
 from pathlib import Path
 import secrets
 import sys
@@ -978,15 +1029,18 @@ mac_home = Path(sys.argv[2])
 home = Path(sys.argv[3])
 port = sys.argv[4]
 configured_home_channel = sys.argv[5].strip().lstrip("#")
-configured_hub_url = sys.argv[6].strip()
-configured_hub_token = sys.argv[7].strip()
-configured_bind_host = sys.argv[8].strip() or "127.0.0.1"
-configured_worker_mode = sys.argv[9].strip() or "heartbeat"
-configured_worker_capabilities = sys.argv[10].strip() or "ops,python,hermes"
-configured_worker_allowed_projects = sys.argv[11].strip()
-configured_worker_required_metadata = sys.argv[12].strip()
-configured_worker_require_canary = sys.argv[13].strip() or "1"
-agent_name = sys.argv[14].strip()
+configured_gateway_model = sys.argv[6].strip()
+configured_gateway_provider = sys.argv[7].strip()
+configured_gateway_base_url = sys.argv[8].strip()
+configured_hub_url = sys.argv[9].strip()
+configured_hub_token = sys.argv[10].strip()
+configured_bind_host = sys.argv[11].strip() or "127.0.0.1"
+configured_worker_mode = sys.argv[12].strip() or "heartbeat"
+configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes"
+configured_worker_allowed_projects = sys.argv[14].strip()
+configured_worker_required_metadata = sys.argv[15].strip()
+configured_worker_require_canary = sys.argv[16].strip() or "1"
+agent_name = sys.argv[17].strip()
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -1007,8 +1061,23 @@ values["HERMES_REDACT_SECRETS"] = "true"
 values["ACC_DIR"] = str(home / ".acc")
 values["MAC_HERMES_AGENT_DIR"] = str(mac_home / "hermes-agent")
 values["MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM"] = "1"
+values["MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM"] = "1"
 values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
+if configured_gateway_model:
+    values["MAC_HERMES_GATEWAY_MODEL"] = configured_gateway_model
+    values["ACC_HERMES_GATEWAY_MODEL"] = configured_gateway_model
+    values["HERMES_INFERENCE_MODEL"] = configured_gateway_model
+    values["ACC_LLM_MODEL"] = configured_gateway_model
+if configured_gateway_provider:
+    values["MAC_HERMES_GATEWAY_PROVIDER"] = configured_gateway_provider
+    values["ACC_HERMES_GATEWAY_PROVIDER"] = configured_gateway_provider
+    values["HERMES_INFERENCE_PROVIDER"] = configured_gateway_provider
+if configured_gateway_base_url:
+    values["MAC_HERMES_GATEWAY_BASE_URL"] = configured_gateway_base_url
+    values["ACC_HERMES_GATEWAY_BASE_URL"] = configured_gateway_base_url
+    values["CUSTOM_BASE_URL"] = configured_gateway_base_url
+    values["OPENAI_BASE_URL"] = configured_gateway_base_url
 if configured_hub_token:
     values["MAC_WORKER_TOKEN"] = configured_hub_token
 else:
@@ -1073,6 +1142,7 @@ fi
 "$PY" -m venv "$HERMES_DIR/.venv"
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$HERMES_DIR/.venv/bin/python" -m pip install -e "$HERMES_DIR" >/dev/null
+apply_hermes_gateway_runtime_shim
 install_hermes_messaging_deps
 repair_hermes_kanban_schema
 log "installed Hermes agent from upstream plus mac-managed patch"
@@ -1229,6 +1299,19 @@ set +a
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 export HERMES_DISABLE_LAZY_INSTALLS=1
 export HERMES_REDACT_SECRETS=true
+if [ -z "${CUSTOM_BASE_URL:-}" ] && [ -n "${TOKENHUB_URL:-}" ]; then
+  export CUSTOM_BASE_URL="${TOKENHUB_URL%/}/v1"
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [ -n "${CUSTOM_BASE_URL:-}" ]; then
+  export OPENAI_BASE_URL="$CUSTOM_BASE_URL"
+fi
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  if [ -n "${TOKENHUB_API_KEY:-}" ]; then
+    export OPENAI_API_KEY="$TOKENHUB_API_KEY"
+  elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
+    export OPENAI_API_KEY="$TOKENHUB_AGENT_KEY"
+  fi
+fi
 exec "$HOME/.mac/hermes-agent/.venv/bin/python" "$HOME/.mac/hermes-agent/hermes" gateway run --replace
 EOF
   chmod 700 "$wrapper"
@@ -1318,11 +1401,28 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 set -a
+set +u
+[ -f "$HOME/.acc/.env" ] && . "$HOME/.acc/.env"
+[ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
 . "$HOME/.mac/mac.env"
+set -u
 set +a
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 export HERMES_DISABLE_LAZY_INSTALLS=1
 export HERMES_REDACT_SECRETS=true
+if [ -z "${CUSTOM_BASE_URL:-}" ] && [ -n "${TOKENHUB_URL:-}" ]; then
+  export CUSTOM_BASE_URL="${TOKENHUB_URL%/}/v1"
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [ -n "${CUSTOM_BASE_URL:-}" ]; then
+  export OPENAI_BASE_URL="$CUSTOM_BASE_URL"
+fi
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  if [ -n "${TOKENHUB_API_KEY:-}" ]; then
+    export OPENAI_API_KEY="$TOKENHUB_API_KEY"
+  elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
+    export OPENAI_API_KEY="$TOKENHUB_AGENT_KEY"
+  fi
+fi
 exec "$HOME/.mac/venv/bin/python" "$HOME/.mac/bin/mac-hermes-task-executor.py"
 EOF
   chmod 700 "$executor"
