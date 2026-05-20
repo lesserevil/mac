@@ -281,6 +281,24 @@ class RoleSeed(BaseModel):
     replace: bool = False
 
 
+class ProvisioningRequestCreate(BaseModel):
+    reason: str
+    role_slug: Optional[str] = None
+    capabilities: List[str] = Field(default_factory=list)
+    hardware: Dict[str, Any] = Field(default_factory=dict)
+    task_id: Optional[str] = None
+    tenant_id: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProvisioningRequestFulfill(BaseModel):
+    agent_id: str
+
+
+class ProvisioningRequestCancel(BaseModel):
+    reason: str = "operator-cancelled"
+
+
 class WorkflowCreate(BaseModel):
     slug: str
     name: str
@@ -670,6 +688,11 @@ def _required_scope(method: str, path: str) -> Optional[str]:
         return "roles"
     if path.startswith("/workflows"):
         return "workflow"
+    if path.startswith("/provisioning"):
+        # Provisioning rows are operational signals; treat them as
+        # deploy-level (a future provisioner that polls + spawns agents
+        # is doing infra work, not user-facing writes).
+        return "deploy"
     return "write"
 
 
@@ -1377,6 +1400,53 @@ def create_app(
     @app.get("/agents/{agent_id}/identity")
     def get_agent_identity(agent_id: str) -> Dict[str, Any]:
         return cp.agent_identity(agent_id)
+
+    # Agent provisioning hook --------------------------------------
+
+    @app.post("/provisioning/requests")
+    def create_provisioning_request(
+        body: ProvisioningRequestCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.provisioning.request_agent(**_data(body)).to_dict()
+
+    @app.get("/provisioning/requests")
+    def list_provisioning_requests(
+        status: Optional[str] = Query(default=None),
+        role_slug: Optional[str] = Query(default=None),
+        tenant_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            request.to_dict()
+            for request in cp.provisioning.list_requests(
+                status=status,
+                role_slug=role_slug,
+                tenant_id=tenant_id,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/provisioning/requests/{request_id}")
+    def get_provisioning_request(request_id: str) -> Dict[str, Any]:
+        return cp.provisioning.get_request(request_id).to_dict()
+
+    @app.post("/provisioning/requests/{request_id}/fulfill")
+    def fulfill_provisioning_request(
+        request_id: str,
+        body: ProvisioningRequestFulfill,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        return cp.provisioning.fulfill_request(request_id, body.agent_id).to_dict()
+
+    @app.post("/provisioning/requests/{request_id}/cancel")
+    def cancel_provisioning_request(
+        request_id: str,
+        body: ProvisioningRequestCancel,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        return cp.provisioning.cancel_request(request_id, reason=body.reason).to_dict()
 
     # Workflows (data-driven, definable) -----------------------------
 

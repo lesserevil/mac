@@ -533,6 +533,51 @@ ROLE_LEVELS = {value.value for value in RoleLevel}
 
 
 @dataclass
+class AgentProvisioningRequest:
+    """Signal that the swarm needs an agent it doesn't have.
+
+    Emitted by the dispatcher and the default-review workflow when no
+    eligible agent can be selected for a task. A future provisioner (k8s
+    operator, nomad job, local spawner) polls these rows and fulfills
+    them by registering the requested agent. For now the actual
+    provisioning is unimplemented — requests sit in ``pending`` until an
+    operator hand-fulfills or cancels them, and the observability log
+    plus this table are the signal.
+    """
+
+    id: str
+    status: str
+    reason: str
+    role_slug: Optional[str]
+    capabilities: List[str]
+    hardware: JsonDict
+    task_id: Optional[str]
+    tenant_id: Optional[str]
+    detail: JsonDict
+    fulfilled_agent_id: Optional[str]
+    created_at: str
+    updated_at: str
+    closed_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+class ProvisioningStatus(StrEnum):
+    PENDING = "pending"
+    FULFILLED = "fulfilled"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+PROVISIONING_TERMINAL_STATES = {
+    ProvisioningStatus.FULFILLED.value,
+    ProvisioningStatus.FAILED.value,
+    ProvisioningStatus.CANCELLED.value,
+}
+
+
+@dataclass
 class Workflow:
     """Versioned, data-driven workflow definition.
 

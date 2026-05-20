@@ -705,6 +705,31 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_workflow_run_history_run
                     ON workflow_run_history (run_id, seq);
 
+                -- Provisioning requests: durable record of "the swarm needs
+                -- an agent it does not have." Surfaced by the dispatcher
+                -- and the default-review workflow when no eligible agent
+                -- can be selected. A future provisioner (k8s operator,
+                -- nomad job, local spawner) polls this table.
+                CREATE TABLE IF NOT EXISTS agent_provisioning_requests (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    role_slug TEXT,
+                    capabilities TEXT NOT NULL DEFAULT '[]',
+                    hardware TEXT NOT NULL DEFAULT '{}',
+                    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    fulfilled_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_provisioning_status
+                    ON agent_provisioning_requests (status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_provisioning_role
+                    ON agent_provisioning_requests (role_slug, status);
+
                 -- Unified audit stream. Operators query one surface instead of
                 -- joining four per-resource tables. The view is read-only; each
                 -- write still goes to its owning table inside the originating

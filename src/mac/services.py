@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from mac.models import (
     Agent,
+    AgentProvisioningRequest,
     AgentRole,
     Workflow,
     WorkflowRun,
@@ -91,6 +92,7 @@ from mac.identity_service import IdentityService
 from mac.memory_service import MemoryService
 from mac.messaging_service import MessagingService
 from mac.observability_service import ObservabilityService
+from mac.provisioning_service import ProvisioningService
 from mac.review_service import ReviewService
 from mac.roles_service import RolesService
 from mac.rollout_service import RolloutService
@@ -159,6 +161,7 @@ class ControlPlane:
         self.identity = IdentityService(self.store)
         self.observability = ObservabilityService(self.store)
         self.agentbus = AgentBusService(self.store, self.observability)
+        self.provisioning = ProvisioningService(self.store, self.observability)
         self.roles = RolesService(
             self.store,
             self.observability,
@@ -348,6 +351,33 @@ class ControlPlane:
 
     def seed_default_roles(self, *args: Any, **kwargs: Any) -> List[AgentRole]:
         return self.roles.seed_defaults(*args, **kwargs)
+
+    # Provisioning hook: emitted when the swarm needs an agent it doesn't
+    # have. Today the provisioner is unimplemented; rows + observability
+    # are the signal an external poller acts on.
+
+    def request_agent_provisioning(
+        self, *args: Any, **kwargs: Any
+    ) -> AgentProvisioningRequest:
+        return self.provisioning.request_agent(*args, **kwargs)
+
+    def list_provisioning_requests(
+        self, *args: Any, **kwargs: Any
+    ) -> List[AgentProvisioningRequest]:
+        return self.provisioning.list_requests(*args, **kwargs)
+
+    def get_provisioning_request(self, request_id: str) -> AgentProvisioningRequest:
+        return self.provisioning.get_request(request_id)
+
+    def fulfill_provisioning_request(
+        self, request_id: str, agent_id: str
+    ) -> AgentProvisioningRequest:
+        return self.provisioning.fulfill_request(request_id, agent_id)
+
+    def cancel_provisioning_request(
+        self, request_id: str, *, reason: str = "operator-cancelled"
+    ) -> AgentProvisioningRequest:
+        return self.provisioning.cancel_request(request_id, reason=reason)
 
     def agent_identity(self, agent_id: str) -> JsonDict:
         """Layered identity for an agent: soul → role → mood → hardware.
@@ -1403,7 +1433,9 @@ class ControlPlane:
             if (self._task_tenant_id(task) or "") not in skipped
         ]
         agents = self._available_agents()
+        unmatched: List[Task] = []
         for task in tasks:
+            matched = False
             for agent in agents:
                 if not self._agent_available_for(agent, task):
                     continue
@@ -1421,7 +1453,38 @@ class ControlPlane:
                     task_id=claimed.id,
                 )
                 return {"task": claimed.to_dict(), "agent": agent.to_dict(), "lease": lease.to_dict()}
+            if not matched:
+                unmatched.append(task)
+        # No agent could claim any pending task. Emit a provisioning
+        # signal so a future provisioner (k8s operator, nomad job, local
+        # spawner) can spin up the kind of agent that's missing. Today
+        # the row + observability log are the signal; no auto-spawn.
+        for task in unmatched:
+            self._emit_dispatch_provisioning_signal(task)
         return None
+
+    def _emit_dispatch_provisioning_signal(self, task: Task) -> None:
+        required_role = None
+        hardware: JsonDict = {}
+        if isinstance(task.metadata, dict):
+            md_role = task.metadata.get("required_role")
+            if isinstance(md_role, str) and md_role.strip():
+                required_role = md_role.strip()
+            md_hw = task.metadata.get("hardware")
+            if isinstance(md_hw, dict):
+                hardware = md_hw
+        self.provisioning.request_agent(
+            reason="dispatch.no_eligible_agent",
+            role_slug=required_role,
+            capabilities=list(task.required_capabilities or []),
+            hardware=hardware,
+            task_id=task.id,
+            tenant_id=self._task_tenant_id(task),
+            detail={
+                "task_state": task.state,
+                "task_title": task.title,
+            },
+        )
 
     def claim_next_for_agent(
         self,
@@ -1723,6 +1786,19 @@ class ControlPlane:
                     "warning",
                     {"reason": "no_eligible_reviewer"},
                     actor,
+                )
+                # Signal that the swarm needs a reviewer-capable agent it
+                # doesn't have. The default-review workflow will pick the
+                # request up on a future tick once the provisioner has
+                # registered a matching agent.
+                self.provisioning.request_agent(
+                    reason="review.no_eligible_reviewer",
+                    capabilities=["review"],
+                    task_id=task_id,
+                    tenant_id=self._task_tenant_id(task),
+                    detail={
+                        "evidence_type": evidence_assessment.get("evidence_type"),
+                    },
                 )
                 return {"task_id": task_id, "status": "waiting_for_reviewer"}
             review = self.request_review(task_id, reviewer.id, actor=actor)
