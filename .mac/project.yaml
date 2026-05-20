@@ -1,0 +1,25 @@
+schema: mac.repository_contract.v1
+project: repo-beads-mac
+platforms:
+  - darwin
+  - linux
+  - wsl2
+toolchain:
+  required_commands:
+    - python3
+    - git
+    - bd
+bootstrap:
+  command: python3 scripts/bootstrap-project.py
+  creates:
+    - .venv/bin/python
+    - .venv/bin/pytest
+test:
+  command: .venv/bin/python -m pytest
+evidence:
+  required:
+    - repo.head_sha
+    - repo.pushed
+    - repo.dirty
+    - repo.files_changed
+    - tests

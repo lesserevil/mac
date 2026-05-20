@@ -32,6 +32,9 @@ This project provides durable contracts for coordinating a fleet:
 - Reproducible runtime manifests with stable digests and secret-value checks.
 - Tenant, user, Persona, Hermes instance, and platform binding records for multi-user expansion.
 - Project bridge, operational memory/provenance records, and gated rollout/rescue workflows.
+- Repository runtime contract enforcement for registered project checkouts so
+  agents can bootstrap and test work on macOS, Linux, WSL2, or narrower
+  declared host families without relying on accidental local state.
 - Evaluation contract: named `eval_sets` (scoring direction, baseline, regression threshold) and `eval_runs` against rollout versions, runtime environments, or agent builds; rollouts can require a passing `eval_run` before `promote`.
 - FastAPI REST API and `mac` CLI.
 - Hermes-side `mac-hermes` adapter for registration, sanitized task creation, status replies, and memory write-back payloads.
@@ -62,7 +65,8 @@ The identity framework reflects that split:
 ## Quick Start
 
 ```bash
-uv run --extra dev pytest
+python3 scripts/bootstrap-project.py
+.venv/bin/python -m pytest
 
 # Required: a 32+ char secret used to derive the Fernet key for the secrets table.
 # Without it, the CLI and API both refuse to start.

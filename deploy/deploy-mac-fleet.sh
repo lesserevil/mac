@@ -1722,6 +1722,36 @@ import sys
 from pathlib import Path
 
 
+def repository_contract_section(task: dict) -> str:
+    metadata = task.get("metadata") if isinstance(task, dict) else {}
+    origin = metadata.get("origin") if isinstance(metadata, dict) else {}
+    contract = origin.get("repository_contract") if isinstance(origin, dict) else None
+    if not isinstance(contract, dict):
+        return (
+            "No repository runtime contract is attached. Do not guess bootstrap or "
+            "test commands; report this as a task contract failure."
+        )
+    summary = {
+        "schema": contract.get("schema"),
+        "project": contract.get("project"),
+        "contract_path": contract.get("contract_path"),
+        "platforms": contract.get("platforms"),
+        "toolchain": contract.get("toolchain"),
+        "bootstrap": contract.get("bootstrap"),
+        "test": contract.get("test"),
+        "evidence": contract.get("evidence"),
+    }
+    return "\n".join(
+        [
+            json.dumps(summary, indent=2, sort_keys=True),
+            "For repository tasks, locate the local checkout for this project on this host.",
+            "Do not trust a repository_path absolute path if it belongs to a different machine.",
+            "Before build or test work, run bootstrap.command from the repository root when the declared tools or bootstrap.creates outputs are missing.",
+            "Use test.command as the canonical verification command unless the task explicitly narrows the check.",
+        ]
+    )
+
+
 def main() -> int:
     task_file = Path(os.environ["MAC_TASK_FILE"])
     task_workspace = Path(os.environ["MAC_TASK_WORKSPACE"])
@@ -1735,6 +1765,7 @@ def main() -> int:
             "Also write a verifiable evidence manifest to $MAC_TASK_WORKSPACE/mac-evidence.json.",
             "Use schema mac.worker_evidence.v1 with status=complete and evidence_type set to one of repo_change, documentation, investigation, deployment, test, artifact, or no_change.",
             "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
+            "Repository runtime contract:\n%s" % repository_contract_section(task),
             "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
         ]
     )

@@ -691,6 +691,34 @@ def test_fastapi_publishes_agentbus_repo_update_to_all_agents():
 def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
+    contract_dir = repo / ".mac"
+    contract_dir.mkdir()
+    (contract_dir / "project.yaml").write_text(
+        "\n".join(
+            [
+                "schema: mac.repository_contract.v1",
+                "project: repo-beads-mac",
+                "platforms:",
+                "  - darwin",
+                "  - linux",
+                "  - wsl2",
+                "toolchain:",
+                "  required_commands:",
+                "    - python3",
+                "bootstrap:",
+                "  command: python3 scripts/bootstrap-project.py",
+                "  creates:",
+                "    - .venv/bin/python",
+                "test:",
+                "  command: .venv/bin/python -m pytest",
+                "evidence:",
+                "  required:",
+                "    - tests",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     beads_dir = repo / ".beads"
     beads_dir.mkdir()
     (beads_dir / "issues.jsonl").write_text(

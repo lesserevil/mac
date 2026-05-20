@@ -67,3 +67,12 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     assert '[_beads_cli(), "ready", "--json"]' in (
         ROOT / "src" / "mac" / "services.py"
     ).read_text(encoding="utf-8")
+
+
+def test_executor_prompt_includes_repository_runtime_contract():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert "def repository_contract_section(task: dict) -> str:" in script
+    assert "Repository runtime contract:" in script
+    assert "bootstrap.command" in script
+    assert "test.command" in script

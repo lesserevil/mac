@@ -1433,12 +1433,59 @@ def test_project_bridge_memory_and_rollout_rescue(cp):
 
 
 def _write_beads(repo_path, issues):
+    _write_repository_contract(repo_path)
     beads_dir = repo_path / ".beads"
     beads_dir.mkdir(parents=True)
     (beads_dir / "issues.jsonl").write_text(
         "\n".join(json.dumps(issue) for issue in issues) + "\n",
         encoding="utf-8",
     )
+
+
+def _write_repository_contract(repo_path, project="repo-beads-mac", include_test=True):
+    contract_dir = repo_path / ".mac"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    test_block = "test:\n  command: .venv/bin/python -m pytest\n" if include_test else "test: {}\n"
+    (contract_dir / "project.yaml").write_text(
+        (
+            "schema: mac.repository_contract.v1\n"
+            "project: %s\n"
+            "platforms:\n"
+            "  - darwin\n"
+            "  - linux\n"
+            "  - wsl2\n"
+            "toolchain:\n"
+            "  required_commands:\n"
+            "    - python3\n"
+            "bootstrap:\n"
+            "  command: python3 scripts/bootstrap-project.py\n"
+            "  creates:\n"
+            "    - .venv/bin/python\n"
+            "%s"
+            "evidence:\n"
+            "  required:\n"
+            "    - tests\n"
+        )
+        % (project, test_block),
+        encoding="utf-8",
+    )
+
+
+def test_beads_repository_registration_requires_runtime_contract(cp, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    with pytest.raises(ValidationError, match="runtime contract not found"):
+        cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+
+
+def test_beads_repository_registration_rejects_incomplete_runtime_contract(cp, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repository_contract(repo, include_test=False)
+
+    with pytest.raises(ValidationError, match="test.command"):
+        cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
 
 
 def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
@@ -1490,13 +1537,17 @@ def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
     item = cp.list_project_items()[0]
     assert item.source == "repo-beads-mac"
     assert item.external_id == "mac-ready"
+    assert item.payload["repository_contract"]["test"]["command"] == ".venv/bin/python -m pytest"
     task = cp.get_task(item.task_id)
     assert task.state == TaskState.OPEN.value
     assert task.project == "repo-beads-mac"
     assert task.priority >= 98
     assert task.required_capabilities == ["python"]
+    assert repo_record.metadata["repository_contract"]["bootstrap"]["command"] == "python3 scripts/bootstrap-project.py"
     assert task.metadata["origin"]["type"] == "beads"
+    assert task.metadata["origin"]["repository_contract"]["project"] == "repo-beads-mac"
     assert task.metadata["acc_metadata"]["beads_sync_close_on_complete"] is True
+    assert task.metadata["acc_metadata"]["repository_contract_schema"] == "mac.repository_contract.v1"
 
 
 def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):

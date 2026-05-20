@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import yaml
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -142,6 +143,11 @@ def _safe_slug(value: str) -> str:
     return slug or "repo"
 
 
+REPOSITORY_CONTRACT_SCHEMA = "mac.repository_contract.v1"
+REPOSITORY_CONTRACT_FILES = (
+    Path(".mac") / "project.yaml",
+    Path(".mac") / "project.yml",
+)
 VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
 _GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
@@ -157,6 +163,118 @@ def _generate_attestation_key() -> str:
     import secrets as _secrets
 
     return base64.urlsafe_b64encode(_secrets.token_bytes(ATTESTATION_KEY_BYTES)).decode("ascii").rstrip("=")
+
+
+def _contract_mapping(value: Any, field: str) -> JsonDict:
+    if not isinstance(value, dict):
+        raise ValidationError("%s must be an object" % field)
+    return value
+
+
+def _contract_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("%s must be a non-empty string" % field)
+    return value.strip()
+
+
+def _contract_string_list(value: Any, field: str, *, required: bool = True) -> List[str]:
+    if value is None and not required:
+        return []
+    if not isinstance(value, list):
+        raise ValidationError("%s must be a list of strings" % field)
+    strings = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValidationError("%s must contain only non-empty strings" % field)
+        strings.append(item.strip())
+    if required and not strings:
+        raise ValidationError("%s must not be empty" % field)
+    return strings
+
+
+def _contract_relative_paths(value: Any, field: str) -> List[str]:
+    paths = _contract_string_list(value, field, required=False)
+    for raw_path in paths:
+        candidate = Path(raw_path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValidationError("%s entries must be relative paths inside the repository" % field)
+    return paths
+
+
+def _repository_contract_root(repo_path: Path) -> Path:
+    expanded = repo_path.expanduser()
+    if not expanded.exists():
+        raise ValidationError("beads repository path does not exist: %s" % repo_path)
+    return expanded if expanded.is_dir() else expanded.parent
+
+
+def _load_repository_contract(repo_path: Path) -> JsonDict:
+    root = _repository_contract_root(repo_path)
+    checked = []
+    for relative in REPOSITORY_CONTRACT_FILES:
+        candidate = root / relative
+        checked.append(str(relative))
+        if not candidate.exists():
+            continue
+        try:
+            raw = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise ValidationError("repository runtime contract is invalid YAML: %s: %s" % (candidate, exc)) from exc
+        try:
+            contract_path = str(candidate.relative_to(root))
+        except ValueError:
+            contract_path = str(candidate)
+        return _normalize_repository_contract(raw, contract_path)
+    raise ValidationError(
+        "repository runtime contract not found under %s; expected one of: %s"
+        % (root, ", ".join(checked))
+    )
+
+
+def _normalize_repository_contract(raw: Any, contract_path: str) -> JsonDict:
+    data = _contract_mapping(raw, "repository runtime contract")
+    schema = _contract_string(data.get("schema"), "repository runtime contract.schema")
+    if schema != REPOSITORY_CONTRACT_SCHEMA:
+        raise ValidationError(
+            "repository runtime contract.schema must be %s" % REPOSITORY_CONTRACT_SCHEMA
+        )
+    project = _contract_string(data.get("project"), "repository runtime contract.project")
+    platforms = _contract_string_list(data.get("platforms"), "repository runtime contract.platforms")
+    toolchain = _contract_mapping(data.get("toolchain"), "repository runtime contract.toolchain")
+    bootstrap = _contract_mapping(data.get("bootstrap"), "repository runtime contract.bootstrap")
+    test = _contract_mapping(data.get("test"), "repository runtime contract.test")
+    evidence = _contract_mapping(data.get("evidence"), "repository runtime contract.evidence")
+    return {
+        "schema": schema,
+        "project": project,
+        "contract_path": contract_path,
+        "platforms": platforms,
+        "toolchain": {
+            "required_commands": _contract_string_list(
+                toolchain.get("required_commands"),
+                "repository runtime contract.toolchain.required_commands",
+            ),
+        },
+        "bootstrap": {
+            "command": _contract_string(
+                bootstrap.get("command"),
+                "repository runtime contract.bootstrap.command",
+            ),
+            "creates": _contract_relative_paths(
+                bootstrap.get("creates"),
+                "repository runtime contract.bootstrap.creates",
+            ),
+        },
+        "test": {
+            "command": _contract_string(test.get("command"), "repository runtime contract.test.command"),
+        },
+        "evidence": {
+            "required": _contract_string_list(
+                evidence.get("required"),
+                "repository runtime contract.evidence.required",
+            ),
+        },
+    }
 
 
 def _canonicalize_for_signature(manifest: Dict[str, Any]) -> bytes:
@@ -2368,11 +2486,20 @@ class ControlPlane:
         name = name.strip()
         if not name:
             raise ValidationError("beads repository name is required")
-        repo_path = str(Path(path).expanduser())
+        repo_path_obj = Path(path).expanduser()
+        repo_path = str(repo_path_obj)
         repo_source = (source or "repo-beads-%s" % _safe_slug(name)).strip()
         if not repo_source:
             raise ValidationError("beads repository source is required")
         repo_project = (project or repo_source).strip()
+        contract = _load_repository_contract(repo_path_obj)
+        if contract["project"] != repo_project:
+            raise ValidationError(
+                "repository runtime contract project %s does not match registered project %s"
+                % (contract["project"], repo_project)
+            )
+        repo_metadata = ensure_json_object(metadata)
+        repo_metadata["repository_contract"] = contract
         now = utcnow()
         row = self.store.query_one("SELECT id FROM beads_repositories WHERE name = ?", (name,))
         repo_id = row["id"] if row is not None else new_id("beadsrepo")
@@ -2401,7 +2528,7 @@ class ControlPlane:
                 json_dumps(coerce_list(required_capabilities)),
                 1 if enabled else 0,
                 max(1, int(poll_interval_seconds)),
-                json_dumps(ensure_json_object(metadata)),
+                json_dumps(repo_metadata),
                 now,
                 now,
             ),
@@ -2412,7 +2539,15 @@ class ControlPlane:
             source=actor,
             subject_type="environment",
             subject_id=repo_id,
-            detail={"name": name, "path": repo_path, "source": repo_source, "enabled": enabled},
+            detail={
+                "name": name,
+                "path": repo_path,
+                "source": repo_source,
+                "project": repo_project,
+                "enabled": enabled,
+                "repository_contract_schema": contract["schema"],
+                "repository_contract_path": contract["contract_path"],
+            },
         )
         return self.get_beads_repository(repo_id)
 
@@ -2434,6 +2569,15 @@ class ControlPlane:
                 (1 if enabled else 0,),
             )
         return [self._beads_repository_from_row(row) for row in rows]
+
+    def _repository_contract_for_beads_repo(self, repo: BeadsRepository) -> JsonDict:
+        contract = _load_repository_contract(Path(repo.path))
+        if contract["project"] != repo.project:
+            raise ValidationError(
+                "repository runtime contract project %s does not match registered project %s"
+                % (contract["project"], repo.project)
+            )
+        return contract
 
     def poll_beads_repositories(
         self,
@@ -2494,6 +2638,7 @@ class ControlPlane:
                     "skipped_count": 0,
                 }
         try:
+            repository_contract = self._repository_contract_for_beads_repo(repo)
             issues = self._ready_beads_issues(repo)
             imported = 0
             existing = 0
@@ -2502,7 +2647,7 @@ class ControlPlane:
                     "SELECT id, task_id FROM project_items WHERE source = ? AND external_id = ?",
                     (repo.source, str(issue["id"])),
                 )
-                self._import_bead_issue(repo, issue, actor=actor)
+                self._import_bead_issue(repo, issue, actor=actor, repository_contract=repository_contract)
                 if prior is None:
                     imported += 1
                 else:
@@ -2522,6 +2667,7 @@ class ControlPlane:
                 "imported_count": imported,
                 "existing_count": existing,
                 "skipped_count": 0,
+                "repository_contract_schema": repository_contract["schema"],
             }
         except Exception as exc:  # noqa: BLE001 - one broken repo must not break heartbeats.
             self._update_beads_repository_poll_state(
@@ -2607,12 +2753,21 @@ class ControlPlane:
             return False
         return str(issue.get("status") or "").strip().lower() == "open"
 
-    def _import_bead_issue(self, repo: BeadsRepository, issue: JsonDict, actor: str) -> ProjectItem:
+    def _import_bead_issue(
+        self,
+        repo: BeadsRepository,
+        issue: JsonDict,
+        actor: str,
+        *,
+        repository_contract: Optional[JsonDict] = None,
+    ) -> ProjectItem:
         issue_id = str(issue["id"])
         priority = 100 - int(issue.get("priority") or 2)
+        contract = repository_contract or self._repository_contract_for_beads_repo(repo)
         payload = {
             "schema": "mac.beads_bridge.issue.v1",
             "repository": repo.to_dict(),
+            "repository_contract": contract,
             "issue": issue,
         }
         metadata = {
@@ -2623,6 +2778,7 @@ class ControlPlane:
                 "repository_path": repo.path,
                 "source": repo.source,
                 "bead_id": issue_id,
+                "repository_contract": contract,
             },
             "acc_metadata": {
                 "source": "mac-beads-bridge",
@@ -2632,6 +2788,8 @@ class ControlPlane:
                 "workflow_role": "work",
                 "beads_sync_claim_on_claim": True,
                 "beads_sync_close_on_complete": True,
+                "repository_contract_schema": contract["schema"],
+                "repository_contract_project": contract["project"],
             },
         }
         return self.import_project_item(

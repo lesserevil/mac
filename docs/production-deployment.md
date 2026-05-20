@@ -266,6 +266,12 @@ mac --db ~/.mac/mac.db bridge beads register mac ~/.mac/src/mac \
   --source repo-beads-mac --project repo-beads-mac
 ```
 
+Every registered repository must include a repository runtime contract at
+`.mac/project.yaml`. The bridge validates that contract at registration and on
+each poll, and rejects repositories that do not declare their supported host
+families, bootstrap command, canonical test command, and required evidence.
+See [Repository Runtime Contract](repository-runtime-contract.md).
+
 The deploy script enables heartbeat polling on the hub agent (`rocky`) and
 registers the deployed mac checkout by default through:
 
