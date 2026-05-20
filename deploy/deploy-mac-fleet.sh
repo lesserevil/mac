@@ -143,8 +143,96 @@ make_archive() {
   git -C "$ROOT" archive --format=tar.gz --output="$ARCHIVE" HEAD
 }
 
+reconcile_remote_deploy() {
+  # On SSH transport loss (e.g. exit 255 "Connection reset by peer") the remote
+  # heredoc may still have finished writing its post manifest and "deploy
+  # complete" log line before the channel died. This function reconnects to the
+  # host, inspects the deploy log and post manifest for ${ts}, and returns 0 if
+  # the remote deploy actually completed. It returns the original failure code
+  # otherwise so the caller can decide to surface the error.
+  local target="$1" agent="$2" ts="$3" original_rc="$4"
+  local attempt=0 max_attempts=5 delay=2 reconcile_rc=1 probe_rc remote_payload
+
+  echo "==> ${agent}: reconciling remote deploy after SSH exit ${original_rc} (ts=${ts})"
+  while [ "$attempt" -lt "$max_attempts" ]; do
+    attempt=$((attempt + 1))
+    # Capture stdout + exit code without disturbing the caller's errexit state.
+    remote_payload="$(
+      ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+        "$target" \
+        "MAC_DEPLOY_RECONCILE_TS=$(shell_quote "$ts") bash -s" <<'REMOTE_RECONCILE'
+set -uo pipefail
+MAC_HOME="${MAC_HOME:-$HOME/.mac}"
+TS="${MAC_DEPLOY_RECONCILE_TS:?}"
+LOG_DIR="$MAC_HOME/logs"
+DEPLOY_LOG="$LOG_DIR/deploy-${TS}.log"
+MANIFEST_POST="$LOG_DIR/deploy-manifest-${TS}-post.json"
+MANIFEST_LATEST="$LOG_DIR/deploy-manifest-latest.json"
+
+log_present=0
+manifest_present=0
+manifest_matches_ts=0
+deploy_complete=0
+deploy_log_tail=""
+
+if [ -f "$DEPLOY_LOG" ]; then
+  log_present=1
+  deploy_log_tail="$(tail -n 5 "$DEPLOY_LOG" 2>/dev/null || true)"
+  if grep -q 'deploy complete' "$DEPLOY_LOG" 2>/dev/null; then
+    deploy_complete=1
+  fi
+fi
+
+if [ -f "$MANIFEST_POST" ]; then
+  manifest_present=1
+  if grep -q "\"deploy_ts\"[[:space:]]*:[[:space:]]*\"${TS}\"" "$MANIFEST_POST" 2>/dev/null; then
+    manifest_matches_ts=1
+  elif grep -q "${TS}" "$MANIFEST_POST" 2>/dev/null; then
+    manifest_matches_ts=1
+  fi
+fi
+
+# Surface a structured status line that the local reconcile loop can parse.
+printf 'RECONCILE_STATUS log_present=%s manifest_present=%s manifest_matches_ts=%s deploy_complete=%s manifest_post=%s deploy_log=%s manifest_latest_exists=%s\n' \
+  "$log_present" "$manifest_present" "$manifest_matches_ts" "$deploy_complete" \
+  "$MANIFEST_POST" "$DEPLOY_LOG" "$([ -f "$MANIFEST_LATEST" ] && echo 1 || echo 0)"
+if [ -n "$deploy_log_tail" ]; then
+  printf 'RECONCILE_LOG_TAIL_BEGIN\n%s\nRECONCILE_LOG_TAIL_END\n' "$deploy_log_tail"
+fi
+REMOTE_RECONCILE
+    )" && probe_rc=0 || probe_rc=$?
+
+    if [ "$probe_rc" -eq 0 ] && [ -n "$remote_payload" ]; then
+      # Echo what the remote reported (useful for postmortems).
+      printf '%s\n' "$remote_payload" | sed "s/^/    ${agent}: /"
+      if printf '%s\n' "$remote_payload" \
+          | grep -q 'RECONCILE_STATUS .*manifest_present=1.*manifest_matches_ts=1.*deploy_complete=1'; then
+        echo "==> ${agent}: reconciliation confirms remote deploy completed for ts=${ts}; treating SSH exit ${original_rc} as transport-only"
+        reconcile_rc=0
+        break
+      fi
+      # Reconcile probe succeeded but the deploy did not finish — no point retrying.
+      echo "==> ${agent}: reconciliation reached host but remote deploy is incomplete (ts=${ts})"
+      reconcile_rc=$original_rc
+      break
+    fi
+
+    echo "==> ${agent}: reconcile probe attempt ${attempt}/${max_attempts} failed (rc=${probe_rc}); retrying in ${delay}s"
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      sleep "${MAC_DEPLOY_RECONCILE_SLEEP_OVERRIDE:-$delay}"
+    fi
+    delay=$((delay * 2))
+  done
+
+  if [ "$reconcile_rc" -ne 0 ] && [ "$attempt" -ge "$max_attempts" ]; then
+    echo "==> ${agent}: reconciliation exhausted ${max_attempts} attempts; preserving original SSH exit ${original_rc}"
+    reconcile_rc=$original_rc
+  fi
+  return "$reconcile_rc"
+}
+
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary remote_archive
+  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary remote_archive deploy_rc
   IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
@@ -152,6 +240,7 @@ deploy_host() {
   scp -q -o BatchMode=yes -o ConnectTimeout=10 "$ARCHIVE" "${target}:${remote_archive}"
 
   echo "==> ${agent}: running one-time deploy"
+  set +e
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
     "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
 set -euo pipefail
@@ -2372,6 +2461,18 @@ write_deploy_manifest "post" "$MANIFEST_POST"
 cp -f "$MANIFEST_POST" "$LOG_DIR/deploy-manifest-latest.json"
 log "deploy complete"
 REMOTE
+  deploy_rc=$?
+  set -e
+  if [ "$deploy_rc" -ne 0 ]; then
+    echo "==> ${agent}: ssh deploy session exited ${deploy_rc} (possible transport loss); attempting reconciliation"
+    if reconcile_remote_deploy "$target" "$agent" "$TS" "$deploy_rc"; then
+      echo "==> ${agent}: deploy reconciled successfully after SSH exit ${deploy_rc}"
+      return 0
+    fi
+    echo "==> ${agent}: reconciliation could not confirm completion; surfacing original SSH exit ${deploy_rc}" >&2
+    return "$deploy_rc"
+  fi
+  return 0
 }
 
 hub_target() {
