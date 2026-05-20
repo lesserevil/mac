@@ -292,6 +292,7 @@ registers the deployed mac checkout by default through:
 ```bash
 MAC_BEADS_BRIDGE_ON_HEARTBEAT=1
 MAC_BEADS_BRIDGE_HUB_AGENT=rocky
+MAC_BEADS_AUTO_PULL=1
 MAC_BEADS_CLI=$HOME/.mac/bin/bd
 MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac:repo-beads-mac:repo-beads-mac::30
 ```
@@ -308,10 +309,22 @@ keeps `~/.mac/src/mac` clean enough for AgentBus self-update pulls.
 
 On each Rocky heartbeat or lease renewal, the control plane
 polls every enabled registered repository whose poll interval has elapsed. The
-poller runs `bd ready --json` when available, falling back to `.beads/issues.jsonl`
-parsing for simple local fixtures. Only `open` Beads with no active blockers are
-imported; blocked Beads wait until their blockers close. Imports are idempotent
-through the `project_items(source, external_id)` unique key.
+poller first checks git source state. With `MAC_BEADS_AUTO_PULL=1` (default), a
+clean checkout with an upstream is fast-forwarded before Beads are read. If
+tracked files are dirty, or fetch/pull fails, the bridge does not silently poll
+ambiguous local state; it returns `source_dirty` or `source_refresh_error`, logs
+`bridge.beads.repository_source`, and writes a dashboard/Hermes notification.
+The poller then runs `bd ready --json` when available, falling back to
+`.beads/issues.jsonl` parsing for simple local fixtures. Only `open` Beads with
+no active blockers are imported; blocked Beads wait until their blockers close.
+Imports are idempotent through the `project_items(source, external_id)` unique
+key.
+
+The hub also advances the default review/publication workflow from heartbeat by
+default (`MAC_REVIEW_TICK_ON_HEARTBEAT=1`, `MAC_REVIEW_TICK_HUB_AGENT=rocky`).
+The tick only moves tasks when required evidence, reviewer verdicts, and
+publication targets are present; otherwise it records explicit waiting reasons
+in observability.
 
 Useful operator commands:
 
@@ -413,12 +426,16 @@ process. Restore is a file copy while the service is stopped.
   /observability/summary` returns dashboard aggregates and latest metric
   snapshots; `GET /observability/stream` tails observations as NDJSON for live
   dashboards or collectors.
+- `GET /notifications` lists the durable operator notification outbox for task
+  lifecycle, review, publication, and bridge-stale events. `POST
+  /notifications/{id}/delivered` marks entries delivered, failed, or skipped.
 
 The FastAPI middleware records per-request `http.request.duration_ms` metrics
 and `http.request` logs. Control-plane task, agent, secret, environment,
 rollout, and eval events are mirrored into the observability stream with their
 original subject ids. The dashboard Observability tab uses the summary endpoint
-and an NDJSON subscription to visualize the live stream.
+and an NDJSON subscription to visualize the live stream, command audit, and the
+operator notification outbox.
 
 ## Upgrade procedure
 

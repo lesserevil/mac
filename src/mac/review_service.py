@@ -30,7 +30,6 @@ from mac.models import (
     TaskState,
     TransitionError,
     ValidationError,
-    json_dumps,
     new_id,
     utcnow,
 )
@@ -235,70 +234,23 @@ class ReviewService:
                     now,
                 ),
             )
-            conn.execute(
-                """
-                INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id("hist"),
-                    task_id,
-                    "task.published",
-                    created_by,
-                    None,
-                    None,
-                    json_dumps({"publication_id": publication_id, "target": target}),
-                    now,
-                ),
-            )
-            self.observability.insert_observation(
-                conn,
-                "log",
+            self._record_history(
+                task_id,
                 "task.published",
-                "control_plane",
-                "task",
-                "info",
+                created_by,
                 None,
-                "",
-                "task",
+                None,
+                {"publication_id": publication_id, "target": target},
+                conn=conn,
+            )
+            self._record_history(
                 task_id,
-                {"actor": created_by, "publication_id": publication_id, "target": target},
-                now,
-            )
-            conn.execute(
-                """
-                INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id("hist"),
-                    task_id,
-                    "task.transitioned",
-                    created_by,
-                    TaskState.REVIEWING.value,
-                    TaskState.COMPLETED.value,
-                    json_dumps({"publication_id": publication_id}),
-                    now,
-                ),
-            )
-            self.observability.insert_observation(
-                conn,
-                "log",
                 "task.transitioned",
-                "control_plane",
-                "task",
-                "info",
-                None,
-                "",
-                "task",
-                task_id,
-                {
-                    "actor": created_by,
-                    "from_state": TaskState.REVIEWING.value,
-                    "to_state": TaskState.COMPLETED.value,
-                    "publication_id": publication_id,
-                },
-                now,
+                created_by,
+                TaskState.REVIEWING.value,
+                TaskState.COMPLETED.value,
+                {"publication_id": publication_id},
+                conn=conn,
             )
             if owner_agent_id:
                 conn.execute(

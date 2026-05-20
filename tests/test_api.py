@@ -409,6 +409,7 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert state["secret_audits"][0]["id"] == handle["audit_id"]
     assert "observability" in state
     assert state["observability"]["counts"]["events"] >= 1
+    assert "notifications" in state
 
     timeline = client.get("/dashboard/tasks/%s/timeline" % task["id"]).json()
     assert timeline["task"]["title"] == "Dashboard task"
@@ -416,6 +417,30 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
 
     agent_detail = client.get("/dashboard/agents/%s" % agent["id"]).json()
     assert agent_detail["availability"]["eligible"] is True
+
+
+def test_fastapi_exposes_operator_notifications():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "host"}).json()
+    agent = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={"title": "notified", "required_capabilities": ["python"]},
+    ).json()
+
+    claim = client.post("/tasks/%s/claim" % task["id"], params={"agent_id": agent["id"]})
+    assert claim.status_code == 200
+    notifications = client.get("/notifications", params={"subject_id": task["id"]}).json()
+    assert notifications[0]["event_type"] == "task.claimed"
+    delivered = client.post(
+        "/notifications/%s/delivered" % notifications[0]["id"],
+        json={"status": "delivered"},
+    ).json()
+    assert delivered["status"] == "delivered"
+    assert delivered["delivered_at"] is not None
 
 
 def test_events_endpoint_returns_unified_stream():

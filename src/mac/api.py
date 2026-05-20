@@ -462,6 +462,10 @@ class ObservabilityLogCreate(BaseModel):
     detail: Dict[str, Any] = Field(default_factory=dict)
 
 
+class NotificationDelivery(BaseModel):
+    status: str = "delivered"
+
+
 class ReviewRequest(BaseModel):
     reviewer_agent_id: str
     actor: str = "dispatcher"
@@ -1044,6 +1048,9 @@ def _dashboard_state(
         "dead_letters": dead_letters,
         "dispatch": _dashboard_dispatch_explain(cp, tasks, agents, machines_by_id),
         "messages": [message.to_dict() for message in cp.list_messages()],
+        "notifications": [
+            notification.to_dict() for notification in cp.list_notifications(limit=120)
+        ],
         "command_audit": [
             record.to_dict() for record in cp.list_command_audit(limit=120)
         ],
@@ -1897,6 +1904,30 @@ def create_app(
                 limit=limit,
             )
         ]
+
+    @app.get("/notifications")
+    def list_notifications(
+        status: Optional[str] = Query(default=None),
+        subject_type: Optional[str] = Query(default=None),
+        subject_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            notification.to_dict()
+            for notification in cp.list_notifications(
+                status=status,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                limit=limit,
+            )
+        ]
+
+    @app.post("/notifications/{notification_id}/delivered")
+    def mark_notification_delivered(
+        notification_id: str,
+        body: NotificationDelivery,
+    ) -> Dict[str, Any]:
+        return cp.mark_notification_delivered(notification_id, status=body.status).to_dict()
 
     @app.get("/observability/summary")
     def observability_summary(limit: int = Query(default=80)) -> Dict[str, Any]:

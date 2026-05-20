@@ -1555,6 +1555,124 @@ def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
     assert task.metadata["acc_metadata"]["repository_contract_schema"] == "mac.repository_contract.v1"
 
 
+def test_direct_task_for_registered_project_gets_repository_execution_contract(cp, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(repo, [])
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+
+    task = cp.create_task(
+        "Direct repository task",
+        project="repo-beads-mac",
+        required_capabilities=["python"],
+    )
+
+    assert task.metadata["execution_contract"]["type"] == "repository"
+    assert task.metadata["execution_contract"]["quality"] == "strong"
+    assert task.metadata["origin"]["repository_contract"]["project"] == "repo-beads-mac"
+    assert task.metadata["acc_metadata"]["repository_contract_schema"] == "mac.repository_contract.v1"
+
+
+def test_direct_task_without_repository_gets_explicit_operator_contract(cp):
+    task = cp.create_task("Operator task", required_capabilities=["ops"])
+
+    assert task.metadata["execution_contract"]["type"] == "operator_directive"
+    assert task.metadata["execution_contract"]["quality"] == "weak"
+    assert task.metadata["execution_contract"]["repository_required"] is False
+    names = {event.name for event in cp.list_observability(layer="control_plane", limit=20)}
+    assert "task.execution_contract.weak" in names
+
+
+def _git(cmd, cwd=None):
+    return subprocess.run(
+        ["git", *cmd],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _seed_bare_beads_repo(tmp_path, issue_id="mac-old"):
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    clone = tmp_path / "clone"
+    _git(["init", "--bare", "--initial-branch=main", str(origin)])
+    _git(["init", "--initial-branch=main", str(seed)])
+    _git(["config", "user.email", "mac-tests@example.invalid"], cwd=seed)
+    _git(["config", "user.name", "mac tests"], cwd=seed)
+    _write_beads(
+        seed,
+        [
+            {
+                "_type": "issue",
+                "id": issue_id,
+                "title": issue_id,
+                "description": "seeded",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    _git(["add", ".mac/project.yaml", ".beads/issues.jsonl"], cwd=seed)
+    _git(["commit", "-m", "seed beads"], cwd=seed)
+    _git(["remote", "add", "origin", str(origin)], cwd=seed)
+    _git(["push", "-u", "origin", "main"], cwd=seed)
+    _git(["clone", str(origin), str(clone)])
+    return origin, seed, clone
+
+
+def test_beads_bridge_auto_pulls_git_repository_before_poll(cp, tmp_path, monkeypatch):
+    _origin, seed, clone = _seed_bare_beads_repo(tmp_path, "mac-old")
+    repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    (seed / ".beads" / "issues.jsonl").write_text(
+        json.dumps(
+            {
+                "_type": "issue",
+                "id": "mac-new",
+                "title": "New upstream bead",
+                "description": "arrived after hub checkout became stale",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:01:00Z",
+                "dependency_count": 0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _git(["add", ".beads/issues.jsonl"], cwd=seed)
+    _git(["commit", "-m", "new bead"], cwd=seed)
+    _git(["push"], cwd=seed)
+    monkeypatch.setenv("MAC_BEADS_AUTO_PULL", "1")
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    assert report["imported_count"] == 1
+    assert report["repositories"][0]["source_state"]["status"] == "updated"
+    assert cp.list_project_items()[0].external_id == "mac-new"
+
+
+def test_beads_bridge_marks_dirty_git_repository_stale(cp, tmp_path, monkeypatch):
+    _origin, _seed, clone = _seed_bare_beads_repo(tmp_path, "mac-dirty")
+    repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    (clone / ".beads" / "issues.jsonl").write_text(
+        '{"_type":"issue","id":"local-dirty","status":"open"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MAC_BEADS_AUTO_PULL", "1")
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    assert report["error_count"] == 1
+    assert report["repositories"][0]["status"] == "source_dirty"
+    assert cp.list_project_items() == []
+    notifications = cp.list_notifications(subject_id=repo_record.id)
+    assert notifications[0].event_type == "bridge.beads.source_dirty"
+
+
 def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1617,6 +1735,57 @@ def test_hub_lease_renewal_polls_registered_beads_repositories(cp, tmp_path, mon
 
     imported = [item.external_id for item in cp.list_project_items()]
     assert imported == ["mac-renewal"]
+
+
+def test_hub_heartbeat_advances_default_review_workflow(cp, monkeypatch):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    rocky = register_agent(cp, "rocky", ["python"])
+    task = cp.create_task(
+        "needs review",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://publish"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    monkeypatch.setenv("MAC_REVIEW_TICK_ON_HEARTBEAT", "1")
+    monkeypatch.setenv("MAC_REVIEW_TICK_HUB_AGENT", "rocky")
+
+    cp.heartbeat_agent(rocky.id, status=AgentStatus.IDLE.value)
+
+    refreshed = cp.get_task(task.id)
+    assert refreshed.state == TaskState.REVIEWING.value
+    reviews = cp.list_reviews(task.id)
+    assert len(reviews) == 1
+    assert reviews[0].reviewer_agent_id == reviewer.id
+    names = {event.name for event in cp.list_observability(layer="control_plane", limit=50)}
+    assert "workflow.default_review.heartbeat_tick" in names
+
+
+def test_operator_notifications_track_task_lifecycle(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("observable task", required_capabilities=["python"])
+
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(task.id, "test", "artifact://pytest", "pytest passed", worker.id)
+    cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "boom"})
+
+    event_types = {item.event_type for item in cp.list_notifications(subject_id=task.id)}
+    assert {"task.claimed", "task.running", "task.evidence_added", "task.failed"} <= event_types
+    pending = cp.list_notifications(status="pending")
+    delivered = cp.mark_notification_delivered(pending[0].id)
+    assert delivered.status == "delivered"
+    assert delivered.delivered_at is not None
 
 
 def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch):

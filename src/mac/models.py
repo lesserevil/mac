@@ -760,6 +760,24 @@ class ObservabilityEvent:
         return asdict(self)
 
 
+@dataclass
+class OperatorNotification:
+    id: str
+    event_type: str
+    subject_type: Optional[str]
+    subject_id: Optional[str]
+    title: str
+    body: str
+    channels: List[str]
+    metadata: JsonDict
+    status: str
+    created_at: str
+    delivered_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
 COMMAND_AUDIT_PHASES = {
     "started",
     "completed",

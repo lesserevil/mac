@@ -56,6 +56,7 @@ from mac.models import (
     MessageType,
     NotFoundError,
     ObservabilityEvent,
+    OperatorNotification,
     Persona,
     PlatformBinding,
     ProjectItem,
@@ -762,6 +763,11 @@ class ControlPlane:
         now = utcnow()
         task_id = new_id("task")
         state = TaskState.BLOCKED.value if dep_ids else TaskState.OPEN.value
+        normalized_metadata = self._normalize_task_execution_contract(
+            ensure_json_object(metadata),
+            project,
+            coerce_list(required_capabilities),
+        )
         self.store.execute(
             """
             INSERT INTO tasks (
@@ -780,7 +786,7 @@ class ControlPlane:
                 state,
                 json_dumps(coerce_list(required_capabilities)),
                 json_dumps(dep_ids),
-                json_dumps(ensure_json_object(metadata)),
+                json_dumps(normalized_metadata),
                 int(max_attempts),
                 now,
                 now,
@@ -796,9 +802,118 @@ class ControlPlane:
                 "title": title,
                 "required_capabilities": coerce_list(required_capabilities),
                 "dependencies": dep_ids,
+                "execution_contract_type": (
+                    normalized_metadata.get("execution_contract", {}).get("type")
+                    if isinstance(normalized_metadata.get("execution_contract"), dict)
+                    else None
+                ),
             },
         )
+        if (
+            isinstance(normalized_metadata.get("execution_contract"), dict)
+            and normalized_metadata["execution_contract"].get("quality") == "weak"
+        ):
+            self.record_log(
+                "task.execution_contract.weak",
+                layer="control_plane",
+                source=actor,
+                level="warning",
+                subject_type="task",
+                subject_id=task_id,
+                detail={
+                    "project": project,
+                    "required_capabilities": coerce_list(required_capabilities),
+                    "reason": normalized_metadata["execution_contract"].get("reason"),
+                },
+            )
         return self.get_task(task_id)
+
+    def _normalize_task_execution_contract(
+        self,
+        metadata: Dict[str, Any],
+        project: Optional[str],
+        required_capabilities: List[str],
+    ) -> JsonDict:
+        normalized = ensure_json_object(metadata)
+        origin = normalized.get("origin")
+        origin_dict = dict(origin) if isinstance(origin, dict) else {}
+        existing_contract = normalized.get("execution_contract")
+        if isinstance(existing_contract, dict) and existing_contract.get("type"):
+            return normalized
+        repository_contract = origin_dict.get("repository_contract")
+        if isinstance(repository_contract, dict) and repository_contract.get("schema"):
+            normalized["execution_contract"] = {
+                "schema": "mac.task_execution_contract.v1",
+                "type": "repository",
+                "quality": "strong",
+                "source": "task_origin",
+                "repository_contract": repository_contract,
+            }
+            return normalized
+        repo = self._beads_repository_for_project(project)
+        if repo is not None:
+            contract = repo.metadata.get("repository_contract")
+            if not isinstance(contract, dict) or not contract.get("schema"):
+                contract = self._repository_contract_for_beads_repo(repo)
+            origin_dict.setdefault("type", "direct_task")
+            origin_dict.setdefault("repository_id", repo.id)
+            origin_dict.setdefault("repository_name", repo.name)
+            origin_dict.setdefault("repository_path", repo.path)
+            origin_dict.setdefault("source", repo.source)
+            origin_dict["repository_contract"] = contract
+            normalized["origin"] = origin_dict
+            acc_metadata = (
+                dict(normalized.get("acc_metadata"))
+                if isinstance(normalized.get("acc_metadata"), dict)
+                else {}
+            )
+            acc_metadata.setdefault("repo_beads_workflow", True)
+            acc_metadata.setdefault("workflow_role", "work")
+            acc_metadata.setdefault("repository_contract_schema", contract["schema"])
+            acc_metadata.setdefault("repository_contract_project", contract["project"])
+            normalized["acc_metadata"] = acc_metadata
+            normalized["execution_contract"] = {
+                "schema": "mac.task_execution_contract.v1",
+                "type": "repository",
+                "quality": "strong",
+                "source": "registered_project",
+                "repository_id": repo.id,
+                "repository_path": repo.path,
+                "repository_contract": contract,
+            }
+            return normalized
+        policy = normalized.get("policy") if isinstance(normalized.get("policy"), dict) else {}
+        evidence_type = str(
+            normalized.get("evidence_type")
+            or policy.get("evidence_type")
+            or policy.get("expected_evidence_type")
+            or "operator_result"
+        ).strip()
+        normalized["execution_contract"] = {
+            "schema": "mac.task_execution_contract.v1",
+            "type": "operator_directive",
+            "quality": "weak",
+            "source": "task_crud",
+            "repository_required": False,
+            "evidence_type": evidence_type,
+            "required_capabilities": required_capabilities,
+            "reason": "no_registered_repository_or_task_repository_contract",
+        }
+        return normalized
+
+    def _beads_repository_for_project(self, project: Optional[str]) -> Optional[BeadsRepository]:
+        if not project:
+            return None
+        row = self.store.query_one(
+            """
+            SELECT * FROM beads_repositories
+            WHERE project = ? AND enabled = ?
+            ORDER BY name, id
+            LIMIT 1
+            """,
+            (project, 1),
+        )
+        return self._beads_repository_from_row(row) if row is not None else None
 
     def get_task(self, task_id: str) -> Task:
         row = self.store.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -969,6 +1084,128 @@ class ControlPlane:
 
     def observability_summary(self, *args: Any, **kwargs: Any) -> JsonDict:
         return self.observability.summary(*args, **kwargs)
+
+    # Operator notifications ------------------------------------------
+
+    def record_notification(
+        self,
+        event_type: str,
+        title: str,
+        body: str,
+        *,
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        channels: Optional[Iterable[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: str = "pending",
+        conn: Any = None,
+        created_at: Optional[str] = None,
+    ) -> OperatorNotification:
+        event_value = str(event_type or "").strip()
+        title_value = str(title or "").strip()
+        body_value = str(body or "").strip()
+        status_value = str(status or "pending").strip().lower()
+        if not event_value:
+            raise ValidationError("notification event_type is required")
+        if not title_value:
+            raise ValidationError("notification title is required")
+        if not body_value:
+            raise ValidationError("notification body is required")
+        if status_value not in {"pending", "delivered", "failed", "skipped"}:
+            raise ValidationError("unsupported notification status: %s" % status)
+        channel_list = [
+            str(item).strip()
+            for item in (channels or ["dashboard"])
+            if str(item).strip()
+        ]
+        if not channel_list:
+            channel_list = ["dashboard"]
+        notification_id = new_id("note")
+        now = created_at or utcnow()
+        writer = conn if conn is not None else self.store
+        writer.execute(
+            """
+            INSERT INTO operator_notifications (
+                id, event_type, subject_type, subject_id, title, body,
+                channels, metadata, status, created_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                notification_id,
+                event_value,
+                subject_type,
+                subject_id,
+                title_value,
+                body_value,
+                json_dumps(channel_list),
+                json_dumps(ensure_json_object(metadata)),
+                status_value,
+                now,
+            ),
+        )
+        if conn is not None:
+            row = conn.execute(
+                "SELECT * FROM operator_notifications WHERE id = ?", (notification_id,)
+            ).fetchone()
+            return self._notification_from_row(row)
+        return self.get_notification(notification_id)
+
+    def get_notification(self, notification_id: str) -> OperatorNotification:
+        row = self.store.query_one(
+            "SELECT * FROM operator_notifications WHERE id = ?", (notification_id,)
+        )
+        if row is None:
+            raise NotFoundError("notification not found: %s" % notification_id)
+        return self._notification_from_row(row)
+
+    def list_notifications(
+        self,
+        status: Optional[str] = None,
+        subject_type: Optional[str] = None,
+        subject_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[OperatorNotification]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(str(status).strip().lower())
+        if subject_type is not None:
+            clauses.append("subject_type = ?")
+            params.append(subject_type)
+        if subject_id is not None:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        sql = "SELECT * FROM operator_notifications"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(min(max(1, int(limit)), 1000))
+        return [
+            self._notification_from_row(row)
+            for row in self.store.query_all(sql, tuple(params))
+        ]
+
+    def mark_notification_delivered(
+        self,
+        notification_id: str,
+        *,
+        status: str = "delivered",
+    ) -> OperatorNotification:
+        status_value = str(status or "delivered").strip().lower()
+        if status_value not in {"delivered", "failed", "skipped"}:
+            raise ValidationError("unsupported delivered notification status: %s" % status)
+        self.get_notification(notification_id)
+        now = utcnow()
+        self.store.execute(
+            """
+            UPDATE operator_notifications
+            SET status = ?, delivered_at = ?
+            WHERE id = ?
+            """,
+            (status_value, now, notification_id),
+        )
+        return self.get_notification(notification_id)
 
     # Short-retention command audit -------------------------------------
 
@@ -1416,7 +1653,9 @@ class ControlPlane:
                 (AgentStatus.BUSY.value, lease.task_id, now, now, agent_id),
             )
         self._record_history(lease.task_id, "task.lease_renewed", agent_id, None, None, {"lease_id": lease_id})
-        self._maybe_poll_beads_bridge_on_heartbeat(self.get_agent(agent_id))
+        heartbeat_agent = self.get_agent(agent_id)
+        self._maybe_poll_beads_bridge_on_heartbeat(heartbeat_agent)
+        self._maybe_advance_reviews_on_heartbeat(heartbeat_agent)
         return self.get_lease(lease_id)
 
     def get_lease(self, lease_id: str) -> Lease:
@@ -1753,6 +1992,7 @@ class ControlPlane:
         self.store.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
         agent = self.get_agent(agent_id)
         self._maybe_poll_beads_bridge_on_heartbeat(agent_before)
+        self._maybe_advance_reviews_on_heartbeat(agent_before)
         return agent
 
     def _maybe_poll_beads_bridge_on_heartbeat(self, agent: Agent) -> None:
@@ -1767,6 +2007,58 @@ class ControlPlane:
             try:
                 self.record_log(
                     "bridge.beads.heartbeat_poll_failed",
+                    layer="control_plane",
+                    source=agent.id,
+                    level="warning",
+                    detail={"error": str(exc)},
+                )
+            except Exception:
+                pass
+
+    def _maybe_advance_reviews_on_heartbeat(self, agent: Agent) -> None:
+        if not _truthy_env("MAC_REVIEW_TICK_ON_HEARTBEAT", "1"):
+            return
+        hub_agent = os.environ.get(
+            "MAC_REVIEW_TICK_HUB_AGENT",
+            os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky"),
+        ).strip()
+        if hub_agent and agent.name != hub_agent and agent.id != hub_agent:
+            return
+        try:
+            limit = int(os.environ.get("MAC_REVIEW_TICK_LIMIT", "25"))
+        except ValueError:
+            limit = 25
+        try:
+            result = self.advance_default_review_workflows(
+                limit=max(1, limit),
+                actor=agent.id,
+                tenant_id=None,
+            )
+            stuck = [
+                item
+                for item in result.get("results", [])
+                if item.get("status")
+                in {
+                    "waiting_for_verifiable_evidence",
+                    "waiting_for_reviewer",
+                    "waiting_for_reviewer_verdict",
+                    "waiting_for_publication_evidence",
+                    "waiting_for_publication_target",
+                    "ambiguous_pending_reviews",
+                }
+            ]
+            if result.get("processed") or stuck:
+                self.record_log(
+                    "workflow.default_review.heartbeat_tick",
+                    layer="control_plane",
+                    source=agent.id,
+                    level="warning" if stuck else "info",
+                    detail={"processed": result.get("processed", 0), "stuck": stuck},
+                )
+        except Exception as exc:  # noqa: BLE001 - heartbeat liveness must survive review sweeps.
+            try:
+                self.record_log(
+                    "workflow.default_review.heartbeat_tick_failed",
                     layer="control_plane",
                     source=agent.id,
                     level="warning",
@@ -2801,7 +3093,11 @@ class ControlPlane:
             report["imported_count"] += int(repo_report.get("imported_count", 0))
             report["existing_count"] += int(repo_report.get("existing_count", 0))
             report["skipped_count"] += int(repo_report.get("skipped_count", 0))
-            if repo_report.get("status") == "error":
+            if repo_report.get("status") in {
+                "error",
+                "source_dirty",
+                "source_refresh_error",
+            }:
                 report["error_count"] += 1
         if report["imported_count"] or report["error_count"]:
             self.record_log(
@@ -2833,6 +3129,38 @@ class ControlPlane:
                     "skipped_count": 0,
                 }
         try:
+            source_state = self._refresh_beads_repository_source(repo, actor)
+            if source_state["status"] in {"dirty", "error"}:
+                status = (
+                    "source_dirty"
+                    if source_state["status"] == "dirty"
+                    else "source_refresh_error"
+                )
+                self._update_beads_repository_poll_state(
+                    repo.id,
+                    now,
+                    last_imported_at=repo.last_imported_at,
+                    last_error=source_state.get("error") or source_state["status"],
+                )
+                self.record_notification(
+                    "bridge.beads.%s" % status,
+                    "Beads bridge source stale",
+                    "%s was not polled because its checkout is %s"
+                    % (repo.name, source_state["status"]),
+                    subject_type="environment",
+                    subject_id=repo.id,
+                    channels=["dashboard", "hermes"],
+                    metadata={"repository": repo.to_dict(), "source_state": source_state},
+                )
+                return {
+                    "repository_id": repo.id,
+                    "name": repo.name,
+                    "status": status,
+                    "source_state": source_state,
+                    "imported_count": 0,
+                    "existing_count": 0,
+                    "skipped_count": 0,
+                }
             repository_contract = self._repository_contract_for_beads_repo(repo)
             issues = self._ready_beads_issues(repo)
             imported = 0
@@ -2863,6 +3191,7 @@ class ControlPlane:
                 "existing_count": existing,
                 "skipped_count": 0,
                 "repository_contract_schema": repository_contract["schema"],
+                "source_state": source_state,
             }
         except Exception as exc:  # noqa: BLE001 - one broken repo must not break heartbeats.
             self._update_beads_repository_poll_state(
@@ -2880,6 +3209,105 @@ class ControlPlane:
                 "existing_count": 0,
                 "skipped_count": 0,
             }
+
+    def _refresh_beads_repository_source(self, repo: BeadsRepository, actor: str) -> JsonDict:
+        repo_path = Path(repo.path).expanduser()
+        state: JsonDict = {
+            "schema": "mac.beads_bridge.source_state.v1",
+            "repository_id": repo.id,
+            "repository_name": repo.name,
+            "path": str(repo_path),
+            "auto_pull": _truthy_env("MAC_BEADS_AUTO_PULL", "1"),
+            "status": "skipped",
+        }
+        if not state["auto_pull"]:
+            state["status"] = "disabled"
+            return state
+        if repo_path.is_file():
+            state["status"] = "file"
+            return state
+        if not (repo_path / ".git").exists():
+            state["status"] = "not_git"
+            return state
+
+        before = self._git_output(repo_path, ["rev-parse", "HEAD"])
+        state["head_before"] = before.get("stdout", "")
+        branch = self._git_output(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"])
+        state["branch"] = branch.get("stdout", "")
+        upstream = self._git_output(
+            repo_path,
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        if upstream["returncode"] != 0 or not upstream.get("stdout"):
+            state["status"] = "no_upstream"
+            self._record_beads_source_state(actor, repo, state, "info")
+            return state
+        state["upstream"] = upstream["stdout"]
+        dirty = self._git_output(repo_path, ["status", "--porcelain", "--untracked-files=no"])
+        if dirty["returncode"] != 0:
+            state["status"] = "error"
+            state["error"] = dirty.get("stderr") or dirty.get("stdout") or "git status failed"
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        dirty_paths = [line.strip() for line in dirty.get("stdout", "").splitlines() if line.strip()]
+        if dirty_paths:
+            state["status"] = "dirty"
+            state["dirty_paths"] = dirty_paths
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        fetch = self._git_output(repo_path, ["fetch", "--quiet", "--prune"])
+        if fetch["returncode"] != 0:
+            state["status"] = "error"
+            state["error"] = fetch.get("stderr") or fetch.get("stdout") or "git fetch failed"
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        pull = self._git_output(repo_path, ["pull", "--ff-only", "--quiet"])
+        if pull["returncode"] != 0:
+            state["status"] = "error"
+            state["error"] = pull.get("stderr") or pull.get("stdout") or "git pull failed"
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        after = self._git_output(repo_path, ["rev-parse", "HEAD"])
+        state["head_after"] = after.get("stdout", "")
+        state["status"] = (
+            "updated"
+            if state.get("head_before") and state.get("head_after") != state.get("head_before")
+            else "current"
+        )
+        self._record_beads_source_state(actor, repo, state, "info")
+        return state
+
+    def _git_output(self, repo_path: Path, args: List[str], timeout: int = 20) -> JsonDict:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "returncode": int(completed.returncode),
+            "stdout": (completed.stdout or "").strip(),
+            "stderr": (completed.stderr or "").strip(),
+        }
+
+    def _record_beads_source_state(
+        self,
+        actor: str,
+        repo: BeadsRepository,
+        state: JsonDict,
+        level: str,
+    ) -> None:
+        self.record_log(
+            "bridge.beads.repository_source",
+            layer="control_plane",
+            source=actor,
+            level=level,
+            subject_type="environment",
+            subject_id=repo.id,
+            detail=state,
+        )
 
     def _ready_beads_issues(self, repo: BeadsRepository) -> List[JsonDict]:
         repo_path = Path(repo.path).expanduser()
@@ -3399,6 +3827,21 @@ class ControlPlane:
             row["created_at"],
         )
 
+    def _notification_from_row(self, row: Any) -> OperatorNotification:
+        return OperatorNotification(
+            row["id"],
+            row["event_type"],
+            row["subject_type"],
+            row["subject_id"],
+            row["title"],
+            row["body"],
+            json_loads(row["channels"], []),
+            json_loads(row["metadata"], {}),
+            row["status"],
+            row["created_at"],
+            row["delivered_at"],
+        )
+
     def _lease_from_row(self, row: Any) -> Lease:
         return Lease(row["id"], row["task_id"], row["agent_id"], row["expires_at"], row["status"], row["created_at"], row["updated_at"])
 
@@ -3507,6 +3950,140 @@ class ControlPlane:
             {"actor": actor, "from_state": from_state, "to_state": to_state, **detail},
             when,
         )
+        self._record_history_notification(
+            writer,
+            task_id,
+            event_type,
+            actor,
+            from_state,
+            to_state,
+            detail,
+            when,
+        )
+
+    def _record_history_notification(
+        self,
+        writer: Any,
+        task_id: str,
+        event_type: str,
+        actor: str,
+        from_state: Optional[str],
+        to_state: Optional[str],
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        payload = self._notification_payload_for_history(
+            task_id, event_type, actor, from_state, to_state, detail
+        )
+        if payload is None:
+            return
+        self.record_notification(
+            payload["event_type"],
+            payload["title"],
+            payload["body"],
+            subject_type="task",
+            subject_id=task_id,
+            channels=payload.get("channels"),
+            metadata=payload.get("metadata"),
+            conn=writer,
+            created_at=when,
+        )
+
+    def _notification_payload_for_history(
+        self,
+        task_id: str,
+        event_type: str,
+        actor: str,
+        from_state: Optional[str],
+        to_state: Optional[str],
+        detail: Dict[str, Any],
+    ) -> Optional[JsonDict]:
+        task_title = task_id
+        try:
+            task_title = self.get_task(task_id).title
+        except Exception:
+            pass
+        metadata = {
+            "actor": actor,
+            "from_state": from_state,
+            "to_state": to_state,
+            **ensure_json_object(detail),
+        }
+        if event_type == "task.claimed":
+            return {
+                "event_type": event_type,
+                "title": "Task claimed",
+                "body": "%s claimed %s" % (actor, task_title),
+                "channels": ["dashboard", "hermes"],
+                "metadata": metadata,
+            }
+        if event_type == "task.evidence_added":
+            return {
+                "event_type": event_type,
+                "title": "Evidence recorded",
+                "body": "%s added %s evidence for %s"
+                % (actor, detail.get("kind", "task"), task_title),
+                "channels": ["dashboard"],
+                "metadata": metadata,
+            }
+        if event_type == "task.review_requested":
+            return {
+                "event_type": event_type,
+                "title": "Review requested",
+                "body": "Review requested for %s" % task_title,
+                "channels": ["dashboard", "hermes"],
+                "metadata": metadata,
+            }
+        if event_type == "task.review_completed":
+            return {
+                "event_type": event_type,
+                "title": "Review completed",
+                "body": "Review %s for %s"
+                % (str(detail.get("status") or "completed"), task_title),
+                "channels": ["dashboard", "hermes"],
+                "metadata": metadata,
+            }
+        if event_type == "task.published":
+            return {
+                "event_type": event_type,
+                "title": "Task published",
+                "body": "%s published %s" % (actor, task_title),
+                "channels": ["dashboard", "hermes"],
+                "metadata": metadata,
+            }
+        if event_type == "task.lease_expired":
+            return {
+                "event_type": event_type,
+                "title": "Task lease expired",
+                "body": "%s was requeued after lease expiry" % task_title,
+                "channels": ["dashboard", "hermes"],
+                "metadata": metadata,
+            }
+        if event_type == "task.transitioned" and to_state in {
+            TaskState.RUNNING.value,
+            TaskState.NEEDS_REVIEW.value,
+            TaskState.REVIEWING.value,
+            TaskState.COMPLETED.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        }:
+            return {
+                "event_type": "task.%s" % to_state,
+                "title": "Task %s" % to_state.replace("_", " "),
+                "body": "%s moved to %s" % (task_title, to_state),
+                "channels": ["dashboard", "hermes"]
+                if to_state
+                in {
+                    TaskState.NEEDS_REVIEW.value,
+                    TaskState.REVIEWING.value,
+                    TaskState.COMPLETED.value,
+                    TaskState.FAILED.value,
+                    TaskState.CANCELLED.value,
+                }
+                else ["dashboard"],
+                "metadata": metadata,
+            }
+        return None
 
     def _dependencies_satisfied(self, task: Task) -> bool:
         for dep_id in task.dependencies:

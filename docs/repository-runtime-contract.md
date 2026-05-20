@@ -62,6 +62,14 @@ and `task.metadata.origin.repository_contract`. The Hermes executor prompt
 surfaces the contract and tells workers to bootstrap from the local checkout
 before running the declared test command.
 
+Direct tasks created through the task CRUD API are normalized too. If their
+`project` matches an enabled registered repository, mac attaches the same
+repository contract to `task.metadata.origin.repository_contract` and records a
+strong `task.metadata.execution_contract`. If no repository applies, mac records
+a weak `operator_directive` execution contract and emits
+`task.execution_contract.weak` telemetry so under-specified work is visible
+before an agent tries to execute it.
+
 ## mac As First Adopter
 
 mac declares its own contract in `.mac/project.yaml`. Its bootstrap command is:

@@ -309,6 +309,24 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_observability_events_name_created
                     ON observability_events (name, created_at);
 
+                CREATE TABLE IF NOT EXISTS operator_notifications (
+                    id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    subject_type TEXT,
+                    subject_id TEXT,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    channels TEXT NOT NULL,
+                    metadata TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_operator_notifications_status_created
+                    ON operator_notifications (status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_operator_notifications_subject
+                    ON operator_notifications (subject_type, subject_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS command_audit (
                     id TEXT PRIMARY KEY,
                     command_id TEXT NOT NULL,

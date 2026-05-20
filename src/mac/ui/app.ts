@@ -136,6 +136,19 @@ interface CommandAuditRecord extends ApiRecord {
   created_at: string;
 }
 
+interface OperatorNotification extends ApiRecord {
+  event_type: string;
+  subject_type?: string | null;
+  subject_id?: string | null;
+  title: string;
+  body: string;
+  channels?: string[];
+  metadata?: JsonObject;
+  status: string;
+  created_at: string;
+  delivered_at?: string | null;
+}
+
 interface DashboardData {
   overview: {
     counts: Record<string, number>;
@@ -153,6 +166,7 @@ interface DashboardData {
   dead_letters: TaskRecord[];
   dispatch: { open_task_count: number; tasks: DispatchTask[] };
   messages: ApiRecord[];
+  notifications: OperatorNotification[];
   command_audit: CommandAuditRecord[];
   secrets: ApiRecord[];
   secret_audits: ApiRecord[];
@@ -554,6 +568,8 @@ function renderObservability(): string {
   };
   const counts = observability.counts || {};
   const commandAudit = data.command_audit || [];
+  const notifications = data.notifications || [];
+  const pendingNotifications = notifications.filter((item) => item.status === "pending").length;
   const live = uniqueObservations([...state.observabilityLive, ...(observability.latest || [])]);
   const layerTotal = Object.values(observability.layers || {}).reduce((sum, value) => sum + Number(value || 0), 0);
   const levelTotal = Object.values(observability.levels || {}).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -562,6 +578,7 @@ function renderObservability(): string {
       ${metric("Observations", counts.events || 0, `${counts.logs || 0} logs, ${counts.metrics || 0} metrics`)}
       ${metric("Warnings", counts.warnings || 0, "warning observations")}
       ${metric("Errors", counts.errors || 0, "error observations")}
+      ${metric("Notifications", notifications.length, `${pendingNotifications} pending`)}
       ${metric("Stream", state.observabilityStreamStatus, `${state.observabilityLive.length} live item(s)`)}
     </section>
     <section class="split">
@@ -577,6 +594,15 @@ function renderObservability(): string {
         <h2>Distribution</h2>
         ${stateBars(Object.keys(observability.layers || {}).sort(), observability.layers || {}, layerTotal, "No layers")}
         ${stateBars(Object.keys(observability.levels || {}).sort(), observability.levels || {}, levelTotal, "No levels")}
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Notifications</h2>
+        ${chip(`${pendingNotifications} pending`, pendingNotifications ? "warn" : "good")}
+      </div>
+      <div class="observability-feed">
+        ${notifications.length ? notifications.slice(0, 80).map(notificationRecord).join("") : `<div class="empty-state">No notifications</div>`}
       </div>
     </section>
     <section class="surface">
@@ -597,6 +623,22 @@ function renderObservability(): string {
         ${live.length ? live.slice(0, 80).map(observationRecord).join("") : `<div class="empty-state">No observations</div>`}
       </div>
     </section>
+  `;
+}
+
+function notificationRecord(item: OperatorNotification): string {
+  return `
+    <article class="feed-item">
+      <div>
+        <strong>${escapeHtml(item.title)}</strong>
+        <p>${escapeHtml(item.body)}</p>
+        <p class="muted small">${escapeHtml(item.event_type)} · ${escapeHtml(item.created_at)}</p>
+      </div>
+      <div class="chip-row">
+        ${chip(item.status, item.status === "pending" ? "warn" : item.status === "failed" ? "bad" : "good")}
+        ${(item.channels || []).map((channel) => chip(channel, "info")).join("")}
+      </div>
+    </article>
   `;
 }
 
