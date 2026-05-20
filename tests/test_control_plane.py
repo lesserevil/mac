@@ -1532,6 +1532,37 @@ def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeyp
     assert cp.list_project_items()[0].external_id == "mac-heartbeat"
 
 
+def test_hub_lease_renewal_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-renewal",
+                "title": "Lease renewal imported bead",
+                "description": "import me while hub is busy",
+                "status": "open",
+                "priority": 1,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    rocky = register_agent(cp, "rocky", ["python"])
+    task = cp.create_task("busy hub task", required_capabilities=["python"])
+    _claimed, lease = cp.claim_task(task.id, rocky.id)
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+
+    cp.renew_lease(lease.id, rocky.id)
+
+    imported = [item.external_id for item in cp.list_project_items()]
+    assert imported == ["mac-renewal"]
+
+
 def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -1107,6 +1107,7 @@ class ControlPlane:
                 (AgentStatus.BUSY.value, lease.task_id, now, now, agent_id),
             )
         self._record_history(lease.task_id, "task.lease_renewed", agent_id, None, None, {"lease_id": lease_id})
+        self._maybe_poll_beads_bridge_on_heartbeat(self.get_agent(agent_id))
         return self.get_lease(lease_id)
 
     def get_lease(self, lease_id: str) -> Lease:
