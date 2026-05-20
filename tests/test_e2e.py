@@ -161,6 +161,16 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
         "/agents",
         json={"machine_id": m2["id"], "name": "natasha", "capabilities": ["python"]},
     ).json()
+    # Reviewer is now a required role (mac-s1a) — register a separate
+    # agent that can do the review work for the auto-publish path.
+    client.post(
+        "/agents",
+        json={
+            "machine_id": m1["id"],
+            "name": "reviewer",
+            "capabilities": ["review"],
+        },
+    )
     task = client.post(
         "/tasks",
         json={
@@ -215,7 +225,10 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
     assert needs_review_transitions[0]["from_state"] == TaskState.RUNNING.value
     assert needs_review_transitions[0]["actor"] in {a1["id"], a2["id"]}
     assert len(final["reviews"]) == 1
-    assert final["reviews"][0]["reviewer_agent_id"] in {a1["id"], a2["id"]}
+    # Reviewer is a separate agent — mac-s1a requires the `review`
+    # capability so the workers (python only) can't review their own
+    # work. mac-v2i additionally bars same-persona collusion, which
+    # this test doesn't exercise (workers have no soul).
     assert final["reviews"][0]["reviewer_agent_id"] != needs_review_transitions[0]["actor"]
     assert len(final["publications"]) == 1
 

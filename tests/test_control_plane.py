@@ -812,6 +812,151 @@ def test_default_review_rejects_alias_evidence_taxonomy(cp):
     assert result["status"] == "waiting_for_verifiable_evidence"
 
 
+def test_default_reviewer_requires_review_capability(cp):
+    """mac-s1a: the reviewer pool must require the `review` capability,
+    not merely prefer it. An autonomous review can't be performed by an
+    agent whose role doesn't include review duties."""
+    worker = register_agent(cp, "worker", ["python"])
+    # Three more agents, none with `review` capability. The workflow
+    # must refuse to assign a reviewer rather than picking the
+    # alphabetically-first idle agent.
+    register_agent(cp, "alpha", ["docs"])
+    register_agent(cp, "bravo", ["ops"])
+    register_agent(cp, "charlie", ["python"])
+    task = cp.create_task(
+        "needs-real-reviewer",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://r"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id, "log", "x", "y", worker.id, metadata=verified_repo_metadata()
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_reviewer"
+    assert cp.list_reviews(task.id) == []
+
+    # Once a `review`-capable agent comes online, the workflow advances.
+    register_agent(cp, "real-reviewer", ["review"])
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "published"
+
+
+def test_default_reviewer_refuses_same_persona_as_executor(cp):
+    """mac-v2i: two agents souled to the same persona can't approve
+    each other. The second-eyes role only matters if the eyes are
+    different."""
+    machine = cp.register_machine("h-collusion")
+    from tests.conftest import bind_soul
+
+    code_reviewer_soul_a = bind_soul(
+        cp,
+        persona_name="Code Reviewer",  # default slug = "code-reviewer"
+        tenant_name="collusion-tenant",
+        instance_name="instance-a",
+    )
+    # Reuse the same tenant by passing a different tenant_name=... isn't
+    # straightforward; bind_soul registers a fresh tenant each call.
+    # Use the same instance approach: two instances bound to the same
+    # persona under the same tenant.
+    tenant = cp.identity.get_hermes_instance(code_reviewer_soul_a)
+    code_reviewer_soul_b = cp.register_hermes_instance(
+        tenant.tenant_id,
+        "instance-b",
+        persona_id=tenant.persona_id,
+    ).id
+
+    executor = cp.register_agent(
+        machine.id, "exec", capabilities=["python", "review"], hermes_instance_id=code_reviewer_soul_a
+    )
+    peer = cp.register_agent(
+        machine.id, "peer", capabilities=["python", "review"], hermes_instance_id=code_reviewer_soul_b
+    )
+    cp.roles.create_role(
+        slug="code-reviewer",
+        name="Code Reviewer",
+        description="d",
+        system_prompt="p",
+        level="ic",
+    )
+    cp.roles.assign_role(executor.id, "code-reviewer")
+    cp.roles.assign_role(peer.id, "code-reviewer")
+
+    task = cp.create_task(
+        "collusion-target",
+        required_capabilities=["python"],
+        metadata={
+            "publication_target": "test://collusion",
+            # Same-tenant task so the tenancy gate doesn't get in the way.
+            "origin": {"tenant_id": tenant.tenant_id},
+        },
+    )
+    cp.claim_task(task.id, executor.id)
+    cp.start_task(task.id, executor.id)
+    cp.add_evidence(
+        task.id, "log", "x", "y", executor.id, metadata=verified_repo_metadata()
+    )
+    cp.submit_for_review(task.id, executor.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    # Peer has the right capability AND the right tenant but the SAME
+    # persona — the workflow must refuse to draft them.
+    assert result["status"] == "waiting_for_reviewer"
+    assert cp.list_reviews(task.id) == []
+
+
+def test_default_review_refuses_reviewer_from_different_tenant(cp):
+    """mac-dyk: the reviewer's persona tenant must match the task's
+    tenant. Without this, tenant B's idle agent could auto-approve
+    tenant A's work."""
+    from tests.conftest import bind_soul
+
+    machine_a = cp.register_machine("host-a")
+    machine_b = cp.register_machine("host-b")
+    soul_a = bind_soul(
+        cp,
+        persona_name="Reviewer-A",
+        tenant_name="alpha",
+        allowed_role_slugs=["reviewer-a"],
+    )
+    soul_b = bind_soul(
+        cp,
+        persona_name="Reviewer-B",
+        tenant_name="beta",
+        allowed_role_slugs=["reviewer-b"],
+    )
+    tenant_a = cp.identity.get_hermes_instance(soul_a).tenant_id
+
+    executor = cp.register_agent(
+        machine_a.id, "exec-a", capabilities=["python"], hermes_instance_id=soul_a
+    )
+    cp.register_agent(
+        machine_b.id, "reviewer-b", capabilities=["review"], hermes_instance_id=soul_b
+    )
+    task = cp.create_task(
+        "tenant-a-work",
+        required_capabilities=["python"],
+        metadata={
+            "publication_target": "test://a",
+            "origin": {"tenant_id": tenant_a},
+        },
+    )
+    cp.claim_task(task.id, executor.id)
+    cp.start_task(task.id, executor.id)
+    cp.add_evidence(
+        task.id, "log", "x", "y", executor.id, metadata=verified_repo_metadata()
+    )
+    cp.submit_for_review(task.id, executor.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    # Tenant B's review-capable agent must NOT be drafted.
+    assert result["status"] == "waiting_for_reviewer"
+    assert cp.list_reviews(task.id) == []
+
+
 def test_renew_lease_refuses_on_transitioning_task(cp):
     """mac-eow: renew_lease must refuse when the underlying task is no
     longer CLAIMED/RUNNING. Previous silent-update behavior was a

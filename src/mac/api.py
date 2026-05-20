@@ -1972,8 +1972,24 @@ def create_app(
     def default_review_tick(
         limit: int = Query(default=100),
         actor: str = Query(default="operator"),
+        tenant_id: Optional[str] = Query(default=None),
+        principal: TokenPrincipal = Depends(_get_principal),
     ) -> Dict[str, Any]:
-        return cp.advance_default_review_workflows(limit=limit, actor=actor)
+        # Admin scope is required by _required_scope. If the caller is
+        # tenant-bound (rare for admin tokens but supported), force the
+        # filter to their tenant so a misconfigured admin can't sweep
+        # across tenant boundaries (mac-dyk).
+        if principal.tenant_id is not None and tenant_id is None:
+            tenant_id = principal.tenant_id
+        if (
+            principal.tenant_id is not None
+            and tenant_id is not None
+            and tenant_id != principal.tenant_id
+        ):
+            principal.assert_tenant(tenant_id)
+        return cp.advance_default_review_workflows(
+            limit=limit, actor=actor, tenant_id=tenant_id
+        )
 
     @app.post("/publications")
     def publish(body: PublicationCreate) -> Dict[str, Any]:

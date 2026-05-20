@@ -1717,10 +1717,18 @@ class ControlPlane:
         self,
         limit: int = 100,
         actor: str = "default-review-workflow",
+        tenant_id: Optional[str] = None,
     ) -> JsonDict:
+        """Sweep reviewable tasks. When ``tenant_id`` is set, only tasks
+        owned by that tenant are processed — operator tools call this
+        scoped, and the autonomous-tick endpoint passes their tenant
+        through. Without a filter, sweeps everything (admin / single-
+        tenant deployments)."""
         results = []
         for task in self.list_tasks():
             if task.state not in {TaskState.NEEDS_REVIEW.value, TaskState.REVIEWING.value}:
+                continue
+            if tenant_id is not None and self._task_tenant_id(task) != tenant_id:
                 continue
             results.append(self.advance_default_review_workflow(task.id, actor=actor))
             if len(results) >= max(1, int(limit)):
@@ -2643,24 +2651,113 @@ class ControlPlane:
         return None
 
     def _select_default_reviewer(self, task: Task) -> Optional[Agent]:
-        candidates = [
-            agent
-            for agent in self.list_agents()
-            if agent.health_status == HealthStatus.HEALTHY.value
-            and agent.status != AgentStatus.OFFLINE.value
-            and not self.reviews.agent_has_owned_task(task.id, agent.id)
-        ]
+        """Pick a default reviewer for ``task``.
+
+        Trust boundaries enforced here (autonomous-review context where
+        there is no human in the loop):
+
+        * Tenancy (mac-dyk): the reviewer's persona tenant_id must
+          match the task's tenant. Without a human to catch a misroute,
+          the tenancy boundary IS the safety boundary.
+        * Capability (mac-s1a): ``review`` capability is *required*,
+          not preferred. An agent without it cannot be drafted.
+        * Persona separation / anti-collusion (mac-v2i): the reviewer's
+          persona slug must differ from the executor's persona slug.
+          Two code-reviewer-souled agents cannot approve each other's
+          work — the second-eyes role only matters if it's a different
+          eye.
+        * Not the executor (existing): agent_has_owned_task continues
+          to exclude prior owners.
+        """
+        task_tenant = self._task_tenant_id(task)
+        executor_persona_slug = self._task_executor_persona_slug(task)
+
+        candidates: List[Agent] = []
+        for agent in self.list_agents():
+            if agent.health_status != HealthStatus.HEALTHY.value:
+                continue
+            if agent.status == AgentStatus.OFFLINE.value:
+                continue
+            if self.reviews.agent_has_owned_task(task.id, agent.id):
+                continue
+            if "review" not in set(agent.capabilities):
+                continue
+            agent_tenant, agent_persona_slug = self._agent_tenant_and_persona(agent)
+            # Tenant gate: if the task has a tenant, the agent's soul
+            # must be in the same one. Agents without a soul are
+            # ineligible to act as reviewers in tenant-scoped flows.
+            if task_tenant is not None:
+                if agent_tenant is None or agent_tenant != task_tenant:
+                    continue
+            # Anti-collusion: peers from the same persona can't endorse
+            # each other.
+            if (
+                executor_persona_slug is not None
+                and agent_persona_slug is not None
+                and agent_persona_slug == executor_persona_slug
+            ):
+                continue
+            candidates.append(agent)
         if not candidates:
             return None
         candidates.sort(
             key=lambda agent: (
-                0 if "review" in set(agent.capabilities) else 1,
                 0 if agent.status == AgentStatus.IDLE.value else 1,
                 agent.name,
                 agent.id,
             )
         )
         return candidates[0]
+
+    def _agent_tenant_and_persona(self, agent: Agent) -> Tuple[Optional[str], Optional[str]]:
+        """Return ``(tenant_id, persona_slug)`` for an agent, both
+        optional. Used by the reviewer-selection guards (tenancy +
+        anti-collusion). Agents without a hermes_instance_id have
+        neither and are treated as ineligible by the reviewer picker
+        when the task is tenant-scoped."""
+        if not agent.hermes_instance_id:
+            return None, None
+        try:
+            instance = self.identity.get_hermes_instance(agent.hermes_instance_id)
+        except NotFoundError:
+            return None, None
+        if not instance.persona_id:
+            return instance.tenant_id, None
+        try:
+            persona = self.identity.get_persona(instance.persona_id)
+        except NotFoundError:
+            return instance.tenant_id, None
+        slug = persona.name.strip().lower().replace(" ", "-").replace("_", "-") or None
+        return instance.tenant_id, slug
+
+    def _task_executor_persona_slug(self, task: Task) -> Optional[str]:
+        """Find the persona slug of whichever agent owned the task last
+        (the executor). Used by anti-collusion. Returns None when the
+        task has no recorded owner — in that case no executor-side
+        persona constraint applies."""
+        executor_agent_id: Optional[str] = task.owner_agent_id
+        if executor_agent_id is None:
+            # Look for the last lease against this task — it identifies
+            # the executor even after submit-for-review releases owner.
+            row = self.store.query_one(
+                """
+                SELECT agent_id FROM leases
+                WHERE task_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (task.id,),
+            )
+            if row is not None:
+                executor_agent_id = row["agent_id"]
+        if executor_agent_id is None:
+            return None
+        try:
+            executor = self.get_agent(executor_agent_id)
+        except NotFoundError:
+            return None
+        _, slug = self._agent_tenant_and_persona(executor)
+        return slug
 
     def _default_publication_target(self, task: Task) -> Optional[str]:
         """Resolve the publication target from task metadata or return None.
