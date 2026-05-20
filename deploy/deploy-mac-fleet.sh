@@ -78,7 +78,7 @@ EOF
     MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
     MAC_DEPLOY_CONTROL_BIND_HOST=""
     MAC_DEPLOY_WORKER_MODE="heartbeat"
-    MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes"
+    MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes,review"
     MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=""
     MAC_DEPLOY_WORKER_REQUIRED_METADATA=""
     MAC_DEPLOY_WORKER_REQUIRE_CANARY="1"
@@ -171,7 +171,7 @@ HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
 HUB_TOKEN="${MAC_DEPLOY_HUB_TOKEN:-}"
 CONTROL_BIND_HOST="${MAC_DEPLOY_CONTROL_BIND_HOST:-127.0.0.1}"
 WORKER_MODE="${MAC_DEPLOY_WORKER_MODE:-heartbeat}"
-WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes}"
+WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}"
 WORKER_ALLOWED_PROJECTS="${MAC_DEPLOY_WORKER_ALLOWED_PROJECTS:-}"
 WORKER_REQUIRED_METADATA="${MAC_DEPLOY_WORKER_REQUIRED_METADATA:-}"
 WORKER_REQUIRE_CANARY="${MAC_DEPLOY_WORKER_REQUIRE_CANARY:-1}"
@@ -1304,7 +1304,7 @@ configured_hub_url = sys.argv[9].strip()
 configured_hub_token = sys.argv[10].strip()
 configured_bind_host = sys.argv[11].strip() or "127.0.0.1"
 configured_worker_mode = sys.argv[12].strip() or "heartbeat"
-configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes"
+configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes,review"
 configured_worker_allowed_projects = sys.argv[14].strip()
 configured_worker_required_metadata = sys.argv[15].strip()
 configured_worker_require_canary = sys.argv[16].strip() or "1"
@@ -1621,7 +1621,7 @@ agent_name="${MAC_WORKER_AGENT_NAME:-$(hostname -s 2>/dev/null || hostname)}"
 host_name="${MAC_WORKER_HOSTNAME:-$agent_name}"
 workspace="${MAC_WORKER_WORKSPACE:-$HOME/.mac/agent-workspaces}"
 mode="${MAC_WORKER_MODE:-heartbeat}"
-capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes}"
+capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review}"
 mkdir -p "$workspace"
 
 common=(
@@ -1635,6 +1635,8 @@ common=(
   --workspace "$workspace"
   --lease-seconds "${MAC_WORKER_LEASE_SECONDS:-900}"
   --poll-interval "${MAC_WORKER_POLL_INTERVAL:-2}"
+  --attestation-key-env "$HOME/.mac/mac.env"
+  --rotate-missing-attestation-key
 )
 if [ -n "${MAC_WORKER_RESOURCES:-}" ]; then
   common+=(--resources "$MAC_WORKER_RESOURCES")
@@ -1757,18 +1759,37 @@ def main() -> int:
     task_workspace = Path(os.environ["MAC_TASK_WORKSPACE"])
     task_payload = json.loads(task_file.read_text(encoding="utf-8"))
     task = task_payload.get("task", task_payload)
-    prompt = "\n\n".join(
-        [
-            "You are running as a MAC fleet worker. Complete the assigned task from first principles.",
-            "Use the task JSON as the source of truth. Preserve secrets and do not print bearer tokens.",
-            "When you finish, report the exact outcome, files changed, tests run, and any blockers.",
-            "Also write a verifiable evidence manifest to $MAC_TASK_WORKSPACE/mac-evidence.json.",
-            "Use schema mac.worker_evidence.v1 with status=complete and evidence_type set to one of repo_change, documentation, investigation, deployment, test, artifact, or no_change.",
-            "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
-            "Repository runtime contract:\n%s" % repository_contract_section(task),
-            "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
-        ]
-    )
+    metadata = task.get("metadata") if isinstance(task, dict) else {}
+    review_context = metadata.get("review_context") if isinstance(metadata, dict) else None
+    if isinstance(review_context, dict):
+        prompt = "\n\n".join(
+            [
+                "You are running as a MAC fleet reviewer. Review the executor's work independently.",
+                "Use the task JSON and review_context as the source of truth. Preserve secrets and do not print bearer tokens.",
+                "Decide whether the executor evidence actually proves the task was completed and verified.",
+                "Approve only when the evidence is coherent, pushed/published when required, and the checks are passing. Reject unverifiable, local-only, failing, or mismatched work.",
+                "When you finish, report concise findings and write a review verdict manifest to $MAC_TASK_WORKSPACE/mac-evidence.json.",
+                "Use schema mac.worker_evidence.v1 with status=complete, evidence_type=review_verdict, verdict=approved or rejected, reviewed_evidence_id=%s, and review_id=%s."
+                % (
+                    review_context.get("executor_evidence_id", ""),
+                    review_context.get("review_id", ""),
+                ),
+                "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
+            ]
+        )
+    else:
+        prompt = "\n\n".join(
+            [
+                "You are running as a MAC fleet worker. Complete the assigned task from first principles.",
+                "Use the task JSON as the source of truth. Preserve secrets and do not print bearer tokens.",
+                "When you finish, report the exact outcome, files changed, tests run, and any blockers.",
+                "Also write a verifiable evidence manifest to $MAC_TASK_WORKSPACE/mac-evidence.json.",
+                "Use schema mac.worker_evidence.v1 with status=complete and evidence_type set to one of repo_change, documentation, investigation, deployment, test, artifact, or no_change.",
+                "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
+                "Repository runtime contract:\n%s" % repository_contract_section(task),
+                "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
+            ]
+        )
     hermes_py = Path.home() / ".mac" / "hermes-agent" / ".venv" / "bin" / "python"
     hermes = Path.home() / ".mac" / "hermes-agent" / "hermes"
     result = subprocess.run(

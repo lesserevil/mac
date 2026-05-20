@@ -18,7 +18,7 @@ from mac.agentbus_control import (
 from mac.api import create_app
 from mac.hermes_adapter import MacApiClient, MacApiError
 from mac.models import TaskState
-from mac.services import ControlPlane
+from mac.services import ControlPlane, sign_verification_manifest
 from mac.worker import MacWorker, WorkerExecution, register_worker
 
 
@@ -118,6 +118,89 @@ def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: P
     assert "worker.task_claimed" in names
     assert "worker.execution.duration_ms" in names
     assert any(item.subject_id == task.id for item in observations)
+
+
+def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    machine = cp.register_machine("review-host")
+    executor_agent = cp.register_agent(machine.id, "executor", capabilities=["python"])
+    reviewer = cp.register_agent(machine.id, "reviewer", capabilities=["review"])
+    task = cp.create_task(
+        "Reviewable repo task",
+        required_capabilities=["python"],
+        metadata={"publication_target": "git://main"},
+    )
+    cp.claim_task(task.id, executor_agent.id)
+    cp.start_task(task.id, executor_agent.id)
+    executor_manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "repo_change",
+        "repo": {
+            "head_sha": "abc123abc123abc123abc123abc123abc123abcd",
+            "remote_ref": "origin/main",
+            "pushed": True,
+            "dirty": False,
+            "files_changed": ["src/example.py"],
+        },
+        "checks": [{"name": "pytest", "status": "passed", "returncode": 0}],
+        "signed_by": executor_agent.id,
+    }
+    executor_manifest["signature"] = sign_verification_manifest(
+        cp._agent_attestation_key(executor_agent.id), executor_manifest
+    )
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "file:///tmp/executor-result.json",
+        "executor completed",
+        executor_agent.id,
+        metadata={"returncode": 0, "verification": executor_manifest},
+    )
+    cp.submit_for_review(task.id, executor_agent.id)
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    assert first["reviewer_agent_id"] == reviewer.id
+    client = TestClient(create_app(control_plane=cp))
+
+    def review_executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        context = task_payload["metadata"]["review_context"]
+        assert context["task_id"] == task.id
+        assert context["review_id"] == first["review_id"]
+        assert context["executor_evidence_id"] == evidence.id
+        manifest = {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "review_verdict",
+            "verdict": "approved",
+            "review_id": context["review_id"],
+            "reviewed_evidence_id": context["executor_evidence_id"],
+            "findings": ["executor evidence is signed and tests passed"],
+        }
+        (task_dir / "mac-evidence.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return WorkerExecution(0, "review approved", stdout="approved\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        reviewer.id,
+        tmp_path,
+        review_executor,
+        attestation_key=cp._agent_attestation_key(reviewer.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "review_verdict_recorded"
+    verdict_evidence = cp.list_evidence(task.id)[-1]
+    manifest = verdict_evidence.metadata["verification"]
+    assert verdict_evidence.kind == "review"
+    assert manifest["evidence_type"] == "review_verdict"
+    assert manifest["signed_by"] == reviewer.id
+    assert manifest["reviewed_evidence_id"] == evidence.id
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
 
 
 def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):

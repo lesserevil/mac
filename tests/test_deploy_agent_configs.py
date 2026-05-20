@@ -50,6 +50,29 @@ def test_fleet_agent_configs_use_distinct_hermes_models():
     assert len(set(models)) == len(models)
 
 
+def test_fleet_agent_configs_enable_review_capability_by_default():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    template = parse_env(ROOT / "deploy" / "agents" / "TEMPLATE" / "config.env")
+
+    assert 'MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes,review"' in script
+    assert 'WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}"' in script
+    assert 'configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes,review"' in script
+    assert 'capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review}"' in script
+    assert template["MAC_DEPLOY_WORKER_CAPABILITIES"] == "ops,python,hermes,review"
+
+    for agent in ("rocky", "natasha", "bullwinkle"):
+        values = parse_env(ROOT / "deploy" / "agents" / agent / "config.env")
+        assert values["MAC_DEPLOY_WORKER_CAPABILITIES"] == "ops,python,hermes,review"
+
+
+def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert '--attestation-key-env "$HOME/.mac/mac.env"' in script
+    assert "--rotate-missing-attestation-key" in script
+    assert "evidence_type=review_verdict" in script
+
+
 def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 

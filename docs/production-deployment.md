@@ -182,11 +182,11 @@ visible in Rocky's registry without claiming imported ACC work prematurely:
 ```bash
 mac-agent --url http://100.125.137.89:8789 --register \
   --agent-name rocky --hostname rocky.local \
-  --capabilities python,ops --resources '{"capacity":2}' \
+  --capabilities python,ops,review --resources '{"capacity":2}' \
   --heartbeat-only
 
 mac-agent --url http://100.125.137.89:8789 --register \
-  --agent-name rocky --capabilities python,ops \
+  --agent-name rocky --capabilities python,ops,review \
   --workspace ~/.mac-agent/workspaces --loop \
   --executor ~/.mac/bin/mac-hermes-task-executor
 ```
@@ -242,7 +242,7 @@ To enable executor-backed claiming from deploy config, set:
 
 ```bash
 MAC_DEPLOY_WORKER_MODE=loop
-MAC_DEPLOY_WORKER_CAPABILITIES=ops,python,hermes
+MAC_DEPLOY_WORKER_CAPABILITIES=ops,python,hermes,review
 MAC_DEPLOY_WORKER_REQUIRE_CANARY=1
 MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=mac-canary
 ```
@@ -251,6 +251,12 @@ The generated service then runs `mac-agent --register --loop` against
 `MAC_HUB_URL`, using `MAC_WORKER_TOKEN` from `~/.mac/mac.env`. The default
 executor wrapper is `~/.mac/bin/mac-hermes-task-executor`, which calls the
 deployed upstream Hermes checkout in one-shot mode.
+
+Workers advertise `review` by default so the default review workflow can pick
+real second-eye reviewers. During registration the worker persists its
+attestation key into `~/.mac/mac.env`; if an older deploy missed that one-time
+key, the service rotates a replacement before it signs new evidence. Rotation
+is explicit recovery behavior and invalidates old signatures from that agent.
 
 Loop mode is canary-gated by default. To make a worker eligible for real
 migrated work, explicitly set `MAC_DEPLOY_WORKER_REQUIRE_CANARY=0` and narrow

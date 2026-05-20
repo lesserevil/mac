@@ -197,16 +197,16 @@ mac --db mac.db migrate acc ~/.acc/data/acc.db --mode import \
 # Minimal worker harness: register/heartbeat first without claiming, then run
 # an executor-backed claim/start/evidence/submit loop.
 mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
-    --hostname rocky.local --capabilities python,ops \
+    --hostname rocky.local --capabilities python,ops,review \
     --resources '{"capacity":2}' --heartbeat-only
 mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
-    --capabilities python,ops --allowed-projects mac-canary --require-canary \
+    --capabilities python,ops,review --allowed-projects mac-canary --require-canary \
     --dry-run-claim
 mac-agent --url http://100.125.137.89:8789 --agent-id agent_... \
     --workspace ~/.mac-agent/workspaces --allowed-projects mac-canary \
     --require-canary --executor ~/.mac/bin/mac-hermes-task-executor
 mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
-    --capabilities python,ops --loop --workspace ~/.mac-agent/workspaces \
+    --capabilities python,ops,review --loop --workspace ~/.mac-agent/workspaces \
     --allowed-projects mac-canary --require-canary \
     --executor ~/.mac/bin/mac-hermes-task-executor
 

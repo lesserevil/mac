@@ -1484,6 +1484,29 @@ class ControlPlane:
         except Exception:  # noqa: BLE001 - corrupt or rotated key shouldn't crash review
             return None
 
+    def rotate_agent_attestation_key(self, agent_id: str) -> str:
+        """Rotate and return the cleartext HMAC key for one agent.
+
+        Registration returns the first key exactly once. This explicit
+        recovery path is for deploy/bootstrap cases where the host-local
+        environment lost that one-time value before the worker could sign
+        evidence. It intentionally rotates instead of exporting the old
+        secret; in-flight signatures from the previous key will no longer
+        verify.
+        """
+        self.get_agent(agent_id)
+        key = _generate_attestation_key()
+        now = utcnow()
+        self.store.execute(
+            """
+            UPDATE agents
+            SET attestation_key_ciphertext = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (self.secrets._encrypt(key), now, agent_id),
+        )
+        return key
+
     def get_agent(self, agent_id: str) -> Agent:
         row = self.store.query_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
         if row is None:

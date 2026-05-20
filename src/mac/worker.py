@@ -260,6 +260,9 @@ class MacWorker:
                 evidence=control_result,
                 error=control_result.get("summary"),
             )
+        review_result = self._process_review_nudges()
+        if review_result is not None:
+            return review_result
         self._observe_policy_once()
         assignment = self._claim_next_for_agent()
         if assignment is None:
@@ -504,6 +507,134 @@ class MacWorker:
             },
         )
         return assignment
+
+    def _process_review_nudges(self) -> Optional[WorkerRunResult]:
+        try:
+            messages = self.client.post(
+                "/agents/%s/messages/deliver?%s"
+                % (quote(self.agent_id, safe=""), urlencode({"limit": 20})),
+                {},
+            )
+        except Exception as exc:  # noqa: BLE001 - message polling must not break task polling.
+            self._observe_log(
+                "worker.review_nudge.poll_failed",
+                level="warning",
+                detail={"agent_id": self.agent_id, "error": str(exc)},
+            )
+            return None
+
+        if not isinstance(messages, list):
+            return None
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("message_type") or "") != "nudge":
+                continue
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("reason") or "") != "produce_review_verdict":
+                continue
+            return self._handle_review_verdict_nudge(message, payload)
+        return None
+
+    def _handle_review_verdict_nudge(self, message: JsonDict, payload: JsonDict) -> WorkerRunResult:
+        task_id = str(payload.get("task_id") or "").strip()
+        review_id = str(payload.get("review_id") or "").strip()
+        executor_evidence_id = str(payload.get("executor_evidence_id") or "").strip()
+        if not task_id or not review_id or not executor_evidence_id:
+            error = "review verdict nudge missing task_id, review_id, or executor_evidence_id"
+            self._observe_log(
+                "worker.review_nudge.invalid",
+                level="warning",
+                detail={"message_id": message.get("id"), "error": error, "payload": payload},
+            )
+            return WorkerRunResult(status="review_nudge_invalid", error=error)
+
+        try:
+            task_detail = self.client.get("/tasks/%s" % quote(task_id, safe=""))
+            task_dir = self._prepare_review_workspace(
+                task_id,
+                review_id,
+                executor_evidence_id,
+                task_detail if isinstance(task_detail, dict) else {},
+                message,
+            )
+            started = time.monotonic()
+            execution = self.executor(self._review_task_payload(task_dir), task_dir)
+            duration_ms = (time.monotonic() - started) * 1000.0
+            self._observe_metric(
+                "worker.review.duration_ms",
+                duration_ms,
+                unit="ms",
+                subject_type="task",
+                subject_id=task_id,
+                detail={
+                    "returncode": execution.returncode,
+                    "review_id": review_id,
+                    "executor_evidence_id": executor_evidence_id,
+                },
+            )
+            evidence = self._record_review_execution(
+                task_id,
+                task_dir,
+                execution,
+                review_id=review_id,
+                executor_evidence_id=executor_evidence_id,
+                message_id=str(message.get("id") or ""),
+            )
+            if execution.succeeded:
+                self._advance_review_workflow_after_verdict(task_id)
+            status = "review_verdict_recorded" if execution.succeeded else "review_verdict_failed"
+            self._observe_log(
+                "worker.%s" % status,
+                level="info" if execution.succeeded else "error",
+                subject_type="task",
+                subject_id=task_id,
+                detail={
+                    "review_id": review_id,
+                    "executor_evidence_id": executor_evidence_id,
+                    "evidence_id": evidence.get("id"),
+                    "returncode": execution.returncode,
+                    "summary": execution.summary,
+                },
+            )
+            return WorkerRunResult(
+                status=status,
+                task=(task_detail.get("task") if isinstance(task_detail, dict) else None),
+                evidence=evidence,
+                error=None if execution.succeeded else execution.summary,
+            )
+        except Exception as exc:
+            self._observe_log(
+                "worker.review_nudge.exception",
+                level="error",
+                subject_type="task",
+                subject_id=task_id,
+                detail={
+                    "message_id": message.get("id"),
+                    "review_id": review_id,
+                    "executor_evidence_id": executor_evidence_id,
+                    "error": str(exc),
+                },
+            )
+            return WorkerRunResult(status="review_verdict_failed", error=str(exc))
+
+    def _advance_review_workflow_after_verdict(self, task_id: str) -> None:
+        try:
+            self.client.post(
+                "/reviews/default/tick?%s"
+                % urlencode({"limit": 10, "actor": self.agent_id}),
+                {},
+            )
+        except Exception as exc:  # noqa: BLE001 - verdict evidence is already recorded.
+            self._observe_log(
+                "worker.review_workflow.advance_failed",
+                level="warning",
+                subject_type="task",
+                subject_id=task_id,
+                detail={"agent_id": self.agent_id, "error": str(exc)},
+            )
 
     def _process_agentbus_control(self) -> Optional[JsonDict]:
         if not self.agentbus_control_enabled:
@@ -803,6 +934,45 @@ class MacWorker:
         )
         return task_dir
 
+    def _prepare_review_workspace(
+        self,
+        task_id: str,
+        review_id: str,
+        executor_evidence_id: str,
+        task_detail: JsonDict,
+        message: JsonDict,
+    ) -> Path:
+        task_dir = self.workspace / "_reviews" / _safe_path_component(review_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task = {
+            "id": "review_%s" % review_id,
+            "title": "Review task %s" % task_id,
+            "description": (
+                "Review the executor evidence for task %s and write a signed "
+                "review_verdict manifest." % task_id
+            ),
+            "required_capabilities": ["review"],
+            "metadata": {
+                "review_context": {
+                    "task_id": task_id,
+                    "review_id": review_id,
+                    "executor_evidence_id": executor_evidence_id,
+                    "nudge_message_id": message.get("id"),
+                    "task_detail": task_detail,
+                }
+            },
+        }
+        (task_dir / "task.json").write_text(
+            json.dumps({"task": task}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return task_dir
+
+    def _review_task_payload(self, task_dir: Path) -> JsonDict:
+        loaded = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+        task = loaded.get("task", loaded)
+        return task if isinstance(task, dict) else loaded
+
     def _record_execution(
         self,
         task_id: str,
@@ -836,6 +1006,53 @@ class MacWorker:
                     "returncode": execution.returncode,
                     "stdout": (task_dir / "stdout.txt").resolve().as_uri(),
                     "stderr": (task_dir / "stderr.txt").resolve().as_uri(),
+                    **metadata,
+                },
+            },
+        )
+
+    def _record_review_execution(
+        self,
+        task_id: str,
+        task_dir: Path,
+        execution: WorkerExecution,
+        *,
+        review_id: str,
+        executor_evidence_id: str,
+        message_id: str,
+    ) -> JsonDict:
+        (task_dir / "stdout.txt").write_text(execution.stdout, encoding="utf-8")
+        (task_dir / "stderr.txt").write_text(execution.stderr, encoding="utf-8")
+        result_path = task_dir / "review-result.json"
+        metadata = self._execution_metadata(task_dir, execution)
+        result_path.write_text(
+            json.dumps(
+                {
+                    "returncode": execution.returncode,
+                    "summary": execution.summary,
+                    "review_id": review_id,
+                    "executor_evidence_id": executor_evidence_id,
+                    "metadata": metadata,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return self.client.post(
+            "/tasks/%s/evidence" % quote(task_id, safe=""),
+            {
+                "kind": "review",
+                "uri": result_path.resolve().as_uri(),
+                "summary": execution.summary,
+                "created_by": self.agent_id,
+                "metadata": {
+                    "returncode": execution.returncode,
+                    "stdout": (task_dir / "stdout.txt").resolve().as_uri(),
+                    "stderr": (task_dir / "stderr.txt").resolve().as_uri(),
+                    "review_id": review_id,
+                    "executor_evidence_id": executor_evidence_id,
+                    "nudge_message_id": message_id,
                     **metadata,
                 },
             },
@@ -1029,6 +1246,40 @@ def _json_arg(value: Optional[str]) -> JsonDict:
     return loaded
 
 
+def _read_env_value(path: Path, key: str) -> Optional[str]:
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == key and value.strip():
+                return value.strip()
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _write_env_value(path: Path, key: str, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: List[str] = []
+    replaced = False
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    updated: List[str] = []
+    for line in lines:
+        if line and not line.lstrip().startswith("#") and "=" in line:
+            name, _old = line.split("=", 1)
+            if name.strip() == key:
+                updated.append("%s=%s" % (key, value))
+                replaced = True
+                continue
+        updated.append(line)
+    if not replaced:
+        updated.append("%s=%s" % (key, value))
+    path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -1109,6 +1360,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable AgentBus control-message polling before task claims",
     )
     parser.add_argument(
+        "--attestation-key-env",
+        default=os.environ.get("MAC_ATTESTATION_KEY_ENV"),
+        help="env file where a first-registration attestation key should be persisted",
+    )
+    parser.add_argument(
+        "--rotate-missing-attestation-key",
+        action="store_true",
+        default=_env_bool("MAC_ROTATE_MISSING_ATTESTATION_KEY", False),
+        help="rotate and persist this agent's attestation key when no local key is configured",
+    )
+    parser.add_argument(
         "--heartbeat-only",
         action="store_true",
         help="register/heartbeat once and exit without claiming tasks",
@@ -1133,6 +1395,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     agent_id = args.agent_id
     try:
         registered: Optional[JsonDict] = None
+        attestation_key = os.environ.get("MAC_ATTESTATION_KEY")
+        attestation_env_path = Path(args.attestation_key_env).expanduser() if args.attestation_key_env else None
+        if not attestation_key and attestation_env_path is not None:
+            attestation_key = _read_env_value(attestation_env_path, "MAC_ATTESTATION_KEY")
         if args.register:
             registered = register_worker(
                 client,
@@ -1144,8 +1410,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 agent_id=args.agent_id,
             )
             agent_id = registered["id"]
+            if registered.get("attestation_key"):
+                attestation_key = str(registered["attestation_key"])
+                os.environ["MAC_ATTESTATION_KEY"] = attestation_key
+                if attestation_env_path is not None:
+                    _write_env_value(attestation_env_path, "MAC_ATTESTATION_KEY", attestation_key)
         if not agent_id:
             raise MacApiError("--agent-id or --register is required")
+        if not attestation_key and args.rotate_missing_attestation_key:
+            rotated = client.post(
+                "/agents/%s/attestation-key/rotate" % quote(agent_id, safe=""),
+                {},
+            )
+            attestation_key = str(rotated["attestation_key"])
+            os.environ["MAC_ATTESTATION_KEY"] = attestation_key
+            if attestation_env_path is not None:
+                _write_env_value(attestation_env_path, "MAC_ATTESTATION_KEY", attestation_key)
         if args.heartbeat_only:
             heartbeat = client.post(
                 "/agents/%s/heartbeat" % quote(agent_id, safe=""),
@@ -1180,6 +1460,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 self_update_repo=Path(args.self_update_repo).expanduser()
                 if args.self_update_repo
                 else None,
+                attestation_key=attestation_key,
             )
             print(json.dumps({"status": "dry_run", "assignment": worker.dry_run_claim()}, indent=2, sort_keys=True))
             return 0
@@ -1200,6 +1481,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             self_update_repo=Path(args.self_update_repo).expanduser()
             if args.self_update_repo
             else None,
+            attestation_key=attestation_key,
         )
         if args.loop:
             results = worker.run_forever(max_iterations=args.max_iterations)

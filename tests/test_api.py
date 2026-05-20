@@ -132,6 +132,44 @@ def test_default_review_tick_requires_admin_not_write():
     assert allowed.status_code == 200
 
 
+def test_attestation_key_rotation_requires_global_fleet_token():
+    client = TestClient(
+        create_app(
+            control_plane=ControlPlane.in_memory(),
+            auth_tokens={
+                "tenant": {"scopes": ["write"], "tenant_id": "tenant-a"},
+                "admin": ["admin"],
+            },
+        )
+    )
+    machine = client.post(
+        "/machines",
+        headers={"Authorization": "Bearer admin"},
+        json={"hostname": "host-1"},
+    ).json()
+    agent = client.post(
+        "/agents",
+        headers={"Authorization": "Bearer admin"},
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+    original_key = agent["attestation_key"]
+
+    blocked = client.post(
+        "/agents/%s/attestation-key/rotate" % agent["id"],
+        headers={"Authorization": "Bearer tenant"},
+    )
+    assert blocked.status_code == 403
+
+    rotated = client.post(
+        "/agents/%s/attestation-key/rotate" % agent["id"],
+        headers={"Authorization": "Bearer admin"},
+    )
+    assert rotated.status_code == 200
+    rotated_key = rotated.json()["attestation_key"]
+    assert rotated_key
+    assert rotated_key != original_key
+
+
 def test_fastapi_can_require_scoped_bearer_tokens():
     client = TestClient(
         create_app(

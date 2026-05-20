@@ -1371,6 +1371,17 @@ def create_app(
             payload["attestation_key"] = key
         return payload
 
+    @app.post("/agents/{agent_id}/attestation-key/rotate")
+    def rotate_agent_attestation_key(
+        agent_id: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, str]:
+        principal.require_global_fleet()
+        return {
+            "agent_id": agent_id,
+            "attestation_key": cp.rotate_agent_attestation_key(agent_id),
+        }
+
     @app.get("/agents")
     def list_agents() -> List[Dict[str, Any]]:
         return [agent.to_dict() for agent in cp.list_agents()]
