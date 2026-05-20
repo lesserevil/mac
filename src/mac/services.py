@@ -2221,7 +2221,7 @@ class ControlPlane:
         """Register operator-configured Beads repos once at process startup.
 
         Format:
-            MAC_BEADS_REPOSITORIES="mac=/path/to/repo|repo-beads-mac|mac|python,ops|60;ACC=/path"
+            MAC_BEADS_REPOSITORIES="mac=/path/to/repo:repo-beads-mac:mac:python,ops:60;ACC=/path"
 
         Only the name and path are required. The remaining pipe-delimited
         fields are source, project, required capabilities, and poll interval.
@@ -2242,7 +2242,7 @@ class ControlPlane:
                 if "=" not in entry:
                     raise ValidationError("entry must be name=path")
                 name, rest = entry.split("=", 1)
-                parts = rest.split("|")
+                parts = rest.split("|") if "|" in rest else rest.split(":")
                 path = parts[0].strip()
                 source = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
                 project = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None

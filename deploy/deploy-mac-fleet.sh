@@ -1123,10 +1123,15 @@ if agent_name == values.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky"):
     values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
     values.setdefault(
         "MAC_BEADS_REPOSITORIES",
-        "mac=%s|repo-beads-mac|repo-beads-mac||30" % (mac_home / "src" / "mac"),
+        "mac=%s:repo-beads-mac:repo-beads-mac::30" % (mac_home / "src" / "mac"),
     )
 else:
     values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "0")
+if "MAC_BEADS_REPOSITORIES" in values:
+    # Older generated env files used "|" as an internal separator. That is
+    # readable by Python but invalid in a shell-sourced env file because it is
+    # parsed as a pipeline. Normalize before the file is sourced below.
+    values["MAC_BEADS_REPOSITORIES"] = values["MAC_BEADS_REPOSITORIES"].replace("|", ":")
 home_channel = (
     configured_home_channel
     or values.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")

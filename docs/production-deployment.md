@@ -272,7 +272,7 @@ registers the deployed mac checkout by default through:
 ```bash
 MAC_BEADS_BRIDGE_ON_HEARTBEAT=1
 MAC_BEADS_BRIDGE_HUB_AGENT=rocky
-MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac|repo-beads-mac|repo-beads-mac||30
+MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac:repo-beads-mac:repo-beads-mac::30
 ```
 
 On each Rocky heartbeat, the control plane polls every enabled registered
