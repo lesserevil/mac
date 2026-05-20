@@ -1658,17 +1658,29 @@ def test_beads_bridge_auto_pulls_git_repository_before_poll(cp, tmp_path, monkey
 def test_beads_bridge_marks_dirty_git_repository_stale(cp, tmp_path, monkeypatch):
     _origin, _seed, clone = _seed_bare_beads_repo(tmp_path, "mac-dirty")
     repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    rocky = register_agent(cp, "rocky", ["python"])
+    natasha = register_agent(cp, "natasha", ["python"])
     (clone / ".beads" / "issues.jsonl").write_text(
         '{"_type":"issue","id":"local-dirty","status":"open"}\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("MAC_BEADS_AUTO_PULL", "1")
 
-    report = cp.poll_beads_repositories(repo_record.id, force=True)
+    report = cp.poll_beads_repositories(repo_record.id, force=True, actor=rocky.id)
+    again = cp.poll_beads_repositories(repo_record.id, force=True, actor=rocky.id)
 
     assert report["error_count"] == 1
     assert report["repositories"][0]["status"] == "source_dirty"
+    assert report["repositories"][0]["remediation_task_id"]
+    assert again["repositories"][0]["remediation_task_id"] == report["repositories"][0]["remediation_task_id"]
     assert cp.list_project_items() == []
+    remediation = cp.get_task(report["repositories"][0]["remediation_task_id"])
+    assert remediation.metadata["origin"]["type"] == "beads_source_remediation"
+    assert remediation.metadata["target_agent_id"] == rocky.id
+    assert remediation.metadata["remediation"]["required_workflow"] == "git_pull_rebase_then_merge_local_changes"
+    assert "git pull --rebase --autostash" in remediation.description
+    assert cp.claim_next_for_agent(natasha.id) is None
+    assert cp.claim_next_for_agent(rocky.id)["task"]["id"] == remediation.id
     notifications = cp.list_notifications(subject_id=repo_record.id)
     assert notifications[0].event_type == "bridge.beads.source_dirty"
 

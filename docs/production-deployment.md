@@ -313,12 +313,18 @@ poller first checks git source state. With `MAC_BEADS_AUTO_PULL=1` (default), a
 clean checkout with an upstream is fast-forwarded before Beads are read. If
 tracked files are dirty, or fetch/pull fails, the bridge does not silently poll
 ambiguous local state; it returns `source_dirty` or `source_refresh_error`, logs
-`bridge.beads.repository_source`, and writes a dashboard/Hermes notification.
-The poller then runs `bd ready --json` when available, falling back to
-`.beads/issues.jsonl` parsing for simple local fixtures. Only `open` Beads with
-no active blockers are imported; blocked Beads wait until their blockers close.
-Imports are idempotent through the `project_items(source, external_id)` unique
-key.
+`bridge.beads.repository_source`, writes a dashboard/Hermes notification, and
+creates one idempotent remediation task for the agent that owns that registered
+environment. Ownership is resolved from repository metadata
+(`owner_agent_id`/`owner_agent_name` and aliases), then from the polling hub
+agent. The remediation task is targeted at that agent and instructs it to fetch,
+pull with rebase/autostash or an equivalent explicit rebase workflow, reconcile
+intentional local changes, run the repository contract when needed, and leave
+the checkout clean before polling resumes. The poller then runs `bd ready
+--json` when available, falling back to `.beads/issues.jsonl` parsing for simple
+local fixtures. Only `open` Beads with no active blockers are imported; blocked
+Beads wait until their blockers close. Imports are idempotent through the
+`project_items(source, external_id)` unique key.
 
 The hub also advances the default review/publication workflow from heartbeat by
 default (`MAC_REVIEW_TICK_ON_HEARTBEAT=1`, `MAC_REVIEW_TICK_HUB_AGENT=rocky`).

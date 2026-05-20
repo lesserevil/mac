@@ -3136,6 +3136,12 @@ class ControlPlane:
                     if source_state["status"] == "dirty"
                     else "source_refresh_error"
                 )
+                remediation_task = self._ensure_beads_source_remediation_task(
+                    repo,
+                    source_state,
+                    actor,
+                    status,
+                )
                 self._update_beads_repository_poll_state(
                     repo.id,
                     now,
@@ -3150,13 +3156,18 @@ class ControlPlane:
                     subject_type="environment",
                     subject_id=repo.id,
                     channels=["dashboard", "hermes"],
-                    metadata={"repository": repo.to_dict(), "source_state": source_state},
+                    metadata={
+                        "repository": repo.to_dict(),
+                        "source_state": source_state,
+                        "remediation_task_id": remediation_task.id if remediation_task else None,
+                    },
                 )
                 return {
                     "repository_id": repo.id,
                     "name": repo.name,
                     "status": status,
                     "source_state": source_state,
+                    "remediation_task_id": remediation_task.id if remediation_task else None,
                     "imported_count": 0,
                     "existing_count": 0,
                     "skipped_count": 0,
@@ -3308,6 +3319,166 @@ class ControlPlane:
             subject_id=repo.id,
             detail=state,
         )
+
+    def _ensure_beads_source_remediation_task(
+        self,
+        repo: BeadsRepository,
+        source_state: JsonDict,
+        actor: str,
+        status: str,
+    ) -> Optional[Task]:
+        owner = self._beads_repository_owner_agent(repo, actor)
+        if owner is None:
+            self.record_log(
+                "bridge.beads.source_remediation.no_owner",
+                layer="control_plane",
+                source=actor,
+                level="warning",
+                subject_type="environment",
+                subject_id=repo.id,
+                detail={"repository": repo.to_dict(), "source_state": source_state},
+            )
+            return None
+        existing = self._existing_beads_source_remediation_task(repo, status)
+        if existing is not None:
+            return existing
+        title = "Repair %s checkout before Beads polling" % repo.name
+        dirty_paths = source_state.get("dirty_paths") or []
+        description = (
+            "The Beads bridge refused to poll %(name)s because %(path)s is in "
+            "%(status)s state.\n\n"
+            "This task belongs to the agent that owns that environment. Fetch "
+            "upstream, pull with rebase enabled, then intentionally merge or "
+            "re-apply any local changes so the checkout is clean and aligned "
+            "with upstream before Beads polling resumes.\n\n"
+            "Expected operator-grade shape:\n"
+            "- inspect `git status --porcelain` and `git branch --show-current`\n"
+            "- run `git fetch --prune` and `git pull --rebase --autostash` or an "
+            "equivalent explicit rebase workflow\n"
+            "- resolve conflicts by preserving intentional local work, not by "
+            "discarding it blindly\n"
+            "- run the repository bootstrap/test contract if the merge changes "
+            "tracked source files\n"
+            "- leave the registered checkout clean, with a pushed branch or PR "
+            "when local changes need to become upstream changes\n\n"
+            "Dirty paths observed by mac: %(dirty_paths)s\n"
+            "Source state: %(source_state)s"
+        ) % {
+            "name": repo.name,
+            "path": str(Path(repo.path).expanduser()),
+            "status": source_state.get("status"),
+            "dirty_paths": ", ".join(str(item) for item in dirty_paths) or "none",
+            "source_state": json_dumps(source_state),
+        }
+        metadata = {
+            "origin": {
+                "type": "beads_source_remediation",
+                "repository_id": repo.id,
+                "repository_name": repo.name,
+                "repository_path": repo.path,
+                "source": repo.source,
+                "repository_contract": repo.metadata.get("repository_contract"),
+            },
+            "target_agent_id": owner.id,
+            "target_agent_name": owner.name,
+            "remediation": {
+                "type": "beads_source_refresh",
+                "repository_id": repo.id,
+                "repository_name": repo.name,
+                "repository_path": repo.path,
+                "source_status": status,
+                "source_state": source_state,
+                "required_workflow": "git_pull_rebase_then_merge_local_changes",
+            },
+            "publication_target": "environment://beads-repository/%s/source" % repo.id,
+            "policy": {
+                "expected_evidence_type": "repo_change",
+            },
+        }
+        task = self.create_task(
+            title,
+            description=description,
+            project=repo.project,
+            priority=95,
+            required_capabilities=repo.required_capabilities,
+            metadata=metadata,
+            actor=actor,
+        )
+        self.record_log(
+            "bridge.beads.source_remediation.task_created",
+            layer="control_plane",
+            source=actor,
+            subject_type="task",
+            subject_id=task.id,
+            detail={
+                "repository_id": repo.id,
+                "repository_name": repo.name,
+                "owner_agent_id": owner.id,
+                "source_status": status,
+            },
+        )
+        return task
+
+    def _existing_beads_source_remediation_task(
+        self,
+        repo: BeadsRepository,
+        status: str,
+    ) -> Optional[Task]:
+        active_states = {
+            TaskState.OPEN.value,
+            TaskState.BLOCKED.value,
+            TaskState.CLAIMED.value,
+            TaskState.RUNNING.value,
+            TaskState.NEEDS_REVIEW.value,
+            TaskState.REVIEWING.value,
+        }
+        for task in self.list_tasks():
+            if task.state not in active_states:
+                continue
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            remediation = metadata.get("remediation")
+            if not isinstance(remediation, dict):
+                continue
+            if remediation.get("type") != "beads_source_refresh":
+                continue
+            if remediation.get("repository_id") != repo.id:
+                continue
+            if remediation.get("source_status") != status:
+                continue
+            return task
+        return None
+
+    def _beads_repository_owner_agent(
+        self,
+        repo: BeadsRepository,
+        actor: str,
+    ) -> Optional[Agent]:
+        metadata = repo.metadata if isinstance(repo.metadata, dict) else {}
+        owner_candidates = [
+            metadata.get("owner_agent_id"),
+            metadata.get("owning_agent_id"),
+            metadata.get("environment_owner_agent_id"),
+            metadata.get("owner_agent_name"),
+            metadata.get("owning_agent_name"),
+            metadata.get("environment_owner_agent_name"),
+            actor,
+            os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT"),
+        ]
+        for candidate in owner_candidates:
+            agent = self._agent_by_id_or_name(candidate)
+            if agent is not None:
+                return agent
+        return None
+
+    def _agent_by_id_or_name(self, value: Any) -> Optional[Agent]:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return None
+        row = self.store.query_one(
+            "SELECT * FROM agents WHERE id = ? OR name = ? ORDER BY id LIMIT 1",
+            (candidate, candidate),
+        )
+        return self._agent_from_row(row) if row is not None else None
 
     def _ready_beads_issues(self, repo: BeadsRepository) -> List[JsonDict]:
         repo_path = Path(repo.path).expanduser()
@@ -4167,6 +4338,20 @@ class ControlPlane:
         if agent.status not in {AgentStatus.IDLE.value, AgentStatus.BUSY.value}:
             return False
         if agent.health_status != HealthStatus.HEALTHY.value:
+            return False
+        target_agent_id = (
+            task.metadata.get("target_agent_id")
+            if isinstance(task.metadata, dict)
+            else None
+        )
+        if target_agent_id and agent.id != str(target_agent_id):
+            return False
+        target_agent_name = (
+            task.metadata.get("target_agent_name")
+            if isinstance(task.metadata, dict)
+            else None
+        )
+        if target_agent_name and agent.name != str(target_agent_name):
             return False
         machine = self.get_machine(agent.machine_id)
         if not machine.trusted:
