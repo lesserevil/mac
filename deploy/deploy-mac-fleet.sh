@@ -805,6 +805,37 @@ install_beads_cli() {
   "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
 }
 
+bootstrap_beads_repositories() {
+  local raw="${MAC_BEADS_REPOSITORIES:-}" entry rest repo_path index log_path
+  [ -n "$raw" ] || return 0
+  index=0
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    if [ "$entry" = "${entry#*=}" ]; then
+      log "WARNING: skipping malformed MAC_BEADS_REPOSITORIES entry: $entry"
+      continue
+    fi
+    rest="${entry#*=}"
+    repo_path="${rest%%|*}"
+    repo_path="${repo_path%%:*}"
+    [ -n "$repo_path" ] || continue
+    if [ ! -d "$repo_path/.beads" ]; then
+      log "WARNING: skipping Beads bootstrap for $repo_path because .beads is absent"
+      continue
+    fi
+    index=$((index + 1))
+    log_path="$LOG_DIR/beads-bootstrap-${index}.log"
+    log "bootstrapping Beads repository at $repo_path"
+    if ! (cd "$repo_path" && "$MAC_BEADS_CLI" bootstrap --yes) > "$log_path" 2>&1; then
+      log "ERROR: Beads bootstrap failed for $repo_path; see $log_path"
+      cat "$log_path"
+      exit 1
+    fi
+  done <<EOF
+${raw//;/$'\n'}
+EOF
+}
+
 normalize_hermes_redaction_env() {
   "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" "$HOME/.acc/.env" <<'PY'
 import json
@@ -1374,6 +1405,7 @@ normalize_hermes_redaction_env
 set -a
 . "$ENV_FILE"
 set +a
+bootstrap_beads_repositories
 sync_hermes_home_channels
 
 log "installing mac Python package"

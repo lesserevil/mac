@@ -53,10 +53,16 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
 
     assert "BEADS_REPO_URL=\"${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}\"" in script
     assert "install_beads_cli()" in script
+    assert "bootstrap_beads_repositories()" in script
+    assert 'bootstrap --yes' in script
     source_install_block = script.split('mv "$SRC_DIR.new" "$SRC_DIR"', 1)[1].split(
         'log "creating/updating mac environment file"', 1
     )[0]
     assert "install_beads_cli" in source_install_block
+    env_source_block = script.split('. "$ENV_FILE"', 1)[1].split(
+        'log "installing mac Python package"', 1
+    )[0]
+    assert "bootstrap_beads_repositories" in env_source_block
     assert 'values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")' in script
     assert '[_beads_cli(), "ready", "--json"]' in (
         ROOT / "src" / "mac" / "services.py"

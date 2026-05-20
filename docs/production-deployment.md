@@ -278,13 +278,14 @@ MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac:repo-beads-mac:repo-beads-mac::30
 
 The deploy bootstrap installs the `bd` CLI into `~/.mac/bin/bd` from the
 configured Beads source (`MAC_DEPLOY_BEADS_REPO_URL`, `MAC_DEPLOY_BEADS_REF`)
-when it is not already present. On each Rocky heartbeat or lease renewal, the
-control plane polls every enabled registered repository whose poll interval has
-elapsed. The poller runs `bd ready --json` when available, falling back to
-`.beads/issues.jsonl` parsing for simple local fixtures. Only `open` Beads with
-no active blockers are imported; blocked Beads wait until their blockers close.
-Imports are idempotent through the `project_items(source, external_id)` unique
-key.
+when it is not already present, then runs `bd bootstrap --yes` for each
+configured Beads repository so fresh clones have a writable Beads database, not
+only tracked JSONL. On each Rocky heartbeat or lease renewal, the control plane
+polls every enabled registered repository whose poll interval has elapsed. The
+poller runs `bd ready --json` when available, falling back to `.beads/issues.jsonl`
+parsing for simple local fixtures. Only `open` Beads with no active blockers are
+imported; blocked Beads wait until their blockers close. Imports are idempotent
+through the `project_items(source, external_id)` unique key.
 
 Useful operator commands:
 
