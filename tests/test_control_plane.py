@@ -538,7 +538,11 @@ def test_task_lifecycle_requires_evidence_review_and_publication(cp):
 def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
-    task = cp.create_task("Implement thing", required_capabilities=["python"])
+    task = cp.create_task(
+        "Implement thing",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://publish"},
+    )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
     evidence = cp.add_evidence(
@@ -563,7 +567,7 @@ def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
     assert reviews[0].status == ReviewStatus.APPROVED.value
     publications = cp.list_publications(task.id)
     assert len(publications) == 1
-    assert publications[0].target == "mac://tasks/%s" % task.id
+    assert publications[0].target == "test://publish"
     names = {event.name for event in cp.list_observability(limit=50)}
     assert "workflow.default_review.assigned" in names
     assert "workflow.default_review.approved" in names
@@ -595,7 +599,11 @@ def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
 def test_default_review_tick_processes_backlog(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
-    task = cp.create_task("Backlog item", required_capabilities=["python"])
+    task = cp.create_task(
+        "Backlog item",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://publish"},
+    )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
     cp.add_evidence(
@@ -670,7 +678,11 @@ def test_default_review_workflow_rejects_unpushed_repo_manifest(cp):
 def test_default_review_workflow_allows_verified_deployment_evidence(cp):
     worker = register_agent(cp, "worker", ["ops"])
     reviewer = register_agent(cp, "reviewer", ["review"])
-    task = cp.create_task("Deploy thing", required_capabilities=["ops"])
+    task = cp.create_task(
+        "Deploy thing",
+        required_capabilities=["ops"],
+        metadata={"publication_target": "test://deploy"},
+    )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
     evidence = cp.add_evidence(
@@ -690,10 +702,145 @@ def test_default_review_workflow_allows_verified_deployment_evidence(cp):
     assert cp.list_reviews(task.id)[0].evidence_id == evidence.id
 
 
+def test_default_review_workflow_refuses_on_ambiguous_pending_reviews(cp):
+    """mac-d9c: with more than one pending review the workflow must
+    refuse to pick — no auto-merge under ambiguity."""
+    worker = register_agent(cp, "worker", ["python"])
+    rev_one = register_agent(cp, "rev-one", ["review"])
+    rev_two = register_agent(cp, "rev-two", ["review"])
+    task = cp.create_task(
+        "ambiguous",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://ambig"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://x",
+        "done",
+        worker.id,
+        metadata=verified_repo_metadata(),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    cp.request_review(task.id, rev_one.id, "human")
+    cp.request_review(task.id, rev_two.id, "human")
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "ambiguous_pending_reviews"
+    assert len(result["pending_review_ids"]) == 2
+    # Task is untouched; no publication was created.
+    assert cp.list_publications(task.id) == []
+    names = {event.name for event in cp.list_observability(limit=50)}
+    assert "workflow.default_review.ambiguous" in names
+
+
+def test_default_review_workflow_refuses_without_publication_target(cp):
+    """mac-w29: when no operator-set publication_target exists, the
+    workflow approves the review but does NOT publish — refuses to
+    invent a target."""
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("no-target", required_capabilities=["python"])  # no metadata
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://x",
+        "done",
+        worker.id,
+        metadata=verified_repo_metadata(),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_publication_target"
+    assert cp.list_publications(task.id) == []
+    # Task remains in REVIEWING — the review approval landed but
+    # publication is held until a target is configured.
+    assert cp.get_task(task.id).state == TaskState.REVIEWING.value
+    names = {event.name for event in cp.list_observability(limit=50)}
+    assert "workflow.default_review.no_publication_target" in names
+
+
+def test_default_review_rejects_alias_evidence_taxonomy(cp):
+    """mac-q38: canonical names only. Aliases like status='verified',
+    evidence_type='code', and field aliases like 'git'/'commit_sha' are
+    rejected."""
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "aliases",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://aliases"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    # Verify each alias is rejected one at a time.
+    bad_status = verified_repo_metadata()
+    bad_status["verification"]["status"] = "verified"
+    cp.add_evidence(
+        task.id, "log", "artifact://1", "x", worker.id, metadata=bad_status
+    )
+    cp.submit_for_review(task.id, worker.id)
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_verifiable_evidence"
+
+    # New evidence with alias evidence_type='code' (was alias for repo_change).
+    bad_type = verified_repo_metadata()
+    bad_type["verification"]["evidence_type"] = "code"
+    cp.store.execute(
+        "UPDATE tasks SET state = ? WHERE id = ?",
+        (TaskState.NEEDS_REVIEW.value, task.id),
+    )
+    cp.add_evidence(task.id, "log", "artifact://2", "x", worker.id, metadata=bad_type)
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_verifiable_evidence"
+
+    # And with field alias `git` instead of `repo`.
+    bad_field = verified_repo_metadata()
+    bad_field["verification"]["git"] = bad_field["verification"].pop("repo")
+    cp.store.execute(
+        "UPDATE tasks SET state = ? WHERE id = ?",
+        (TaskState.NEEDS_REVIEW.value, task.id),
+    )
+    cp.add_evidence(task.id, "log", "artifact://3", "x", worker.id, metadata=bad_field)
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_verifiable_evidence"
+
+
+def test_renew_lease_refuses_on_transitioning_task(cp):
+    """mac-eow: renew_lease must refuse when the underlying task is no
+    longer CLAIMED/RUNNING. Previous silent-update behavior was a
+    footgun — pin the strict refusal so a future revert doesn't quietly
+    unbreak it."""
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task(
+        "transitioning",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://x"},
+    )
+    _, lease = cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(task.id, "log", "x", "y", worker.id)
+    # Submit moves task to NEEDS_REVIEW and releases the lease.
+    cp.submit_for_review(task.id, worker.id)
+    with pytest.raises(ValidationError) as exc:
+        cp.renew_lease(lease.id, worker.id)
+    assert "active" in str(exc.value).lower()
+
+
 def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
-    task = cp.create_task("Reopened work", required_capabilities=["python"])
+    task = cp.create_task(
+        "Reopened work",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://reopened"},
+    )
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
     cp.add_evidence(

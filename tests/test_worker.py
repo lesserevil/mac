@@ -1,10 +1,20 @@
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import json
+import subprocess
 import time
 from typing import Any, Dict, Optional
 
+import pytest
+
 from fastapi.testclient import TestClient
 
+from mac.agentbus_control import (
+    REPO_UPDATE_CONTENT_TYPE,
+    REPO_UPDATE_RESULT_TOPIC,
+    REPO_UPDATE_SCHEMA,
+    REPO_UPDATE_TOPIC,
+)
 from mac.api import create_app
 from mac.hermes_adapter import MacApiClient, MacApiError
 from mac.models import TaskState
@@ -30,6 +40,46 @@ def register_worker_fixture(cp: ControlPlane):
     machine = cp.register_machine("worker-host")
     agent = cp.register_agent(machine.id, "worker", capabilities=["python"])
     return agent
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "init", str(seed)], check=True, capture_output=True)
+    _git(seed, "config", "user.email", "mac-tests@example.invalid")
+    _git(seed, "config", "user.name", "mac tests")
+    (seed / "README.md").write_text("one\n", encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "initial")
+    _git(seed, "branch", "-M", "main")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "-u", "origin", "main")
+    subprocess.run(
+        ["git", "clone", "--branch", "main", str(origin), str(work)],
+        check=True,
+        capture_output=True,
+    )
+    return seed, work
+
+
+def _commit_fixture_update(seed: Path, text: str) -> str:
+    (seed / "README.md").write_text(text, encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "update")
+    _git(seed, "push", "origin", "main")
+    return _git(seed, "rev-parse", "HEAD")
 
 
 def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: Path):
@@ -118,6 +168,37 @@ def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
 
     assert result.status == "submitted_for_review"
     assert any(event.event_type == "task.lease_renewed" for event in cp.task_history(task.id))
+
+
+def test_assignment_is_current_propagates_programming_errors_not_silently_true(tmp_path: Path):
+    """mac-h3d: _assignment_is_current's exception net was bare
+    ``except Exception`` and silently returned True. Narrowed to
+    MacApiError so a TypeError from a malformed response (or any
+    programming bug) bubbles instead of being treated as "still
+    current" — that path lets a worker complete a task it doesn't
+    own."""
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    client = TestClient(create_app(control_plane=cp))
+    api = MacApiClient("http://mac.test", transport=api_transport(client))
+
+    original_get = api.get
+
+    def crashing_get(path: str) -> Any:
+        if path.startswith("/tasks/"):
+            # Simulate a malformed response that would crash the
+            # downstream .get("task", ...) call. Pre-fix this was caught
+            # by the bare except and returned True; post-fix it should
+            # bubble out of _assignment_is_current.
+            raise TypeError("simulated malformed response")
+        return original_get(path)
+
+    api.get = crashing_get  # type: ignore[assignment]
+    worker = MacWorker(api, agent.id, tmp_path, lambda _t, _d: WorkerExecution(0, "ok"))
+    # Direct call — no task in flight, but the helper should now raise
+    # the TypeError instead of swallowing it.
+    with pytest.raises(TypeError):
+        worker._assignment_is_current("task_doesnt_matter", "lease_doesnt_matter")
 
 
 def test_mac_worker_does_not_mutate_task_after_losing_lease(tmp_path: Path):
@@ -253,6 +334,87 @@ def test_mac_worker_run_forever_tolerates_failing_offline_heartbeat(tmp_path: Pa
     # Should not raise — _shutdown swallows transport errors.
     results = worker.run_forever(max_iterations=2)
     assert any(r.status == "submitted_for_review" for r in results)
+
+
+def test_mac_worker_processes_agentbus_repo_update_and_requests_restart(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    sender_machine = cp.register_machine("sender-host")
+    sender = cp.register_agent(sender_machine.id, "sender")
+    agent = register_worker_fixture(cp)
+    seed, work = _git_fixture(tmp_path)
+    expected = _commit_fixture_update(seed, "two\n")
+    cp.publish_agentbus_content(
+        sender.id,
+        recipient_agent_id=agent.id,
+        content_type=REPO_UPDATE_CONTENT_TYPE,
+        topic=REPO_UPDATE_TOPIC,
+        payload={
+            "schema": REPO_UPDATE_SCHEMA,
+            "remote": "origin",
+            "branch": "main",
+            "restart": True,
+            "request_id": "req-1",
+        },
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspace",
+        lambda _t, _d: WorkerExecution(0, "unused"),
+        self_update_repo=work,
+    )
+    result = worker.run_once()
+
+    assert result.status == "self_update_restart"
+    assert _git(work, "rev-parse", "HEAD") == expected
+    result_streams = [
+        stream
+        for stream in cp.list_agentbus_streams(agent_id=sender.id, status="closed")
+        if stream.topic == REPO_UPDATE_RESULT_TOPIC
+    ]
+    assert result_streams
+    chunks = cp.read_agentbus_chunks(sender.id, result_streams[0].id)
+    assert chunks[0].payload["status"] == "updated"
+    assert chunks[0].payload["restart_requested"] is True
+    assert chunks[0].payload["request_id"] == "req-1"
+
+
+def test_mac_worker_repo_update_noops_without_restart_when_current(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    sender_machine = cp.register_machine("sender-host")
+    sender = cp.register_agent(sender_machine.id, "sender")
+    agent = register_worker_fixture(cp)
+    _seed, work = _git_fixture(tmp_path)
+    cp.publish_agentbus_content(
+        sender.id,
+        recipient_agent_id=agent.id,
+        content_type=REPO_UPDATE_CONTENT_TYPE,
+        topic=REPO_UPDATE_TOPIC,
+        payload={"schema": REPO_UPDATE_SCHEMA, "remote": "origin", "branch": "main"},
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspace",
+        lambda _t, _d: WorkerExecution(0, "unused"),
+        self_update_repo=work,
+    )
+    result = worker.run_once()
+
+    assert result.status == "no_task"
+    result_streams = [
+        stream
+        for stream in cp.list_agentbus_streams(agent_id=sender.id, status="closed")
+        if stream.topic == REPO_UPDATE_RESULT_TOPIC
+    ]
+    assert result_streams
+    chunks = cp.read_agentbus_chunks(sender.id, result_streams[0].id)
+    assert chunks[0].payload["status"] == "no_update"
+    assert chunks[0].payload["restart_requested"] is False
 
 
 def test_mac_worker_declares_running_digest_on_first_heartbeat(tmp_path: Path):

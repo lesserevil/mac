@@ -1776,6 +1776,30 @@ class ControlPlane:
                 **evidence_assessment,
             }
 
+        # If the task has more than one pending review, refuse to act —
+        # the ambiguous state has no clear winner and the autonomous
+        # swarm shouldn't silently pick one (mac-d9c).
+        pending_reviews = [
+            r for r in self.list_reviews(task_id)
+            if r.status == ReviewStatus.PENDING.value
+        ]
+        if len(pending_reviews) > 1:
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.ambiguous",
+                "warning",
+                {
+                    "reason": "multiple_pending_reviews",
+                    "pending_review_ids": [r.id for r in pending_reviews],
+                },
+                actor,
+            )
+            return {
+                "task_id": task_id,
+                "status": "ambiguous_pending_reviews",
+                "pending_review_ids": [r.id for r in pending_reviews],
+            }
+
         review = self._default_review_for_task(task_id)
         if review is None:
             reviewer = self._select_default_reviewer(task)
@@ -1865,9 +1889,27 @@ class ControlPlane:
                 "review_id": review.id,
             }
 
+        target = self._default_publication_target(task)
+        if target is None:
+            # No operator-configured publication destination; refuse to
+            # invent one. The review is approved, but the task stays in
+            # REVIEWING until an operator sets metadata.publication_target
+            # (mac-w29).
+            self._record_default_review_observation(
+                task_id,
+                "workflow.default_review.no_publication_target",
+                "warning",
+                {"review_id": review.id, "evidence_id": evidence.id},
+                actor,
+            )
+            return {
+                "task_id": task_id,
+                "status": "waiting_for_publication_target",
+                "review_id": review.id,
+            }
         publication = self.publish_task(
             task_id,
-            self._default_publication_target(task),
+            target,
             review.reviewer_agent_id,
             evidence_id=evidence.id,
         )
@@ -2434,10 +2476,15 @@ class ControlPlane:
         schema = str(manifest.get("schema") or "").strip()
         if schema != VERIFICATION_SCHEMA:
             problems.append("verification.schema must be %s" % VERIFICATION_SCHEMA)
-        status = str(manifest.get("status") or manifest.get("verdict") or "").strip().lower()
-        if status not in {"complete", "verified", "pass", "passed"}:
-            problems.append("verification.status must be complete/verified/pass")
-        evidence_type = str(manifest.get("evidence_type") or manifest.get("type") or "").strip().lower()
+        # Canonical names only (mac-q38). Aliases were a maintainability
+        # multiplier — every alias is a separate door downstream
+        # validation must remember. Status must be ``complete``; the
+        # alternative aliases (verified/pass/passed) are rejected at the
+        # boundary. Same for evidence_type below.
+        status = str(manifest.get("status") or "").strip().lower()
+        if status != "complete":
+            problems.append('verification.status must be "complete"')
+        evidence_type = str(manifest.get("evidence_type") or "").strip().lower()
         if not evidence_type:
             problems.append("verification.evidence_type is required")
         if problems:
@@ -2468,9 +2515,12 @@ class ControlPlane:
         manifest: JsonDict,
         evidence_type: str,
     ) -> List[str]:
-        if evidence_type in {"repo_change", "code", "git"}:
+        # Canonical evidence_type vocabulary (mac-q38):
+        #   repo_change | documentation | deployment | test | artifact | no_change
+        # Aliases (code/git/investigation/decision_record) are rejected.
+        if evidence_type == "repo_change":
             return self._repo_verification_problems(manifest, require_tests=True)
-        if evidence_type in {"documentation", "investigation", "decision_record"}:
+        if evidence_type == "documentation":
             repo_problems = self._repo_verification_problems(manifest, require_tests=False)
             if not repo_problems:
                 return []
@@ -2478,7 +2528,7 @@ class ControlPlane:
             if artifacts and self._passed_verification_check_count(manifest) > 0:
                 return []
             return [
-                "documentation/investigation evidence requires a pushed repo artifact "
+                "documentation evidence requires a pushed repo artifact "
                 "or explicit artifacts plus passing checks"
             ]
         if evidence_type == "deployment":
@@ -2508,34 +2558,28 @@ class ControlPlane:
         return ["unsupported verification.evidence_type: %s" % evidence_type]
 
     def _repo_verification_problems(self, manifest: JsonDict, require_tests: bool) -> List[str]:
-        repo = manifest.get("repo") or manifest.get("git")
+        # Canonical field names only (mac-q38). The previous code
+        # accepted ``git``/``commit``/``commit_sha``/``changed_files``/
+        # ``pushed_ref``/``pull_request_url``/etc. — each alias is a
+        # separate doorway. Single canonical schema:
+        #   verification.repo: { head_sha, files_changed, dirty, pushed,
+        #                        remote_ref, pr_url? }
+        repo = manifest.get("repo")
         if not isinstance(repo, dict):
             return ["repo evidence requires verification.repo object"]
         problems: List[str] = []
-        head_sha = str(
-            repo.get("head_sha")
-            or repo.get("commit")
-            or repo.get("commit_sha")
-            or manifest.get("head_sha")
-            or ""
-        ).strip()
+        head_sha = str(repo.get("head_sha") or "").strip()
         if not _GIT_SHA_RE.match(head_sha):
             problems.append("repo.head_sha must be a git SHA")
-        files_changed = _manifest_list(
-            repo.get("files_changed")
-            or repo.get("changed_files")
-            or manifest.get("files_changed")
-        )
+        files_changed = _manifest_list(repo.get("files_changed"))
         if not files_changed:
             problems.append("repo evidence requires changed files")
         dirty = repo.get("dirty")
-        if dirty is None:
-            dirty = repo.get("dirty_worktree")
         if dirty not in {False, "false", "False", 0, "0"}:
             problems.append("repo evidence must declare dirty=false")
         pushed = repo.get("pushed") is True or str(repo.get("pushed") or "").lower() == "true"
-        remote_ref = str(repo.get("remote_ref") or repo.get("pushed_ref") or "").strip()
-        pr_url = str(repo.get("pr_url") or repo.get("pull_request_url") or manifest.get("pr_url") or "").strip()
+        remote_ref = str(repo.get("remote_ref") or "").strip()
+        pr_url = str(repo.get("pr_url") or "").strip()
         if not (pushed and remote_ref) and not pr_url:
             problems.append("repo evidence requires pushed=true with remote_ref, or pr_url")
         if require_tests and self._passed_verification_check_count(manifest) < 1:
@@ -2543,8 +2587,10 @@ class ControlPlane:
         return problems
 
     def _passed_verification_check_count(self, manifest: JsonDict) -> int:
+        # Canonical names only (mac-q38): ``tests`` and ``checks``.
+        # ``test_runs`` was an alias; rejecting it here.
         count = 0
-        for item in _manifest_list(manifest.get("tests") or manifest.get("test_runs")):
+        for item in _manifest_list(manifest.get("tests")):
             if self._verification_item_passed(item):
                 count += 1
         for item in _manifest_list(manifest.get("checks")):
@@ -2553,6 +2599,9 @@ class ControlPlane:
         return count
 
     def _verification_item_passed(self, item: Any) -> bool:
+        # Canonical: returncode=0 OR status=="pass" (mac-q38). The
+        # earlier accept-list (passed/success/succeeded/ok plus a
+        # ``result`` alias) was four extra doors; reject them.
         if not isinstance(item, dict):
             return False
         if "returncode" in item:
@@ -2560,8 +2609,7 @@ class ControlPlane:
                 return int(item["returncode"]) == 0
             except (TypeError, ValueError):
                 return False
-        status = str(item.get("status") or item.get("result") or "").strip().lower()
-        return status in {"pass", "passed", "success", "succeeded", "ok"}
+        return str(item.get("status") or "").strip().lower() == "pass"
 
     def _evidence_returncode(self, evidence: Evidence) -> Optional[int]:
         value = evidence.metadata.get("returncode")
@@ -2573,12 +2621,22 @@ class ControlPlane:
             return None
 
     def _default_review_for_task(self, task_id: str) -> Optional[Review]:
+        """Return the unambiguous review row to act on, or None.
+
+        Refuses to pick when the task has more than one pending review
+        (mac-d9c) — that's an ambiguous state and in an autonomous
+        swarm there's no operator to break the tie. The caller logs
+        ``workflow.default_review.ambiguous`` and leaves the task
+        alone for explicit resolution.
+        """
         reviews = self.list_reviews(task_id)
         if not reviews:
             return None
         pending = [review for review in reviews if review.status == ReviewStatus.PENDING.value]
+        if len(pending) > 1:
+            return None
         if pending:
-            return pending[-1]
+            return pending[0]
         approved = [review for review in reviews if review.status == ReviewStatus.APPROVED.value]
         if approved:
             return approved[-1]
@@ -2604,7 +2662,16 @@ class ControlPlane:
         )
         return candidates[0]
 
-    def _default_publication_target(self, task: Task) -> str:
+    def _default_publication_target(self, task: Task) -> Optional[str]:
+        """Resolve the publication target from task metadata or return None.
+
+        Returns ``None`` when no operator-set target is available
+        (mac-w29). Previously this synthesized ``mac://tasks/{id}`` which
+        is filler — no resolver exists for that URI. The auto-review
+        workflow now treats ``None`` as "no publication destination
+        configured; leave the task in REVIEWING and emit a waiting
+        observability event."
+        """
         metadata = task.metadata
         for key in ("publication_target", "publish_target"):
             value = metadata.get(key)
@@ -2620,7 +2687,7 @@ class ControlPlane:
             beads_id = acc_metadata.get("beads_id")
             if isinstance(beads_id, str) and beads_id.strip():
                 return "beads://%s" % beads_id.strip()
-        return "mac://tasks/%s" % task.id
+        return None
 
     def _record_default_review_observation(
         self,

@@ -16,6 +16,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from mac.agentbus_control import (
+    REPO_UPDATE_CONTENT_TYPE,
+    REPO_UPDATE_TOPIC,
+    repo_update_payload,
+)
 from mac.hermes_startup import build_hermes_startup_report
 from mac.models import AuthorizationError, MACError, NotFoundError, ValidationError
 from mac.services import ControlPlane
@@ -406,6 +411,17 @@ class AgentBusPublish(BaseModel):
     payload_encoding: str = "json"
 
 
+class AgentBusRepoUpdate(BaseModel):
+    sender_agent_id: str
+    recipient_agent_ids: List[str] = Field(default_factory=list)
+    all_agents: bool = False
+    repo_path: Optional[str] = None
+    remote: str = "origin"
+    branch: str = "main"
+    restart: bool = True
+    request_id: Optional[str] = None
+
+
 class ObservabilityMetricCreate(BaseModel):
     name: str
     value: float
@@ -693,6 +709,12 @@ def _required_scope(method: str, path: str) -> Optional[str]:
         # deploy-level (a future provisioner that polls + spawns agents
         # is doing infra work, not user-facing writes).
         return "deploy"
+    if path.startswith("/reviews/default"):
+        # The automated review tick is the closest thing the swarm has
+        # to an auto-merge button. Restrict to admin so an ordinary
+        # `write` token can't flush every reviewable task to
+        # COMPLETED on demand. mac-iez.
+        return "admin"
     return "write"
 
 
@@ -1870,6 +1892,37 @@ def create_app(
     @app.post("/agentbus")
     def publish_agentbus_content(body: AgentBusPublish) -> Dict[str, Any]:
         return cp.publish_agentbus_content(**_data(body))
+
+    @app.post("/agentbus/repo-update")
+    def publish_agentbus_repo_update(body: AgentBusRepoUpdate) -> Dict[str, Any]:
+        recipients = list(body.recipient_agent_ids)
+        if body.all_agents:
+            recipients.extend(agent.id for agent in cp.list_agents())
+        recipients = list(dict.fromkeys(item for item in recipients if item))
+        if not recipients:
+            raise ValidationError("repo-update requires recipient_agent_ids or all_agents=true")
+        payload = repo_update_payload(
+            repo_path=body.repo_path,
+            remote=body.remote,
+            branch=body.branch,
+            restart=body.restart,
+            request_id=body.request_id,
+        )
+        published = [
+            cp.publish_agentbus_content(
+                sender_agent_id=body.sender_agent_id,
+                recipient_agent_id=recipient_id,
+                content_type=REPO_UPDATE_CONTENT_TYPE,
+                topic=REPO_UPDATE_TOPIC,
+                payload=payload,
+            )
+            for recipient_id in recipients
+        ]
+        return {
+            "schema": "mac.agentbus.repo_update_publish.v1",
+            "count": len(published),
+            "streams": [item["stream"] for item in published],
+        }
 
     @app.get("/agentbus/streams/{stream_id}/events")
     async def agentbus_stream_events(

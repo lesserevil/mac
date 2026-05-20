@@ -104,7 +104,11 @@ def test_e2e_full_task_lifecycle_via_http_and_disk(tmp_path: Path):
     ).json()
     task = client.post(
         "/tasks",
-        json={"title": "E2E task", "required_capabilities": ["python"]},
+        json={
+            "title": "E2E task",
+            "required_capabilities": ["python"],
+            "metadata": {"publication_target": "test://e2e"},
+        },
     ).json()
 
     # MacWorker drives claim → start → run → evidence → submit_for_review
@@ -158,7 +162,12 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
         json={"machine_id": m2["id"], "name": "natasha", "capabilities": ["python"]},
     ).json()
     task = client.post(
-        "/tasks", json={"title": "race", "required_capabilities": ["python"]}
+        "/tasks",
+        json={
+            "title": "race",
+            "required_capabilities": ["python"],
+            "metadata": {"publication_target": "test://race"},
+        },
     ).json()
 
     api = MacApiClient("http://mac.test", transport=_api_transport(client))

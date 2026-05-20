@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
+from mac.agentbus_control import (
+    REPO_UPDATE_CONTENT_TYPE,
+    REPO_UPDATE_TOPIC,
+    repo_update_payload,
+)
 from mac.migration import import_jsonl, migrate_acc_sqlite
 from mac.models import MACError
 from mac.services import ControlPlane
@@ -416,6 +421,39 @@ def cmd_agentbus_publish(args: argparse.Namespace) -> None:
             task_id=args.task_id,
             payload_encoding=args.payload_encoding,
         )
+    )
+
+
+def cmd_agentbus_repo_update(args: argparse.Namespace) -> None:
+    cp = _plane(args)
+    recipients = list(args.recipient_agent_id or [])
+    if args.all_agents:
+        recipients.extend(agent.id for agent in cp.list_agents())
+    recipients = list(dict.fromkeys(item for item in recipients if item))
+    if not recipients:
+        raise MACError("repo-update requires --recipient-agent-id or --all-agents")
+    payload = repo_update_payload(
+        repo_path=args.repo_path,
+        remote=args.remote,
+        branch=args.branch,
+        restart=not args.no_restart,
+        request_id=args.request_id,
+    )
+    _print(
+        {
+            "schema": "mac.agentbus.repo_update_publish.v1",
+            "count": len(recipients),
+            "streams": [
+                cp.publish_agentbus_content(
+                    args.sender_agent_id,
+                    recipient_agent_id=recipient_id,
+                    content_type=REPO_UPDATE_CONTENT_TYPE,
+                    payload=payload,
+                    topic=REPO_UPDATE_TOPIC,
+                )["stream"]
+                for recipient_id in recipients
+            ],
+        }
     )
 
 
@@ -1048,6 +1086,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
     )
     _set(cmd_agentbus_publish, bus_publish)
+
+    bus_repo_update = agentbus.add_parser("repo-update")
+    bus_repo_update.add_argument("sender_agent_id")
+    bus_repo_update.add_argument("--recipient-agent-id", action="append")
+    bus_repo_update.add_argument("--all-agents", action="store_true")
+    bus_repo_update.add_argument("--repo-path")
+    bus_repo_update.add_argument("--remote", default="origin")
+    bus_repo_update.add_argument("--branch", default="main")
+    bus_repo_update.add_argument("--request-id")
+    bus_repo_update.add_argument("--no-restart", action="store_true")
+    _set(cmd_agentbus_repo_update, bus_repo_update)
 
     review = sub.add_parser("review", help="review pipeline commands").add_subparsers(dest="review_command", required=True)
     request = review.add_parser("request")

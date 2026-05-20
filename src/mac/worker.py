@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -15,11 +16,20 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
+from mac.agentbus_control import (
+    REPO_UPDATE_CONTENT_TYPE,
+    REPO_UPDATE_RESULT_CONTENT_TYPE,
+    REPO_UPDATE_RESULT_SCHEMA,
+    REPO_UPDATE_RESULT_TOPIC,
+    REPO_UPDATE_SCHEMA,
+    REPO_UPDATE_TOPIC,
+)
 from mac.hermes_adapter import MacApiClient, MacApiError
 
 
 JsonDict = Dict[str, Any]
 Executor = Callable[[JsonDict, Path], "WorkerExecution"]
+SAFE_GIT_REF_RE = r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$"
 
 
 @dataclass
@@ -142,6 +152,9 @@ class MacWorker:
         required_metadata: Optional[JsonDict] = None,
         require_canary: bool = False,
         lease_renew_interval_seconds: Optional[float] = None,
+        agentbus_control_enabled: bool = True,
+        self_update_repo: Optional[Path] = None,
+        agentbus_control_state_path: Optional[Path] = None,
     ) -> None:
         if not agent_id:
             raise MacApiError("agent_id is required")
@@ -156,6 +169,13 @@ class MacWorker:
         self.required_metadata = dict(required_metadata or {})
         self.require_canary = bool(require_canary)
         self.lease_renew_interval_seconds = lease_renew_interval_seconds
+        self.agentbus_control_enabled = bool(agentbus_control_enabled)
+        self.self_update_repo = self_update_repo or _default_self_update_repo()
+        self.agentbus_control_state_path = (
+            agentbus_control_state_path
+            if agentbus_control_state_path is not None
+            else self.workspace / ".mac-agentbus-control.json"
+        )
         self._stop = False
         self._declared_digest = False
         self._declared_policy = False
@@ -224,6 +244,14 @@ class MacWorker:
 
     def run_once(self) -> WorkerRunResult:
         self._heartbeat()
+        control_result = self._process_agentbus_control()
+        if control_result and control_result.get("restart_requested"):
+            self.stop()
+            return WorkerRunResult(
+                status="self_update_restart",
+                evidence=control_result,
+                error=control_result.get("summary"),
+            )
         self._observe_policy_once()
         assignment = self._claim_next_for_agent()
         if assignment is None:
@@ -337,9 +365,13 @@ class MacWorker:
     def _assignment_is_current(self, task_id: str, lease_id: str) -> bool:
         try:
             current = self.client.get("/tasks/%s" % quote(task_id, safe=""))
-        except Exception:
-            # If the hub is unreachable, preserve the older behavior and let
-            # the concrete API operation surface the failure.
+        except MacApiError:
+            # Hub unreachable / transient API error: preserve the older
+            # behavior and let the concrete operation surface the
+            # failure. Narrowed from bare ``except Exception`` (mac-h3d)
+            # so TypeError/KeyError/AttributeError from a malformed
+            # response or a programming bug bubbles up instead of being
+            # silently treated as "still current."
             return True
         current_task = current.get("task", current)
         return (
@@ -464,6 +496,270 @@ class MacWorker:
             },
         )
         return assignment
+
+    def _process_agentbus_control(self) -> Optional[JsonDict]:
+        if not self.agentbus_control_enabled:
+            return None
+        try:
+            processed = self._load_agentbus_control_state()
+            streams = self.client.get(
+                "/agentbus/streams?%s"
+                % urlencode({"agent_id": self.agent_id, "status": "closed", "limit": 50})
+            )
+        except Exception as exc:  # noqa: BLE001 - control bus must not break task polling.
+            self._observe_log(
+                "worker.agentbus.control_poll_failed",
+                level="warning",
+                detail={"agent_id": self.agent_id, "error": str(exc)},
+            )
+            return None
+
+        if not isinstance(streams, list):
+            return None
+        for stream in reversed(streams):
+            if not isinstance(stream, dict):
+                continue
+            stream_id = str(stream.get("id") or "")
+            if not stream_id or stream_id in processed:
+                continue
+            if stream.get("recipient_agent_id") != self.agent_id:
+                continue
+            if stream.get("topic") != REPO_UPDATE_TOPIC:
+                continue
+            if str(stream.get("content_type") or "").split(";", 1)[0] != REPO_UPDATE_CONTENT_TYPE:
+                continue
+
+            result = self._handle_repo_update_stream(stream)
+            processed.append(stream_id)
+            self._save_agentbus_control_state(processed)
+            self._publish_repo_update_result(stream, result)
+            if result.get("restart_requested"):
+                return result
+        return None
+
+    def _handle_repo_update_stream(self, stream: JsonDict) -> JsonDict:
+        stream_id = str(stream.get("id") or "")
+        chunks = self.client.get(
+            "/agentbus/streams/%s/chunks?%s"
+            % (
+                quote(stream_id, safe=""),
+                urlencode({"agent_id": self.agent_id, "after_sequence": 0, "limit": 10}),
+            )
+        )
+        payload: Any = None
+        if isinstance(chunks, list) and chunks:
+            payload = chunks[-1].get("payload") if isinstance(chunks[-1], dict) else None
+        try:
+            result = self._execute_repo_update(payload, stream_id)
+        except Exception as exc:  # noqa: BLE001 - malformed control messages should report failure.
+            result = self._repo_update_result(
+                stream_id,
+                "error",
+                "repo update handler failed: %s" % exc,
+                {},
+            )
+        self._observe_log(
+            "worker.agentbus.repo_update.%s" % result["status"],
+            level="info" if result["status"] in {"updated", "no_update", "skipped"} else "error",
+            detail=result,
+        )
+        return result
+
+    def _execute_repo_update(self, payload: Any, stream_id: str) -> JsonDict:
+        request: JsonDict = payload if isinstance(payload, dict) else {}
+        if request.get("schema") not in {None, "", REPO_UPDATE_SCHEMA}:
+            return self._repo_update_result(
+                stream_id,
+                "error",
+                "unsupported repo update schema: %s" % request.get("schema"),
+                request,
+            )
+
+        repo = self.self_update_repo.expanduser()
+        requested_repo = str(request.get("repo_path") or "").strip()
+        if requested_repo:
+            try:
+                if Path(requested_repo).expanduser().resolve() != repo.resolve():
+                    return self._repo_update_result(
+                        stream_id,
+                        "error",
+                        "repo_path does not match this listener's configured update repo",
+                        request,
+                        repo_path=str(repo),
+                    )
+            except OSError as exc:
+                return self._repo_update_result(
+                    stream_id,
+                    "error",
+                    "could not resolve repo_path: %s" % exc,
+                    request,
+                    repo_path=str(repo),
+                )
+
+        remote = str(request.get("remote") or "origin").strip()
+        branch = str(request.get("branch") or "").strip()
+        restart = bool(request.get("restart", True))
+        if not _safe_git_ref(remote):
+            return self._repo_update_result(
+                stream_id,
+                "error",
+                "invalid git remote name",
+                request,
+                repo_path=str(repo),
+            )
+        if branch and not _safe_git_ref(branch):
+            return self._repo_update_result(
+                stream_id,
+                "error",
+                "invalid git branch/ref name",
+                request,
+                repo_path=str(repo),
+            )
+        if not repo.exists():
+            return self._repo_update_result(
+                stream_id,
+                "skipped",
+                "self-update repo does not exist",
+                request,
+                repo_path=str(repo),
+            )
+
+        inside = _run_git(repo, ["rev-parse", "--is-inside-work-tree"])
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return self._repo_update_result(
+                stream_id,
+                "skipped",
+                "self-update repo is not a git worktree",
+                request,
+                repo_path=str(repo),
+                stderr=inside.stderr,
+            )
+
+        dirty = _run_git(repo, ["status", "--porcelain"])
+        if dirty.returncode != 0:
+            return self._repo_update_result(
+                stream_id,
+                "error",
+                "could not inspect git status",
+                request,
+                repo_path=str(repo),
+                stderr=dirty.stderr,
+            )
+        if dirty.stdout.strip():
+            return self._repo_update_result(
+                stream_id,
+                "skipped",
+                "self-update repo has local modifications",
+                request,
+                repo_path=str(repo),
+            )
+
+        before = _run_git(repo, ["rev-parse", "HEAD"])
+        before_sha = before.stdout.strip() if before.returncode == 0 else ""
+        pull_args = ["pull", "--ff-only"]
+        if branch:
+            pull_args.extend([remote, branch])
+        pulled = _run_git(repo, pull_args)
+        if pulled.returncode != 0:
+            return self._repo_update_result(
+                stream_id,
+                "error",
+                "git pull --ff-only failed",
+                request,
+                repo_path=str(repo),
+                before_sha=before_sha,
+                stdout=pulled.stdout,
+                stderr=pulled.stderr,
+            )
+
+        after = _run_git(repo, ["rev-parse", "HEAD"])
+        after_sha = after.stdout.strip() if after.returncode == 0 else ""
+        updated = bool(before_sha and after_sha and before_sha != after_sha)
+        return self._repo_update_result(
+            stream_id,
+            "updated" if updated else "no_update",
+            "repo updated; restart requested" if updated and restart else "repo already current",
+            request,
+            repo_path=str(repo),
+            before_sha=before_sha,
+            after_sha=after_sha,
+            stdout=pulled.stdout,
+            stderr=pulled.stderr,
+            restart_requested=updated and restart,
+        )
+
+    def _repo_update_result(
+        self,
+        stream_id: str,
+        status: str,
+        summary: str,
+        request: JsonDict,
+        **extra: Any,
+    ) -> JsonDict:
+        result: JsonDict = {
+            "schema": REPO_UPDATE_RESULT_SCHEMA,
+            "status": status,
+            "summary": summary,
+            "agent_id": self.agent_id,
+            "stream_id": stream_id,
+            "request_id": request.get("request_id"),
+            "restart_requested": bool(extra.pop("restart_requested", False)),
+        }
+        for key, value in extra.items():
+            if isinstance(value, str):
+                result[key] = value[:4000]
+            else:
+                result[key] = value
+        return result
+
+    def _publish_repo_update_result(self, stream: JsonDict, result: JsonDict) -> None:
+        sender = str(stream.get("sender_agent_id") or "")
+        if not sender:
+            return
+        try:
+            self.client.post(
+                "/agentbus",
+                {
+                    "sender_agent_id": self.agent_id,
+                    "recipient_agent_id": sender,
+                    "content_type": REPO_UPDATE_RESULT_CONTENT_TYPE,
+                    "topic": REPO_UPDATE_RESULT_TOPIC,
+                    "payload": result,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - result publishing is best-effort.
+            self._observe_log(
+                "worker.agentbus.repo_update_result_failed",
+                level="warning",
+                detail={"stream_id": stream.get("id"), "error": str(exc)},
+            )
+
+    def _load_agentbus_control_state(self) -> List[str]:
+        try:
+            loaded = json.loads(self.agentbus_control_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except Exception:
+            return []
+        values = loaded.get("processed_stream_ids") if isinstance(loaded, dict) else []
+        if not isinstance(values, list):
+            return []
+        return [str(value) for value in values if str(value)]
+
+    def _save_agentbus_control_state(self, processed_stream_ids: List[str]) -> None:
+        try:
+            self.agentbus_control_state_path.parent.mkdir(parents=True, exist_ok=True)
+            deduped = list(dict.fromkeys(processed_stream_ids))[-500:]
+            self.agentbus_control_state_path.write_text(
+                json.dumps({"processed_stream_ids": deduped}, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 - state loss should not break task polling.
+            self._observe_log(
+                "worker.agentbus.control_state_write_failed",
+                level="warning",
+                detail={"path": str(self.agentbus_control_state_path), "error": str(exc)},
+            )
 
     def _claim_payload(self, dry_run: bool) -> JsonDict:
         return {
@@ -665,6 +961,31 @@ def _sha256_file(path: Path) -> str:
     return "sha256:%s" % digest.hexdigest()
 
 
+def _default_self_update_repo() -> Path:
+    configured = os.environ.get("MAC_SELF_UPDATE_REPO")
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[2]
+
+
+def _safe_git_ref(value: str) -> bool:
+    return bool(value and not value.startswith("-") and re.match(SAFE_GIT_REF_RE, value))
+
+
+def _run_git(repo: Path, args: List[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        timeout = float(os.environ.get("MAC_SELF_UPDATE_GIT_TIMEOUT", "120"))
+    except ValueError:
+        timeout = 120.0
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def _stable_id(prefix: str, value: str) -> str:
     return "%s_%s" % (prefix, _safe_path_component(value.lower()).strip("_") or "default")
 
@@ -754,6 +1075,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to sleep between polls when no task is available",
     )
     parser.add_argument(
+        "--self-update-repo",
+        default=os.environ.get("MAC_SELF_UPDATE_REPO"),
+        help="git worktree this worker may pull for AgentBus repo-update control messages",
+    )
+    parser.add_argument(
+        "--disable-agentbus-control",
+        action="store_true",
+        help="disable AgentBus control-message polling before task claims",
+    )
+    parser.add_argument(
         "--heartbeat-only",
         action="store_true",
         help="register/heartbeat once and exit without claiming tasks",
@@ -821,6 +1152,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 allowed_projects=allowed_projects,
                 required_metadata=required_metadata,
                 require_canary=args.require_canary,
+                agentbus_control_enabled=not args.disable_agentbus_control,
+                self_update_repo=Path(args.self_update_repo).expanduser()
+                if args.self_update_repo
+                else None,
             )
             print(json.dumps({"status": "dry_run", "assignment": worker.dry_run_claim()}, indent=2, sort_keys=True))
             return 0
@@ -837,13 +1172,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             allowed_projects=allowed_projects,
             required_metadata=required_metadata,
             require_canary=args.require_canary,
+            agentbus_control_enabled=not args.disable_agentbus_control,
+            self_update_repo=Path(args.self_update_repo).expanduser()
+            if args.self_update_repo
+            else None,
         )
         if args.loop:
             results = worker.run_forever(max_iterations=args.max_iterations)
             print(json.dumps([r.to_dict() for r in results], indent=2, sort_keys=True))
+            if any(result.status == "self_update_restart" for result in results):
+                return 75
         else:
             result = worker.run_once()
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+            if result.status == "self_update_restart":
+                return 75
     except MacApiError as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, indent=2, sort_keys=True))
         return 1

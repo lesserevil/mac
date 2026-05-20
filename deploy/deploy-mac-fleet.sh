@@ -6,6 +6,16 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 TMPDIR_LOCAL="${TMPDIR:-/tmp}/mac-fleet-deploy-${TS}.$$"
 ARCHIVE="${TMPDIR_LOCAL}/mac.tar.gz"
 GIT_REV="$(git -C "$ROOT" rev-parse HEAD)"
+GIT_URL="$(git -C "$ROOT" config --get remote.origin.url || true)"
+case "$GIT_URL" in
+  git@github.com:*)
+    GIT_URL="https://github.com/${GIT_URL#git@github.com:}"
+    ;;
+  github.com:*)
+    GIT_URL="https://github.com/${GIT_URL#github.com:}"
+    ;;
+esac
+GIT_BRANCH="${MAC_DEPLOY_GIT_BRANCH:-main}"
 AGENT_CONFIG_DIR="${MAC_DEPLOY_AGENT_CONFIG_DIR:-$ROOT/deploy/agents}"
 MAC_DEPLOY_HUB_AGENT="${MAC_DEPLOY_HUB_AGENT:-rocky}"
 MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
@@ -143,7 +153,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -151,6 +161,8 @@ OS_KIND="${MAC_DEPLOY_OS:?}"
 ARCHIVE="${MAC_DEPLOY_ARCHIVE:?}"
 DEPLOY_TS="${MAC_DEPLOY_TS:?}"
 DEPLOY_REV="${MAC_DEPLOY_GIT_REV:?}"
+DEPLOY_GIT_URL="${MAC_DEPLOY_GIT_URL:-}"
+DEPLOY_GIT_BRANCH="${MAC_DEPLOY_GIT_BRANCH:-main}"
 HERMES_SLACK_HOME_CHANNEL_NAME="${MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
 HERMES_GATEWAY_MODEL="${MAC_DEPLOY_HERMES_GATEWAY_MODEL:-}"
 HERMES_GATEWAY_PROVIDER="${MAC_DEPLOY_HERMES_GATEWAY_PROVIDER:-custom}"
@@ -221,7 +233,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -391,6 +403,8 @@ manifest = {
     "deploy": {
         "timestamp": os.environ["DEPLOY_TS"],
         "mac_git_rev": os.environ["DEPLOY_REV"],
+        "mac_git_url": os.environ.get("DEPLOY_GIT_URL") or None,
+        "mac_git_branch": os.environ.get("DEPLOY_GIT_BRANCH") or None,
         "log": os.environ["DEPLOY_LOG"],
         "hermes_slack_home_channel_name": os.environ.get("HERMES_SLACK_HOME_CHANNEL_NAME") or None,
         "hermes_gateway_model": os.environ.get("HERMES_GATEWAY_MODEL") or None,
@@ -1013,8 +1027,17 @@ stop_existing_services_for_deploy
 backup_existing_artifacts
 log "installing mac source"
 rm -rf "$SRC_DIR.new"
-mkdir -p "$SRC_DIR.new"
-tar -xzf "$ARCHIVE" -C "$SRC_DIR.new"
+if [ -n "$DEPLOY_GIT_URL" ] && git clone --quiet --branch "$DEPLOY_GIT_BRANCH" "$DEPLOY_GIT_URL" "$SRC_DIR.new"; then
+  actual_rev="$(git -C "$SRC_DIR.new" rev-parse HEAD)"
+  if [ "$actual_rev" != "$DEPLOY_REV" ]; then
+    git -C "$SRC_DIR.new" fetch --quiet origin "$DEPLOY_REV"
+    git -C "$SRC_DIR.new" merge --ff-only "$DEPLOY_REV"
+  fi
+else
+  log "WARNING: git clone failed or was not configured; installing archive without self-update worktree"
+  mkdir -p "$SRC_DIR.new"
+  tar -xzf "$ARCHIVE" -C "$SRC_DIR.new"
+fi
 mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
@@ -1064,6 +1087,7 @@ values["MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM"] = "1"
 values["MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM"] = "1"
 values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
+values["MAC_SELF_UPDATE_REPO"] = str(mac_home / "src" / "mac")
 if configured_gateway_model:
     values["MAC_HERMES_GATEWAY_MODEL"] = configured_gateway_model
     values["ACC_HERMES_GATEWAY_MODEL"] = configured_gateway_model

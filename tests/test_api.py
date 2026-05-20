@@ -107,6 +107,31 @@ def test_fastapi_exposes_hermes_identity_boundary():
     assert task["metadata"]["memory_boundary"]["mac_records_operational_provenance_only"] is True
 
 
+def test_default_review_tick_requires_admin_not_write():
+    """mac-iez: /reviews/default/tick is the closest thing to an
+    auto-merge button in an autonomous swarm. A `write`-scope token —
+    same as a task author — must NOT be able to flush every reviewable
+    task to COMPLETED. Admin only."""
+    client = TestClient(
+        create_app(
+            control_plane=ControlPlane.in_memory(),
+            auth_tokens={"writer": ["write"], "admin": ["admin"]},
+        )
+    )
+
+    blocked = client.post(
+        "/reviews/default/tick",
+        headers={"Authorization": "Bearer writer"},
+    )
+    assert blocked.status_code == 403
+
+    allowed = client.post(
+        "/reviews/default/tick",
+        headers={"Authorization": "Bearer admin"},
+    )
+    assert allowed.status_code == 200
+
+
 def test_fastapi_can_require_scoped_bearer_tokens():
     client = TestClient(
         create_app(
@@ -625,6 +650,42 @@ def test_fastapi_exposes_typed_agentbus_streams_and_ndjson_events():
     ).json()
     assert published["stream"]["status"] == "closed"
     assert published["chunk"]["payload"] == "one-shot"
+
+
+def test_fastapi_publishes_agentbus_repo_update_to_all_agents():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "bus-host"}).json()
+    sender = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "sender"},
+    ).json()
+    recipient = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "recipient"},
+    ).json()
+
+    published = client.post(
+        "/agentbus/repo-update",
+        json={
+            "sender_agent_id": sender["id"],
+            "recipient_agent_ids": [recipient["id"]],
+            "remote": "origin",
+            "branch": "main",
+            "request_id": "req-api",
+        },
+    ).json()
+
+    assert published["schema"] == "mac.agentbus.repo_update_publish.v1"
+    assert published["count"] == 1
+    stream = published["streams"][0]
+    assert stream["topic"] == "mac.repo.update.v1"
+    assert stream["content_type"] == "application/vnd.mac.repo-update+json"
+    chunks = client.get(
+        "/agentbus/streams/%s/chunks" % stream["id"],
+        params={"agent_id": recipient["id"]},
+    ).json()
+    assert chunks[0]["payload"]["schema"] == "mac.agentbus.repo_update.v1"
+    assert chunks[0]["payload"]["request_id"] == "req-api"
 
 
 def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():
