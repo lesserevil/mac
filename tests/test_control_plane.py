@@ -44,36 +44,57 @@ def create_runtime(cp, name="runtime"):
     )
 
 
-def verified_repo_metadata(head_sha="abcdef1234567890abcdef1234567890abcdef12"):
-    return {
-        "returncode": 0,
-        "verification": {
-            "schema": "mac.worker_evidence.v1",
-            "status": "complete",
-            "evidence_type": "repo_change",
-            "repo": {
-                "head_sha": head_sha,
-                "pushed": True,
-                "remote_ref": "refs/heads/task/example",
-                "dirty": False,
-                "files_changed": ["src/example.py"],
-            },
-            "tests": [{"command": "pytest tests/test_example.py", "returncode": 0}],
-        },
-    }
+def _sign(cp, agent_id, manifest):
+    """Stamp ``signed_by`` + HMAC ``signature`` onto a verification
+    manifest, using the test agent's attestation key. Mirrors what the
+    worker does in production via _sign_verification_manifest. Tests
+    that want to demonstrate the security model (unsigned, wrong-key,
+    etc.) should use the raw helpers below instead."""
+    from mac.services import sign_verification_manifest
+
+    key = cp._agent_attestation_key(agent_id)
+    if key is None:
+        return manifest
+    signed = dict(manifest)
+    signed["signed_by"] = agent_id
+    signed["signature"] = sign_verification_manifest(key, signed)
+    return signed
 
 
-def verified_deployment_metadata():
-    return {
-        "returncode": 0,
-        "verification": {
-            "schema": "mac.worker_evidence.v1",
-            "status": "complete",
-            "evidence_type": "deployment",
-            "targets": ["rocky"],
-            "checks": [{"name": "systemd status", "status": "pass"}],
+def verified_repo_metadata(
+    cp=None,
+    agent_id=None,
+    head_sha="abcdef1234567890abcdef1234567890abcdef12",
+):
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "repo_change",
+        "repo": {
+            "head_sha": head_sha,
+            "pushed": True,
+            "remote_ref": "refs/heads/task/example",
+            "dirty": False,
+            "files_changed": ["src/example.py"],
         },
+        "tests": [{"command": "pytest tests/test_example.py", "returncode": 0}],
     }
+    if cp is not None and agent_id is not None:
+        manifest = _sign(cp, agent_id, manifest)
+    return {"returncode": 0, "verification": manifest}
+
+
+def verified_deployment_metadata(cp=None, agent_id=None):
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "deployment",
+        "targets": ["rocky"],
+        "checks": [{"name": "systemd status", "status": "pass"}],
+    }
+    if cp is not None and agent_id is not None:
+        manifest = _sign(cp, agent_id, manifest)
+    return {"returncode": 0, "verification": manifest}
 
 
 def create_verified_rollout(cp, version="1.0", strategy="canary", tenant_id=None, channel="fleet", health_policy=None):
@@ -551,7 +572,7 @@ def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
         "artifact://worker-result",
         "tests passed",
         worker.id,
-        metadata=verified_repo_metadata(),
+        metadata=verified_repo_metadata(cp, worker.id),
     )
 
     cp.submit_for_review(task.id, worker.id)
@@ -585,7 +606,7 @@ def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
         "artifact://worker-result",
         "tests passed",
         worker.id,
-        metadata=verified_repo_metadata(),
+        metadata=verified_repo_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -612,7 +633,7 @@ def test_default_review_tick_processes_backlog(cp):
         "artifact://worker-result",
         "tests passed",
         worker.id,
-        metadata=verified_repo_metadata(),
+        metadata=verified_repo_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -655,9 +676,14 @@ def test_default_review_workflow_rejects_unpushed_repo_manifest(cp):
     task = cp.create_task("Local-only code", required_capabilities=["python"])
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
-    metadata = verified_repo_metadata()
-    metadata["verification"]["repo"]["pushed"] = False
-    metadata["verification"]["repo"].pop("remote_ref")
+    # Construct the manifest, edit it, then sign — otherwise the
+    # signature would verify against the pre-edit shape and we'd never
+    # exercise the unpushed-repo guard.
+    raw = verified_repo_metadata()
+    raw["verification"]["repo"]["pushed"] = False
+    raw["verification"]["repo"].pop("remote_ref")
+    raw["verification"] = _sign(cp, worker.id, raw["verification"])
+    metadata = raw
     cp.add_evidence(
         task.id,
         "log",
@@ -691,7 +717,7 @@ def test_default_review_workflow_allows_verified_deployment_evidence(cp):
         "artifact://deploy-result",
         "deployment verified",
         worker.id,
-        metadata=verified_deployment_metadata(),
+        metadata=verified_deployment_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -700,6 +726,108 @@ def test_default_review_workflow_allows_verified_deployment_evidence(cp):
     assert result["status"] == "published"
     assert cp.list_reviews(task.id)[0].reviewer_agent_id == reviewer.id
     assert cp.list_reviews(task.id)[0].evidence_id == evidence.id
+
+
+def test_unsigned_verification_manifest_is_rejected(cp):
+    """mac-ng2 / mac-8r1: a syntactically-perfect but UNSIGNED manifest
+    must be rejected. Without a signature, anything an executor can
+    write it can fake — and in an autonomous swarm there is no human
+    to notice."""
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "unsigned",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://x"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    # Manifest with no signed_by / signature — the pre-fix code path
+    # would have accepted this. Now it must refuse.
+    unsigned = verified_repo_metadata()
+    cp.add_evidence(task.id, "log", "x", "y", worker.id, metadata=unsigned)
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_verifiable_evidence"
+    assert result["rejected_evidence"][0]["reason"] == "manifest_not_signed"
+    assert cp.list_publications(task.id) == []
+
+
+def test_forged_manifest_signed_with_wrong_key_is_rejected(cp):
+    """mac-ng2 / mac-8r1: a signed manifest that claims to be from
+    Worker A but was actually signed with Worker B's key must be
+    rejected. This is the core HMAC verification path."""
+    from mac.services import sign_verification_manifest
+
+    worker_a = register_agent(cp, "worker-a", ["python"])
+    worker_b = register_agent(cp, "worker-b", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "forged",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://x"},
+    )
+    cp.claim_task(task.id, worker_a.id)
+    cp.start_task(task.id, worker_a.id)
+
+    # Construct a manifest, sign with B's key but claim it's from A.
+    manifest = verified_repo_metadata()["verification"]
+    wrong_key = cp._agent_attestation_key(worker_b.id)
+    manifest["signed_by"] = worker_a.id  # forged identity
+    manifest["signature"] = sign_verification_manifest(wrong_key, manifest)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "x",
+        "y",
+        worker_a.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
+    cp.submit_for_review(task.id, worker_a.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_verifiable_evidence"
+    assert result["rejected_evidence"][0]["reason"] == "signature_invalid"
+    assert cp.list_publications(task.id) == []
+
+
+def test_manifest_signed_by_unknown_agent_is_rejected(cp):
+    """mac-ng2 / mac-8r1: signed_by must refer to a real agent in the
+    control plane's registry. Anonymous signers don't pass."""
+    from mac.services import sign_verification_manifest
+
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "ghost-signer",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://x"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+
+    # Mint a fresh key (not on file), sign with it, claim a non-existent
+    # signer.
+    manifest = verified_repo_metadata()["verification"]
+    from mac.services import _generate_attestation_key
+
+    rogue_key = _generate_attestation_key()
+    manifest["signed_by"] = "agent_does_not_exist"
+    manifest["signature"] = sign_verification_manifest(rogue_key, manifest)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "x",
+        "y",
+        worker.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+    assert result["status"] == "waiting_for_verifiable_evidence"
+    assert result["rejected_evidence"][0]["reason"] == "signer_unknown"
 
 
 def test_default_review_workflow_refuses_on_ambiguous_pending_reviews(cp):
@@ -721,7 +849,7 @@ def test_default_review_workflow_refuses_on_ambiguous_pending_reviews(cp):
         "artifact://x",
         "done",
         worker.id,
-        metadata=verified_repo_metadata(),
+        metadata=verified_repo_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
     cp.request_review(task.id, rev_one.id, "human")
@@ -752,7 +880,7 @@ def test_default_review_workflow_refuses_without_publication_target(cp):
         "artifact://x",
         "done",
         worker.id,
-        metadata=verified_repo_metadata(),
+        metadata=verified_repo_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -780,7 +908,7 @@ def test_default_review_rejects_alias_evidence_taxonomy(cp):
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
     # Verify each alias is rejected one at a time.
-    bad_status = verified_repo_metadata()
+    bad_status = verified_repo_metadata(cp, worker.id)
     bad_status["verification"]["status"] = "verified"
     cp.add_evidence(
         task.id, "log", "artifact://1", "x", worker.id, metadata=bad_status
@@ -790,7 +918,7 @@ def test_default_review_rejects_alias_evidence_taxonomy(cp):
     assert result["status"] == "waiting_for_verifiable_evidence"
 
     # New evidence with alias evidence_type='code' (was alias for repo_change).
-    bad_type = verified_repo_metadata()
+    bad_type = verified_repo_metadata(cp, worker.id)
     bad_type["verification"]["evidence_type"] = "code"
     cp.store.execute(
         "UPDATE tasks SET state = ? WHERE id = ?",
@@ -801,7 +929,7 @@ def test_default_review_rejects_alias_evidence_taxonomy(cp):
     assert result["status"] == "waiting_for_verifiable_evidence"
 
     # And with field alias `git` instead of `repo`.
-    bad_field = verified_repo_metadata()
+    bad_field = verified_repo_metadata(cp, worker.id)
     bad_field["verification"]["git"] = bad_field["verification"].pop("repo")
     cp.store.execute(
         "UPDATE tasks SET state = ? WHERE id = ?",
@@ -831,7 +959,7 @@ def test_default_reviewer_requires_review_capability(cp):
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
     cp.add_evidence(
-        task.id, "log", "x", "y", worker.id, metadata=verified_repo_metadata()
+        task.id, "log", "x", "y", worker.id, metadata=verified_repo_metadata(cp, worker.id)
     )
     cp.submit_for_review(task.id, worker.id)
 
@@ -897,7 +1025,7 @@ def test_default_reviewer_refuses_same_persona_as_executor(cp):
     cp.claim_task(task.id, executor.id)
     cp.start_task(task.id, executor.id)
     cp.add_evidence(
-        task.id, "log", "x", "y", executor.id, metadata=verified_repo_metadata()
+        task.id, "log", "x", "y", executor.id, metadata=verified_repo_metadata(cp, executor.id)
     )
     cp.submit_for_review(task.id, executor.id)
 
@@ -947,7 +1075,7 @@ def test_default_review_refuses_reviewer_from_different_tenant(cp):
     cp.claim_task(task.id, executor.id)
     cp.start_task(task.id, executor.id)
     cp.add_evidence(
-        task.id, "log", "x", "y", executor.id, metadata=verified_repo_metadata()
+        task.id, "log", "x", "y", executor.id, metadata=verified_repo_metadata(cp, executor.id)
     )
     cp.submit_for_review(task.id, executor.id)
 
@@ -994,7 +1122,7 @@ def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
         "artifact://old-result",
         "old verified result",
         worker.id,
-        metadata=verified_repo_metadata(),
+        metadata=verified_repo_metadata(cp, worker.id),
     )
     cp.submit_for_review(task.id, worker.id)
     first = cp.advance_default_review_workflow(task.id)
@@ -1009,7 +1137,7 @@ def test_default_review_workflow_ignores_retracted_publication_and_review(cp):
         "artifact://new-result",
         "new verified result",
         worker.id,
-        metadata=verified_repo_metadata(head_sha="abcdef1234567890"),
+        metadata=verified_repo_metadata(cp, worker.id, head_sha="abcdef1234567890"),
     )
 
     second = cp.advance_default_review_workflow(task.id)

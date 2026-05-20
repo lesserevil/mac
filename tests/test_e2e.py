@@ -112,13 +112,16 @@ def test_e2e_full_task_lifecycle_via_http_and_disk(tmp_path: Path):
     ).json()
 
     # MacWorker drives claim → start → run → evidence → submit_for_review
-    # through the same API surface.
+    # through the same API surface. The attestation key returned by
+    # /agents POST signs the verification manifest so the default-
+    # review workflow accepts the evidence (mac-ng2).
     api = MacApiClient("http://mac.test", transport=_api_transport(client))
     macworker = MacWorker(
         api,
         worker["id"],
         tmp_path / "workspaces",
         lambda _t, _d: _verified_execution("tests passed"),
+        attestation_key=worker["attestation_key"],
     )
     result = macworker.run_once()
     assert result.status == "submitted_for_review"
@@ -182,12 +185,15 @@ def test_e2e_two_workers_race_for_one_task_serializes(tmp_path: Path):
 
     api = MacApiClient("http://mac.test", transport=_api_transport(client))
 
+    keys = {a1["id"]: a1["attestation_key"], a2["id"]: a2["attestation_key"]}
+
     def make_worker(agent_id: str) -> MacWorker:
         return MacWorker(
             api,
             agent_id,
             tmp_path / ("ws-%s" % agent_id),
             lambda _t, _d: _verified_execution("ok"),
+            attestation_key=keys[agent_id],
         )
 
     results: Dict[str, Any] = {}

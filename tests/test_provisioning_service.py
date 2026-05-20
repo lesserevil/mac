@@ -142,28 +142,31 @@ def test_review_workflow_emits_provisioning_signal_when_no_reviewer(cp):
     task = cp.create_task("solo", required_capabilities=["python"])
     cp.claim_task(task.id, worker.id)
     cp.start_task(task.id, worker.id)
+    from mac.services import sign_verification_manifest
+
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "repo_change",
+        "repo": {
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "pushed": True,
+            "remote_ref": "refs/heads/x",
+            "dirty": False,
+            "files_changed": ["src/x.py"],
+        },
+        "tests": [{"command": "pytest", "returncode": 0}],
+    }
+    key = cp._agent_attestation_key(worker.id)
+    manifest["signed_by"] = worker.id
+    manifest["signature"] = sign_verification_manifest(key, manifest)
     cp.add_evidence(
         task.id,
         "log",
         "artifact://x",
         "done",
         worker.id,
-        metadata={
-            "returncode": 0,
-            "verification": {
-                "schema": "mac.worker_evidence.v1",
-                "status": "complete",
-                "evidence_type": "repo_change",
-                "repo": {
-                    "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
-                    "pushed": True,
-                    "remote_ref": "refs/heads/x",
-                    "dirty": False,
-                    "files_changed": ["src/x.py"],
-                },
-                "tests": [{"command": "pytest", "returncode": 0}],
-            },
-        },
+        metadata={"returncode": 0, "verification": manifest},
     )
     cp.submit_for_review(task.id, worker.id)
     result = cp.advance_default_review_workflow(task.id)

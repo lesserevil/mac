@@ -113,6 +113,56 @@ def _manifest_list(value: Any) -> List[Any]:
 VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
 _GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
+# Bytes of cleartext attestation key per agent. 256 bits of HMAC key is
+# overkill for the threat model but fits in one stretch of base64 and
+# keeps the door closed if HMAC-SHA256 ever becomes the bottleneck.
+ATTESTATION_KEY_BYTES = 32
+
+
+def _generate_attestation_key() -> str:
+    """Mint a fresh per-agent HMAC key. Returned base64url so it fits
+    in a single env var or JSON string without escaping."""
+    import secrets as _secrets
+
+    return base64.urlsafe_b64encode(_secrets.token_bytes(ATTESTATION_KEY_BYTES)).decode("ascii").rstrip("=")
+
+
+def _canonicalize_for_signature(manifest: Dict[str, Any]) -> bytes:
+    """Deterministic JSON encoding of the verification manifest for
+    HMAC signing. The ``signature`` field is excluded from the
+    canonical form so a manifest can be signed once and embedded
+    without recursive hashing.
+    """
+    excluded = {"signature", "signed_by"}
+    filtered = {k: v for k, v in manifest.items() if k not in excluded}
+    return json_dumps(filtered).encode("utf-8")
+
+
+def sign_verification_manifest(key: str, manifest: Dict[str, Any]) -> str:
+    """Sign ``manifest`` with the agent's attestation key. Returns the
+    base64url HMAC tag. Exposed for the worker (writes signatures) and
+    for tests (constructs signed evidence fixtures)."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+
+    digest = _hmac.new(
+        key.encode("ascii"), _canonicalize_for_signature(manifest), _hashlib.sha256
+    ).digest()
+    return "v1:" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def verify_verification_manifest_signature(
+    key: str, manifest: Dict[str, Any], signature: str
+) -> bool:
+    """Constant-time HMAC verification. Returns True iff ``signature``
+    matches the expected tag for ``manifest`` under ``key``."""
+    import hmac as _hmac
+
+    if not signature or not signature.startswith("v1:"):
+        return False
+    expected = sign_verification_manifest(key, manifest)
+    return _hmac.compare_digest(expected, signature)
+
 
 class ControlPlane:
     """Application service layer for the multi-agent control plane."""
@@ -1208,12 +1258,28 @@ class ControlPlane:
             hermes_instance_id = (
                 existing_soul["hermes_instance_id"] if existing_soul is not None else None
             )
+        # Attestation key. mac-ng2: every agent gets an HMAC-SHA256 key
+        # at first registration. The cleartext key is returned ONCE in
+        # the registration response so the operator can deploy it to
+        # the worker; the ciphertext is stored under the same Fernet
+        # used for secrets. Re-registrations preserve the existing key
+        # — rotating it would invalidate all in-flight signed evidence.
+        attestation_key_plaintext: Optional[str] = None
+        existing_key_row = self.store.query_one(
+            "SELECT attestation_key_ciphertext FROM agents WHERE id = ?", (aid,)
+        )
+        if existing_key_row is not None and existing_key_row["attestation_key_ciphertext"]:
+            attestation_ciphertext = existing_key_row["attestation_key_ciphertext"]
+        else:
+            attestation_key_plaintext = _generate_attestation_key()
+            attestation_ciphertext = self.secrets._encrypt(attestation_key_plaintext)
         self.store.execute(
             """
             INSERT INTO agents (
                 id, machine_id, name, capabilities, resources, status, health_status,
-                current_task_id, created_at, updated_at, last_seen_at, hermes_instance_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                current_task_id, created_at, updated_at, last_seen_at,
+                hermes_instance_id, attestation_key_ciphertext
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 machine_id = excluded.machine_id,
                 name = excluded.name,
@@ -1221,7 +1287,8 @@ class ControlPlane:
                 resources = excluded.resources,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at,
-                hermes_instance_id = excluded.hermes_instance_id
+                hermes_instance_id = excluded.hermes_instance_id,
+                attestation_key_ciphertext = excluded.attestation_key_ciphertext
             """,
             (
                 aid,
@@ -1235,9 +1302,30 @@ class ControlPlane:
                 now,
                 now,
                 hermes_instance_id,
+                attestation_ciphertext,
             ),
         )
-        return self.get_agent(aid)
+        agent = self.get_agent(aid)
+        # Stash the cleartext key on the returned agent so the API layer
+        # can surface it to the caller on first registration. The Agent
+        # dataclass itself never persists this — it's an attribute set
+        # only on the in-memory object returned from this call.
+        if attestation_key_plaintext is not None:
+            agent.attestation_key = attestation_key_plaintext  # type: ignore[attr-defined]
+        return agent
+
+    def _agent_attestation_key(self, agent_id: str) -> Optional[str]:
+        """Decrypted HMAC key for an agent, or None if the row predates
+        the attestation-key column."""
+        row = self.store.query_one(
+            "SELECT attestation_key_ciphertext FROM agents WHERE id = ?", (agent_id,)
+        )
+        if row is None or not row["attestation_key_ciphertext"]:
+            return None
+        try:
+            return self.secrets._decrypt(row["attestation_key_ciphertext"])
+        except Exception:  # noqa: BLE001 - corrupt or rotated key shouldn't crash review
+            return None
 
     def get_agent(self, agent_id: str) -> Agent:
         row = self.store.query_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
@@ -2502,6 +2590,36 @@ class ControlPlane:
                 "evidence_type": evidence_type or None,
                 "problems": problems,
             }
+        # Root of trust (mac-ng2). The verification manifest must carry
+        # ``signed_by`` (an agent_id) and ``signature`` (HMAC v1) made
+        # with that agent's attestation key. Without this any executor
+        # could self-approve by writing valid-looking JSON. Verification
+        # is per-agent: the signer's key must be on file in the
+        # ``agents.attestation_key_ciphertext`` column.
+        signed_by = str(manifest.get("signed_by") or "").strip()
+        signature = str(manifest.get("signature") or "").strip()
+        if not signed_by or not signature:
+            return {
+                "valid": False,
+                "reason": "manifest_not_signed",
+                "evidence_type": evidence_type,
+                "problems": ["verification.signed_by and verification.signature are required"],
+            }
+        signer_key = self._agent_attestation_key(signed_by)
+        if signer_key is None:
+            return {
+                "valid": False,
+                "reason": "signer_unknown",
+                "evidence_type": evidence_type,
+                "problems": ["verification.signed_by does not match a known agent with an attestation key"],
+            }
+        if not verify_verification_manifest_signature(signer_key, manifest, signature):
+            return {
+                "valid": False,
+                "reason": "signature_invalid",
+                "evidence_type": evidence_type,
+                "problems": ["verification.signature does not verify against signed_by's attestation key"],
+            }
         type_problems = self._verification_type_problems(task, manifest, evidence_type)
         if type_problems:
             return {
@@ -2514,6 +2632,7 @@ class ControlPlane:
             "valid": True,
             "reason": "verification_contract_satisfied",
             "evidence_type": evidence_type,
+            "signed_by": signed_by,
             "verified_by": "default-review-evidence-v1",
         }
 

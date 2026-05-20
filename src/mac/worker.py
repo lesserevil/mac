@@ -155,6 +155,7 @@ class MacWorker:
         agentbus_control_enabled: bool = True,
         self_update_repo: Optional[Path] = None,
         agentbus_control_state_path: Optional[Path] = None,
+        attestation_key: Optional[str] = None,
     ) -> None:
         if not agent_id:
             raise MacApiError("agent_id is required")
@@ -164,6 +165,13 @@ class MacWorker:
         self.executor = executor
         self.lease_seconds = lease_seconds
         self.running_digest = running_digest
+        # Attestation key for signing verification manifests
+        # (mac-ng2). Falls back to MAC_ATTESTATION_KEY when not passed.
+        # Without a key the worker still writes evidence — but the
+        # default-review workflow will reject it as "manifest_not_signed"
+        # and refuse to publish. The CLI surfaces this in deploy via
+        # MAC_ATTESTATION_KEY.
+        self.attestation_key = attestation_key or os.environ.get("MAC_ATTESTATION_KEY")
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.allowed_projects = list(allowed_projects or [])
         self.required_metadata = dict(required_metadata or {})
@@ -835,7 +843,8 @@ class MacWorker:
 
     def _execution_metadata(self, task_dir: Path, execution: WorkerExecution) -> JsonDict:
         metadata = dict(execution.metadata)
-        metadata.setdefault("verification", self._load_verification_manifest(task_dir))
+        manifest = metadata.get("verification") or self._load_verification_manifest(task_dir)
+        metadata["verification"] = self._sign_verification_manifest(manifest)
         metadata.setdefault(
             "workspace_outputs",
             {
@@ -844,6 +853,21 @@ class MacWorker:
             },
         )
         return metadata
+
+    def _sign_verification_manifest(self, manifest: JsonDict) -> JsonDict:
+        """Stamp ``signed_by`` + ``signature`` onto the manifest if an
+        attestation key is configured (mac-ng2). Without a key the
+        manifest is returned unmodified — the default-review workflow
+        will then refuse the evidence as ``manifest_not_signed``,
+        which is the correct outcome for an unkeyed worker."""
+        if not self.attestation_key or not isinstance(manifest, dict):
+            return manifest
+        from mac.services import sign_verification_manifest
+
+        signed = dict(manifest)
+        signed["signed_by"] = self.agent_id
+        signed["signature"] = sign_verification_manifest(self.attestation_key, signed)
+        return signed
 
     def _load_verification_manifest(self, task_dir: Path) -> JsonDict:
         manifest_path = task_dir / "mac-evidence.json"

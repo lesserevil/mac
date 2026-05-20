@@ -1342,7 +1342,16 @@ def create_app(
     ) -> Dict[str, Any]:
         principal.require_global_fleet()
         _ensure_payload_bounded(body.resources, "agent.resources")
-        return cp.register_agent(**_data(body)).to_dict()
+        agent = cp.register_agent(**_data(body))
+        payload = agent.to_dict()
+        # First-registration only: surface the freshly-minted
+        # attestation key so the operator can deploy it to the worker.
+        # The key is never returned again — re-registrations get a
+        # response without ``attestation_key``. mac-ng2.
+        key = getattr(agent, "attestation_key", None)
+        if key:
+            payload["attestation_key"] = key
+        return payload
 
     @app.get("/agents")
     def list_agents() -> List[Dict[str, Any]]:
