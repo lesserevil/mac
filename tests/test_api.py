@@ -710,7 +710,7 @@ def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path):
                 "  creates:",
                 "    - .venv/bin/python",
                 "test:",
-                "  command: .venv/bin/python -m pytest",
+                "  command: PATH=.venv/bin:$PATH .venv/bin/python -m pytest",
                 "evidence:",
                 "  required:",
                 "    - tests",

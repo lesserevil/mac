@@ -1445,7 +1445,11 @@ def _write_beads(repo_path, issues):
 def _write_repository_contract(repo_path, project="repo-beads-mac", include_test=True):
     contract_dir = repo_path / ".mac"
     contract_dir.mkdir(parents=True, exist_ok=True)
-    test_block = "test:\n  command: .venv/bin/python -m pytest\n" if include_test else "test: {}\n"
+    test_block = (
+        "test:\n  command: PATH=.venv/bin:$PATH .venv/bin/python -m pytest\n"
+        if include_test
+        else "test: {}\n"
+    )
     (contract_dir / "project.yaml").write_text(
         (
             "schema: mac.repository_contract.v1\n"
@@ -1537,7 +1541,7 @@ def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
     item = cp.list_project_items()[0]
     assert item.source == "repo-beads-mac"
     assert item.external_id == "mac-ready"
-    assert item.payload["repository_contract"]["test"]["command"] == ".venv/bin/python -m pytest"
+    assert item.payload["repository_contract"]["test"]["command"] == "PATH=.venv/bin:$PATH .venv/bin/python -m pytest"
     task = cp.get_task(item.task_id)
     assert task.state == TaskState.OPEN.value
     assert task.project == "repo-beads-mac"

@@ -66,7 +66,7 @@ The identity framework reflects that split:
 
 ```bash
 python3 scripts/bootstrap-project.py
-.venv/bin/python -m pytest
+PATH=.venv/bin:$PATH .venv/bin/python -m pytest
 
 # Required: a 32+ char secret used to derive the Fernet key for the secrets table.
 # Without it, the CLI and API both refuse to start.

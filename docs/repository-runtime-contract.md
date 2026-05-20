@@ -23,7 +23,7 @@ bootstrap:
   creates:
     - .venv/bin/python
 test:
-  command: .venv/bin/python -m pytest
+  command: PATH=.venv/bin:$PATH .venv/bin/python -m pytest
 evidence:
   required:
     - repo.head_sha
@@ -74,5 +74,5 @@ That script creates `.venv` and installs the dev extra so a fresh macOS, Linux,
 or WSL2 agent can run:
 
 ```bash
-.venv/bin/python -m pytest
+PATH=.venv/bin:$PATH .venv/bin/python -m pytest
 ```

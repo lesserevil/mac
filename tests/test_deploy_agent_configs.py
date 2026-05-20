@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,3 +78,9 @@ def test_executor_prompt_includes_repository_runtime_contract():
     assert "Repository runtime contract:" in script
     assert "bootstrap.command" in script
     assert "test.command" in script
+
+
+def test_mac_repository_contract_test_command_uses_local_venv_path():
+    contract = yaml.safe_load((ROOT / ".mac" / "project.yaml").read_text(encoding="utf-8"))
+
+    assert contract["test"]["command"] == "PATH=.venv/bin:$PATH .venv/bin/python -m pytest"
