@@ -915,7 +915,10 @@ class ControlPlane:
                     logging.getLogger(__name__).exception(
                         "workflow runtime failed to advance on task %s", task_id
                     )
-        return self.get_task(task_id)
+        transitioned = self.get_task(task_id)
+        if target in {TaskState.FAILED.value, TaskState.CANCELLED.value}:
+            self._sync_beads_reopen(transitioned, actor, target, detail or {})
+        return transitioned
 
     def claim_task(self, task_id: str, agent_id: str, lease_seconds: int = 900) -> Tuple[Task, Lease]:
         task = self.get_task(task_id)
@@ -977,7 +980,9 @@ class ControlPlane:
             TaskState.CLAIMED.value,
             {"lease_id": lease_id, "expires_at": expires_at},
         )
-        return self.get_task(task_id), self.get_lease(lease_id)
+        claimed_task = self.get_task(task_id)
+        self._sync_beads_claim(claimed_task, agent_id)
+        return claimed_task, self.get_lease(lease_id)
 
     def start_task(self, task_id: str, agent_id: str) -> Task:
         task = self.get_task(task_id)
@@ -1812,6 +1817,7 @@ class ControlPlane:
 
     def publish_task(self, *args: Any, **kwargs: Any) -> Publication:
         publication = self.reviews.publish_task(*args, **kwargs)
+        self._sync_beads_close(self.get_task(publication.task_id), publication.created_by)
         # publish_task transitions the underlying task to COMPLETED inside
         # its own transaction (bypassing transition_task), so we run the
         # workflow runtime hook here so workflow runs advance on publish.
@@ -2223,8 +2229,9 @@ class ControlPlane:
         Format:
             MAC_BEADS_REPOSITORIES="mac=/path/to/repo:repo-beads-mac:mac:python,ops:60;ACC=/path"
 
-        Only the name and path are required. The remaining pipe-delimited
+        Only the name and path are required. The remaining colon-delimited
         fields are source, project, required capabilities, and poll interval.
+        Legacy pipe-delimited values are also accepted for compatibility.
         Bad entries are logged instead of failing service startup.
         """
         raw = os.environ.get("MAC_BEADS_REPOSITORIES", "").strip()
@@ -2600,6 +2607,7 @@ class ControlPlane:
                 "beads_path": str(Path(repo.path).expanduser() / ".beads" / "issues.jsonl"),
                 "repo_beads_workflow": True,
                 "workflow_role": "work",
+                "beads_sync_claim_on_claim": True,
                 "beads_sync_close_on_complete": True,
             },
         }
@@ -2631,6 +2639,112 @@ class ControlPlane:
             WHERE id = ?
             """,
             (last_polled_at, last_imported_at, last_error, utcnow(), repo_id),
+        )
+
+    def _beads_binding_for_task(self, task: Task) -> Optional[JsonDict]:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        origin = metadata.get("origin")
+        acc_metadata = metadata.get("acc_metadata")
+        if not isinstance(origin, dict) or origin.get("type") != "beads":
+            return None
+        if not isinstance(acc_metadata, dict):
+            return None
+        bead_id = str(origin.get("bead_id") or acc_metadata.get("beads_id") or "").strip()
+        repo_path = str(origin.get("repository_path") or "").strip()
+        if not bead_id or not repo_path:
+            return None
+        return {"bead_id": bead_id, "repo_path": repo_path}
+
+    def _run_bd_for_task(self, task: Task, args: List[str], actor: str, action: str) -> None:
+        binding = self._beads_binding_for_task(task)
+        if binding is None:
+            return
+        repo_path = Path(binding["repo_path"]).expanduser()
+        if not repo_path.exists():
+            return
+        try:
+            completed = subprocess.run(
+                ["bd", "--actor", actor, *args],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise ValidationError((completed.stderr or completed.stdout or "").strip())
+            self.record_log(
+                "bridge.beads.sync.%s" % action,
+                layer="control_plane",
+                source=actor,
+                subject_type="task",
+                subject_id=task.id,
+                detail={"bead_id": binding["bead_id"], "repo_path": str(repo_path)},
+            )
+        except Exception as exc:  # noqa: BLE001 - Beads sync is secondary to task state.
+            self.record_log(
+                "bridge.beads.sync_failed",
+                layer="control_plane",
+                source=actor,
+                level="warning",
+                subject_type="task",
+                subject_id=task.id,
+                detail={
+                    "action": action,
+                    "bead_id": binding["bead_id"],
+                    "repo_path": str(repo_path),
+                    "error": str(exc),
+                },
+            )
+
+    def _sync_beads_claim(self, task: Task, actor: str) -> None:
+        binding = self._beads_binding_for_task(task)
+        if binding is None:
+            return
+        acc_metadata = task.metadata.get("acc_metadata") if isinstance(task.metadata, dict) else {}
+        if isinstance(acc_metadata, dict) and acc_metadata.get("beads_sync_claim_on_claim") is False:
+            return
+        self._run_bd_for_task(task, ["update", binding["bead_id"], "--claim"], actor, "claim")
+
+    def _sync_beads_close(self, task: Task, actor: str) -> None:
+        binding = self._beads_binding_for_task(task)
+        if binding is None:
+            return
+        acc_metadata = task.metadata.get("acc_metadata") if isinstance(task.metadata, dict) else {}
+        if isinstance(acc_metadata, dict) and acc_metadata.get("beads_sync_close_on_complete") is False:
+            return
+        self._run_bd_for_task(
+            task,
+            [
+                "close",
+                binding["bead_id"],
+                "--reason",
+                "Completed by mac task %s" % task.id,
+            ],
+            actor,
+            "close",
+        )
+
+    def _sync_beads_reopen(
+        self,
+        task: Task,
+        actor: str,
+        state: str,
+        detail: Dict[str, Any],
+    ) -> None:
+        binding = self._beads_binding_for_task(task)
+        if binding is None:
+            return
+        reason = "mac task %s moved to %s: %s" % (
+            task.id,
+            state,
+            json_dumps(detail or {}),
+        )
+        self._run_bd_for_task(
+            task,
+            ["update", binding["bead_id"], "--status", "open", "--append-notes", reason],
+            actor,
+            "reopen",
         )
 
     def get_project_item(self, item_id: str) -> ProjectItem:

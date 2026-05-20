@@ -1532,6 +1532,126 @@ def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeyp
     assert cp.list_project_items()[0].external_id == "mac-heartbeat"
 
 
+def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-sync",
+                "title": "Sync lifecycle",
+                "description": "sync claim and failure",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+    calls = []
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        calls.append({"command": command, "cwd": cwd})
+
+        class Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    cp.claim_task(task.id, worker.id)
+    cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "canary failed"})
+
+    assert calls[0] == {
+        "command": ["bd", "--actor", worker.id, "update", "mac-sync", "--claim"],
+        "cwd": str(repo),
+    }
+    assert calls[1]["cwd"] == str(repo)
+    assert calls[1]["command"][:7] == [
+        "bd",
+        "--actor",
+        worker.id,
+        "update",
+        "mac-sync",
+        "--status",
+        "open",
+    ]
+    assert calls[1]["command"][7] == "--append-notes"
+    assert "canary failed" in calls[1]["command"][8]
+
+
+def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-close",
+                "title": "Close lifecycle",
+                "description": "sync publication close",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    calls = []
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        calls.append({"command": command, "cwd": cwd})
+
+        class Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(task.id, "test", "artifact://pytest", "pytest passed", worker.id)
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=evidence.id)
+    cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+
+    assert calls[0] == {
+        "command": ["bd", "--actor", worker.id, "update", "mac-close", "--claim"],
+        "cwd": str(repo),
+    }
+    assert calls[1] == {
+        "command": [
+            "bd",
+            "--actor",
+            reviewer.id,
+            "close",
+            "mac-close",
+            "--reason",
+            "Completed by mac task %s" % task.id,
+        ],
+        "cwd": str(repo),
+    }
+
+
 def test_acc_migration_dry_run_reports_without_writing(cp, tmp_path):
     acc_db = tmp_path / "acc.db"
     create_acc_migration_fixture(acc_db)
