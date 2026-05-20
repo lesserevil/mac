@@ -777,7 +777,16 @@ install_beads_cli() {
     "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
     return 0
   fi
-  if existing="$(command -v bd 2>/dev/null)" && [ -x "$existing" ]; then
+  existing="$(command -v bd 2>/dev/null || true)"
+  if [ -z "$existing" ]; then
+    for candidate in "$HOME/.local/bin/bd" "$HOME/bin/bd" /opt/homebrew/bin/bd /usr/local/bin/bd; do
+      if [ -x "$candidate" ]; then
+        existing="$candidate"
+        break
+      fi
+    done
+  fi
+  if [ -n "$existing" ] && [ -x "$existing" ]; then
     log "copying existing bd CLI from $existing to managed mac bin"
     if [ "$existing" != "$target" ]; then
       cp "$existing" "$target"

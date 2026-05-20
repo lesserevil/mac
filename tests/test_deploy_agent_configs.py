@@ -78,6 +78,8 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
 
     assert "BEADS_REPO_URL=\"${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}\"" in script
     assert "install_beads_cli()" in script
+    assert '"$HOME/.local/bin/bd"' in script
+    assert '"$HOME/bin/bd"' in script
     assert "bootstrap_beads_repositories()" in script
     assert 'bootstrap --yes' in script
     source_install_block = script.split('mv "$SRC_DIR.new" "$SRC_DIR"', 1)[1].split(
