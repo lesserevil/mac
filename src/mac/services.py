@@ -2478,7 +2478,7 @@ class ControlPlane:
             existing = 0
             for issue in issues:
                 prior = self.store.query_one(
-                    "SELECT id FROM project_items WHERE source = ? AND external_id = ?",
+                    "SELECT id, task_id FROM project_items WHERE source = ? AND external_id = ?",
                     (repo.source, str(issue["id"])),
                 )
                 self._import_bead_issue(repo, issue, actor=actor)
@@ -2486,6 +2486,7 @@ class ControlPlane:
                     imported += 1
                 else:
                     existing += 1
+                    self._sync_existing_beads_task(self.get_task(prior["task_id"]), actor)
             self._update_beads_repository_poll_state(
                 repo.id,
                 now,
@@ -2706,6 +2707,16 @@ class ControlPlane:
         if isinstance(acc_metadata, dict) and acc_metadata.get("beads_sync_claim_on_claim") is False:
             return
         self._run_bd_for_task(task, ["update", binding["bead_id"], "--claim"], actor, "claim")
+
+    def _sync_existing_beads_task(self, task: Task, actor: str) -> None:
+        if task.state not in {
+            TaskState.CLAIMED.value,
+            TaskState.RUNNING.value,
+            TaskState.NEEDS_REVIEW.value,
+            TaskState.REVIEWING.value,
+        }:
+            return
+        self._sync_beads_claim(task, task.owner_agent_id or actor)
 
     def _sync_beads_close(self, task: Task, actor: str) -> None:
         binding = self._beads_binding_for_task(task)

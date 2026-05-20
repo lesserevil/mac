@@ -1620,6 +1620,62 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     assert "canary failed" in calls[1]["command"][8]
 
 
+def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-reconcile",
+                "title": "Reconcile missed claim",
+                "description": "claim sync missed during deploy",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    metadata = task.metadata
+    metadata["acc_metadata"]["beads_sync_claim_on_claim"] = False
+    cp.store.execute("UPDATE tasks SET metadata = ? WHERE id = ?", (json.dumps(metadata), task.id))
+    worker = register_agent(cp, "worker", ["python"])
+    cp.claim_task(task.id, worker.id)
+    claimed = cp.get_task(task.id)
+    metadata = claimed.metadata
+    metadata["acc_metadata"]["beads_sync_claim_on_claim"] = True
+    cp.store.execute("UPDATE tasks SET metadata = ? WHERE id = ?", (json.dumps(metadata), task.id))
+    calls = []
+
+    class Completed:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        if command == ["bd", "ready", "--json"]:
+            return Completed(returncode=1, stderr="no beads database")
+        calls.append({"command": command, "cwd": cwd})
+        return Completed()
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    cp.poll_beads_repositories(force=True)
+
+    assert calls == [
+        {
+            "command": ["bd", "--actor", worker.id, "update", "mac-reconcile", "--claim"],
+            "cwd": str(repo),
+        }
+    ]
+
+
 def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
