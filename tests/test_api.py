@@ -688,6 +688,48 @@ def test_fastapi_publishes_agentbus_repo_update_to_all_agents():
     assert chunks[0]["payload"]["request_id"] == "req-api"
 
 
+def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    beads_dir = repo / ".beads"
+    beads_dir.mkdir()
+    (beads_dir / "issues.jsonl").write_text(
+        json.dumps(
+            {
+                "_type": "issue",
+                "id": "mac-api",
+                "title": "API imported bead",
+                "description": "import through the HTTP bridge",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+
+    registered = client.post(
+        "/bridge/beads/repositories",
+        json={
+            "name": "mac",
+            "path": str(repo),
+            "source": "repo-beads-mac",
+            "required_capabilities": ["python"],
+        },
+    ).json()
+    poll = client.post("/bridge/beads/poll", json={"force": True}).json()
+    repos = client.get("/bridge/beads/repositories").json()
+    items = client.get("/bridge/items").json()
+
+    assert registered["name"] == "mac"
+    assert poll["imported_count"] == 1
+    assert repos[0]["source"] == "repo-beads-mac"
+    assert items[0]["external_id"] == "mac-api"
+
+
 def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():
     import time as _time
 

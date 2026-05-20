@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import os
 import re
+import subprocess
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from cryptography.fernet import Fernet
@@ -23,6 +25,7 @@ from mac.models import (
     AgentStatus,
     Artifact,
     AuthorizationError,
+    BeadsRepository,
     MoodMode,
     MoodOverlay,
     NapRun,
@@ -108,6 +111,16 @@ def _state_value(state: Any) -> str:
 
 def _manifest_list(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
+
+
+def _truthy_env(name: str, default: str = "") -> bool:
+    value = os.environ.get(name, default).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _safe_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-._").lower()
+    return slug or "repo"
 
 
 VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
@@ -297,6 +310,7 @@ class ControlPlane:
             add_memory=self.add_memory,
             task_from_row=self._task_from_row,
         )
+        self._seed_beads_repositories_from_env()
 
     @classmethod
     def in_memory(cls) -> "ControlPlane":
@@ -1345,7 +1359,7 @@ class ControlPlane:
         resources: Optional[Dict[str, Any]] = None,
         running_digest: Optional[str] = None,
     ) -> Agent:
-        self.get_agent(agent_id)
+        agent_before = self.get_agent(agent_id)
         now = utcnow()
         updates = ["last_seen_at = ?", "updated_at = ?"]
         params: List[Any] = [now, now]
@@ -1397,7 +1411,29 @@ class ControlPlane:
             updates.append("current_task_id = NULL")
         params.append(agent_id)
         self.store.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
-        return self.get_agent(agent_id)
+        agent = self.get_agent(agent_id)
+        self._maybe_poll_beads_bridge_on_heartbeat(agent_before)
+        return agent
+
+    def _maybe_poll_beads_bridge_on_heartbeat(self, agent: Agent) -> None:
+        if not _truthy_env("MAC_BEADS_BRIDGE_ON_HEARTBEAT"):
+            return
+        hub_agent = os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky").strip()
+        if hub_agent and agent.name != hub_agent and agent.id != hub_agent:
+            return
+        try:
+            self.poll_beads_repositories(actor=agent.id)
+        except Exception as exc:  # noqa: BLE001 - heartbeat liveness must survive bridge failures.
+            try:
+                self.record_log(
+                    "bridge.beads.heartbeat_poll_failed",
+                    layer="control_plane",
+                    source=agent.id,
+                    level="warning",
+                    detail={"error": str(exc)},
+                )
+            except Exception:
+                pass
 
     def fleet_build_distribution(self) -> JsonDict:
         """Aggregate agents by their declared running_digest.
@@ -2181,6 +2217,60 @@ class ControlPlane:
 
     # Project bridge
 
+    def _seed_beads_repositories_from_env(self) -> None:
+        """Register operator-configured Beads repos once at process startup.
+
+        Format:
+            MAC_BEADS_REPOSITORIES="mac=/path/to/repo|repo-beads-mac|mac|python,ops|60;ACC=/path"
+
+        Only the name and path are required. The remaining pipe-delimited
+        fields are source, project, required capabilities, and poll interval.
+        Bad entries are logged instead of failing service startup.
+        """
+        raw = os.environ.get("MAC_BEADS_REPOSITORIES", "").strip()
+        if not raw and _truthy_env("MAC_BEADS_AUTO_REGISTER_SELF"):
+            self_repo = os.environ.get("MAC_SELF_UPDATE_REPO", "").strip()
+            if self_repo:
+                raw = "mac=%s|repo-beads-mac|repo-beads-mac||60" % self_repo
+        if not raw:
+            return
+        for entry in raw.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                if "=" not in entry:
+                    raise ValidationError("entry must be name=path")
+                name, rest = entry.split("=", 1)
+                parts = rest.split("|")
+                path = parts[0].strip()
+                source = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+                project = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+                caps = parts[3].strip() if len(parts) > 3 else ""
+                interval = int(parts[4]) if len(parts) > 4 and parts[4].strip() else 60
+                self.register_beads_repository(
+                    name.strip(),
+                    path,
+                    source=source,
+                    project=project,
+                    required_capabilities=[item.strip() for item in caps.split("+") if item.strip()]
+                    if "+" in caps
+                    else [item.strip() for item in caps.split(",") if item.strip()],
+                    poll_interval_seconds=interval,
+                    actor="env",
+                )
+            except Exception as exc:  # noqa: BLE001 - bad env should not kill the API.
+                try:
+                    self.record_log(
+                        "bridge.beads_repository.seed_failed",
+                        layer="control_plane",
+                        source="env",
+                        level="warning",
+                        detail={"entry": entry, "error": str(exc)},
+                    )
+                except Exception:
+                    pass
+
     def import_project_item(
         self,
         source: str,
@@ -2188,6 +2278,12 @@ class ControlPlane:
         title: str,
         payload: Dict[str, Any],
         required_capabilities: Optional[Iterable[str]] = None,
+        *,
+        description: Optional[str] = None,
+        project: Optional[str] = None,
+        priority: int = 0,
+        dependencies: Optional[Iterable[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         actor: str = "bridge",
     ) -> ProjectItem:
         existing = self.store.query_one(
@@ -2196,12 +2292,16 @@ class ControlPlane:
         )
         if existing is not None:
             return self._project_item_from_row(existing)
+        task_metadata = {"source": source, "external_id": external_id}
+        task_metadata.update(ensure_json_object(metadata))
         task = self.create_task(
             title,
-            description=json_dumps(payload),
-            project=source,
+            description=description if description is not None else json_dumps(payload),
+            project=project or source,
+            priority=priority,
             required_capabilities=required_capabilities,
-            metadata={"source": source, "external_id": external_id},
+            dependencies=dependencies,
+            metadata=task_metadata,
             actor=actor,
         )
         now = utcnow()
@@ -2223,6 +2323,315 @@ class ControlPlane:
             actor,
         )
         return self.get_project_item(item_id)
+
+    def register_beads_repository(
+        self,
+        name: str,
+        path: str,
+        source: Optional[str] = None,
+        project: Optional[str] = None,
+        required_capabilities: Optional[Iterable[str]] = None,
+        enabled: bool = True,
+        poll_interval_seconds: int = 60,
+        metadata: Optional[Dict[str, Any]] = None,
+        actor: str = "beads-bridge",
+    ) -> BeadsRepository:
+        name = name.strip()
+        if not name:
+            raise ValidationError("beads repository name is required")
+        repo_path = str(Path(path).expanduser())
+        repo_source = (source or "repo-beads-%s" % _safe_slug(name)).strip()
+        if not repo_source:
+            raise ValidationError("beads repository source is required")
+        repo_project = (project or repo_source).strip()
+        now = utcnow()
+        row = self.store.query_one("SELECT id FROM beads_repositories WHERE name = ?", (name,))
+        repo_id = row["id"] if row is not None else new_id("beadsrepo")
+        self.store.execute(
+            """
+            INSERT INTO beads_repositories (
+                id, name, path, source, project, required_capabilities,
+                enabled, poll_interval_seconds, metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                path = excluded.path,
+                source = excluded.source,
+                project = excluded.project,
+                required_capabilities = excluded.required_capabilities,
+                enabled = excluded.enabled,
+                poll_interval_seconds = excluded.poll_interval_seconds,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            """,
+            (
+                repo_id,
+                name,
+                repo_path,
+                repo_source,
+                repo_project,
+                json_dumps(coerce_list(required_capabilities)),
+                1 if enabled else 0,
+                max(1, int(poll_interval_seconds)),
+                json_dumps(ensure_json_object(metadata)),
+                now,
+                now,
+            ),
+        )
+        self.record_log(
+            "bridge.beads_repository.registered",
+            layer="control_plane",
+            source=actor,
+            subject_type="environment",
+            subject_id=repo_id,
+            detail={"name": name, "path": repo_path, "source": repo_source, "enabled": enabled},
+        )
+        return self.get_beads_repository(repo_id)
+
+    def get_beads_repository(self, repo_id_or_name: str) -> BeadsRepository:
+        row = self.store.query_one(
+            "SELECT * FROM beads_repositories WHERE id = ? OR name = ?",
+            (repo_id_or_name, repo_id_or_name),
+        )
+        if row is None:
+            raise NotFoundError("beads repository not found: %s" % repo_id_or_name)
+        return self._beads_repository_from_row(row)
+
+    def list_beads_repositories(self, enabled: Optional[bool] = None) -> List[BeadsRepository]:
+        if enabled is None:
+            rows = self.store.query_all("SELECT * FROM beads_repositories ORDER BY name, id")
+        else:
+            rows = self.store.query_all(
+                "SELECT * FROM beads_repositories WHERE enabled = ? ORDER BY name, id",
+                (1 if enabled else 0,),
+            )
+        return [self._beads_repository_from_row(row) for row in rows]
+
+    def poll_beads_repositories(
+        self,
+        repo_id_or_name: Optional[str] = None,
+        *,
+        force: bool = False,
+        actor: str = "beads-bridge",
+    ) -> JsonDict:
+        if repo_id_or_name:
+            repos = [self.get_beads_repository(repo_id_or_name)]
+        else:
+            repos = self.list_beads_repositories(enabled=True)
+        report: JsonDict = {
+            "schema": "mac.beads_bridge.poll.v1",
+            "actor": actor,
+            "repository_count": len(repos),
+            "imported_count": 0,
+            "existing_count": 0,
+            "skipped_count": 0,
+            "error_count": 0,
+            "repositories": [],
+        }
+        for repo in repos:
+            repo_report = self._poll_beads_repository(repo, force=force, actor=actor)
+            report["repositories"].append(repo_report)
+            report["imported_count"] += int(repo_report.get("imported_count", 0))
+            report["existing_count"] += int(repo_report.get("existing_count", 0))
+            report["skipped_count"] += int(repo_report.get("skipped_count", 0))
+            if repo_report.get("status") == "error":
+                report["error_count"] += 1
+        if report["imported_count"] or report["error_count"]:
+            self.record_log(
+                "bridge.beads.poll",
+                layer="control_plane",
+                source=actor,
+                detail=report,
+            )
+        return report
+
+    def _poll_beads_repository(
+        self,
+        repo: BeadsRepository,
+        *,
+        force: bool,
+        actor: str,
+    ) -> JsonDict:
+        now = utcnow()
+        if not force and repo.last_polled_at:
+            elapsed = parse_time(now) - parse_time(repo.last_polled_at)
+            if elapsed.total_seconds() < repo.poll_interval_seconds:
+                return {
+                    "repository_id": repo.id,
+                    "name": repo.name,
+                    "status": "not_due",
+                    "next_poll_in_seconds": repo.poll_interval_seconds - int(elapsed.total_seconds()),
+                    "imported_count": 0,
+                    "existing_count": 0,
+                    "skipped_count": 0,
+                }
+        try:
+            issues = self._ready_beads_issues(repo)
+            imported = 0
+            existing = 0
+            for issue in issues:
+                prior = self.store.query_one(
+                    "SELECT id FROM project_items WHERE source = ? AND external_id = ?",
+                    (repo.source, str(issue["id"])),
+                )
+                self._import_bead_issue(repo, issue, actor=actor)
+                if prior is None:
+                    imported += 1
+                else:
+                    existing += 1
+            self._update_beads_repository_poll_state(
+                repo.id,
+                now,
+                last_imported_at=now if imported else repo.last_imported_at,
+                last_error=None,
+            )
+            return {
+                "repository_id": repo.id,
+                "name": repo.name,
+                "status": "ok",
+                "ready_count": len(issues),
+                "imported_count": imported,
+                "existing_count": existing,
+                "skipped_count": 0,
+            }
+        except Exception as exc:  # noqa: BLE001 - one broken repo must not break heartbeats.
+            self._update_beads_repository_poll_state(
+                repo.id,
+                now,
+                last_imported_at=repo.last_imported_at,
+                last_error=str(exc),
+            )
+            return {
+                "repository_id": repo.id,
+                "name": repo.name,
+                "status": "error",
+                "error": str(exc),
+                "imported_count": 0,
+                "existing_count": 0,
+                "skipped_count": 0,
+            }
+
+    def _ready_beads_issues(self, repo: BeadsRepository) -> List[JsonDict]:
+        repo_path = Path(repo.path).expanduser()
+        if not repo_path.exists():
+            raise ValidationError("beads repository path does not exist: %s" % repo.path)
+        if repo_path.is_file():
+            return self._ready_beads_issues_from_jsonl(repo_path)
+        try:
+            completed = subprocess.run(
+                ["bd", "ready", "--json"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            output = completed.stdout.strip()
+            if not output:
+                return []
+            data = json_loads(output, [])
+            if not isinstance(data, list):
+                raise ValidationError("bd ready --json did not return a list for %s" % repo.path)
+            return [issue for issue in data if self._bead_issue_is_importable(issue)]
+        return self._ready_beads_issues_from_jsonl(repo_path / ".beads" / "issues.jsonl")
+
+    def _ready_beads_issues_from_jsonl(self, issues_path: Path) -> List[JsonDict]:
+        if not issues_path.exists():
+            raise ValidationError("beads issues file not found: %s" % issues_path)
+        issues: List[JsonDict] = []
+        for raw in issues_path.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            issue = json_loads(raw, {})
+            if isinstance(issue, dict) and issue.get("_type", "issue") == "issue":
+                issues.append(issue)
+        by_id = {str(issue.get("id")): issue for issue in issues if issue.get("id")}
+        ready: List[JsonDict] = []
+        for issue in issues:
+            if not self._bead_issue_is_importable(issue):
+                continue
+            dependencies = issue.get("dependencies") or []
+            if int(issue.get("dependency_count") or 0) > 0 and not dependencies:
+                continue
+            blocked = False
+            for dependency in dependencies:
+                if not isinstance(dependency, dict):
+                    blocked = True
+                    break
+                dep_id = str(dependency.get("depends_on_id") or "").strip()
+                dep_issue = by_id.get(dep_id)
+                if dep_issue is None or str(dep_issue.get("status") or "") != "closed":
+                    blocked = True
+                    break
+            if not blocked:
+                ready.append(issue)
+        ready.sort(key=lambda item: (int(item.get("priority") or 2), str(item.get("created_at") or ""), str(item.get("id") or "")))
+        return ready
+
+    def _bead_issue_is_importable(self, issue: Any) -> bool:
+        if not isinstance(issue, dict):
+            return False
+        if not str(issue.get("id") or "").strip():
+            return False
+        return str(issue.get("status") or "").strip().lower() == "open"
+
+    def _import_bead_issue(self, repo: BeadsRepository, issue: JsonDict, actor: str) -> ProjectItem:
+        issue_id = str(issue["id"])
+        priority = 100 - int(issue.get("priority") or 2)
+        payload = {
+            "schema": "mac.beads_bridge.issue.v1",
+            "repository": repo.to_dict(),
+            "issue": issue,
+        }
+        metadata = {
+            "origin": {
+                "type": "beads",
+                "repository_id": repo.id,
+                "repository_name": repo.name,
+                "repository_path": repo.path,
+                "source": repo.source,
+                "bead_id": issue_id,
+            },
+            "acc_metadata": {
+                "source": "mac-beads-bridge",
+                "beads_id": issue_id,
+                "beads_path": str(Path(repo.path).expanduser() / ".beads" / "issues.jsonl"),
+                "repo_beads_workflow": True,
+                "workflow_role": "work",
+                "beads_sync_close_on_complete": True,
+            },
+        }
+        return self.import_project_item(
+            repo.source,
+            issue_id,
+            str(issue.get("title") or issue_id),
+            payload,
+            required_capabilities=repo.required_capabilities,
+            description=str(issue.get("description") or ""),
+            project=repo.project,
+            priority=priority,
+            metadata=metadata,
+            actor=actor,
+        )
+
+    def _update_beads_repository_poll_state(
+        self,
+        repo_id: str,
+        last_polled_at: str,
+        *,
+        last_imported_at: Optional[str],
+        last_error: Optional[str],
+    ) -> None:
+        self.store.execute(
+            """
+            UPDATE beads_repositories
+            SET last_polled_at = ?, last_imported_at = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (last_polled_at, last_imported_at, last_error, utcnow(), repo_id),
+        )
 
     def get_project_item(self, item_id: str) -> ProjectItem:
         row = self.store.query_one("SELECT * FROM project_items WHERE id = ?", (item_id,))
@@ -2420,6 +2829,24 @@ class ControlPlane:
             json_loads(row["payload"], {}),
             row["task_id"],
             row["status"],
+            row["created_at"],
+            row["updated_at"],
+        )
+
+    def _beads_repository_from_row(self, row: Any) -> BeadsRepository:
+        return BeadsRepository(
+            row["id"],
+            row["name"],
+            row["path"],
+            row["source"],
+            row["project"],
+            json_loads(row["required_capabilities"], []),
+            bool(row["enabled"]),
+            int(row["poll_interval_seconds"]),
+            row["last_polled_at"],
+            row["last_imported_at"],
+            row["last_error"],
+            json_loads(row["metadata"], {}),
             row["created_at"],
             row["updated_at"],
         )

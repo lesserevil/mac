@@ -586,6 +586,24 @@ class ProjectImport(BaseModel):
     actor: str = "bridge"
 
 
+class BeadsRepositoryRegister(BaseModel):
+    name: str
+    path: str
+    source: Optional[str] = None
+    project: Optional[str] = None
+    required_capabilities: List[str] = Field(default_factory=list)
+    enabled: bool = True
+    poll_interval_seconds: int = 60
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    actor: str = "beads-bridge"
+
+
+class BeadsRepositoryPoll(BaseModel):
+    repository: Optional[str] = None
+    force: bool = False
+    actor: str = "beads-bridge"
+
+
 class MemoryCreate(BaseModel):
     task_id: Optional[str] = None
     subject_type: str
@@ -2132,6 +2150,18 @@ def create_app(
     @app.get("/bridge/items")
     def list_project_items() -> List[Dict[str, Any]]:
         return [item.to_dict() for item in cp.list_project_items()]
+
+    @app.post("/bridge/beads/repositories")
+    def register_beads_repository(body: BeadsRepositoryRegister) -> Dict[str, Any]:
+        return cp.register_beads_repository(**_data(body)).to_dict()
+
+    @app.get("/bridge/beads/repositories")
+    def list_beads_repositories(enabled: Optional[bool] = Query(default=None)) -> List[Dict[str, Any]]:
+        return [repo.to_dict() for repo in cp.list_beads_repositories(enabled=enabled)]
+
+    @app.post("/bridge/beads/poll")
+    def poll_beads_repositories(body: BeadsRepositoryPoll) -> Dict[str, Any]:
+        return cp.poll_beads_repositories(body.repository, force=body.force, actor=body.actor)
 
     @app.post("/memory")
     def add_memory(body: MemoryCreate) -> Dict[str, Any]:

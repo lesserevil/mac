@@ -1432,6 +1432,106 @@ def test_project_bridge_memory_and_rollout_rescue(cp):
     assert rescue_task.metadata["rescue"] is True
 
 
+def _write_beads(repo_path, issues):
+    beads_dir = repo_path / ".beads"
+    beads_dir.mkdir(parents=True)
+    (beads_dir / "issues.jsonl").write_text(
+        "\n".join(json.dumps(issue) for issue in issues) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-ready",
+                "title": "Ready bead",
+                "description": "do the ready work",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            },
+            {
+                "_type": "issue",
+                "id": "mac-blocked",
+                "title": "Blocked bead",
+                "description": "must wait",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:01:00Z",
+                "dependencies": [
+                    {"issue_id": "mac-blocked", "depends_on_id": "mac-ready", "type": "blocks"}
+                ],
+                "dependency_count": 1,
+            },
+        ],
+    )
+    repo_record = cp.register_beads_repository(
+        "mac",
+        str(repo),
+        source="repo-beads-mac",
+        required_capabilities=["python"],
+        poll_interval_seconds=60,
+    )
+
+    report = cp.poll_beads_repositories(force=True)
+    again = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    assert report["imported_count"] == 1
+    assert again["imported_count"] == 0
+    assert again["existing_count"] == 1
+    assert len(cp.list_project_items()) == 1
+    item = cp.list_project_items()[0]
+    assert item.source == "repo-beads-mac"
+    assert item.external_id == "mac-ready"
+    task = cp.get_task(item.task_id)
+    assert task.state == TaskState.OPEN.value
+    assert task.project == "repo-beads-mac"
+    assert task.priority >= 98
+    assert task.required_capabilities == ["python"]
+    assert task.metadata["origin"]["type"] == "beads"
+    assert task.metadata["acc_metadata"]["beads_sync_close_on_complete"] is True
+
+
+def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-heartbeat",
+                "title": "Heartbeat imported bead",
+                "description": "import me from heartbeat",
+                "status": "open",
+                "priority": 1,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    rocky = register_agent(cp, "rocky", ["python"])
+    natasha = register_agent(cp, "natasha", ["python"])
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+
+    cp.heartbeat_agent(natasha.id, status=AgentStatus.IDLE.value)
+    assert cp.list_project_items() == []
+
+    cp.heartbeat_agent(rocky.id, status=AgentStatus.IDLE.value)
+
+    assert len(cp.list_project_items()) == 1
+    assert cp.list_project_items()[0].external_id == "mac-heartbeat"
+
+
 def test_acc_migration_dry_run_reports_without_writing(cp, tmp_path):
     acc_db = tmp_path / "acc.db"
     create_acc_migration_fixture(acc_db)

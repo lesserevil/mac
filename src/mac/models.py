@@ -1014,6 +1014,27 @@ class ProjectItem:
 
 
 @dataclass
+class BeadsRepository:
+    id: str
+    name: str
+    path: str
+    source: str
+    project: str
+    required_capabilities: List[str]
+    enabled: bool
+    poll_interval_seconds: int
+    last_polled_at: Optional[str]
+    last_imported_at: Optional[str]
+    last_error: Optional[str]
+    metadata: JsonDict
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
 class MemoryRecord:
     id: str
     task_id: Optional[str]

@@ -536,6 +536,25 @@ class SQLiteStore:
                     UNIQUE(source, external_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS beads_repositories (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    path TEXT NOT NULL,
+                    source TEXT NOT NULL UNIQUE,
+                    project TEXT NOT NULL,
+                    required_capabilities TEXT NOT NULL DEFAULT '[]',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    poll_interval_seconds INTEGER NOT NULL DEFAULT 60,
+                    last_polled_at TEXT,
+                    last_imported_at TEXT,
+                    last_error TEXT,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_beads_repositories_enabled
+                    ON beads_repositories (enabled, last_polled_at);
+
                 CREATE TABLE IF NOT EXISTS memory_records (
                     id TEXT PRIMARY KEY,
                     task_id TEXT,

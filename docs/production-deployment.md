@@ -196,9 +196,10 @@ without claiming migrated ACC work. Start the `--loop` form only after the
 executor command is the intended production worker. Successful executions write
 log evidence, move tasks to `needs_review`, and ask the control plane to run
 the default review workflow. The default workflow assigns a healthy agent that
-has never owned the task as reviewer, records an approval against successful
-executor evidence, and publishes/completes the task only when the evidence is
-verifiable. Failed executions fail the task with evidence attached.
+has never owned the task as reviewer, then waits for a separate signed
+`review_verdict` evidence row from that reviewer. It publishes/completes the
+task only when both executor evidence and reviewer verdict are verifiable.
+Failed executions fail the task with evidence attached.
 
 Executor success is not completion. A zero return code only means the executor
 reported without crashing. For the default workflow to auto-approve and publish,
@@ -254,6 +255,43 @@ deployed upstream Hermes checkout in one-shot mode.
 Loop mode is canary-gated by default. To make a worker eligible for real
 migrated work, explicitly set `MAC_DEPLOY_WORKER_REQUIRE_CANARY=0` and narrow
 the blast radius with project or metadata filters first.
+
+## Beads Bridge
+
+Rocky's hub can turn ready Beads into durable mac tasks automatically. Register
+each repository once:
+
+```bash
+mac --db ~/.mac/mac.db bridge beads register mac ~/.mac/src/mac \
+  --source repo-beads-mac --project repo-beads-mac
+```
+
+The deploy script enables heartbeat polling on the hub agent (`rocky`) and
+registers the deployed mac checkout by default through:
+
+```bash
+MAC_BEADS_BRIDGE_ON_HEARTBEAT=1
+MAC_BEADS_BRIDGE_HUB_AGENT=rocky
+MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac|repo-beads-mac|repo-beads-mac||30
+```
+
+On each Rocky heartbeat, the control plane polls every enabled registered
+repository whose poll interval has elapsed. The poller runs `bd ready --json`
+when available, falling back to `.beads/issues.jsonl` parsing for simple local
+fixtures. Only `open` Beads with no active blockers are imported; blocked Beads
+wait until their blockers close. Imports are idempotent through the
+`project_items(source, external_id)` unique key.
+
+Useful operator commands:
+
+```bash
+mac --db ~/.mac/mac.db bridge beads repos
+mac --db ~/.mac/mac.db bridge beads poll --force
+```
+
+Imported tasks keep Beads provenance in `task.metadata.origin` and
+`task.metadata.acc_metadata`, use the repository source as their mac project,
+and are immediately eligible for normal worker claiming.
 
 ## AgentBus
 

@@ -1118,6 +1118,15 @@ values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
 values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
 values.setdefault("MAC_WORKER_LEASE_SECONDS", "900")
 values.setdefault("MAC_WORKER_EXECUTOR", str(mac_home / "bin" / "mac-hermes-task-executor"))
+values.setdefault("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+if agent_name == values.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky"):
+    values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
+    values.setdefault(
+        "MAC_BEADS_REPOSITORIES",
+        "mac=%s|repo-beads-mac|repo-beads-mac||30" % (mac_home / "src" / "mac"),
+    )
+else:
+    values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "0")
 home_channel = (
     configured_home_channel
     or values.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
