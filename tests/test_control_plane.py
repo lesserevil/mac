@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import threading
 
 import pytest
@@ -1675,6 +1676,48 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     ]
     assert calls[1]["command"][7] == "--append-notes"
     assert "canary failed" in calls[1]["command"][8]
+
+
+def test_beads_export_noise_can_be_restored_after_sync(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    beads = repo / ".beads"
+    beads.mkdir(parents=True)
+    (beads / "config.yaml").write_text("sync.remote: origin\n", encoding="utf-8")
+    (beads / "issues.jsonl").write_text('{"id":"mac-one","status":"open"}\n', encoding="utf-8")
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "mac-tests@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "mac tests"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".beads/config.yaml", ".beads/issues.jsonl"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "seed beads"],
+        check=True,
+        capture_output=True,
+    )
+    (beads / "config.yaml").write_text("sync.remote: origin", encoding="utf-8")
+    (beads / "issues.jsonl").write_text(
+        '{"id":"mac-one","status":"in_progress"}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", ".beads/issues.jsonl"], check=True)
+
+    monkeypatch.setenv("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")
+    cp._restore_beads_tracked_exports(repo, "agent_rocky", "task_1", "claim")
+
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert status == ""
+    names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
+    assert "bridge.beads.tracked_exports_restored" in names
 
 
 def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkeypatch):

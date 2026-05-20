@@ -92,6 +92,8 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     assert '"$HOME/.local/bin/bd"' in script
     assert '"$HOME/bin/bd"' in script
     assert "bootstrap_beads_repositories()" in script
+    assert "restore_beads_tracked_exports()" in script
+    assert 'values.setdefault("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")' in script
     assert 'bootstrap --yes' in script
     source_install_block = script.split('mv "$SRC_DIR.new" "$SRC_DIR"', 1)[1].split(
         'log "creating/updating mac environment file"', 1
@@ -101,6 +103,7 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
         'log "installing mac Python package"', 1
     )[0]
     assert "bootstrap_beads_repositories" in env_source_block
+    assert "restore_beads_tracked_exports" in env_source_block
     assert 'values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")' in script
     assert '[_beads_cli(), "ready", "--json"]' in (
         ROOT / "src" / "mac" / "services.py"

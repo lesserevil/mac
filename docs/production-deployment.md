@@ -292,7 +292,13 @@ The deploy bootstrap installs the `bd` CLI into `~/.mac/bin/bd` from the
 configured Beads source (`MAC_DEPLOY_BEADS_REPO_URL`, `MAC_DEPLOY_BEADS_REF`)
 when it is not already present, then runs `bd bootstrap --yes` for each
 configured Beads repository so fresh clones have a writable Beads database, not
-only tracked JSONL. On each Rocky heartbeat or lease renewal, the control plane
+only tracked JSONL. Production deploys set
+`MAC_BEADS_RESTORE_TRACKED_EXPORTS=1`, so Beads may keep its embedded
+operational state while tracked export noise in `.beads/issues.jsonl` and
+`.beads/config.yaml` is restored after bootstrap and claim/close sync. This
+keeps `~/.mac/src/mac` clean enough for AgentBus self-update pulls.
+
+On each Rocky heartbeat or lease renewal, the control plane
 polls every enabled registered repository whose poll interval has elapsed. The
 poller runs `bd ready --json` when available, falling back to `.beads/issues.jsonl`
 parsing for simple local fixtures. Only `open` Beads with no active blockers are

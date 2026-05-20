@@ -2875,6 +2875,7 @@ class ControlPlane:
                 timeout=20,
                 check=False,
             )
+            self._restore_beads_tracked_exports(repo_path, actor, task.id, action)
             if completed.returncode != 0:
                 output = (completed.stderr or completed.stdout or "").strip()
                 if action == "claim" and "already claimed" in output.lower():
@@ -2911,6 +2912,89 @@ class ControlPlane:
                 detail={
                     "action": action,
                     "bead_id": binding["bead_id"],
+                    "repo_path": str(repo_path),
+                    "error": str(exc),
+                },
+            )
+
+    def _restore_beads_tracked_exports(
+        self,
+        repo_path: Path,
+        actor: str,
+        task_id: str,
+        action: str,
+    ) -> None:
+        if not _truthy_env("MAC_BEADS_RESTORE_TRACKED_EXPORTS"):
+            return
+        try:
+            inside = subprocess.run(
+                ["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if inside.returncode != 0 or inside.stdout.strip() != "true":
+                return
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "status",
+                    "--porcelain",
+                    "--",
+                    ".beads/config.yaml",
+                    ".beads/issues.jsonl",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if status.returncode != 0 or not status.stdout.strip():
+                return
+            restored = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "restore",
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    ".beads/config.yaml",
+                    ".beads/issues.jsonl",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if restored.returncode != 0:
+                raise ValidationError((restored.stderr or restored.stdout or "").strip())
+            self.record_log(
+                "bridge.beads.tracked_exports_restored",
+                layer="control_plane",
+                source=actor,
+                subject_type="task",
+                subject_id=task_id,
+                detail={
+                    "action": action,
+                    "repo_path": str(repo_path),
+                    "status": status.stdout.strip().splitlines(),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - Beads export cleanup is secondary.
+            self.record_log(
+                "bridge.beads.tracked_exports_restore_failed",
+                layer="control_plane",
+                source=actor,
+                level="warning",
+                subject_type="task",
+                subject_id=task_id,
+                detail={
+                    "action": action,
                     "repo_path": str(repo_path),
                     "error": str(exc),
                 },

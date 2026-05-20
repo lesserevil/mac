@@ -847,6 +847,40 @@ ${raw//;/$'\n'}
 EOF
 }
 
+restore_beads_tracked_exports() {
+  local raw="${MAC_BEADS_REPOSITORIES:-}" entry rest repo_path index status_path
+  case "${MAC_BEADS_RESTORE_TRACKED_EXPORTS:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  [ -n "$raw" ] || return 0
+  index=0
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    [ "$entry" != "${entry#*=}" ] || continue
+    rest="${entry#*=}"
+    repo_path="${rest%%|*}"
+    repo_path="${repo_path%%:*}"
+    [ -n "$repo_path" ] || continue
+    if ! git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      continue
+    fi
+    if [ -z "$(git -C "$repo_path" status --porcelain -- .beads/config.yaml .beads/issues.jsonl)" ]; then
+      continue
+    fi
+    index=$((index + 1))
+    status_path="$LOG_DIR/beads-tracked-export-restore-${index}.txt"
+    git -C "$repo_path" status --porcelain -- .beads/config.yaml .beads/issues.jsonl > "$status_path" || true
+    git -C "$repo_path" restore --staged --worktree -- .beads/config.yaml .beads/issues.jsonl
+    log "restored tracked Beads export noise in $repo_path; status saved to $status_path"
+  done <<EOF
+${raw//;/$'\n'}
+EOF
+}
+
 normalize_hermes_redaction_env() {
   "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" "$HOME/.acc/.env" <<'PY'
 import json
@@ -1376,6 +1410,7 @@ values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
 values.setdefault("MAC_WORKER_LEASE_SECONDS", "900")
 values.setdefault("MAC_WORKER_EXECUTOR", str(mac_home / "bin" / "mac-hermes-task-executor"))
 values.setdefault("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+values.setdefault("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")
 if agent_name == values.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky"):
     values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
     values.setdefault(
@@ -1417,6 +1452,7 @@ set -a
 . "$ENV_FILE"
 set +a
 bootstrap_beads_repositories
+restore_beads_tracked_exports
 sync_hermes_home_channels
 
 log "installing mac Python package"
