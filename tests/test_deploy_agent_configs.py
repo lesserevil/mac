@@ -73,6 +73,17 @@ def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
     assert "evidence_type=review_verdict" in script
 
 
+def test_fleet_deploy_drain_agent_lookup_does_not_pipe_json_into_python_stdin():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    agent_id_for_drain = script.split("agent_id_for_drain() {", 1)[1].split(
+        "wait_for_agent_active_leases() {", 1
+    )[0]
+
+    assert 'response="$(mac_api_json GET "/agents")"' in agent_id_for_drain
+    assert "json.loads(sys.argv[2])" in agent_id_for_drain
+    assert 'mac_api_json GET "/agents" |' not in agent_id_for_drain
+
+
 def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 

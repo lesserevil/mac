@@ -651,12 +651,14 @@ PY
 }
 
 agent_id_for_drain() {
-  mac_api_json GET "/agents" | "$PY" - "$AGENT" <<'PY'
+  local response
+  response="$(mac_api_json GET "/agents")" || return 1
+  "$PY" - "$AGENT" "$response" <<'PY'
 import json
 import sys
 
 expected = sys.argv[1]
-agents = json.load(sys.stdin)
+agents = json.loads(sys.argv[2])
 for agent in agents:
     if agent.get("name") == expected or agent.get("id") == expected:
         print(agent.get("id"))
