@@ -1870,6 +1870,54 @@ def test_beads_bridge_records_authority_drift_when_jsonl_export_disagrees_with_d
     assert resolved[0].resolution == "no longer observed"
 
 
+def test_beads_bridge_does_not_alert_for_jsonl_only_issue_already_imported(
+    cp,
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue = {
+        "_type": "issue",
+        "id": "mac-jsonl-active",
+        "title": "Already imported bead",
+        "description": "present in tracked JSONL but already represented by a mac task",
+        "status": "open",
+        "priority": 0,
+        "created_at": "2026-05-20T00:00:00Z",
+        "dependency_count": 0,
+    }
+    _write_beads(repo, [issue])
+    ready_path = tmp_path / "ready.json"
+    ready_path.write_text("[]", encoding="utf-8")
+    fake_bd = tmp_path / "bd"
+    _write_fake_bd_cli(fake_bd, ready_path)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    item = cp.import_project_item(
+        repo_record.source,
+        "mac-jsonl-active",
+        "Already imported bead",
+        {"issue": issue},
+        actor="test",
+    )
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    assert report["imported_count"] == 0
+    assert report["repositories"][0]["source_state"]["authority_findings"] == []
+    drift = report["repositories"][0]["source_state"]["authority_drift"]
+    assert drift["jsonl_only_ready_ids"] == ["mac-jsonl-active"]
+    assert drift["jsonl_only_untracked_ids"] == []
+    assert drift["jsonl_only_already_imported_ids"] == ["mac-jsonl-active"]
+    assert drift["jsonl_only_existing_tasks"]["mac-jsonl-active"] == {
+        "task_id": item.task_id,
+        "state": "open",
+    }
+    assert cp.list_integration_findings(status="open") == []
+    assert cp.list_notifications(subject_id=repo_record.id) == []
+
+
 def test_direct_task_for_registered_project_gets_repository_execution_contract(cp, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

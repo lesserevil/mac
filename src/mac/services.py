@@ -4601,11 +4601,19 @@ class ControlPlane:
         canonical_ids = self._beads_issue_ids(canonical_ready_issues)
         jsonl_ids = self._beads_issue_ids(jsonl_ready_issues)
         jsonl_only = sorted(set(jsonl_ids) - set(canonical_ids))
-        if jsonl_only:
+        existing_jsonl_only = self._existing_beads_project_items_by_external_id(
+            repo,
+            jsonl_only,
+        )
+        already_imported_jsonl_only = sorted(existing_jsonl_only)
+        untracked_jsonl_only = sorted(
+            issue_id for issue_id in jsonl_only if issue_id not in existing_jsonl_only
+        )
+        if untracked_jsonl_only:
             fingerprint = self._integration_fingerprint(
                 {
                     "finding_type": "beads.export_drift.jsonl_only_ready",
-                    "jsonl_only_ready_ids": jsonl_only,
+                    "jsonl_only_ready_ids": untracked_jsonl_only,
                 }
             )
             active_jsonl_only.append(fingerprint)
@@ -4626,8 +4634,11 @@ class ControlPlane:
                     "canonical_ready_ids": canonical_ids,
                     "jsonl_ready_count": len(jsonl_ids),
                     "jsonl_ready_ids": jsonl_ids,
-                    "jsonl_only_ready_count": len(jsonl_only),
-                    "jsonl_only_ready_ids": jsonl_only,
+                    "jsonl_only_ready_count": len(untracked_jsonl_only),
+                    "jsonl_only_ready_ids": untracked_jsonl_only,
+                    "jsonl_only_already_imported_count": len(already_imported_jsonl_only),
+                    "jsonl_only_already_imported_ids": already_imported_jsonl_only,
+                    "jsonl_only_existing_tasks": existing_jsonl_only,
                 },
                 severity="warning",
                 fingerprint=fingerprint,
@@ -4637,7 +4648,7 @@ class ControlPlane:
                     "%s has %d ready issue(s) present only in .beads/issues.jsonl. "
                     "mac will not import them until Beads DB exposes them through `bd ready --json`."
                 )
-                % (repo.name, len(jsonl_only)),
+                % (repo.name, len(untracked_jsonl_only)),
             )
             findings.append(finding.to_dict())
         self._resolve_integration_findings_for_source(
@@ -4648,6 +4659,44 @@ class ControlPlane:
         )
         if source_state is not None:
             source_state["authority_findings"] = findings
+            if jsonl_only:
+                source_state["authority_drift"] = {
+                    "schema": "mac.integration.beads_authority_drift_summary.v1",
+                    "jsonl_only_ready_count": len(jsonl_only),
+                    "jsonl_only_ready_ids": jsonl_only,
+                    "jsonl_only_untracked_count": len(untracked_jsonl_only),
+                    "jsonl_only_untracked_ids": untracked_jsonl_only,
+                    "jsonl_only_already_imported_count": len(already_imported_jsonl_only),
+                    "jsonl_only_already_imported_ids": already_imported_jsonl_only,
+                    "jsonl_only_existing_tasks": existing_jsonl_only,
+                }
+
+    def _existing_beads_project_items_by_external_id(
+        self,
+        repo: BeadsRepository,
+        external_ids: Iterable[str],
+    ) -> Dict[str, JsonDict]:
+        ids = sorted({str(external_id or "").strip() for external_id in external_ids if external_id})
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self.store.query_all(
+            """
+            SELECT project_items.external_id, project_items.task_id, tasks.state
+            FROM project_items
+            LEFT JOIN tasks ON tasks.id = project_items.task_id
+            WHERE project_items.source = ? AND project_items.external_id IN (%s)
+            """
+            % placeholders,
+            (repo.source, *ids),
+        )
+        return {
+            str(row["external_id"]): {
+                "task_id": row["task_id"],
+                "state": row["state"],
+            }
+            for row in rows
+        }
 
     def _bead_issue_is_importable(self, issue: Any) -> bool:
         if not isinstance(issue, dict):
