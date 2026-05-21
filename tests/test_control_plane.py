@@ -2533,6 +2533,92 @@ def test_beads_bridge_backfills_retry_exhausted_failure_summary_to_beads(
     ]
 
 
+def test_beads_sync_falls_back_to_registered_checkout_when_bridge_db_is_broken(
+    cp, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    bridge = tmp_path / "bridge"
+    repo.mkdir()
+    bridge.mkdir()
+    _write_repository_contract(repo)
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-sync",
+                "title": "Sync lifecycle",
+                "description": "sync claim and failure",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    repo_record = cp.register_beads_repository(
+        "mac",
+        str(repo),
+        source="repo-beads-mac",
+        metadata={"beads_bridge_checkout_path": str(bridge)},
+    )
+    cp._import_bead_issue(
+        repo_record,
+        {
+            "_type": "issue",
+            "id": "mac-sync",
+            "title": "Sync lifecycle",
+            "description": "sync claim and failure",
+            "status": "open",
+            "priority": 0,
+            "created_at": "2026-05-20T00:00:00Z",
+            "dependency_count": 0,
+        },
+        actor="bridge",
+    )
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
+    calls = []
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        calls.append({"command": command, "cwd": cwd})
+        if cwd == str(bridge):
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="failed to open database: embeddeddolt: database not found: mac",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    assert cp._run_bd_for_task(
+        task,
+        ["comment", "mac-sync", "failure cause"],
+        "bridge",
+        "ledger",
+    )
+
+    assert calls == [
+        {
+            "command": [bd_cli, "--actor", "bridge", "comment", "mac-sync", "failure cause"],
+            "cwd": str(bridge),
+        },
+        {
+            "command": [bd_cli, "--actor", "bridge", "comment", "mac-sync", "failure cause"],
+            "cwd": str(repo),
+        },
+    ]
+    names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
+    assert "bridge.beads.sync.ledger.registered_fallback" in names
+    assert cp.get_beads_repository(repo_record.id).metadata["beads_bridge_checkout_path"] == str(
+        bridge
+    )
+
+
 def test_beads_export_noise_can_be_restored_after_sync(cp, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     beads = repo / ".beads"

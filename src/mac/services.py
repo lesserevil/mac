@@ -4905,6 +4905,7 @@ class ControlPlane:
         repo_path = self._beads_sync_path_for_binding(binding, actor)
         if not repo_path.exists():
             return False
+        registered_path = Path(str(binding["repo_path"])).expanduser()
         try:
             completed = subprocess.run(
                 [_beads_cli(), "--actor", actor, *args],
@@ -4931,6 +4932,43 @@ class ControlPlane:
                         },
                     )
                     return True
+                if registered_path.exists() and registered_path.resolve() != repo_path.resolve():
+                    fallback = subprocess.run(
+                        [_beads_cli(), "--actor", actor, *args],
+                        cwd=str(registered_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=20,
+                        check=False,
+                    )
+                    self._restore_beads_tracked_exports(
+                        registered_path,
+                        actor,
+                        task.id,
+                        "%s_registered_fallback" % action,
+                    )
+                    if fallback.returncode == 0:
+                        self.record_log(
+                            "bridge.beads.sync.%s.registered_fallback" % action,
+                            layer="control_plane",
+                            source=actor,
+                            level="warning",
+                            subject_type="task",
+                            subject_id=task.id,
+                            detail={
+                                "bead_id": binding["bead_id"],
+                                "repo_path": str(repo_path),
+                                "fallback_repo_path": str(registered_path),
+                                "primary_error": output[:1000],
+                            },
+                        )
+                        return True
+                    fallback_output = (fallback.stderr or fallback.stdout or "").strip()
+                    if fallback_output:
+                        output = "%s; registered checkout fallback failed: %s" % (
+                            output,
+                            fallback_output,
+                        )
                 raise ValidationError(output)
             self.record_log(
                 "bridge.beads.sync.%s" % action,
