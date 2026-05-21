@@ -277,6 +277,7 @@ class MacWorker:
         self._stop = False
         self._declared_digest = False
         self._declared_policy = False
+        self.active_lease: Optional[JsonDict] = None
 
     def stop(self) -> None:
         """Signal the run loop to exit after the current task."""
@@ -332,6 +333,14 @@ class MacWorker:
     def _shutdown(self) -> None:
         # Best-effort: mark offline so the control plane requeues any active
         # lease tied to this agent. Catch broadly: shutdown must not raise.
+        if self.active_lease:
+            try:
+                self.client.post(
+                    f"/leases/{self.active_lease['id']}/release",
+                    {"agent_id": self.agent_id},
+                )
+            except Exception:
+                pass
         try:
             self.client.post(
                 "/agents/%s/heartbeat" % quote(self.agent_id, safe=""),
@@ -361,6 +370,7 @@ class MacWorker:
 
         task = assignment["task"]
         lease = assignment["lease"]
+        self.active_lease = lease
         task_id = task["id"]
         self._observe_log(
             "worker.task_claimed",
@@ -493,6 +503,8 @@ class MacWorker:
             except Exception:
                 pass
             raise
+        finally:
+            self.active_lease = None
 
     def _assignment_is_current(self, task_id: str, lease_id: str) -> bool:
         try:
