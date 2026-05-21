@@ -344,6 +344,9 @@ mac opens an `integration_findings` row of type
 `beads.export_drift.jsonl_only_ready`, emits an operator notification, and does
 not import those export-only issues until the Beads DB exposes them. This keeps
 the bridge from silently choosing the wrong authority during DB/export drift.
+If the managed bridge checkout's embedded Dolt database cannot pull from the
+configured remote, mac moves that disposable DB aside, re-runs
+`bd bootstrap --yes`, and retries `bd dolt pull` before declaring drift.
 See [Integration Authority Contract](integration-authority-contract.md).
 
 The hub also advances the default review/publication workflow from heartbeat by

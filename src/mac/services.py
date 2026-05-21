@@ -3996,8 +3996,35 @@ class ControlPlane:
         subject_id: str,
         state: JsonDict,
     ) -> None:
+        completed = self._run_beads_dolt_pull(repo_path)
+        self._record_beads_dolt_pull_result(
+            completed,
+            repo_path,
+            actor,
+            subject_id,
+            state,
+        )
+        if completed is not None and completed.returncode == 0:
+            return
+        if not _truthy_env("MAC_BEADS_REBUILD_ON_DOLT_PULL_FAILURE", "1"):
+            return
+        if self._rebuild_beads_database(repo_path, actor, subject_id, state):
+            retry = self._run_beads_dolt_pull(repo_path)
+            self._record_beads_dolt_pull_result(
+                retry,
+                repo_path,
+                actor,
+                subject_id,
+                state,
+                prefix="beads_dolt_pull_retry",
+            )
+
+    def _run_beads_dolt_pull(
+        self,
+        repo_path: Path,
+    ) -> Optional[subprocess.CompletedProcess[str]]:
         try:
-            completed = subprocess.run(
+            return subprocess.run(
                 [_beads_cli(), "dolt", "pull"],
                 cwd=str(repo_path),
                 capture_output=True,
@@ -4006,30 +4033,36 @@ class ControlPlane:
                 check=False,
             )
         except Exception as exc:  # noqa: BLE001 - JSONL/DB read can still report drift.
-            state["beads_dolt_pull"] = "error"
-            state["beads_dolt_pull_error"] = str(exc)
-            self.record_log(
-                "bridge.beads.dolt_pull_failed",
-                layer="control_plane",
-                source=actor,
-                level="warning",
-                subject_type="environment",
-                subject_id=subject_id,
-                detail={
-                    "path": str(repo_path),
-                    "error": str(exc),
-                },
+            return subprocess.CompletedProcess(
+                [_beads_cli(), "dolt", "pull"],
+                125,
+                stdout="",
+                stderr=str(exc),
             )
+
+    def _record_beads_dolt_pull_result(
+        self,
+        completed: Optional[subprocess.CompletedProcess[str]],
+        repo_path: Path,
+        actor: str,
+        subject_id: str,
+        state: JsonDict,
+        *,
+        prefix: str = "beads_dolt_pull",
+    ) -> None:
+        if completed is None:
+            state[prefix] = "error"
+            state["%s_error" % prefix] = "bd dolt pull did not run"
             return
         output = (completed.stderr or completed.stdout or "").strip()
         if completed.returncode == 0:
-            state["beads_dolt_pull"] = "ok"
+            state[prefix] = "ok"
             if output:
-                state["beads_dolt_pull_output"] = output[:1000]
+                state["%s_output" % prefix] = output[:1000]
             return
-        state["beads_dolt_pull"] = "failed"
-        state["beads_dolt_pull_returncode"] = int(completed.returncode)
-        state["beads_dolt_pull_error"] = output[:2000]
+        state[prefix] = "failed"
+        state["%s_returncode" % prefix] = int(completed.returncode)
+        state["%s_error" % prefix] = output[:2000]
         self.record_log(
             "bridge.beads.dolt_pull_failed",
             layer="control_plane",
@@ -4043,6 +4076,66 @@ class ControlPlane:
                 "output": output[:2000],
             },
         )
+
+    def _rebuild_beads_database(
+        self,
+        repo_path: Path,
+        actor: str,
+        subject_id: str,
+        state: JsonDict,
+    ) -> bool:
+        beads_dir = repo_path / ".beads"
+        embedded = beads_dir / "embeddeddolt"
+        if not embedded.exists():
+            state["beads_dolt_rebuild"] = "skipped"
+            state["beads_dolt_rebuild_reason"] = "embedded_dolt_missing"
+            return False
+        backup = beads_dir / (
+            "embeddeddolt.rebuild.%s" % _safe_slug(utcnow())
+        )
+        try:
+            shutil.move(str(embedded), str(backup))
+        except OSError as exc:
+            state["beads_dolt_rebuild"] = "failed"
+            state["beads_dolt_rebuild_error"] = str(exc)
+            return False
+        state["beads_dolt_rebuild"] = "started"
+        state["beads_dolt_rebuild_backup"] = str(backup)
+        try:
+            completed = subprocess.run(
+                [_beads_cli(), "bootstrap", "--yes"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the backup for operator repair.
+            state["beads_dolt_rebuild"] = "error"
+            state["beads_dolt_rebuild_error"] = str(exc)
+            return False
+        output = (completed.stderr or completed.stdout or "").strip()
+        if completed.returncode == 0:
+            state["beads_dolt_rebuild"] = "ok"
+            if output:
+                state["beads_dolt_rebuild_output"] = output[:1000]
+            self._restore_beads_tracked_exports(repo_path, actor, subject_id, "dolt_rebuild")
+            self.record_log(
+                "bridge.beads.dolt_rebuilt",
+                layer="control_plane",
+                source=actor,
+                subject_type="environment",
+                subject_id=subject_id,
+                detail={
+                    "path": str(repo_path),
+                    "backup": str(backup),
+                },
+            )
+            return True
+        state["beads_dolt_rebuild"] = "failed"
+        state["beads_dolt_rebuild_returncode"] = int(completed.returncode)
+        state["beads_dolt_rebuild_error"] = output[:2000]
+        return False
 
     def _git_output(self, repo_path: Path, args: List[str], timeout: int = 20) -> JsonDict:
         completed = subprocess.run(

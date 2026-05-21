@@ -891,6 +891,8 @@ bootstrap_beads_repositories() {
       log "WARNING: skipping Beads bootstrap for $repo_path because .beads is absent"
       continue
     fi
+    chmod 700 "$repo_path/.beads" 2>/dev/null || true
+    git -C "$repo_path" config beads.role maintainer 2>/dev/null || true
     index=$((index + 1))
     log_path="$LOG_DIR/beads-bootstrap-${index}.log"
     log "bootstrapping Beads repository at $repo_path"
