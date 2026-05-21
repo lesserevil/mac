@@ -1745,8 +1745,34 @@ def _worker_verification_contract_problems(manifest: JsonDict, evidence_type: st
             problems.append("no_change evidence requires at least one passing check")
         return problems
     if evidence_type == "review_verdict":
-        return []
+        problems = _worker_review_verdict_problems(manifest)
+        return problems
     return ["unsupported verification.evidence_type: %s" % evidence_type]
+
+
+def _worker_review_verdict_problems(manifest: JsonDict) -> List[str]:
+    problems: List[str] = []
+    if str(manifest.get("verdict") or "").strip().lower() not in {"approved", "rejected"}:
+        problems.append("review_verdict evidence requires verdict approved or rejected")
+    if not str(manifest.get("reviewed_evidence_id") or "").strip():
+        problems.append("review_verdict evidence requires reviewed_evidence_id")
+    repo = manifest.get("repo")
+    if not isinstance(repo, dict):
+        problems.append("repo evidence requires verification.repo object")
+    else:
+        head_sha = str(repo.get("head_sha") or "").strip()
+        if not GIT_SHA_RE.match(head_sha):
+            problems.append("repo.head_sha must be a git SHA")
+        pushed = repo.get("pushed") is True or str(repo.get("pushed") or "").lower() == "true"
+        remote_ref = str(repo.get("remote_ref") or "").strip()
+        if not pushed or not remote_ref:
+            problems.append("review verdict requires repo.pushed=true with remote_ref")
+    if _worker_passed_verification_test_count(manifest) < 1:
+        problems.append("review_verdict evidence requires at least one passing reviewer test")
+    digest = str(manifest.get("worktree_digest") or "").strip()
+    if not re.match(r"^sha256:[0-9a-f]{64}$", digest):
+        problems.append("review_verdict evidence requires worktree_digest sha256")
+    return problems
 
 
 def _worker_repo_verification_problems(manifest: JsonDict, require_tests: bool) -> List[str]:
@@ -1787,6 +1813,19 @@ def _worker_passed_verification_check_count(manifest: JsonDict) -> int:
     for item in _manifest_list(manifest.get("checks")):
         if _worker_verification_item_passed(item):
             count += 1
+    return count
+
+
+def _worker_passed_verification_test_count(manifest: JsonDict) -> int:
+    count = 0
+    for item in _manifest_list(manifest.get("tests")):
+        if not isinstance(item, dict) or "returncode" not in item:
+            continue
+        try:
+            if int(item["returncode"]) == 0:
+                count += 1
+        except (TypeError, ValueError):
+            continue
     return count
 
 

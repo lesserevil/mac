@@ -248,7 +248,7 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
             "review_id": context["review_id"],
             "reviewed_evidence_id": context["executor_evidence_id"],
             "repo": dict(executor_manifest["repo"]),
-            "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+            "tests": [{"command": "reviewer independent verification", "returncode": 0}],
             "worktree_digest": "sha256:" + ("0" * 64),
             "findings": ["executor evidence is signed and tests passed"],
         }

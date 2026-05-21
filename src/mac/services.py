@@ -4797,9 +4797,12 @@ class ControlPlane:
 
         The verdict is a separate Evidence row authored by the reviewer
         (not the executor) with a signed verification manifest of type
-        ``review_verdict`` that names the executor's evidence_id.
-        Without this row the workflow blocks — it will no longer
-        auto-approve in the same process that selected the reviewer.
+        ``review_verdict`` that names the executor's evidence_id and pins
+        the git artifact the reviewer independently fetched. The verdict
+        must carry verification.repo.head_sha matching the executor evidence,
+        verification.repo.pushed=true with remote_ref, at least one passing
+        reviewer test for code/test/artifact/deployment evidence, and a
+        sha256 worktree_digest.
 
         Shape required for a valid verdict:
             evidence.metadata.returncode == 0
@@ -4811,6 +4814,11 @@ class ControlPlane:
                 reviewed_evidence_id == executor_evidence_id
                 signed_by = <reviewer_agent_id>
                 signature = <HMAC of manifest under reviewer's key>
+                repo.head_sha = <executor evidence repo.head_sha>
+                repo.pushed = true
+                repo.remote_ref = <fetched remote ref>
+                tests[] includes at least one returncode=0 entry
+                worktree_digest = sha256:<git ls-tree -r HEAD digest>
         """
         problems: List[str] = []
         for evidence in reversed(self.list_evidence(task_id)):
@@ -4855,7 +4863,7 @@ class ControlPlane:
             if not isinstance(executor_manifest, dict):
                 problems.append("verdict %s cannot resolve executor verification manifest" % evidence.id)
                 continue
-            repo_problems = self._require_pushed_repo_anchor(manifest)
+            repo_problems = self._review_verdict_repo_anchor_problems(manifest)
             if repo_problems:
                 problems.extend("verdict %s %s" % (evidence.id, problem) for problem in repo_problems)
                 continue
@@ -4867,15 +4875,52 @@ class ControlPlane:
                     % (evidence.id, reviewed_sha, executor_sha)
                 )
                 continue
-            if self._passed_verification_check_count(manifest) < 1:
-                problems.append("verdict %s requires at least one independent passing check" % evidence.id)
-                continue
+            executor_type = str(executor_manifest.get("evidence_type") or "").strip().lower()
+            if executor_type in {"repo_change", "test", "artifact", "deployment"}:
+                if self._passed_verification_test_count(manifest) < 1:
+                    problems.append(
+                        "verdict %s requires at least one independent passing test" % evidence.id
+                    )
+                    continue
             digest = str(manifest.get("worktree_digest") or "").strip()
             if not re.match(r"^sha256:[0-9a-f]{64}$", digest):
                 problems.append("verdict %s requires worktree_digest sha256" % evidence.id)
                 continue
+            executor_digest = str(executor_manifest.get("worktree_digest") or "").strip()
+            if executor_digest and digest != executor_digest:
+                problems.append(
+                    "verdict %s worktree_digest does not match executor evidence: %s != %s"
+                    % (evidence.id, digest, executor_digest)
+                )
+                continue
             return evidence, []
         return None, problems
+
+    def _review_verdict_repo_anchor_problems(self, manifest: JsonDict) -> List[str]:
+        repo = manifest.get("repo")
+        if not isinstance(repo, dict):
+            return ["repo evidence requires verification.repo object"]
+        problems: List[str] = []
+        head_sha = str(repo.get("head_sha") or "").strip()
+        if not _GIT_SHA_RE.match(head_sha):
+            problems.append("repo.head_sha must be a git SHA")
+        pushed = repo.get("pushed") is True or str(repo.get("pushed") or "").lower() == "true"
+        remote_ref = str(repo.get("remote_ref") or "").strip()
+        if not pushed or not remote_ref:
+            problems.append("review verdict requires repo.pushed=true with remote_ref")
+        return problems
+
+    def _passed_verification_test_count(self, manifest: JsonDict) -> int:
+        count = 0
+        for item in _manifest_list(manifest.get("tests")):
+            if not isinstance(item, dict) or "returncode" not in item:
+                continue
+            try:
+                if int(item["returncode"]) == 0:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+        return count
 
     def _verdict_value(self, evidence: Evidence) -> str:
         manifest = evidence.metadata.get("verification") or {}

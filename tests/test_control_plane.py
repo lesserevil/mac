@@ -2411,6 +2411,131 @@ def test_review_verdict_requires_same_repo_head_as_executor_evidence(cp):
     assert cp.list_publications(task.id) == []
 
 
+def _review_verdict_scenario(
+    cp,
+    *,
+    executor_manifest_updates=None,
+    verdict_manifest_updates=None,
+):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "work",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://publish"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    executor_manifest = verified_repo_metadata(cp=None, agent_id=None)["verification"]
+    if executor_manifest_updates:
+        executor_manifest.update(executor_manifest_updates)
+    metadata = {"returncode": 0, "verification": _sign(cp, worker.id, executor_manifest)}
+    executor_evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://t",
+        "tests passed",
+        worker.id,
+        metadata=metadata,
+    )
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    executor_manifest = executor_evidence.metadata.get("verification") or {}
+    verdict_manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "review_verdict",
+        "verdict": "approved",
+        "reviewed_evidence_id": executor_evidence.id,
+        "repo": dict(executor_manifest.get("repo") or {}),
+        "tests": [{"command": "pytest tests/test_example.py", "returncode": 0}],
+        "worktree_digest": executor_manifest.get("worktree_digest", "sha256:" + ("0" * 64)),
+    }
+    if verdict_manifest_updates:
+        for key, value in verdict_manifest_updates.items():
+            if value is None:
+                verdict_manifest.pop(key, None)
+            else:
+                verdict_manifest[key] = value
+    verdict_manifest = _sign(cp, reviewer.id, verdict_manifest)
+    cp.add_evidence(
+        task.id,
+        "review",
+        "artifact://review",
+        "review approved",
+        reviewer.id,
+        metadata={"returncode": 0, "verification": verdict_manifest},
+    )
+    return task, review
+
+
+def test_review_verdict_rejected_without_repo_anchor(cp):
+    task, review = _review_verdict_scenario(cp, verdict_manifest_updates={"repo": None})
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["review_id"] == review.id
+    assert any("verification.repo object" in problem for problem in result["problems"])
+    assert cp.list_publications(task.id) == []
+
+
+def test_review_verdict_rejected_when_repo_sha_disagrees_with_executor(cp):
+    task, review = _review_verdict_scenario(
+        cp,
+        verdict_manifest_updates={
+            "repo": {
+                "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "pushed": True,
+                "remote_ref": "refs/heads/task/example",
+                "dirty": False,
+            }
+        },
+    )
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["review_id"] == review.id
+    assert any("repo.head_sha does not match" in problem for problem in result["problems"])
+    assert cp.list_publications(task.id) == []
+
+
+def test_review_verdict_rejected_when_worktree_digest_disagrees(cp):
+    task, review = _review_verdict_scenario(
+        cp,
+        executor_manifest_updates={"worktree_digest": "sha256:" + ("1" * 64)},
+        verdict_manifest_updates={"worktree_digest": "sha256:" + ("2" * 64)},
+    )
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["review_id"] == review.id
+    assert any("worktree_digest does not match" in problem for problem in result["problems"])
+    assert cp.list_publications(task.id) == []
+
+
+def test_review_verdict_rejected_when_reviewer_tests_all_failed(cp):
+    task, review = _review_verdict_scenario(
+        cp,
+        verdict_manifest_updates={
+            "tests": [
+                {"command": "pytest tests/test_example.py", "returncode": 1},
+                {"command": "python -m pytest", "returncode": "2"},
+            ],
+            "checks": [{"name": "lint", "status": "pass"}],
+        },
+    )
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["review_id"] == review.id
+    assert any("requires at least one independent passing test" in problem for problem in result["problems"])
+    assert cp.list_publications(task.id) == []
+
+
 def test_publication_requires_verifiable_review_verdict_not_plain_approval(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])

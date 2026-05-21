@@ -38,7 +38,7 @@ def submit_review_verdict(
         "verdict": verdict,
         "reviewed_evidence_id": executor_evidence_id,
         "repo": repo,
-        "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+        "tests": [{"command": "pytest tests/test_example.py", "returncode": 0}],
         "worktree_digest": "sha256:" + ("0" * 64),
     }
     manifest["signed_by"] = reviewer_agent_id
