@@ -171,6 +171,38 @@ The rollback script restores the prior mac source tree, mac venv, Hermes
 checkout, and service definitions or launchd plists that existed before the
 deploy pass, then restarts the mac-managed services.
 
+### Active-worker drain
+
+Before each host's mac-agent is stopped for artifact replacement, the deploy
+script drains its active leases so an in-flight Hermes subprocess is not
+interrupted mid-task. Drain is implemented in `deploy/deploy-mac-fleet.sh` by
+the `drain_mac_agent_before_deploy` and `clear_mac_agent_drain_after_deploy`
+helpers and runs in this order:
+
+1. `write_deploy_manifest "pre"`
+2. `drain_mac_agent_before_deploy` — heartbeats the host's agent as
+   `status=draining` / `health_status=degraded` so the control plane stops
+   dispatching new work to it, then polls `/agents/<id>` for active leases
+3. `stop_existing_services_for_deploy` (only after drain succeeds)
+4. artifact replacement (venv, Hermes checkout, services)
+5. `verify_hub_registration`
+6. `clear_mac_agent_drain_after_deploy` — heartbeats the agent back to
+   `status=idle` / `health_status=healthy` so it resumes claiming work
+7. `write_deploy_manifest "post"`
+
+Operator knobs (all read from the host environment or `deploy/agents/<agent>/config.env`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MAC_DEPLOY_DRAIN_MODE` | `wait` | `wait` blocks the deploy until active leases clear; `fail-fast` aborts the deploy as soon as an active lease is observed; `skip` bypasses drain entirely (only safe when the host is known idle) |
+| `MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS` | `1800` | Maximum time (seconds) to wait for active leases to clear before the deploy errors out |
+| `MAC_DEPLOY_DRAIN_POLL_SECONDS` | `10` | Polling interval (seconds) between active-lease checks |
+
+Each host writes a per-deploy drain decision to
+`~/.mac/logs/mac-agent-drain.json` (status, observed lease count, mode,
+timeout, agent_id), and the deploy log records the same decision inline so a
+rollout can be audited after the fact.
+
 ## Worker Agents
 
 The control-plane service does not execute tasks by itself. Each execution host
