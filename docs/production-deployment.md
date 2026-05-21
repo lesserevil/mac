@@ -143,6 +143,7 @@ host:
 - `deploy-*.log`
 - `deploy-manifest-*-pre.json`, `deploy-manifest-*-post.json`, and
   `deploy-manifest-latest.json`
+- `mac-agent-drain.json` (latest active-lease drain summary for this host)
 - `rollback-*.sh` and `rollback-latest.sh`
 - `acc-migration-dry-run.json`
 - `acc-migration-import.json`
@@ -170,6 +171,28 @@ To roll back the most recent deployment on a host:
 The rollback script restores the prior mac source tree, mac venv, Hermes
 checkout, and service definitions or launchd plists that existed before the
 deploy pass, then restarts the mac-managed services.
+
+### Active-worker drain
+
+Before replacing artifacts, the fleet deploy script detects active leases on
+the local `mac-agent`, asks the hub to stop dispatching new work to it, and
+waits for the currently-running task (if any) to finish so the Hermes worker
+subprocess is not interrupted mid-claim. Operators tune this with:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAC_DEPLOY_DRAIN_MODE` | `wait` | `wait` polls until active leases drop to zero; `fail-fast` aborts deploy if any are active; `skip`/`off`/`disabled` bypasses drain entirely. |
+| `MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS` | `1800` | Maximum seconds to wait for active leases to clear before aborting the deploy. |
+| `MAC_DEPLOY_DRAIN_POLL_SECONDS` | `10` | Interval between active-lease checks while draining. |
+
+Drain decisions, the per-host active-lease snapshot, and the drain mode used
+are logged to `~/.mac/logs/deploy-*.log` and summarised in
+`~/.mac/logs/mac-agent-drain.json`. The drain pauses new claims by sending an
+authenticated `status=draining`, `health_status=degraded` heartbeat to the hub
+for this host's agent record; once the deploy and service restart finish, the
+script restores `status=idle`, `health_status=healthy`. If the hub API is not
+reachable or the agent is not yet registered (first-time deploy), drain is
+skipped with an explicit log line — there is no active work to protect.
 
 ## Worker Agents
 
