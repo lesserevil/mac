@@ -424,6 +424,7 @@ class ControlPlane:
             get_evidence=self.get_evidence,
             transition_task=self.transition_task,
             record_history=self._record_history,
+            enqueue_outbox=self._enqueue_domain_event,
         )
         self.agent_state = AgentStateService(
             self.store,
@@ -1443,28 +1444,40 @@ class ControlPlane:
             self._record_history(
                 task_id, "task.transitioned", actor, task.state, target, detail or {}, conn=conn
             )
-        # Workflow-runtime hook. The link is the `tasks.workflow_run_id`
-        # *column* (never the caller-supplied metadata), so a forged
-        # `metadata.workflow_run_id` cannot push a free-floating task
-        # into the workflow state machine. Runs in terminal states are
-        # short-circuited inside `on_task_completed`.
-        if target in TERMINAL_TASK_STATES:
-            row = self.store.query_one(
-                "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
-            )
-            if row is not None and row["workflow_run_id"]:
-                try:
-                    self.workflow_runtime.on_task_completed(task_id, target)
-                except Exception:  # noqa: BLE001 - runtime side-effects must not abort the transition
-                    import logging
-
-                    logging.getLogger(__name__).exception(
-                        "workflow runtime failed to advance on task %s", task_id
+            # Domain-event outbox: queue *intent* to perform external
+            # side-effects in the same transaction as the state change.
+            # The actual side-effects (workflow runtime, Beads sync) are
+            # dispatched post-commit by `drain_domain_events`, and
+            # replayed on the next drain if this process dies between
+            # COMMIT and dispatch.
+            if target in TERMINAL_TASK_STATES:
+                row = conn.execute(
+                    "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if row is not None and row["workflow_run_id"]:
+                    self._enqueue_domain_event(
+                        conn,
+                        "workflow.advance",
+                        {"task_id": task_id, "terminal_state": target},
+                        task_id=task_id,
                     )
-        transitioned = self.get_task(task_id)
-        if target in {TaskState.FAILED.value, TaskState.CANCELLED.value}:
-            self._sync_beads_reopen(transitioned, actor, target, detail or {})
-        return transitioned
+            if target in {TaskState.FAILED.value, TaskState.CANCELLED.value}:
+                self._enqueue_domain_event(
+                    conn,
+                    "beads.reopen",
+                    {
+                        "task_id": task_id,
+                        "actor": actor,
+                        "state": target,
+                        "detail": detail or {},
+                    },
+                    task_id=task_id,
+                )
+        # All state + history + outbox intents are committed atomically
+        # at this point. Drain the outbox best-effort; any failures stay
+        # marked pending for the next drain pass or process restart.
+        self.drain_domain_events()
+        return self.get_task(task_id)
 
     def claim_task(self, task_id: str, agent_id: str, lease_seconds: int = 900) -> Tuple[Task, Lease]:
         task = self.get_task(task_id)
@@ -1518,16 +1531,26 @@ class ControlPlane:
                 """,
                 (AgentStatus.BUSY.value, task_id, now, now, agent_id),
             )
-        self._record_history(
-            task_id,
-            "task.claimed",
-            agent_id,
-            task.state,
-            TaskState.CLAIMED.value,
-            {"lease_id": lease_id, "expires_at": expires_at},
-        )
+            # History + outbox intent committed atomically with the claim
+            # itself, so a crash here cannot leave Beads out-of-sync with
+            # a successfully claimed task — the next drain replays it.
+            self._record_history(
+                task_id,
+                "task.claimed",
+                agent_id,
+                task.state,
+                TaskState.CLAIMED.value,
+                {"lease_id": lease_id, "expires_at": expires_at},
+                conn=conn,
+            )
+            self._enqueue_domain_event(
+                conn,
+                "beads.claim",
+                {"task_id": task_id, "actor": agent_id},
+                task_id=task_id,
+            )
+        self.drain_domain_events()
         claimed_task = self.get_task(task_id)
-        self._sync_beads_claim(claimed_task, agent_id)
         return claimed_task, self.get_lease(lease_id)
 
     def start_task(self, task_id: str, agent_id: str) -> Task:
@@ -2465,24 +2488,12 @@ class ControlPlane:
         if task_id is not None:
             self._validate_publication_evidence(str(task_id), evidence_id)
         publication = self.reviews.publish_task(*args, **kwargs)
-        self._sync_beads_close(self.get_task(publication.task_id), publication.created_by)
-        # publish_task transitions the underlying task to COMPLETED inside
-        # its own transaction (bypassing transition_task), so we run the
-        # workflow runtime hook here so workflow runs advance on publish.
-        row = self.store.query_one(
-            "SELECT workflow_run_id FROM tasks WHERE id = ?", (publication.task_id,)
-        )
-        if row is not None and row["workflow_run_id"]:
-            try:
-                self.workflow_runtime.on_task_completed(
-                    publication.task_id, TaskState.COMPLETED.value
-                )
-            except Exception:  # noqa: BLE001
-                import logging
-
-                logging.getLogger(__name__).exception(
-                    "workflow runtime failed to advance after publish_task"
-                )
+        # `publish_task` already enqueued beads.close + (when applicable)
+        # workflow.advance domain events inside its transaction, so both
+        # the COMPLETED state change and the *intent* to deliver those
+        # side-effects committed together. Drain the outbox now;
+        # leftovers stay pending for the next drain pass.
+        self.drain_domain_events()
         return publication
 
     def _validate_publication_evidence(self, task_id: str, evidence_id: Optional[str]) -> None:
@@ -4224,6 +4235,179 @@ class ControlPlane:
         )
 
     # Internal helpers
+
+    # ------------------------------------------------------------------
+    # Domain-event outbox
+    #
+    # Task lifecycle transitions used to update the core `tasks` row in a
+    # transaction, then fire workflow-runtime and Beads side-effects after
+    # the COMMIT. That left a window where a process crash (or any later
+    # exception during the side-effect) silently lost the side-effect: the
+    # task was already in the new state, but Beads never learned about it
+    # and the workflow run never advanced.
+    #
+    # `_enqueue_domain_event` writes the *intent* to perform a side-effect
+    # into the `domain_events` table inside the same transaction as the
+    # state change. `drain_domain_events` then drains pending rows after
+    # commit (and can be called at startup to recover any rows the
+    # previous process committed but never dispatched). The result is
+    # at-least-once delivery: handlers must tolerate replay.
+    # ------------------------------------------------------------------
+
+    # Dispatcher table is populated lazily so subclasses/tests can swap
+    # handlers via `register_domain_event_handler` if needed.
+    def _domain_event_dispatchers(self) -> Dict[str, Any]:
+        cached = getattr(self, "_domain_event_dispatch_cache", None)
+        if cached is not None:
+            return cached
+        cached = {
+            "beads.claim": self._dispatch_beads_claim_event,
+            "beads.close": self._dispatch_beads_close_event,
+            "beads.reopen": self._dispatch_beads_reopen_event,
+            "workflow.advance": self._dispatch_workflow_advance_event,
+        }
+        self._domain_event_dispatch_cache = cached
+        return cached
+
+    def register_domain_event_handler(self, event_type: str, handler: Any) -> None:
+        """Override or extend the dispatch table for a given event_type.
+
+        Tests use this to intercept side-effects; production callers can
+        plug in additional outbox consumers without modifying the core
+        transition code.
+        """
+        self._domain_event_dispatchers()[event_type] = handler
+
+    def _enqueue_domain_event(
+        self,
+        conn: Any,
+        event_type: str,
+        payload: Dict[str, Any],
+        task_id: Optional[str] = None,
+    ) -> str:
+        """Append an outbox row in the *same* transaction as the caller.
+
+        `conn` MUST be the transaction connection the caller already
+        owns. Returns the new event id so callers can correlate (mostly
+        useful for tests).
+        """
+        event_id = new_id("evt")
+        when = utcnow()
+        conn.execute(
+            """
+            INSERT INTO domain_events
+                (id, task_id, event_type, payload, status, attempts, created_at)
+            VALUES (?, ?, ?, ?, 'pending', 0, ?)
+            """,
+            (event_id, task_id, event_type, json_dumps(payload), when),
+        )
+        return event_id
+
+    def drain_domain_events(self, max_events: int = 256) -> int:
+        """Drain pending outbox rows. Safe to call from anywhere.
+
+        Returns the number of events successfully delivered. Failures
+        are recorded on the row and left as ``pending`` so the next
+        drain (or process start) retries them. Handlers are expected to
+        be idempotent — at-least-once delivery means replays will
+        happen across process restarts.
+        """
+        rows = self.store.query_all(
+            "SELECT id, task_id, event_type, payload, attempts "
+            "FROM domain_events WHERE status = 'pending' "
+            "ORDER BY created_at, id LIMIT ?",
+            (int(max_events),),
+        )
+        if not rows:
+            return 0
+        dispatchers = self._domain_event_dispatchers()
+        delivered = 0
+        for row in rows:
+            event_id = row["id"]
+            event_type = row["event_type"]
+            payload = json_loads(row["payload"], {})
+            handler = dispatchers.get(event_type)
+            if handler is None:
+                # No handler registered. Park the row as failed so it
+                # doesn't get re-processed forever — but keep the audit
+                # trail intact. Operators can re-register a handler and
+                # re-mark the row pending if they need to.
+                self.store.execute(
+                    "UPDATE domain_events SET status='failed', attempts=attempts+1, "
+                    "last_error=? WHERE id=?",
+                    ("no handler registered for %s" % event_type, event_id),
+                )
+                continue
+            try:
+                handler(payload)
+            except Exception as exc:  # noqa: BLE001 - capture for retry
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "domain event %s (%s) dispatch failed", event_id, event_type
+                )
+                self.store.execute(
+                    "UPDATE domain_events SET attempts = attempts + 1, "
+                    "last_error = ? WHERE id = ?",
+                    (str(exc)[:2000], event_id),
+                )
+                continue
+            self.store.execute(
+                "UPDATE domain_events SET status='delivered', attempts=attempts+1, "
+                "delivered_at=? WHERE id=?",
+                (utcnow(), event_id),
+            )
+            delivered += 1
+        return delivered
+
+    def _dispatch_beads_claim_event(self, payload: Dict[str, Any]) -> None:
+        task_id = payload.get("task_id")
+        actor = payload.get("actor")
+        if not task_id or not actor:
+            return
+        try:
+            task = self.get_task(str(task_id))
+        except NotFoundError:
+            return
+        self._sync_beads_claim(task, str(actor))
+
+    def _dispatch_beads_close_event(self, payload: Dict[str, Any]) -> None:
+        task_id = payload.get("task_id")
+        actor = payload.get("actor")
+        if not task_id or not actor:
+            return
+        try:
+            task = self.get_task(str(task_id))
+        except NotFoundError:
+            return
+        self._sync_beads_close(task, str(actor))
+
+    def _dispatch_beads_reopen_event(self, payload: Dict[str, Any]) -> None:
+        task_id = payload.get("task_id")
+        actor = payload.get("actor")
+        state = payload.get("state")
+        detail = payload.get("detail") or {}
+        if not task_id or not actor or not state:
+            return
+        try:
+            task = self.get_task(str(task_id))
+        except NotFoundError:
+            return
+        self._sync_beads_reopen(task, str(actor), str(state), detail)
+
+    def _dispatch_workflow_advance_event(self, payload: Dict[str, Any]) -> None:
+        task_id = payload.get("task_id")
+        terminal_state = payload.get("terminal_state")
+        if not task_id or not terminal_state:
+            return
+        # Re-check that the task is still attached to a workflow run, in
+        # case the run was severed between enqueue and drain.
+        row = self.store.query_one(
+            "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
+        )
+        if row is None or not row["workflow_run_id"]:
+            return
+        self.workflow_runtime.on_task_completed(str(task_id), str(terminal_state))
 
     def _record_history(
         self,
