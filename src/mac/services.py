@@ -4947,7 +4947,13 @@ class ControlPlane:
                         task.id,
                         "%s_registered_fallback" % action,
                     )
-                    if fallback.returncode == 0:
+                    if fallback.returncode == 0 and self._push_beads_writeback(
+                        registered_path,
+                        actor,
+                        task,
+                        binding["bead_id"],
+                        "%s_registered_fallback" % action,
+                    ):
                         self.record_log(
                             "bridge.beads.sync.%s.registered_fallback" % action,
                             layer="control_plane",
@@ -4970,6 +4976,8 @@ class ControlPlane:
                             fallback_output,
                         )
                 raise ValidationError(output)
+            if not self._push_beads_writeback(repo_path, actor, task, binding["bead_id"], action):
+                raise ValidationError("Beads writeback push failed")
             self.record_log(
                 "bridge.beads.sync.%s" % action,
                 layer="control_plane",
@@ -4995,6 +5003,51 @@ class ControlPlane:
                 },
             )
             return False
+
+    def _push_beads_writeback(
+        self,
+        repo_path: Path,
+        actor: str,
+        task: Task,
+        bead_id: str,
+        action: str,
+    ) -> bool:
+        if not _truthy_env("MAC_BEADS_PUSH_WRITEBACKS", "1"):
+            return True
+        completed = subprocess.run(
+            [_beads_cli(), "dolt", "push"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if completed.returncode == 0:
+            self.record_log(
+                "bridge.beads.writeback_pushed",
+                layer="control_plane",
+                source=actor,
+                subject_type="task",
+                subject_id=task.id,
+                detail={"action": action, "bead_id": bead_id, "repo_path": str(repo_path)},
+            )
+            return True
+        output = (completed.stderr or completed.stdout or "").strip()
+        self.record_log(
+            "bridge.beads.writeback_push_failed",
+            layer="control_plane",
+            source=actor,
+            level="warning",
+            subject_type="task",
+            subject_id=task.id,
+            detail={
+                "action": action,
+                "bead_id": bead_id,
+                "repo_path": str(repo_path),
+                "error": output[:1000],
+            },
+        )
+        return False
 
     def _append_beads_ledger_comment(
         self,

@@ -2367,8 +2367,13 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     cp.claim_task(task.id, worker.id)
     cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "canary failed"})
 
-    update_calls = [call for call in calls if call["command"][3] == "update"]
-    comment_calls = [call for call in calls if call["command"][3] == "comment"]
+    update_calls = [
+        call for call in calls if len(call["command"]) > 3 and call["command"][3] == "update"
+    ]
+    comment_calls = [
+        call for call in calls if len(call["command"]) > 3 and call["command"][3] == "comment"
+    ]
+    push_calls = [call for call in calls if call["command"] == [bd_cli, "dolt", "push"]]
     assert update_calls[0] == {
         "command": [bd_cli, "--actor", worker.id, "update", "mac-sync", "--claim"],
         "cwd": str(repo),
@@ -2400,6 +2405,7 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     assert "event=state_failed" in comments
     assert "event=state_failed_summary" in comments
     assert "canary failed" in comments
+    assert len(push_calls) == len(update_calls) + len(comment_calls)
 
 
 def test_beads_bridge_backfills_retry_exhausted_failure_summary_to_beads(
@@ -2611,12 +2617,71 @@ def test_beads_sync_falls_back_to_registered_checkout_when_bridge_db_is_broken(
             "command": [bd_cli, "--actor", "bridge", "comment", "mac-sync", "failure cause"],
             "cwd": str(repo),
         },
+        {
+            "command": [bd_cli, "dolt", "push"],
+            "cwd": str(repo),
+        },
     ]
     names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
     assert "bridge.beads.sync.ledger.registered_fallback" in names
     assert cp.get_beads_repository(repo_record.id).metadata["beads_bridge_checkout_path"] == str(
         bridge
     )
+
+
+def test_beads_sync_returns_false_when_writeback_push_fails(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-sync",
+                "title": "Sync lifecycle",
+                "description": "sync claim and failure",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp._import_bead_issue(
+        repo_record,
+        {
+            "_type": "issue",
+            "id": "mac-sync",
+            "title": "Sync lifecycle",
+            "description": "sync claim and failure",
+            "status": "open",
+            "priority": 0,
+            "created_at": "2026-05-20T00:00:00Z",
+            "dependency_count": 0,
+        },
+        actor="bridge",
+    )
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        if command == [bd_cli, "dolt", "push"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="remote rejected")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    assert not cp._run_bd_for_task(
+        task,
+        ["comment", "mac-sync", "failure cause"],
+        "bridge",
+        "ledger",
+    )
+    names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
+    assert "bridge.beads.writeback_push_failed" in names
+    assert "bridge.beads.ledger_failed" in names
 
 
 def test_beads_export_noise_can_be_restored_after_sync(cp, tmp_path, monkeypatch):
@@ -2714,6 +2779,10 @@ def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkey
     assert calls == [
         {
             "command": [bd_cli, "--actor", worker.id, "update", "mac-reconcile", "--claim"],
+            "cwd": str(repo),
+        },
+        {
+            "command": [bd_cli, "dolt", "push"],
             "cwd": str(repo),
         }
     ]
@@ -2829,8 +2898,12 @@ def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
     cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
 
-    close_calls = [call for call in calls if call["command"][3] == "close"]
-    comment_calls = [call for call in calls if call["command"][3] == "comment"]
+    close_calls = [
+        call for call in calls if len(call["command"]) > 3 and call["command"][3] == "close"
+    ]
+    comment_calls = [
+        call for call in calls if len(call["command"]) > 3 and call["command"][3] == "comment"
+    ]
     assert calls[0] == {
         "command": [bd_cli, "--actor", worker.id, "update", "mac-close", "--claim"],
         "cwd": str(repo),
