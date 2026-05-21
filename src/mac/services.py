@@ -5219,7 +5219,10 @@ class ControlPlane:
         reconciliation = ensure_json_object(metadata.get("beads_reconciliation"))
         fields = self._latest_failure_context(task, detail)
         fingerprint = self._failure_summary_fingerprint(task, fields)
-        if reconciliation.get("failure_summary_comment_fingerprint") == fingerprint:
+        if (
+            reconciliation.get("failure_summary_comment_fingerprint") == fingerprint
+            and reconciliation.get("failure_summary_pushed_fingerprint") == fingerprint
+        ):
             return False
         note = self._failure_summary_text(task, fields)
         note_ok = self._run_bd_for_task(
@@ -5240,6 +5243,7 @@ class ControlPlane:
         reconciliation.update(
             {
                 "failure_summary_comment_fingerprint": fingerprint,
+                "failure_summary_pushed_fingerprint": fingerprint,
                 "failure_summary_comment_at": utcnow(),
                 "failure_summary_comment_event": event,
             }

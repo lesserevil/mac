@@ -2468,6 +2468,14 @@ def test_beads_bridge_backfills_retry_exhausted_failure_summary_to_beads(
         "failed_task_reopen_limit": 1,
         "retry_exhausted_at": "2026-05-21T00:00:00+00:00",
     }
+    stale_task = cp.get_task(task.id)
+    stale_task.metadata["beads_reconciliation"] = metadata["beads_reconciliation"]
+    metadata["beads_reconciliation"]["failure_summary_comment_fingerprint"] = (
+        cp._failure_summary_fingerprint(
+            stale_task,
+            cp._latest_failure_context(stale_task, None),
+        )
+    )
     cp.store.execute(
         "UPDATE tasks SET metadata = ? WHERE id = ?",
         (json.dumps(metadata), task.id),
@@ -2526,6 +2534,9 @@ def test_beads_bridge_backfills_retry_exhausted_failure_summary_to_beads(
     fingerprint = cp.get_task(task.id).metadata["beads_reconciliation"][
         "failure_summary_comment_fingerprint"
     ]
+    assert cp.get_task(task.id).metadata["beads_reconciliation"][
+        "failure_summary_pushed_fingerprint"
+    ] == fingerprint
     calls.clear()
 
     again = cp.poll_beads_repositories(force=True, actor="bridge")
