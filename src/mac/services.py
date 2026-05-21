@@ -3580,8 +3580,21 @@ class ControlPlane:
         actor: str,
         state: JsonDict,
     ) -> None:
-        if not (repo_path / ".beads").exists():
+        beads_dir = repo_path / ".beads"
+        if not beads_dir.exists():
             return
+        try:
+            beads_dir.chmod(0o700)
+        except OSError:
+            pass
+        embedded = beads_dir / "embeddeddolt"
+        if embedded.exists():
+            try:
+                if any(embedded.iterdir()):
+                    state["beads_bootstrap"] = "already_exists"
+                    return
+            except OSError:
+                pass
         try:
             completed = subprocess.run(
                 [_beads_cli(), "bootstrap", "--yes"],
@@ -3599,8 +3612,12 @@ class ControlPlane:
             state["beads_bootstrap"] = "ok"
             self._restore_beads_tracked_exports(repo_path, actor, repo.id, "bootstrap")
             return
+        output = (completed.stderr or completed.stdout or "").strip()
+        if "database exists" in output.lower():
+            state["beads_bootstrap"] = "already_exists"
+            return
         state["beads_bootstrap"] = "failed"
-        state["beads_bootstrap_error"] = (completed.stderr or completed.stdout or "").strip()[:1000]
+        state["beads_bootstrap_error"] = output[:1000]
 
     def _git_output(self, repo_path: Path, args: List[str], timeout: int = 20) -> JsonDict:
         completed = subprocess.run(
