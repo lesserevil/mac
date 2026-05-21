@@ -1099,6 +1099,75 @@ def test_default_reviewer_requires_review_capability(cp):
     assert result["status"] == "published"
 
 
+def test_default_review_reassigns_stale_pending_reviewer(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    stale_reviewer = register_agent(cp, "operator-reviewer", ["review"])
+    live_reviewer = register_agent(cp, "rocky", ["review"])
+    task = cp.create_task(
+        "needs-live-reviewer",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://r"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    stale_review = cp.request_review(task.id, stale_reviewer.id, actor="old-workflow")
+    cp.store.execute(
+        "UPDATE agents SET last_seen_at = ? WHERE id = ?",
+        ("2020-01-01T00:00:00+00:00", stale_reviewer.id),
+    )
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["reviewer_agent_id"] == live_reviewer.id
+    reviews = cp.list_reviews(task.id)
+    assert [review.status for review in reviews] == [
+        ReviewStatus.RETRACTED.value,
+        ReviewStatus.PENDING.value,
+    ]
+    assert reviews[0].id == stale_review.id
+    assert reviews[0].reason == "reviewer_unavailable:reviewer_stale"
+    assert reviews[1].reviewer_agent_id == live_reviewer.id
+    names = {event.name for event in cp.list_observability(limit=50)}
+    assert "workflow.default_review.retracted" in names
+    assert "workflow.default_review.assigned" in names
+
+
+def test_default_review_waits_when_only_reviewer_is_stale(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "stale-reviewer", ["review"])
+    cp.store.execute(
+        "UPDATE agents SET last_seen_at = ? WHERE id = ?",
+        ("2020-01-01T00:00:00+00:00", reviewer.id),
+    )
+    task = cp.create_task("needs-fresh-reviewer", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer"
+    assert cp.list_reviews(task.id) == []
+
+
 def test_default_reviewer_refuses_same_persona_as_executor(cp):
     """mac-v2i: two agents souled to the same persona can't approve
     each other. The second-eyes role only matters if the eyes are
@@ -1675,6 +1744,36 @@ def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
     assert task.metadata["origin"]["repository_contract"]["project"] == "repo-beads-mac"
     assert task.metadata["acc_metadata"]["beads_sync_close_on_complete"] is True
     assert task.metadata["acc_metadata"]["repository_contract_schema"] == "mac.repository_contract.v1"
+
+
+def test_beads_bridge_pulls_existing_embedded_dolt_database(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repository_contract(repo)
+    beads_dir = repo / ".beads"
+    beads_dir.mkdir()
+    embedded = beads_dir / "embeddeddolt"
+    embedded.mkdir()
+    (embedded / "marker").write_text("db exists", encoding="utf-8")
+    fake_bd = tmp_path / "bd"
+    fake_bd.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    state = {}
+
+    cp._bootstrap_beads_bridge_checkout(repo_record, repo, "test", state)
+
+    assert state["beads_bootstrap"] == "already_exists"
+    assert state["beads_dolt_pull"] == "ok"
+    assert [str(fake_bd), "dolt", "pull"] in calls
 
 
 def test_beads_bridge_records_authority_drift_when_jsonl_export_disagrees_with_db(cp, tmp_path, monkeypatch):

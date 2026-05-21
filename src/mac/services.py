@@ -3011,6 +3011,29 @@ class ControlPlane:
             }
 
         review = self._default_review_for_task(task_id)
+        if review is not None and review.status == ReviewStatus.PENDING.value:
+            reviewer_issue = self._default_reviewer_unavailable_reason_for_id(
+                task,
+                review.reviewer_agent_id,
+            )
+            if reviewer_issue is not None:
+                self._retract_default_review(
+                    review,
+                    actor,
+                    "reviewer_unavailable:%s" % reviewer_issue,
+                )
+                self._record_default_review_observation(
+                    task_id,
+                    "workflow.default_review.retracted",
+                    "warning",
+                    {
+                        "review_id": review.id,
+                        "reviewer_agent_id": review.reviewer_agent_id,
+                        "reason": reviewer_issue,
+                    },
+                    actor,
+                )
+                review = None
         if review is None:
             reviewer = self._select_default_reviewer(task)
             if reviewer is None:
@@ -3926,11 +3949,17 @@ class ControlPlane:
             beads_dir.chmod(0o700)
         except OSError:
             pass
+        role = self._git_output(repo_path, ["config", "beads.role", "maintainer"])
+        if role["returncode"] == 0:
+            state["beads_role"] = "maintainer"
+        else:
+            state["beads_role_error"] = role.get("stderr") or role.get("stdout") or "git config failed"
         embedded = beads_dir / "embeddeddolt"
         if embedded.exists():
             try:
                 if any(embedded.iterdir()):
                     state["beads_bootstrap"] = "already_exists"
+                    self._sync_beads_database(repo_path, actor, repo.id, state)
                     return
             except OSError:
                 pass
@@ -3950,13 +3979,70 @@ class ControlPlane:
         if completed.returncode == 0:
             state["beads_bootstrap"] = "ok"
             self._restore_beads_tracked_exports(repo_path, actor, repo.id, "bootstrap")
+            self._sync_beads_database(repo_path, actor, repo.id, state)
             return
         output = (completed.stderr or completed.stdout or "").strip()
         if "database exists" in output.lower():
             state["beads_bootstrap"] = "already_exists"
+            self._sync_beads_database(repo_path, actor, repo.id, state)
             return
         state["beads_bootstrap"] = "failed"
         state["beads_bootstrap_error"] = output[:1000]
+
+    def _sync_beads_database(
+        self,
+        repo_path: Path,
+        actor: str,
+        subject_id: str,
+        state: JsonDict,
+    ) -> None:
+        try:
+            completed = subprocess.run(
+                [_beads_cli(), "dolt", "pull"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - JSONL/DB read can still report drift.
+            state["beads_dolt_pull"] = "error"
+            state["beads_dolt_pull_error"] = str(exc)
+            self.record_log(
+                "bridge.beads.dolt_pull_failed",
+                layer="control_plane",
+                source=actor,
+                level="warning",
+                subject_type="environment",
+                subject_id=subject_id,
+                detail={
+                    "path": str(repo_path),
+                    "error": str(exc),
+                },
+            )
+            return
+        output = (completed.stderr or completed.stdout or "").strip()
+        if completed.returncode == 0:
+            state["beads_dolt_pull"] = "ok"
+            if output:
+                state["beads_dolt_pull_output"] = output[:1000]
+            return
+        state["beads_dolt_pull"] = "failed"
+        state["beads_dolt_pull_returncode"] = int(completed.returncode)
+        state["beads_dolt_pull_error"] = output[:2000]
+        self.record_log(
+            "bridge.beads.dolt_pull_failed",
+            layer="control_plane",
+            source=actor,
+            level="warning",
+            subject_type="environment",
+            subject_id=subject_id,
+            detail={
+                "path": str(repo_path),
+                "returncode": int(completed.returncode),
+                "output": output[:2000],
+            },
+        )
 
     def _git_output(self, repo_path: Path, args: List[str], timeout: int = 20) -> JsonDict:
         completed = subprocess.run(
@@ -5971,6 +6057,35 @@ class ControlPlane:
         verdict = str(manifest.get("verdict") or "").strip().lower()
         return verdict if verdict in {"approved", "rejected"} else "approved"
 
+    def _retract_default_review(self, review: Review, actor: str, reason: str) -> None:
+        now = utcnow()
+        self.store.execute(
+            """
+            UPDATE reviews
+            SET status = ?, reason = ?, completed_at = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                ReviewStatus.RETRACTED.value,
+                reason,
+                now,
+                review.id,
+                ReviewStatus.PENDING.value,
+            ),
+        )
+        self._record_history(
+            review.task_id,
+            "task.review_retracted",
+            actor,
+            None,
+            None,
+            {
+                "review_id": review.id,
+                "reviewer_agent_id": review.reviewer_agent_id,
+                "reason": reason,
+            },
+        )
+
     def _select_default_reviewer(self, task: Task) -> Optional[Agent]:
         """Pick a default reviewer for ``task``.
 
@@ -5995,28 +6110,12 @@ class ControlPlane:
 
         candidates: List[Agent] = []
         for agent in self.list_agents():
-            if agent.health_status != HealthStatus.HEALTHY.value:
-                continue
-            if agent.status == AgentStatus.OFFLINE.value:
-                continue
-            if self.reviews.agent_has_owned_task(task.id, agent.id):
-                continue
-            if "review" not in set(agent.capabilities):
-                continue
-            agent_tenant, agent_persona_slug = self._agent_tenant_and_persona(agent)
-            # Tenant gate: if the task has a tenant, the agent's soul
-            # must be in the same one. Agents without a soul are
-            # ineligible to act as reviewers in tenant-scoped flows.
-            if task_tenant is not None:
-                if agent_tenant is None or agent_tenant != task_tenant:
-                    continue
-            # Anti-collusion: peers from the same persona can't endorse
-            # each other.
-            if (
-                executor_persona_slug is not None
-                and agent_persona_slug is not None
-                and agent_persona_slug == executor_persona_slug
-            ):
+            if self._default_reviewer_unavailable_reason(
+                task,
+                agent,
+                task_tenant=task_tenant,
+                executor_persona_slug=executor_persona_slug,
+            ) is not None:
                 continue
             candidates.append(agent)
         if not candidates:
@@ -6029,6 +6128,74 @@ class ControlPlane:
             )
         )
         return candidates[0]
+
+    def _default_reviewer_unavailable_reason_for_id(
+        self,
+        task: Task,
+        reviewer_agent_id: str,
+    ) -> Optional[str]:
+        try:
+            agent = self.get_agent(reviewer_agent_id)
+        except NotFoundError:
+            return "reviewer_missing"
+        return self._default_reviewer_unavailable_reason(task, agent)
+
+    def _default_reviewer_unavailable_reason(
+        self,
+        task: Task,
+        agent: Agent,
+        *,
+        task_tenant: Optional[str] = None,
+        executor_persona_slug: Optional[str] = None,
+    ) -> Optional[str]:
+        if agent.health_status != HealthStatus.HEALTHY.value:
+            return "reviewer_unhealthy"
+        if agent.status not in {AgentStatus.IDLE.value, AgentStatus.BUSY.value}:
+            return "reviewer_not_available"
+        if not self._agent_seen_recently(agent, self._default_reviewer_stale_after_seconds()):
+            return "reviewer_stale"
+        if self.reviews.agent_has_owned_task(task.id, agent.id):
+            return "reviewer_owned_task"
+        if "review" not in set(agent.capabilities):
+            return "reviewer_missing_capability"
+        if task_tenant is None:
+            task_tenant = self._task_tenant_id(task)
+        if executor_persona_slug is None:
+            executor_persona_slug = self._task_executor_persona_slug(task)
+        agent_tenant, agent_persona_slug = self._agent_tenant_and_persona(agent)
+        if task_tenant is not None and (agent_tenant is None or agent_tenant != task_tenant):
+            return "reviewer_wrong_tenant"
+        if (
+            executor_persona_slug is not None
+            and agent_persona_slug is not None
+            and agent_persona_slug == executor_persona_slug
+        ):
+            return "reviewer_same_persona"
+        return None
+
+    def _default_reviewer_stale_after_seconds(self) -> int:
+        raw = (
+            os.environ.get("MAC_DEFAULT_REVIEWER_STALE_AFTER_SECONDS", "").strip()
+            or os.environ.get("MAC_AGENT_STALE_AFTER_SECONDS", "").strip()
+        )
+        if not raw:
+            return 300
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 300
+
+    def _agent_seen_recently(self, agent: Agent, stale_after_seconds: int) -> bool:
+        try:
+            seen_at = parse_time(agent.last_seen_at)
+            now = parse_time(utcnow())
+        except Exception:  # noqa: BLE001 - malformed timestamps should fail closed.
+            return False
+        if seen_at.tzinfo is None and now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        if seen_at.tzinfo is not None and now.tzinfo is None:
+            seen_at = seen_at.replace(tzinfo=None)
+        return (now - seen_at).total_seconds() <= max(1, int(stale_after_seconds))
 
     def _agent_tenant_and_persona(self, agent: Agent) -> Tuple[Optional[str], Optional[str]]:
         """Return ``(tenant_id, persona_slug)`` for an agent, both

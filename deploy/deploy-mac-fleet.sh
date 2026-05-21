@@ -899,6 +899,9 @@ bootstrap_beads_repositories() {
       cat "$log_path"
       exit 1
     fi
+    if ! (cd "$repo_path" && "$MAC_BEADS_CLI" dolt pull) >> "$log_path" 2>&1; then
+      log "WARNING: Beads Dolt pull failed for $repo_path; bridge polling will report authority drift if the embedded DB is stale"
+    fi
   done <<EOF
 ${raw//;/$'\n'}
 EOF

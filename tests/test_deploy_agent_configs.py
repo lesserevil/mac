@@ -96,6 +96,7 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     assert 'values.setdefault("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")' in script
     assert 'values.setdefault("MAC_BEADS_BRIDGE_ROOT", str(mac_home / "beads-checkouts"))' in script
     assert 'bootstrap --yes' in script
+    assert 'dolt pull' in script
     source_install_block = script.split('mv "$SRC_DIR.new" "$SRC_DIR"', 1)[1].split(
         'log "creating/updating mac environment file"', 1
     )[0]
