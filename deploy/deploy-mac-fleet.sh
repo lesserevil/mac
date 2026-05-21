@@ -1638,6 +1638,58 @@ else
   write_migration_status "no_acc_sqlite_db" ""
 fi
 
+# print_redacted_unit_summary <unit> [restart_since]
+#
+# Replacement for `systemctl status <unit>` that NEVER prints the full
+# ExecStart command line, /proc/<pid>/cmdline, or the cgroup process tree.
+# `systemctl status` (and `--no-pager -l status`) renders argv for every
+# process under the unit, which leaks bearer tokens that worker harnesses
+# may pass on the command line. This helper instead pulls a small allow-list
+# of fields via `systemctl show -p` (key=value, no cmdline), redacts any
+# value that looks like a bearer token as a defense-in-depth measure, and
+# falls back to journalctl for a short tail of recent log lines (which is
+# already secret-aware via HERMES_REDACT_SECRETS).
+print_redacted_unit_summary() {
+  local unit="$1"
+  local since="${2:-}"
+  local props
+  props="$(sudo systemctl show "$unit" \
+    -p LoadState -p ActiveState -p SubState -p Result \
+    -p UnitFileState -p MainPID -p ExecMainStatus \
+    -p ExecMainStartTimestamp -p NRestarts -p TasksCurrent \
+    -p MemoryCurrent -p CPUUsageNSec 2>/dev/null || true)"
+  echo "----- $unit (redacted summary) -----"
+  if [ -n "$props" ]; then
+    # Guardrail: scrub any value that smells like a credential. The allow-list
+    # above already excludes ExecStart/Environment/MainPIDExecutable, but if
+    # systemd ever inlines an argv into one of these properties we still want
+    # the deploy log to ship a sanitized form.
+    printf '%s\n' "$props" | "$PY" -c '
+import re
+import sys
+
+KEY_PATTERN = re.compile(r"(?i)(token|secret|password|api[_-]?key|bearer)")
+TOKEN_PATTERN = re.compile(r"\b(eyJ[\w\-.]+|[A-Za-z0-9_\-]{32,})\b")
+for line in sys.stdin.read().splitlines():
+    if not line or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if KEY_PATTERN.search(key):
+        print("%s=<redacted>" % key)
+        continue
+    redacted = TOKEN_PATTERN.sub("<redacted>", value)
+    print("%s=%s" % (key, redacted))
+'
+  else
+    echo "  (systemctl show returned no properties)"
+  fi
+  if [ -n "$since" ]; then
+    echo "----- $unit recent log lines (max 20) -----"
+    sudo journalctl -u "$unit" --since "$since" --no-pager -n 20 2>/dev/null || true
+  fi
+  echo "----- end $unit -----"
+}
+
 install_linux_service() {
   local unit="/etc/systemd/system/mac.service" restart_since
   log "installing systemd service $unit"
@@ -1674,7 +1726,7 @@ EOF
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac.service
   sleep 3
-  sudo systemctl --no-pager -l status mac.service || true
+  print_redacted_unit_summary mac.service "$restart_since"
   sudo journalctl -u mac.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
   install_linux_hermes_service
 }
@@ -1730,6 +1782,13 @@ export PATH="$HOME/.mac/bin:$PATH"
 : "${MAC_HUB_URL:?MAC_HUB_URL is required}"
 : "${MAC_WORKER_TOKEN:?MAC_WORKER_TOKEN is required}"
 
+# Pass the bearer token via environment only. mac-agent's --token argument
+# defaults to $MAC_TOKEN, so keeping it out of argv prevents the secret from
+# being captured by `systemctl status`, `ps`, journald cmdline fields, or any
+# other tool that scrapes /proc/<pid>/cmdline.
+export MAC_TOKEN="$MAC_WORKER_TOKEN"
+unset MAC_WORKER_TOKEN
+
 agent_name="${MAC_WORKER_AGENT_NAME:-$(hostname -s 2>/dev/null || hostname)}"
 host_name="${MAC_WORKER_HOSTNAME:-$agent_name}"
 workspace="${MAC_WORKER_WORKSPACE:-$HOME/.mac/agent-workspaces}"
@@ -1740,7 +1799,6 @@ mkdir -p "$workspace"
 common=(
   "$HOME/.mac/venv/bin/mac-agent"
   --url "$MAC_HUB_URL"
-  --token "$MAC_WORKER_TOKEN"
   --register
   --agent-name "$agent_name"
   --hostname "$host_name"
@@ -2102,7 +2160,7 @@ EOF
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac-hermes-gateway.service
   sleep 5
-  sudo systemctl --no-pager -l status mac-hermes-gateway.service || true
+  print_redacted_unit_summary mac-hermes-gateway.service "$restart_since"
   sudo journalctl -u mac-hermes-gateway.service --since "$restart_since" --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
   install_linux_agent_service
 }
@@ -2144,7 +2202,7 @@ EOF
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac-agent.service
   sleep 3
-  sudo systemctl --no-pager -l status mac-agent.service || true
+  print_redacted_unit_summary mac-agent.service "$restart_since"
   sudo journalctl -u mac-agent.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
