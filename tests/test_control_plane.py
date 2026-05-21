@@ -2374,7 +2374,17 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
         "cwd": str(repo),
     }
     assert update_calls[1]["cwd"] == str(repo)
-    assert update_calls[1]["command"][:7] == [
+    assert update_calls[1]["command"][:5] == [
+        bd_cli,
+        "--actor",
+        worker.id,
+        "update",
+        "mac-sync",
+    ]
+    assert update_calls[1]["command"][5] == "--append-notes"
+    assert "canary failed" in update_calls[1]["command"][6]
+    assert update_calls[2]["cwd"] == str(repo)
+    assert update_calls[2]["command"][:7] == [
         bd_cli,
         "--actor",
         worker.id,
@@ -2383,12 +2393,144 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
         "--status",
         "open",
     ]
-    assert update_calls[1]["command"][7] == "--append-notes"
-    assert "canary failed" in update_calls[1]["command"][8]
+    assert update_calls[2]["command"][7] == "--append-notes"
+    assert "canary failed" in update_calls[2]["command"][8]
     comments = "\n".join(call["command"][5] for call in comment_calls)
     assert "event=claimed" in comments
     assert "event=state_failed" in comments
+    assert "event=state_failed_summary" in comments
     assert "canary failed" in comments
+
+
+def test_beads_bridge_backfills_retry_exhausted_failure_summary_to_beads(
+    cp, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-failed",
+                "title": "Explain failed work",
+                "description": "operator needs cause",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    monkeypatch.setenv("MAC_BEADS_CLI", str(tmp_path / "missing-bd"))
+    monkeypatch.setenv("MAC_BEADS_FAILED_TASK_REOPEN_LIMIT", "1")
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "executor completed without mac-evidence.json",
+        worker.id,
+        metadata={
+            "returncode": 0,
+            "verification": {
+                "schema": "mac.worker_evidence.v1",
+                "status": "missing",
+                "problems": ["mac-evidence.json was not produced by the executor"],
+            },
+        },
+    )
+    cp.transition_task(
+        task.id,
+        TaskState.FAILED.value,
+        worker.id,
+        {
+            "reason": "verification_contract_failed",
+            "problems": ["verification.status must be \"complete\""],
+            "evidence_id": evidence.id,
+        },
+    )
+    metadata = cp.get_task(task.id).metadata
+    metadata["beads_reconciliation"] = {
+        "schema": "mac.beads_reconciliation.v1",
+        "failed_task_reopen_count": 1,
+        "failed_task_reopen_limit": 1,
+        "retry_exhausted_at": "2026-05-21T00:00:00+00:00",
+    }
+    cp.store.execute(
+        "UPDATE tasks SET metadata = ? WHERE id = ?",
+        (json.dumps(metadata), task.id),
+    )
+
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
+    calls = []
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        calls.append({"command": command, "cwd": cwd})
+
+        class Completed:
+            returncode = 0
+            stdout = (
+                json.dumps(
+                    [
+                        {
+                            "_type": "issue",
+                            "id": "mac-failed",
+                            "title": "Explain failed work",
+                            "description": "operator needs cause",
+                            "status": "open",
+                            "priority": 0,
+                            "created_at": "2026-05-20T00:00:00Z",
+                            "dependency_count": 0,
+                        }
+                    ]
+                )
+                if "ready" in command
+                else ""
+            )
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    report = cp.poll_beads_repositories(force=True, actor="bridge")
+
+    assert report["retry_exhausted_count"] == 1
+    update_notes = [
+        call["command"][6]
+        for call in calls
+        if call["command"][3:6] == ["update", "mac-failed", "--append-notes"]
+    ]
+    comments = [
+        call["command"][5]
+        for call in calls
+        if call["command"][3:5] == ["comment", "mac-failed"]
+    ]
+    assert any("verification_contract_failed" in note for note in update_notes)
+    assert any(evidence.id in note for note in update_notes)
+    assert any("event=retry_exhausted_summary" in comment for comment in comments)
+    assert any("verification.status must be" in comment for comment in comments)
+    fingerprint = cp.get_task(task.id).metadata["beads_reconciliation"][
+        "failure_summary_comment_fingerprint"
+    ]
+    calls.clear()
+
+    again = cp.poll_beads_repositories(force=True, actor="bridge")
+
+    assert again["retry_exhausted_count"] == 1
+    assert cp.get_task(task.id).metadata["beads_reconciliation"][
+        "failure_summary_comment_fingerprint"
+    ] == fingerprint
+    assert not [
+        call for call in calls if call["command"][3:5] == ["comment", "mac-failed"]
+    ]
 
 
 def test_beads_export_noise_can_be_restored_after_sync(cp, tmp_path, monkeypatch):

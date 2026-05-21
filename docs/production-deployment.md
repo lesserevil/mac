@@ -398,6 +398,12 @@ Mirrored milestones include:
 - `retry_reopened`, `retry_exhausted`: Beads reconciliation decisions for
   failed mapped tasks.
 
+For failed work, mac also appends a concise failure summary to the Bead notes
+and comments. The summary is derived from mac task history and evidence, and
+includes the failure reason, verification problems, evidence id, and retry
+exhaustion state when available. This is the human-facing breadcrumb for why an
+otherwise open Bead is not currently progressing.
+
 Lease renewals are intentionally not mirrored to Beads; they remain in mac task
 history and observability so issue logs do not fill with heartbeat noise.
 Ledger comment failures are logged as `bridge.beads.ledger_failed` and do not

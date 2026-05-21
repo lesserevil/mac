@@ -4898,13 +4898,13 @@ class ControlPlane:
             "source": str(origin.get("source") or task.metadata.get("source") or "").strip(),
         }
 
-    def _run_bd_for_task(self, task: Task, args: List[str], actor: str, action: str) -> None:
+    def _run_bd_for_task(self, task: Task, args: List[str], actor: str, action: str) -> bool:
         binding = self._beads_binding_for_task(task)
         if binding is None:
-            return
+            return False
         repo_path = self._beads_sync_path_for_binding(binding, actor)
         if not repo_path.exists():
-            return
+            return False
         try:
             completed = subprocess.run(
                 [_beads_cli(), "--actor", actor, *args],
@@ -4930,7 +4930,7 @@ class ControlPlane:
                             "output": output[:1000],
                         },
                     )
-                    return
+                    return True
                 raise ValidationError(output)
             self.record_log(
                 "bridge.beads.sync.%s" % action,
@@ -4940,6 +4940,7 @@ class ControlPlane:
                 subject_id=task.id,
                 detail={"bead_id": binding["bead_id"], "repo_path": str(repo_path)},
             )
+            return True
         except Exception as exc:  # noqa: BLE001 - Beads sync is secondary to task state.
             self.record_log(
                 "bridge.beads.ledger_failed" if action == "ledger" else "bridge.beads.sync_failed",
@@ -4955,6 +4956,7 @@ class ControlPlane:
                     "error": str(exc),
                 },
             )
+            return False
 
     def _append_beads_ledger_comment(
         self,
@@ -4964,13 +4966,13 @@ class ControlPlane:
         message: str,
         *,
         fields: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         binding = self._beads_binding_for_task(task)
         if binding is None:
-            return
+            return False
         acc_metadata = task.metadata.get("acc_metadata") if isinstance(task.metadata, dict) else {}
         if isinstance(acc_metadata, dict) and acc_metadata.get("beads_sync_ledger_comments") is False:
-            return
+            return False
         pieces = [
             "mac-ledger v1",
             "task=%s" % task.id,
@@ -4988,12 +4990,175 @@ class ControlPlane:
                     _compact_beads_ledger_text(value, limit=160),
                 )
             )
-        self._run_bd_for_task(
+        return self._run_bd_for_task(
             task,
             ["comment", binding["bead_id"], " | ".join(pieces)],
             actor,
             "ledger",
         )
+
+    def _latest_failure_context(
+        self,
+        task: Task,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> JsonDict:
+        fields: JsonDict = {}
+        source_detail = detail if isinstance(detail, dict) else {}
+        if source_detail.get("reason"):
+            fields["failure_reason"] = source_detail.get("reason")
+        problems = source_detail.get("problems")
+        if isinstance(problems, list) and problems:
+            fields["failure_problems"] = "; ".join(str(item) for item in problems[:4])
+        if source_detail.get("evidence_id"):
+            fields["evidence_id"] = source_detail.get("evidence_id")
+
+        if not fields.get("failure_reason") or not fields.get("failure_problems"):
+            row = self.store.query_one(
+                """
+                SELECT detail, actor, created_at FROM task_history
+                WHERE task_id = ?
+                  AND (
+                    (event_type = 'task.transitioned' AND to_state = ?)
+                    OR event_type = 'task.beads_retry_exhausted'
+                  )
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (task.id, TaskState.FAILED.value),
+            )
+            if row is not None:
+                hist_detail = ensure_json_object(json_loads(row["detail"], {}))
+                fields.setdefault("failure_actor", row["actor"])
+                fields.setdefault("failure_at", row["created_at"])
+                if hist_detail.get("reason"):
+                    fields.setdefault("failure_reason", hist_detail.get("reason"))
+                hist_problems = hist_detail.get("problems")
+                if isinstance(hist_problems, list) and hist_problems:
+                    fields.setdefault(
+                        "failure_problems",
+                        "; ".join(str(item) for item in hist_problems[:4]),
+                    )
+                if hist_detail.get("evidence_id"):
+                    fields.setdefault("evidence_id", hist_detail.get("evidence_id"))
+
+        evidence: Optional[Evidence] = None
+        evidence_id = str(fields.get("evidence_id") or "").strip()
+        if evidence_id:
+            try:
+                evidence = self.get_evidence(evidence_id)
+            except NotFoundError:
+                evidence = None
+        if evidence is None:
+            rows = self.store.query_all(
+                "SELECT * FROM evidence WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (task.id,),
+            )
+            if rows:
+                evidence = self._evidence_from_row(rows[0])
+        if evidence is not None:
+            fields.setdefault("evidence_id", evidence.id)
+            fields.setdefault("evidence_kind", evidence.kind)
+            fields.setdefault("evidence_by", evidence.created_by)
+            if evidence.summary:
+                fields.setdefault("evidence_summary", evidence.summary)
+            metadata = ensure_json_object(evidence.metadata)
+            if metadata.get("returncode") is not None:
+                fields.setdefault("returncode", metadata.get("returncode"))
+            verification = ensure_json_object(metadata.get("verification"))
+            verification_problems = verification.get("problems")
+            if isinstance(verification_problems, list) and verification_problems:
+                fields.setdefault(
+                    "verification_problems",
+                    "; ".join(str(item) for item in verification_problems[:4]),
+                )
+            if verification.get("status"):
+                fields.setdefault("verification_status", verification.get("status"))
+            if verification.get("summary"):
+                fields.setdefault("verification_summary", verification.get("summary"))
+        if not fields.get("failure_reason") and fields.get("verification_problems"):
+            fields["failure_reason"] = "verification_contract_failed"
+        return fields
+
+    def _failure_summary_text(self, task: Task, fields: JsonDict) -> str:
+        reason = _compact_beads_ledger_text(
+            fields.get("failure_reason") or "failed task", limit=120
+        )
+        problems = _compact_beads_ledger_text(
+            fields.get("failure_problems") or fields.get("verification_problems") or "",
+            limit=220,
+        )
+        evidence = _compact_beads_ledger_text(fields.get("evidence_id") or "", limit=80)
+        parts = ["mac task %s failed: %s" % (task.id, reason)]
+        if problems:
+            parts.append("problems: %s" % problems)
+        if evidence:
+            parts.append("evidence: %s" % evidence)
+        return " | ".join(parts)
+
+    def _failure_summary_fingerprint(self, task: Task, fields: JsonDict) -> str:
+        payload = {
+            "task_id": task.id,
+            "state": task.state,
+            "reason": fields.get("failure_reason"),
+            "problems": fields.get("failure_problems") or fields.get("verification_problems"),
+            "evidence_id": fields.get("evidence_id"),
+            "retry_exhausted_at": ensure_json_object(
+                task.metadata.get("beads_reconciliation")
+                if isinstance(task.metadata, dict)
+                else {}
+            ).get("retry_exhausted_at"),
+        }
+        digest = hashlib.sha256(
+            json_dumps(payload).encode("utf-8")
+        ).hexdigest()
+        return "sha256:%s" % digest
+
+    def _append_beads_failure_summary_if_needed(
+        self,
+        task: Task,
+        actor: str,
+        *,
+        detail: Optional[Dict[str, Any]] = None,
+        event: str = "failure_summary",
+    ) -> bool:
+        binding = self._beads_binding_for_task(task)
+        if binding is None:
+            return False
+        metadata = ensure_json_object(task.metadata)
+        reconciliation = ensure_json_object(metadata.get("beads_reconciliation"))
+        fields = self._latest_failure_context(task, detail)
+        fingerprint = self._failure_summary_fingerprint(task, fields)
+        if reconciliation.get("failure_summary_comment_fingerprint") == fingerprint:
+            return False
+        note = self._failure_summary_text(task, fields)
+        note_ok = self._run_bd_for_task(
+            task,
+            ["update", binding["bead_id"], "--append-notes", note],
+            actor,
+            "failure_note",
+        )
+        comment_ok = self._append_beads_ledger_comment(
+            task,
+            actor,
+            event,
+            note,
+            fields=fields,
+        )
+        if not (note_ok or comment_ok):
+            return False
+        reconciliation.update(
+            {
+                "failure_summary_comment_fingerprint": fingerprint,
+                "failure_summary_comment_at": utcnow(),
+                "failure_summary_comment_event": event,
+            }
+        )
+        metadata["beads_reconciliation"] = reconciliation
+        self.store.execute(
+            "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+            (json_dumps(metadata), utcnow(), task.id),
+        )
+        return True
 
     def _sync_beads_transition_ledger(
         self,
@@ -5028,6 +5193,8 @@ class ControlPlane:
         problems = detail.get("problems") if isinstance(detail, dict) else None
         if isinstance(problems, list) and problems:
             fields["problems"] = "; ".join(str(item) for item in problems[:4])
+        if to_state == TaskState.FAILED.value:
+            fields.update(self._latest_failure_context(task, detail))
         self._append_beads_ledger_comment(
             task,
             actor,
@@ -5040,6 +5207,13 @@ class ControlPlane:
             ),
             fields=fields,
         )
+        if to_state == TaskState.FAILED.value:
+            self._append_beads_failure_summary_if_needed(
+                task,
+                actor,
+                detail=detail,
+                event="state_failed_summary",
+            )
 
     def _beads_sync_path_for_binding(self, binding: JsonDict, actor: str) -> Path:
         repo_id = str(binding.get("repository_id") or "").strip()
@@ -5177,7 +5351,14 @@ class ControlPlane:
             self._sync_beads_claim(task, task.owner_agent_id or actor)
             return "active_claim_synced"
         if task.state == TaskState.FAILED.value:
-            return self._reopen_failed_beads_task(task, actor, issue=issue)
+            result = self._reopen_failed_beads_task(task, actor, issue=issue)
+            if result == "retry_exhausted":
+                self._append_beads_failure_summary_if_needed(
+                    self.get_task(task.id),
+                    actor,
+                    event="retry_exhausted_summary",
+                )
+            return result
         if task.state in TERMINAL_TASK_STATES:
             return "terminal_ignored"
         return "inactive_ignored"
@@ -5316,6 +5497,7 @@ class ControlPlane:
             "failed_task_reopen_count": retry_count,
             "failed_task_reopen_limit": retry_limit,
         }
+        detail.update(self._latest_failure_context(task))
         with self.store.transaction() as conn:
             cursor = conn.execute(
                 "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND state = ?",
@@ -5347,6 +5529,12 @@ class ControlPlane:
             "retry_exhausted",
             "failed mac task exhausted automatic Beads retries",
             fields=detail,
+        )
+        self._append_beads_failure_summary_if_needed(
+            self.get_task(task.id),
+            actor,
+            detail=detail,
+            event="retry_exhausted_summary",
         )
         return True
 
