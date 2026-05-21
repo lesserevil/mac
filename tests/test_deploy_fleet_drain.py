@@ -3,10 +3,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "deploy" / "deploy-mac-fleet.sh"
+DEPLOY_LIB = ROOT / "deploy" / "lib" / "mac-fleet"
 
 
 def script_text():
-    return DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    parts = [DEPLOY_SCRIPT.read_text(encoding="utf-8")]
+    parts.extend(
+        path.read_text(encoding="utf-8")
+        for path in sorted(DEPLOY_LIB.glob("*.sh"))
+    )
+    return "\n".join(parts)
 
 
 def test_deploy_drains_worker_before_stopping_services():
