@@ -298,11 +298,13 @@ MAC_BEADS_BRIDGE_ROOT=$HOME/.mac/beads-checkouts
 MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac:repo-beads-mac:repo-beads-mac::30
 ```
 
-The deploy bootstrap installs the `bd` CLI into `~/.mac/bin/bd` from the
-configured Beads source (`MAC_DEPLOY_BEADS_REPO_URL`, `MAC_DEPLOY_BEADS_REF`)
-when it is not already present, then runs `bd bootstrap --yes` for each
-configured Beads repository so fresh clones have a writable Beads database, not
-only tracked JSONL. Production deploys set
+The deploy bootstrap installs the `gh` CLI into `~/.mac/bin/gh` and the `bd`
+CLI into `~/.mac/bin/bd`. `gh` is required so worker branches can become GitHub
+PRs instead of stranded pushed refs. `bd` is built from the configured Beads
+source (`MAC_DEPLOY_BEADS_REPO_URL`, `MAC_DEPLOY_BEADS_REF`) when it is not
+already present, then deploy runs `bd bootstrap --yes` for each configured
+Beads repository so fresh clones have a writable Beads database, not only
+tracked JSONL. Production deploys set
 `MAC_BEADS_RESTORE_TRACKED_EXPORTS=1`, so Beads may keep its embedded
 operational state while tracked export noise in `.beads/issues.jsonl` and
 `.beads/config.yaml` is restored after bootstrap and claim/close sync.

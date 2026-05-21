@@ -111,6 +111,19 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     ).read_text(encoding="utf-8")
 
 
+def test_fleet_deploy_installs_github_cli_for_workers():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert "install_github_cli()" in script
+    assert 'install_github_cli' in script.split('mv "$SRC_DIR.new" "$SRC_DIR"', 1)[1].split(
+        'log "creating/updating mac environment file"', 1
+    )[0]
+    assert 'brew install gh' in script
+    assert 'sudo apt-get install -y gh' in script
+    assert 'https://cli.github.com/packages' in script
+    assert 'export PATH="$HOME/.mac/bin:$PATH"' in script
+
+
 def test_fleet_deploy_applies_hermes_patch_set():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
     quench_patch = ROOT / "deploy" / "hermes" / "disable-shutdown-chat-notices.patch"
@@ -132,9 +145,19 @@ def test_executor_prompt_includes_repository_runtime_contract():
     assert "origin.repository_path / $MAC_TASK_REPO_SOURCE as read-only" in script
     assert "bootstrap.command" in script
     assert "test.command" in script
+    assert "returncode=0, status=pass, result=passed" in script
+
+
+def test_reviewer_prompt_includes_verdict_contract():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert "repo copied from the executor verification repo object" in script
+    assert "worktree_digest as sha256" in script
+    assert "reviewed_evidence_id=%s" in script
 
 
 def test_mac_repository_contract_test_command_uses_local_venv_path():
     contract = yaml.safe_load((ROOT / ".mac" / "project.yaml").read_text(encoding="utf-8"))
 
     assert contract["test"]["command"] == "PATH=.venv/bin:$PATH .venv/bin/python -m pytest"
+    assert "gh" in contract["toolchain"]["required_commands"]

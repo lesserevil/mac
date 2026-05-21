@@ -1792,15 +1792,46 @@ def _worker_passed_verification_check_count(manifest: JsonDict) -> int:
     return count
 
 
+PASSING_VERIFICATION_WORDS = {"pass", "passed", "success", "successful", "succeeded", "ok"}
+
+
+def _worker_int_value(value: Any) -> Optional[int]:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _worker_verification_item_passed(item: Any) -> bool:
+    if isinstance(item, list):
+        return any(_worker_verification_item_passed(nested) for nested in item)
     if not isinstance(item, dict):
         return False
     if "returncode" in item:
-        try:
-            return int(item["returncode"]) == 0
-        except (TypeError, ValueError):
-            return False
-    return str(item.get("status") or "").strip().lower() == "pass"
+        return _worker_int_value(item["returncode"]) == 0
+    failed = _worker_int_value(item.get("failed"))
+    if failed is not None and failed > 0:
+        return False
+    for key in ("status", "result", "outcome"):
+        if str(item.get(key) or "").strip().lower() in PASSING_VERIFICATION_WORDS:
+            return True
+    for key in ("passed", "success", "succeeded", "ok", "satisfied"):
+        value = item.get(key)
+        if value is True:
+            return True
+        number = _worker_int_value(value)
+        if number is not None and number > 0 and failed == 0:
+            return True
+    bool_values = [value for value in item.values() if isinstance(value, bool)]
+    if bool_values and len(bool_values) == len(item) and all(bool_values):
+        return True
+    return any(
+        _worker_verification_item_passed(nested)
+        for nested in item.values()
+        if isinstance(nested, (dict, list))
+    )
 
 
 def _run_git(repo: Path, args: List[str]) -> subprocess.CompletedProcess[str]:

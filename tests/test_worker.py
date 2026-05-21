@@ -192,6 +192,53 @@ def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: P
     assert any(item.subject_id == task.id for item in observations)
 
 
+def test_mac_worker_accepts_structured_passed_result_evidence(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    task = cp.create_task("Python task", required_capabilities=["python"])
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        _write_worker_manifest(
+            task_dir,
+            evidence_type="repo_change",
+            files_changed=["src/example.py"],
+            extra={
+                "tests": {
+                    "framework": "pytest",
+                    "command": "python -m pytest tests/test_example.py",
+                    "result": "passed",
+                    "passed": 3,
+                    "failed": 0,
+                    "additional_smoke": {
+                        "result": "passed",
+                        "passed": 132,
+                        "failed": 0,
+                    },
+                },
+                "checks": {
+                    "branch_pushed": True,
+                    "git_head_matches_remote": True,
+                    "working_tree_clean": True,
+                },
+            },
+        )
+        return WorkerExecution(0, "manifest validates")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path,
+        executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
 def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: Path):
     cp = ControlPlane.in_memory()
     machine = cp.register_machine("review-host")

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
 BIN_DIR = "Scripts" if os.name == "nt" else "bin"
 VENV_PYTHON = VENV / BIN_DIR / ("python.exe" if os.name == "nt" else "python")
+REQUIRED_COMMANDS = ("python3", "git", "gh", "bd")
 
 
 def run(command: list[str]) -> None:
@@ -24,6 +26,13 @@ def run(command: list[str]) -> None:
 def main() -> int:
     if not (ROOT / "pyproject.toml").exists():
         print("bootstrap-project.py must be run from a mac checkout", file=sys.stderr)
+        return 2
+    missing = [command for command in REQUIRED_COMMANDS if shutil.which(command) is None]
+    if missing:
+        print(
+            "missing required command(s): %s" % ", ".join(missing),
+            file=sys.stderr,
+        )
         return 2
 
     print(

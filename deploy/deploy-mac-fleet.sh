@@ -816,6 +816,59 @@ install_beads_cli() {
   "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
 }
 
+install_github_cli() {
+  local target="$MAC_HOME/bin/gh" existing=""
+  mkdir -p "$MAC_HOME/bin"
+  if [ -x "$target" ]; then
+    log "GitHub CLI already installed at $target"
+    "$target" --version > "$LOG_DIR/gh-version.txt" 2>&1 || true
+    return 0
+  fi
+  existing="$(command -v gh 2>/dev/null || true)"
+  if [ -z "$existing" ]; then
+    for candidate in /opt/homebrew/bin/gh /usr/local/bin/gh "$HOME/.local/bin/gh" "$HOME/bin/gh"; do
+      if [ -x "$candidate" ]; then
+        existing="$candidate"
+        break
+      fi
+    done
+  fi
+  if [ -z "$existing" ]; then
+    if [ "$OS_KIND" = "darwin" ] && command -v brew >/dev/null 2>&1; then
+      log "installing GitHub CLI with Homebrew"
+      HOMEBREW_NO_AUTO_UPDATE=1 brew install gh >/dev/null
+      existing="$(command -v gh 2>/dev/null || true)"
+    elif [ "$OS_KIND" = "linux" ] && command -v apt-get >/dev/null 2>&1; then
+      log "installing GitHub CLI with apt"
+      if ! (sudo apt-get update >/dev/null && sudo apt-get install -y gh >/dev/null); then
+        if command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+          log "configuring upstream GitHub CLI apt repository"
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y gh >/dev/null
+        else
+          log "ERROR: gh is required but apt install failed and curl/gpg/dpkg fallback tools are unavailable"
+          exit 1
+        fi
+      fi
+      existing="$(command -v gh 2>/dev/null || true)"
+    fi
+  fi
+  if [ -z "$existing" ] || [ ! -x "$existing" ]; then
+    log "ERROR: GitHub CLI (gh) is required for worker publication but could not be installed"
+    exit 1
+  fi
+  ln -sf "$existing" "$target" 2>/dev/null || cp -f "$existing" "$target"
+  chmod 0755 "$target"
+  "$target" --version > "$LOG_DIR/gh-version.txt"
+  log "GitHub CLI ready at $target"
+}
+
 bootstrap_beads_repositories() {
   local raw="${MAC_BEADS_REPOSITORIES:-}" entry rest repo_path index log_path
   [ -n "$raw" ] || return 0
@@ -1330,6 +1383,7 @@ mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
 install_beads_cli
+install_github_cli
 
 log "creating/updating mac environment file"
 "$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" <<'PY'
@@ -1634,6 +1688,7 @@ set +u
 [ -f "$HOME/.mac/mac.env" ] && . "$HOME/.mac/mac.env"
 set -u
 set +a
+export PATH="$HOME/.mac/bin:$PATH"
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 export HERMES_DISABLE_LAZY_INSTALLS=1
 export HERMES_REDACT_SECRETS=true
@@ -1666,6 +1721,7 @@ set -euo pipefail
 set -a
 . "$HOME/.mac/mac.env"
 set +a
+export PATH="$HOME/.mac/bin:$PATH"
 
 : "${MAC_HUB_URL:?MAC_HUB_URL is required}"
 : "${MAC_WORKER_TOKEN:?MAC_WORKER_TOKEN is required}"
@@ -1962,6 +2018,8 @@ def main() -> int:
                     review_context.get("executor_evidence_id", ""),
                     review_context.get("review_id", ""),
                 ),
+                "A review verdict must also include repo copied from the executor verification repo object, with the same repo.head_sha, plus at least one independent passing check as checks=[{\"name\":\"...\",\"returncode\":0}] or status=\"pass\".",
+                "Include worktree_digest as sha256:<64 lowercase hex chars>. If you cannot independently verify the executor result, write verdict=rejected and explain the blocker instead of omitting repo/check fields.",
                 "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
             ]
         )
@@ -1973,7 +2031,7 @@ def main() -> int:
                 "When you finish, report the exact outcome, files changed, tests run, and any blockers.",
                 "Also write a verifiable evidence manifest to $MAC_TASK_WORKSPACE/mac-evidence.json.",
                 "Use schema mac.worker_evidence.v1 with status=complete and evidence_type set to one of repo_change, documentation, investigation, deployment, test, artifact, or no_change.",
-                "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
+                "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. Passing tests/checks should use returncode=0, status=pass, result=passed, or boolean/count fields that make success unambiguous. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
                 "Repository runtime contract:\n%s" % repository_contract_section(task),
                 "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
             ]
@@ -2105,6 +2163,7 @@ set -euo pipefail
 set -a
 . "$HOME/.mac/mac.env"
 set +a
+export PATH="$HOME/.mac/bin:$PATH"
 export HERMES_REDACT_SECRETS=true
 exec "$HOME/.mac/venv/bin/uvicorn" mac.api:create_app --factory --host "${MAC_BIND_HOST:-127.0.0.1}" --port "${MAC_PORT:-8789}" --workers 1 --log-level info
 EOF

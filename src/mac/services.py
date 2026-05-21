@@ -5148,26 +5148,87 @@ class ControlPlane:
         # Canonical names only (mac-q38): ``tests`` and ``checks``.
         # ``test_runs`` was an alias; rejecting it here.
         count = 0
-        for item in _manifest_list(manifest.get("tests")):
+        for item in self._verification_item_candidates(manifest.get("tests")):
             if self._verification_item_passed(item):
                 count += 1
-        for item in _manifest_list(manifest.get("checks")):
+        for item in self._verification_item_candidates(manifest.get("checks")):
             if self._verification_item_passed(item):
                 count += 1
         return count
 
+    def _verification_item_candidates(self, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return [value]
+        return []
+
     def _verification_item_passed(self, item: Any) -> bool:
-        # Canonical: returncode=0 OR status=="pass" (mac-q38). The
-        # earlier accept-list (passed/success/succeeded/ok plus a
-        # ``result`` alias) was four extra doors; reject them.
+        # Keep repo fields canonical, but accept common structured pass/fail
+        # spellings for test/check result objects. Agents and tools naturally
+        # emit "result=passed", booleans, and nested smoke/full-suite records;
+        # rejecting those equivalent facts caused good pushed work to dead-letter.
+        if isinstance(item, list):
+            return any(self._verification_item_passed(nested) for nested in item)
         if not isinstance(item, dict):
             return False
         if "returncode" in item:
-            try:
-                return int(item["returncode"]) == 0
-            except (TypeError, ValueError):
-                return False
-        return str(item.get("status") or "").strip().lower() == "pass"
+            return self._verification_int_value(item["returncode"]) == 0
+        failed = self._verification_int_value(item.get("failed"))
+        if failed is not None and failed > 0:
+            return False
+        if str(item.get("status") or "").strip().lower() in {
+            "pass",
+            "passed",
+            "success",
+            "successful",
+            "succeeded",
+            "ok",
+        }:
+            return True
+        if str(item.get("result") or "").strip().lower() in {
+            "pass",
+            "passed",
+            "success",
+            "successful",
+            "succeeded",
+            "ok",
+        }:
+            return True
+        if str(item.get("outcome") or "").strip().lower() in {
+            "pass",
+            "passed",
+            "success",
+            "successful",
+            "succeeded",
+            "ok",
+        }:
+            return True
+        for key in ("passed", "success", "succeeded", "ok", "satisfied"):
+            value = item.get(key)
+            if value is True:
+                return True
+            number = self._verification_int_value(value)
+            if number is not None and number > 0 and failed == 0:
+                return True
+        bool_values = [value for value in item.values() if isinstance(value, bool)]
+        if bool_values and len(bool_values) == len(item) and all(bool_values):
+            return True
+        return any(
+            self._verification_item_passed(nested)
+            for nested in item.values()
+            if isinstance(nested, (dict, list))
+        )
+
+    def _verification_int_value(self, value: Any) -> Optional[int]:
+        try:
+            if isinstance(value, bool):
+                return int(value)
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _evidence_returncode(self, evidence: Evidence) -> Optional[int]:
         value = evidence.metadata.get("returncode")

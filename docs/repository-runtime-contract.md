@@ -18,6 +18,8 @@ toolchain:
   required_commands:
     - python3
     - git
+    - gh
+    - bd
 bootstrap:
   command: python3 scripts/bootstrap-project.py
   creates:
@@ -42,7 +44,9 @@ evidence:
   `darwin`, `linux`, and `wsl2`; document narrower distro assumptions inside
   the bootstrap script instead of assuming Ubuntu.
 - `toolchain.required_commands`: commands that must exist before bootstrap can
-  run. Keep this list small and portable.
+  run. Keep this list small and portable. mac fleet deploy installs baseline
+  worker tools such as `gh` and `bd`; project bootstrap scripts should fail
+  loudly when a required command is still missing.
 - `bootstrap.command`: an idempotent command run from the repository root to
   create the local build/test environment.
 - `bootstrap.creates`: relative paths expected after bootstrap. These are used
@@ -78,8 +82,8 @@ mac declares its own contract in `.mac/project.yaml`. Its bootstrap command is:
 python3 scripts/bootstrap-project.py
 ```
 
-That script creates `.venv` and installs the dev extra so a fresh macOS, Linux,
-or WSL2 agent can run:
+That script first verifies `python3`, `git`, `gh`, and `bd`, then creates
+`.venv` and installs the dev extra so a fresh macOS, Linux, or WSL2 agent can run:
 
 ```bash
 PATH=.venv/bin:$PATH .venv/bin/python -m pytest
