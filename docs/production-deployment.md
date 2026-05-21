@@ -294,6 +294,7 @@ MAC_BEADS_BRIDGE_ON_HEARTBEAT=1
 MAC_BEADS_BRIDGE_HUB_AGENT=rocky
 MAC_BEADS_AUTO_PULL=1
 MAC_BEADS_CLI=$HOME/.mac/bin/bd
+MAC_BEADS_BRIDGE_ROOT=$HOME/.mac/beads-checkouts
 MAC_BEADS_REPOSITORIES=mac=$HOME/.mac/src/mac:repo-beads-mac:repo-beads-mac::30
 ```
 
@@ -304,25 +305,32 @@ configured Beads repository so fresh clones have a writable Beads database, not
 only tracked JSONL. Production deploys set
 `MAC_BEADS_RESTORE_TRACKED_EXPORTS=1`, so Beads may keep its embedded
 operational state while tracked export noise in `.beads/issues.jsonl` and
-`.beads/config.yaml` is restored after bootstrap and claim/close sync. This
-keeps `~/.mac/src/mac` clean enough for AgentBus self-update pulls.
+`.beads/config.yaml` is restored after bootstrap and claim/close sync.
+
+The hub does not poll the live runtime checkout directly. Each git-backed
+registered repository is cloned or refreshed into a managed bridge checkout
+under `MAC_BEADS_BRIDGE_ROOT`, and polling plus Beads claim/close sync run
+there. The registered path remains the canonical project path that workers use
+to create task-owned worktrees, but bridge polling is isolated from local
+self-update, deploy, and repair activity in `~/.mac/src/mac`.
 
 On each Rocky heartbeat or lease renewal, the control plane
 polls every enabled registered repository whose poll interval has elapsed. The
-poller first checks git source state. With `MAC_BEADS_AUTO_PULL=1` (default), a
-clean checkout with an upstream is fast-forwarded before Beads are read. If
-tracked files are dirty, or fetch/pull fails, the bridge does not silently poll
-ambiguous local state; it returns `source_dirty` or `source_refresh_error`, logs
+poller first refreshes the managed bridge checkout. With `MAC_BEADS_AUTO_PULL=1`
+(default), the bridge checkout is cloned if missing, fetches its upstream, and
+is checked out to the registered branch's upstream ref before Beads are read.
+Dirty tracked files in the managed bridge checkout are reset because that tree
+is owned by the bridge; dirty files in the registered runtime checkout are
+recorded in `bridge.beads.repository_source` but do not block polling. If the
+managed checkout cannot be cloned or refreshed, the bridge does not silently
+poll ambiguous local state; it returns `source_refresh_error`, logs
 `bridge.beads.repository_source`, writes a dashboard/Hermes notification, and
 creates one idempotent remediation task for the agent that owns that registered
 environment. Ownership is resolved from repository metadata
 (`owner_agent_id`/`owner_agent_name` and aliases), then from the polling hub
-agent. The remediation task is targeted at that agent and instructs it to fetch,
-pull with rebase/autostash or an equivalent explicit rebase workflow, reconcile
-intentional local changes, run the repository contract when needed, and leave
-the checkout clean before polling resumes. The poller then runs `bd ready
---json` when available, falling back to `.beads/issues.jsonl` parsing for simple
-local fixtures. Only `open` Beads with no active blockers are imported; blocked
+agent. The poller then runs `bd ready --json` when available, falling back to
+`.beads/issues.jsonl` parsing for simple local fixtures. Only `open` Beads with
+no active blockers are imported; blocked
 Beads wait until their blockers close. Imports are idempotent through the
 `project_items(source, external_id)` unique key.
 

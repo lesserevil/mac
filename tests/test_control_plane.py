@@ -2,6 +2,7 @@ import json
 import sqlite3
 import subprocess
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -1725,6 +1726,11 @@ def _seed_bare_beads_repo(tmp_path, issue_id="mac-old"):
 def test_beads_bridge_auto_pulls_git_repository_before_poll(cp, tmp_path, monkeypatch):
     _origin, seed, clone = _seed_bare_beads_repo(tmp_path, "mac-old")
     repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ROOT", str(tmp_path / "bridge-checkouts"))
+    first = cp.poll_beads_repositories(repo_record.id, force=True)
+    assert first["imported_count"] == 1
+    assert first["repositories"][0]["source_state"]["status"] == "cloned"
+
     (seed / ".beads" / "issues.jsonl").write_text(
         json.dumps(
             {
@@ -1750,37 +1756,59 @@ def test_beads_bridge_auto_pulls_git_repository_before_poll(cp, tmp_path, monkey
 
     assert report["imported_count"] == 1
     assert report["repositories"][0]["source_state"]["status"] == "updated"
-    assert cp.list_project_items()[0].external_id == "mac-new"
+    assert [item.external_id for item in cp.list_project_items()] == ["mac-old", "mac-new"]
 
 
-def test_beads_bridge_marks_dirty_git_repository_stale(cp, tmp_path, monkeypatch):
+def test_beads_bridge_polls_dedicated_checkout_when_registered_source_is_dirty(cp, tmp_path, monkeypatch):
     _origin, _seed, clone = _seed_bare_beads_repo(tmp_path, "mac-dirty")
     repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
     rocky = register_agent(cp, "rocky", ["python"])
-    natasha = register_agent(cp, "natasha", ["python"])
     (clone / ".beads" / "issues.jsonl").write_text(
         '{"_type":"issue","id":"local-dirty","status":"open"}\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("MAC_BEADS_AUTO_PULL", "1")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ROOT", str(tmp_path / "bridge-checkouts"))
 
     report = cp.poll_beads_repositories(repo_record.id, force=True, actor=rocky.id)
-    again = cp.poll_beads_repositories(repo_record.id, force=True, actor=rocky.id)
 
-    assert report["error_count"] == 1
-    assert report["repositories"][0]["status"] == "source_dirty"
-    assert report["repositories"][0]["remediation_task_id"]
-    assert again["repositories"][0]["remediation_task_id"] == report["repositories"][0]["remediation_task_id"]
-    assert cp.list_project_items() == []
-    remediation = cp.get_task(report["repositories"][0]["remediation_task_id"])
-    assert remediation.metadata["origin"]["type"] == "beads_source_remediation"
-    assert remediation.metadata["target_agent_id"] == rocky.id
-    assert remediation.metadata["remediation"]["required_workflow"] == "git_pull_rebase_then_merge_local_changes"
-    assert "git pull --rebase --autostash" in remediation.description
-    assert cp.claim_next_for_agent(natasha.id) is None
-    assert cp.claim_next_for_agent(rocky.id)["task"]["id"] == remediation.id
+    repo_report = report["repositories"][0]
+    source_state = repo_report["source_state"]
+    assert report["error_count"] == 0
+    assert repo_report["status"] == "ok"
+    assert source_state["checkout_policy"] == "dedicated_git_checkout"
+    assert source_state["poll_path"] != str(clone)
+    assert source_state["registered_dirty_paths"] == ["M .beads/issues.jsonl"]
+    assert [item.external_id for item in cp.list_project_items()] == ["mac-dirty"]
     notifications = cp.list_notifications(subject_id=repo_record.id)
-    assert notifications[0].event_type == "bridge.beads.source_dirty"
+    assert [item.event_type for item in notifications] == []
+
+
+def test_beads_bridge_resets_dirty_managed_checkout_before_poll(cp, tmp_path, monkeypatch):
+    _origin, seed, clone = _seed_bare_beads_repo(tmp_path, "mac-old")
+    repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ROOT", str(tmp_path / "bridge-checkouts"))
+    first = cp.poll_beads_repositories(repo_record.id, force=True)
+    bridge_path = Path(first["repositories"][0]["source_state"]["poll_path"])
+    (bridge_path / ".beads" / "issues.jsonl").write_text(
+        '{"_type":"issue","id":"local-bridge-dirty","status":"open"}\n',
+        encoding="utf-8",
+    )
+    (seed / ".beads" / "issues.jsonl").write_text(
+        '{"_type":"issue","id":"mac-new","status":"open","priority":0,"dependency_count":0}\n',
+        encoding="utf-8",
+    )
+    _git(["add", ".beads/issues.jsonl"], cwd=seed)
+    _git(["commit", "-m", "replace bead"], cwd=seed)
+    _git(["push"], cwd=seed)
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    source_state = report["repositories"][0]["source_state"]
+    assert report["error_count"] == 0
+    assert source_state["tracked_dirty_reset"] == ["M .beads/issues.jsonl"]
+    assert report["imported_count"] == 1
+    assert [item.external_id for item in cp.list_project_items()] == ["mac-old", "mac-new"]
 
 
 def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):

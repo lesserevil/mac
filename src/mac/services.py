@@ -3195,7 +3195,7 @@ class ControlPlane:
         return [self._beads_repository_from_row(row) for row in rows]
 
     def _repository_contract_for_beads_repo(self, repo: BeadsRepository) -> JsonDict:
-        contract = _load_repository_contract(Path(repo.path))
+        contract = _load_repository_contract(Path(repo.path).expanduser())
         if contract["project"] != repo.project:
             raise ValidationError(
                 "repository runtime contract project %s does not match registered project %s"
@@ -3309,8 +3309,9 @@ class ControlPlane:
                     "existing_count": 0,
                     "skipped_count": 0,
                 }
-            repository_contract = self._repository_contract_for_beads_repo(repo)
-            issues = self._ready_beads_issues(repo)
+            poll_path = Path(str(source_state.get("poll_path") or repo.path)).expanduser()
+            repository_contract = self._repository_contract_for_beads_repo_at_path(repo, poll_path)
+            issues = self._ready_beads_issues(repo, poll_path=poll_path)
             imported = 0
             existing = 0
             for issue in issues:
@@ -3364,7 +3365,10 @@ class ControlPlane:
             "schema": "mac.beads_bridge.source_state.v1",
             "repository_id": repo.id,
             "repository_name": repo.name,
+            "registered_path": str(repo_path),
             "path": str(repo_path),
+            "poll_path": str(repo_path),
+            "checkout_policy": "direct",
             "auto_pull": _truthy_env("MAC_BEADS_AUTO_PULL", "1"),
             "status": "skipped",
         }
@@ -3378,52 +3382,225 @@ class ControlPlane:
             state["status"] = "not_git"
             return state
 
+        repo_path = self._beads_repository_registered_root(repo_path, state)
+        if state.get("status") == "error":
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        state["registered_path"] = str(repo_path)
+        registered_dirty = self._git_output(repo_path, ["status", "--porcelain"])
+        if registered_dirty["returncode"] == 0:
+            dirty_paths = [
+                line.strip()
+                for line in registered_dirty.get("stdout", "").splitlines()
+                if line.strip()
+            ]
+            if dirty_paths:
+                state["registered_dirty_paths"] = dirty_paths[:50]
+                state["registered_dirty_path_count"] = len(dirty_paths)
+
+        bridge = self._ensure_beads_bridge_checkout(repo, repo_path, actor, state)
+        if state.get("status") == "error":
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        if bridge is None:
+            self._record_beads_source_state(actor, repo, state, "warning")
+            return state
+        repo_path = bridge
+        state["path"] = str(repo_path)
+        state["poll_path"] = str(repo_path)
+        state["checkout_policy"] = "dedicated_git_checkout"
+
         before = self._git_output(repo_path, ["rev-parse", "HEAD"])
         state["head_before"] = before.get("stdout", "")
-        branch = self._git_output(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"])
-        state["branch"] = branch.get("stdout", "")
-        upstream = self._git_output(
-            repo_path,
-            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        )
-        if upstream["returncode"] != 0 or not upstream.get("stdout"):
-            state["status"] = "no_upstream"
-            self._record_beads_source_state(actor, repo, state, "info")
-            return state
-        state["upstream"] = upstream["stdout"]
+        branch_name = str(state.get("branch") or "").strip()
+        upstream_ref = str(state.get("bridge_upstream_ref") or "").strip()
         dirty = self._git_output(repo_path, ["status", "--porcelain"])
         if dirty["returncode"] != 0:
             state["status"] = "error"
             state["error"] = dirty.get("stderr") or dirty.get("stdout") or "git status failed"
             self._record_beads_source_state(actor, repo, state, "warning")
             return state
-        dirty_paths = [line.strip() for line in dirty.get("stdout", "").splitlines() if line.strip()]
-        if dirty_paths:
-            state["status"] = "dirty"
-            state["dirty_paths"] = dirty_paths
-            self._record_beads_source_state(actor, repo, state, "warning")
-            return state
+        tracked_dirty_paths = [
+            line.strip()
+            for line in dirty.get("stdout", "").splitlines()
+            if line.strip() and not line.startswith("?? ")
+        ]
+        if tracked_dirty_paths:
+            reset = self._git_output(repo_path, ["reset", "--hard", "HEAD"])
+            if reset["returncode"] != 0:
+                state["status"] = "dirty"
+                state["dirty_paths"] = tracked_dirty_paths
+                state["error"] = reset.get("stderr") or reset.get("stdout") or "git reset failed"
+                self._record_beads_source_state(actor, repo, state, "warning")
+                return state
+            state["tracked_dirty_reset"] = tracked_dirty_paths[:50]
         fetch = self._git_output(repo_path, ["fetch", "--quiet", "--prune"])
         if fetch["returncode"] != 0:
             state["status"] = "error"
             state["error"] = fetch.get("stderr") or fetch.get("stdout") or "git fetch failed"
             self._record_beads_source_state(actor, repo, state, "warning")
             return state
-        pull = self._git_output(repo_path, ["pull", "--ff-only", "--quiet"])
-        if pull["returncode"] != 0:
+        if upstream_ref:
+            update = self._git_output(
+                repo_path,
+                ["checkout", "-B", branch_name or "main", upstream_ref],
+            )
+        else:
+            update = self._git_output(repo_path, ["pull", "--ff-only", "--quiet"])
+        if update["returncode"] != 0:
             state["status"] = "error"
-            state["error"] = pull.get("stderr") or pull.get("stdout") or "git pull failed"
+            state["error"] = update.get("stderr") or update.get("stdout") or "git update failed"
             self._record_beads_source_state(actor, repo, state, "warning")
             return state
         after = self._git_output(repo_path, ["rev-parse", "HEAD"])
         state["head_after"] = after.get("stdout", "")
         state["status"] = (
+            "cloned"
+            if state.get("bridge_cloned")
+            else
             "updated"
             if state.get("head_before") and state.get("head_after") != state.get("head_before")
             else "current"
         )
+        self._bootstrap_beads_bridge_checkout(repo, repo_path, actor, state)
         self._record_beads_source_state(actor, repo, state, "info")
         return state
+
+    def _repository_contract_for_beads_repo_at_path(
+        self,
+        repo: BeadsRepository,
+        repo_path: Path,
+    ) -> JsonDict:
+        contract = _load_repository_contract(repo_path)
+        if contract["project"] != repo.project:
+            raise ValidationError(
+                "repository runtime contract project %s does not match registered project %s"
+                % (contract["project"], repo.project)
+            )
+        return contract
+
+    def _beads_repository_registered_root(self, repo_path: Path, state: JsonDict) -> Path:
+        top_level = self._git_output(repo_path, ["rev-parse", "--show-toplevel"])
+        if top_level["returncode"] != 0 or not top_level.get("stdout"):
+            state["status"] = "error"
+            state["error"] = top_level.get("stderr") or top_level.get("stdout") or "git top-level failed"
+            return repo_path
+        return Path(str(top_level["stdout"])).expanduser()
+
+    def _beads_repository_poll_path(self, repo: BeadsRepository) -> Path:
+        repo_path = Path(repo.path).expanduser()
+        if repo_path.is_file() or not (repo_path / ".git").exists():
+            return repo_path
+        return self._beads_bridge_checkout_path(repo)
+
+    def _beads_bridge_checkout_path(self, repo: BeadsRepository) -> Path:
+        metadata = repo.metadata if isinstance(repo.metadata, dict) else {}
+        explicit = (
+            metadata.get("bridge_checkout_path")
+            or metadata.get("poll_checkout_path")
+            or metadata.get("beads_bridge_checkout_path")
+        )
+        if explicit:
+            return Path(str(explicit)).expanduser()
+        root_raw = (
+            os.environ.get("MAC_BEADS_BRIDGE_ROOT", "").strip()
+            or str(Path(repo.path).expanduser().parent / ".mac-beads-bridge")
+        )
+        slug = _safe_slug("%s-%s" % (repo.source or repo.name, repo.id[:8]))
+        return Path(root_raw).expanduser() / slug
+
+    def _ensure_beads_bridge_checkout(
+        self,
+        repo: BeadsRepository,
+        registered_root: Path,
+        actor: str,
+        state: JsonDict,
+    ) -> Optional[Path]:
+        branch = self._git_output(registered_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        branch_name = branch.get("stdout", "").strip() if branch["returncode"] == 0 else ""
+        if branch_name == "HEAD":
+            branch_name = ""
+        upstream = self._git_output(
+            registered_root,
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        upstream_name = upstream.get("stdout", "").strip() if upstream["returncode"] == 0 else ""
+        remote_name = "origin"
+        upstream_branch = branch_name
+        if upstream_name and "/" in upstream_name:
+            remote_name, upstream_branch = upstream_name.split("/", 1)
+        remote = self._git_output(registered_root, ["remote", "get-url", remote_name])
+        if remote["returncode"] != 0 or not remote.get("stdout"):
+            remote = self._git_output(registered_root, ["remote", "get-url", "origin"])
+            remote_name = "origin"
+        clone_url = remote.get("stdout", "").strip() if remote["returncode"] == 0 else str(registered_root)
+        bridge_path = self._beads_bridge_checkout_path(repo)
+        state["branch"] = branch_name
+        state["upstream"] = upstream_name
+        state["bridge_remote"] = remote_name
+        state["bridge_clone_url"] = clone_url
+        state["bridge_checkout_path"] = str(bridge_path)
+        if upstream_branch:
+            state["bridge_upstream_ref"] = "origin/%s" % upstream_branch
+        bridge_path.parent.mkdir(parents=True, exist_ok=True)
+        if bridge_path.exists() and not (bridge_path / ".git").exists():
+            state["status"] = "error"
+            state["error"] = "bridge checkout path exists but is not a git worktree: %s" % bridge_path
+            return None
+        if not bridge_path.exists():
+            clone = subprocess.run(
+                ["git", "clone", "--quiet", clone_url, str(bridge_path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if clone.returncode != 0:
+                state["status"] = "error"
+                state["error"] = (clone.stderr or clone.stdout or "git clone failed").strip()
+                return None
+            state["bridge_cloned"] = True
+        current_remote = self._git_output(bridge_path, ["remote", "get-url", "origin"])
+        if (
+            clone_url
+            and current_remote["returncode"] == 0
+            and current_remote.get("stdout", "").strip() != clone_url
+        ):
+            set_url = self._git_output(bridge_path, ["remote", "set-url", "origin", clone_url])
+            if set_url["returncode"] != 0:
+                state["status"] = "error"
+                state["error"] = set_url.get("stderr") or set_url.get("stdout") or "git remote set-url failed"
+                return None
+        return bridge_path
+
+    def _bootstrap_beads_bridge_checkout(
+        self,
+        repo: BeadsRepository,
+        repo_path: Path,
+        actor: str,
+        state: JsonDict,
+    ) -> None:
+        if not (repo_path / ".beads").exists():
+            return
+        try:
+            completed = subprocess.run(
+                [_beads_cli(), "bootstrap", "--yes"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - JSONL fallback can still work.
+            state["beads_bootstrap"] = "error"
+            state["beads_bootstrap_error"] = str(exc)
+            return
+        if completed.returncode == 0:
+            state["beads_bootstrap"] = "ok"
+            self._restore_beads_tracked_exports(repo_path, actor, repo.id, "bootstrap")
+            return
+        state["beads_bootstrap"] = "failed"
+        state["beads_bootstrap_error"] = (completed.stderr or completed.stdout or "").strip()[:1000]
 
     def _git_output(self, repo_path: Path, args: List[str], timeout: int = 20) -> JsonDict:
         completed = subprocess.run(
@@ -3617,10 +3794,15 @@ class ControlPlane:
         )
         return self._agent_from_row(row) if row is not None else None
 
-    def _ready_beads_issues(self, repo: BeadsRepository) -> List[JsonDict]:
-        repo_path = Path(repo.path).expanduser()
+    def _ready_beads_issues(
+        self,
+        repo: BeadsRepository,
+        *,
+        poll_path: Optional[Path] = None,
+    ) -> List[JsonDict]:
+        repo_path = poll_path or Path(repo.path).expanduser()
         if not repo_path.exists():
-            raise ValidationError("beads repository path does not exist: %s" % repo.path)
+            raise ValidationError("beads repository path does not exist: %s" % repo_path)
         if repo_path.is_file():
             return self._ready_beads_issues_from_jsonl(repo_path)
         try:
@@ -3765,13 +3947,18 @@ class ControlPlane:
         repo_path = str(origin.get("repository_path") or "").strip()
         if not bead_id or not repo_path:
             return None
-        return {"bead_id": bead_id, "repo_path": repo_path}
+        return {
+            "bead_id": bead_id,
+            "repo_path": repo_path,
+            "repository_id": str(origin.get("repository_id") or "").strip(),
+            "source": str(origin.get("source") or task.metadata.get("source") or "").strip(),
+        }
 
     def _run_bd_for_task(self, task: Task, args: List[str], actor: str, action: str) -> None:
         binding = self._beads_binding_for_task(task)
         if binding is None:
             return
-        repo_path = Path(binding["repo_path"]).expanduser()
+        repo_path = self._beads_sync_path_for_binding(binding, actor)
         if not repo_path.exists():
             return
         try:
@@ -3824,6 +4011,24 @@ class ControlPlane:
                     "error": str(exc),
                 },
             )
+
+    def _beads_sync_path_for_binding(self, binding: JsonDict, actor: str) -> Path:
+        repo_id = str(binding.get("repository_id") or "").strip()
+        if repo_id:
+            try:
+                repo = self.get_beads_repository(repo_id)
+            except NotFoundError:
+                repo = None
+            if repo is not None:
+                repo_path = Path(repo.path).expanduser()
+                if repo_path.is_file() or not (repo_path / ".git").exists():
+                    return repo_path
+                bridge_path = self._beads_bridge_checkout_path(repo)
+                if not bridge_path.exists():
+                    state = self._refresh_beads_repository_source(repo, actor)
+                    return Path(str(state.get("poll_path") or bridge_path)).expanduser()
+                return bridge_path
+        return Path(str(binding["repo_path"])).expanduser()
 
     def _restore_beads_tracked_exports(
         self,

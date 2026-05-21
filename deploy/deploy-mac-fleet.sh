@@ -1379,6 +1379,7 @@ values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
 values["MAC_SELF_UPDATE_REPO"] = str(mac_home / "src" / "mac")
 values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")
+values.setdefault("MAC_BEADS_BRIDGE_ROOT", str(mac_home / "beads-checkouts"))
 if configured_gateway_model:
     values["MAC_HERMES_GATEWAY_MODEL"] = configured_gateway_model
     values["ACC_HERMES_GATEWAY_MODEL"] = configured_gateway_model
