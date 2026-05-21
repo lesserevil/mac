@@ -3406,6 +3406,13 @@ class ControlPlane:
             self._record_beads_source_state(actor, repo, state, "warning")
             return state
         state["registered_path"] = str(repo_path)
+        self._restore_beads_tracked_exports(
+            repo_path,
+            actor,
+            repo.id,
+            "registered_source_poll",
+            subject_type="environment",
+        )
         registered_dirty = self._git_output(repo_path, ["status", "--porcelain"])
         if registered_dirty["returncode"] == 0:
             dirty_paths = [
@@ -4072,6 +4079,8 @@ class ControlPlane:
         actor: str,
         task_id: str,
         action: str,
+        *,
+        subject_type: str = "task",
     ) -> None:
         if not _truthy_env("MAC_BEADS_RESTORE_TRACKED_EXPORTS"):
             return
@@ -4103,6 +4112,13 @@ class ControlPlane:
             )
             if status.returncode != 0 or not status.stdout.strip():
                 return
+            dirty_exports = [
+                path
+                for path in (".beads/config.yaml", ".beads/issues.jsonl")
+                if any(line.endswith(path) for line in status.stdout.strip().splitlines())
+            ]
+            if not dirty_exports:
+                return
             restored = subprocess.run(
                 [
                     "git",
@@ -4112,8 +4128,7 @@ class ControlPlane:
                     "--staged",
                     "--worktree",
                     "--",
-                    ".beads/config.yaml",
-                    ".beads/issues.jsonl",
+                    *dirty_exports,
                 ],
                 capture_output=True,
                 text=True,
@@ -4126,7 +4141,7 @@ class ControlPlane:
                 "bridge.beads.tracked_exports_restored",
                 layer="control_plane",
                 source=actor,
-                subject_type="task",
+                subject_type=subject_type,
                 subject_id=task_id,
                 detail={
                     "action": action,
@@ -4140,7 +4155,7 @@ class ControlPlane:
                 layer="control_plane",
                 source=actor,
                 level="warning",
-                subject_type="task",
+                subject_type=subject_type,
                 subject_id=task_id,
                 detail={
                     "action": action,

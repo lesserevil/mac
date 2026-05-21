@@ -1784,6 +1784,47 @@ def test_beads_bridge_polls_dedicated_checkout_when_registered_source_is_dirty(c
     assert [item.event_type for item in notifications] == []
 
 
+def test_beads_bridge_restores_registered_export_noise_before_poll(cp, tmp_path, monkeypatch):
+    _origin, _seed, clone = _seed_bare_beads_repo(tmp_path, "mac-clean")
+    repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    rocky = register_agent(cp, "rocky", ["python"])
+    (clone / ".beads" / "issues.jsonl").write_text(
+        '{"_type":"issue","id":"local-export-noise","status":"open"}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(clone), "add", ".beads/issues.jsonl"],
+        check=True,
+    )
+    monkeypatch.setenv("MAC_BEADS_AUTO_PULL", "1")
+    monkeypatch.setenv("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ROOT", str(tmp_path / "bridge-checkouts"))
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True, actor=rocky.id)
+
+    source_state = report["repositories"][0]["source_state"]
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clone),
+            "status",
+            "--porcelain",
+            "--",
+            ".beads/config.yaml",
+            ".beads/issues.jsonl",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert report["error_count"] == 0
+    assert status == ""
+    assert "registered_dirty_paths" not in source_state
+    names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
+    assert "bridge.beads.tracked_exports_restored" in names
+
+
 def test_beads_bridge_resets_dirty_managed_checkout_before_poll(cp, tmp_path, monkeypatch):
     _origin, seed, clone = _seed_bare_beads_repo(tmp_path, "mac-old")
     repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
