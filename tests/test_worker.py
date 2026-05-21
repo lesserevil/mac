@@ -869,6 +869,90 @@ def test_mac_worker_run_forever_tolerates_failing_offline_heartbeat(tmp_path: Pa
     assert any(r.status == "submitted_for_review" for r in results)
 
 
+def test_mac_worker_mark_offline_flag_posts_offline_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """The launchd/systemd shutdown path invokes `mac-agent --mark-offline`
+    so the control plane can requeue any active lease held by this worker
+    instead of waiting for lease expiry. The flag must post status=offline,
+    print a JSON receipt, and exit 0 without claiming or executing tasks.
+    """
+    from mac import worker as worker_module
+
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    # Heartbeat the agent to a non-offline state so we can prove --mark-offline
+    # actually changes the recorded status rather than the registration default.
+    cp.heartbeat_agent(agent.id, status="busy", health_status="healthy")
+    assert cp.get_agent(agent.id).status == "busy"
+
+    client = TestClient(create_app(control_plane=cp))
+    transport = api_transport(client)
+
+    captured_clients: list[MacApiClient] = []
+
+    class _RecordingClient(MacApiClient):
+        def __init__(self, url: str, token: Optional[str] = None) -> None:  # type: ignore[no-untyped-def]
+            super().__init__(url, token=token, transport=transport)
+            captured_clients.append(self)
+
+    monkeypatch.setattr(worker_module, "MacApiClient", _RecordingClient)
+
+    rc = worker_module.main(
+        [
+            "--url",
+            "http://mac.test",
+            "--agent-id",
+            agent.id,
+        ]
+        + ["--mark-offline"]
+    )
+
+    assert rc == 0
+    # Single client constructed; status is now offline so any active lease the
+    # control plane held will be requeued by the standard offline-agent sweep.
+    assert captured_clients, "expected MacApiClient to be constructed"
+    refreshed = cp.get_agent(agent.id)
+    assert refreshed.status == "offline"
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["status"] == "offline"
+    assert payload["agent"]["status"] == "offline"
+
+
+def test_mac_worker_mark_offline_flag_tolerates_api_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """If the hub is unreachable during shutdown, --mark-offline must not
+    raise — it should print a diagnostic and exit 0. The shutdown path must
+    never hang or crash a launchd ExitTimeOut window over a flaky API."""
+    from mac import worker as worker_module
+
+    def _failing_transport(method: str, path: str, payload: Any) -> Any:
+        raise MacApiError("simulated network failure on shutdown")
+
+    class _OfflineClient(MacApiClient):
+        def __init__(self, url: str, token: Optional[str] = None) -> None:  # type: ignore[no-untyped-def]
+            super().__init__(url, token=token, transport=_failing_transport)
+
+    monkeypatch.setattr(worker_module, "MacApiClient", _OfflineClient)
+
+    rc = worker_module.main(
+        [
+            "--url",
+            "http://mac.test",
+            "--agent-id",
+            "agent-test-id",
+            "--mark-offline",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["status"] == "mark_offline_error"
+    assert "simulated" in payload["error"]
+
+
 def test_mac_worker_processes_agentbus_repo_update_and_requests_restart(tmp_path: Path):
     cp = ControlPlane.in_memory()
     sender_machine = cp.register_machine("sender-host")

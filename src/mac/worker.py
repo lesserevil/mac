@@ -1997,6 +1997,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="register/heartbeat once and exit without claiming tasks",
     )
     parser.add_argument(
+        "--mark-offline",
+        action="store_true",
+        help=(
+            "post a single status=offline heartbeat for this agent and exit. "
+            "Intended for service wrappers (launchd/systemd) on controlled "
+            "shutdown so the control plane can requeue any active lease."
+        ),
+    )
+    parser.add_argument(
         "--dry-run-claim",
         action="store_true",
         help="register/heartbeat and ask the hub what this worker would claim without creating a lease",
@@ -2047,6 +2056,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             os.environ["MAC_ATTESTATION_KEY"] = attestation_key
             if attestation_env_path is not None:
                 _write_env_value(attestation_env_path, "MAC_ATTESTATION_KEY", attestation_key)
+        if args.mark_offline:
+            # Service wrappers call this on controlled shutdown so the control
+            # plane can immediately requeue any active lease for this agent
+            # instead of waiting for lease expiry. Best-effort: swallow
+            # transport errors so a shutdown path doesn't hang on a flaky API.
+            try:
+                heartbeat = client.post(
+                    "/agents/%s/heartbeat" % quote(agent_id, safe=""),
+                    {"status": "offline"},
+                )
+            except MacApiError as exc:
+                print(
+                    json.dumps(
+                        {"status": "mark_offline_error", "error": str(exc)},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            print(
+                json.dumps(
+                    {"status": "offline", "agent": heartbeat, "registered": registered},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
         if args.heartbeat_only:
             heartbeat = client.post(
                 "/agents/%s/heartbeat" % quote(agent_id, safe=""),

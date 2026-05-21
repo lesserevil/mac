@@ -608,6 +608,78 @@ stop_existing_services_for_deploy() {
       launchctl bootout "gui/$uid/com.mac.control-plane" >/dev/null 2>&1 || true
       ;;
   esac
+  # After the service manager has sent SIGTERM, give the mac-agent worker
+  # a bounded window to post its final status=offline heartbeat. The
+  # heartbeat may already have been posted by drain_mac_agent_before_deploy
+  # (which set status=draining) and by the worker's own SIGTERM handler,
+  # but on macOS launchd does not block bootout on the child's exit, so
+  # we explicitly synchronize here. This makes lease release deterministic
+  # on a controlled shutdown — exactly the gap that left Bullwinkle's
+  # lease stranded (mac-a2e).
+  wait_for_mac_agent_offline || log "WARNING: mac-agent did not report offline within window; proceeding"
+}
+
+wait_for_mac_agent_offline() {
+  local deadline now status agent_id summary_path="$LOG_DIR/mac-agent-shutdown.json"
+  load_drain_api_env
+  if ! mac_api_json GET "/health" >/dev/null 2>&1; then
+    # No API to wait on — assume offline.
+    return 0
+  fi
+  if ! agent_id="$(agent_id_for_drain)" || [ -z "$agent_id" ]; then
+    return 0
+  fi
+  deadline=$(( $(date +%s) + ${MAC_DEPLOY_OFFLINE_WAIT_SECONDS:-90} ))
+  while :; do
+    if status="$(mac_api_json GET "/agents/$agent_id" | "$PY" -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))')"; then
+      if [ "$status" = "offline" ]; then
+        log "mac-agent reported status=offline for $agent_id (lease release confirmed)"
+        "$PY" - "$agent_id" "$summary_path" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+agent_id = sys.argv[1]
+summary = {
+    "agent_id": agent_id,
+    "status": "offline",
+    "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}
+Path(sys.argv[2]).write_text(
+    json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+        return 0
+      fi
+      log "mac-agent status=$status; waiting for offline"
+    else
+      log "WARNING: could not query mac-agent status during shutdown wait"
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      log "ERROR: timed out waiting for mac-agent status=offline (last=$status)"
+      "$PY" - "$agent_id" "$status" "$summary_path" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+agent_id, last_status, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+summary = {
+    "agent_id": agent_id,
+    "status": "timeout",
+    "last_observed_status": last_status,
+    "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}
+Path(out_path).write_text(
+    json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+      return 1
+    fi
+    sleep "${MAC_DEPLOY_OFFLINE_POLL_SECONDS:-3}"
+  done
 }
 
 load_drain_api_env() {
@@ -1766,19 +1838,56 @@ case "${MAC_WORKER_REQUIRE_CANARY:-}" in
     ;;
 esac
 
+# Controlled-shutdown drain.
+#
+# launchd/systemd send SIGTERM to this wrapper on `launchctl bootout` or
+# `systemctl stop`. The shell `while :; do mac-agent --heartbeat-only; sleep`
+# loop below would otherwise die mid-sleep without ever telling the control
+# plane the agent is offline — leaving any active lease held by this worker
+# stranded until lease expiry. The `loop` mode `exec`s mac-agent, which has
+# its own SIGTERM handler that posts the offline heartbeat (see
+# src/mac/worker.py::_shutdown), so it doesn't need the wrapper trap.
+#
+# Implementation note: we deliberately spawn the inner process in the
+# background with `wait` so the trap fires immediately on SIGTERM rather
+# than waiting for `sleep` to complete on macOS — `sleep` does not deliver
+# the signal to a foreground child until the timer elapses.
+mac_agent_drain_offline() {
+  # Best-effort offline heartbeat. Must never raise — shutdown is a
+  # boundary and a flaky API must not delay launchd's ExitTimeOut window.
+  "$HOME/.mac/venv/bin/mac-agent" \
+    --url "$MAC_HUB_URL" \
+    --token "$MAC_WORKER_TOKEN" \
+    --register \
+    --agent-name "$agent_name" \
+    --hostname "$host_name" \
+    --mark-offline >/dev/null 2>&1 || true
+}
+
+# Only the heartbeat / dry-run loops need the wrapper-level trap. The
+# loop-mode `exec`d child handles SIGTERM internally and posting offline
+# from both sides would be a wasted call.
+case "$mode" in
+  heartbeat|dry-run)
+    trap 'mac_agent_drain_offline; exit 0' TERM INT
+    ;;
+esac
+
 case "$mode" in
   heartbeat)
     interval="${MAC_WORKER_HEARTBEAT_INTERVAL:-30}"
     while :; do
       "${common[@]}" --heartbeat-only
-      sleep "$interval"
+      sleep "$interval" &
+      wait $!
     done
     ;;
   dry-run)
     interval="${MAC_WORKER_HEARTBEAT_INTERVAL:-30}"
     while :; do
       "${common[@]}" --dry-run-claim
-      sleep "$interval"
+      sleep "$interval" &
+      wait $!
     done
     ;;
   loop)
@@ -2265,6 +2374,16 @@ install_darwin_agent_service() {
   <key>WorkingDirectory</key><string>$MAC_HOME</string>
   <key>StandardOutPath</key><string>$LOG_DIR/mac-agent.log</string>
   <key>StandardErrorPath</key><string>$LOG_DIR/mac-agent.log</string>
+  <!--
+    ExitTimeOut: how long launchd waits between SIGTERM and SIGKILL on
+    bootout / kickstart -k. The default is 20s. The mac-agent SIGTERM
+    handler must post a final status=offline heartbeat to the control
+    plane (so any active lease is requeued instead of expiring), then
+    let the active task drain to a stop point. 60s gives the worker
+    room to flush its offline heartbeat over a slow link before launchd
+    SIGKILLs it.
+  -->
+  <key>ExitTimeOut</key><integer>60</integer>
 </dict>
 </plist>
 EOF
