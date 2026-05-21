@@ -358,10 +358,17 @@ def test_fastapi_serves_dashboard_shell_without_api_token():
 
     script_response = client.get("/ui/assets/app.js")
     assert script_response.status_code == 200
-    assert "requestJSON" in script_response.text
-    assert "data-action=\"dispatchTick\"" in script_response.text
-    assert "renderObservability" in script_response.text
-    assert "/observability/stream" in script_response.text
+    assert "createDashboardApi" in script_response.text
+    assert "renderView" in script_response.text
+
+    views_response = client.get("/ui/assets/views.js")
+    assert views_response.status_code == 200
+    assert "data-action=\"dispatchTick\"" in views_response.text
+    assert "renderObservability" in views_response.text
+
+    stream_response = client.get("/ui/assets/observability-stream.js")
+    assert stream_response.status_code == 200
+    assert "/observability/stream" in stream_response.text
 
     assert client.get("/agents").status_code == 403
     assert client.get("/agents", headers={"Authorization": "Bearer reader"}).status_code == 200
