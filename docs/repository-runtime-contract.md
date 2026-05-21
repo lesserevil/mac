@@ -74,6 +74,21 @@ a weak `operator_directive` execution contract and emits
 `task.execution_contract.weak` telemetry so under-specified work is visible
 before an agent tries to execute it.
 
+## Worker Checkout Rules
+
+Repository work is not performed directly in the registered source checkout.
+The worker prepares a task-owned git worktree and passes its path through
+`MAC_TASK_REPO_WORKTREE` and `metadata.runtime.repository_worktree`. Agents must
+commit, test, and publish from that task worktree, then report the pushed ref or
+PR URL in `mac.worker_evidence.v1` evidence.
+
+The registered repository path remains the durable project source used to derive
+worktrees and to identify the runtime contract. It should stay clean in normal
+operation. If mac detects dirty registered source state that affects bridge
+polling or worktree preparation, it creates a source-remediation task for the
+agent that owns that environment; ordinary feature or bug tasks should not edit
+the registered checkout directly.
+
 ## mac As First Adopter
 
 mac declares its own contract in `.mac/project.yaml`. Its bootstrap command is:

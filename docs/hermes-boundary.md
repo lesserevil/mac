@@ -73,10 +73,15 @@ than importing `ControlPlane` or editing SQLite directly.
 1. A user talks to Hermes in Slack, Telegram, Discord, CLI, or another gateway.
 2. Hermes interprets the request using its current session, `SOUL.md`, user
    memory, skills, and any relevant long-term context.
-3. If durable work is needed, Hermes creates an interaction task in `mac`.
-4. `mac` dispatches the task to a healthy capable worker agent.
-5. Workers produce evidence. Reviewers approve or request changes.
-6. Publication or completion evidence closes the task.
+3. If durable work is needed, Hermes creates an interaction task in `mac`, or
+   asks `mac` to start a workflow when the request is already a multi-step plan.
+4. `mac` dispatches the task or workflow-created node task to a healthy capable
+   worker agent.
+5. Workers produce typed evidence. Reviewers approve or request changes through
+   the same durable review API.
+6. Publication or completion evidence closes the task. For Beads-backed work,
+   `mac` also mirrors key milestones into Beads comments prefixed
+   `mac-ledger v1` so the issue itself shows what happened.
 7. Hermes reads the durable result and updates its own conversational/user
    memory when appropriate.
 

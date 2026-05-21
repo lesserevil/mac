@@ -59,6 +59,16 @@ database as exposed by `bd ready --json`. The tracked export at
 canonical Beads CLI path is unavailable, which preserves lightweight local test
 fixtures without letting a stale export override the database.
 
+mac does not poll the live runtime checkout directly. The registered repository
+path is the canonical project path for workers and task-owned git worktrees, but
+the bridge refreshes a disposable managed checkout under
+`MAC_BEADS_BRIDGE_ROOT` before polling. With `MAC_BEADS_AUTO_PULL=1`, that
+checkout is cloned or fast-forwarded from its upstream branch. Dirty tracked
+files in the disposable checkout are reset because the bridge owns it; dirty
+files in the registered runtime checkout are recorded as source state and, when
+needed, become an idempotent remediation task for the agent that owns that
+environment.
+
 When `bd ready --json` succeeds, the Beads bridge also parses the tracked JSONL
 export and compares the ready issue IDs. If the JSONL export contains ready
 open issues that the canonical DB does not expose, mac opens a
@@ -68,3 +78,25 @@ export authoritative and recreate the split-brain failure.
 
 When the canonical DB later exposes the same ready IDs, the bridge imports them
 normally and resolves the drift finding as no longer observed.
+
+## Beads Write Policy
+
+mac writes back only derived state needed for human visibility and tracker
+convergence:
+
+- Claim sync: when a Beads-backed mac task is claimed, mac runs `bd update
+  <id> --claim` in the managed bridge checkout.
+- Close sync: when publication completes the mac task, mac runs `bd close <id>`
+  with a reason that points back to the mac task and publication.
+- Failure sync: failed mapped tasks append a note and either reopen for a
+  bounded retry or remain failed when retries are exhausted.
+- Human ledger: key workflow milestones are appended as Beads comments prefixed
+  `mac-ledger v1`.
+
+Those writes never make Beads authoritative for mac execution state. The mac
+task history, evidence, reviews, publications, command audit, observability,
+and notifications remain the execution ledger. Beads comments are a compact
+operator-facing mirror so someone reading the issue can see imports, claims,
+state gates, evidence, review events, publication, retries, and exhaustion
+without opening the mac database. Lease renewals intentionally stay inside mac
+to avoid filling issue logs with liveness noise.

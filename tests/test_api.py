@@ -107,6 +107,15 @@ def test_fastapi_exposes_hermes_identity_boundary():
     assert task["metadata"]["memory_boundary"]["mac_records_operational_provenance_only"] is True
 
 
+def test_workflow_runs_route_is_not_shadowed_by_workflow_slug_route():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+
+    response = client.get("/workflows/runs")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def test_default_review_tick_requires_admin_not_write():
     """mac-iez: /reviews/default/tick is the closest thing to an
     auto-merge button in an autonomous swarm. A `write`-scope token —

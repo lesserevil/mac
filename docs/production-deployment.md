@@ -209,6 +209,10 @@ latest rows are visible from `/command-audit` and the dashboard Observability
 view. This is operational telemetry for proving agents are doing work; a future
 security audit store can consume the same event shape externally.
 
+The command audit is not a durable compliance archive. Its current job is to
+make the last day of worker behavior visible without relying on local shell
+history or unbounded per-host logs.
+
 Executor success is not completion. A zero return code only means the executor
 reported without crashing. For the default workflow to auto-approve and publish,
 the evidence metadata must include a `mac.worker_evidence.v1` verification
@@ -259,6 +263,13 @@ The generated service then runs `mac-agent --register --loop` against
 `MAC_HUB_URL`, using `MAC_WORKER_TOKEN` from `~/.mac/mac.env`. The default
 executor wrapper is `~/.mac/bin/mac-hermes-task-executor`, which calls the
 deployed upstream Hermes checkout in one-shot mode.
+
+Fleet deploy deliberately avoids printing the mac-agent process command line.
+On Linux it reports `mac-agent.service` with `systemctl show` summary fields
+instead of `systemctl status`, because the service wrapper currently passes the
+worker token to `mac-agent` as process argv. Deployment logs should therefore
+show service state, PID, and restart count, but not the bearer token. Operators
+should continue to treat host-level process inspection as privileged access.
 
 Workers advertise `review` by default so the default review workflow can pick
 real second-eye reviewers. During registration the worker persists its
@@ -367,6 +378,31 @@ Imported tasks keep Beads provenance in `task.metadata.origin` and
 `task.metadata.acc_metadata`, use the repository source as their mac project,
 and are immediately eligible for normal worker claiming.
 
+### Beads Human Ledger
+
+mac's internal task history remains the authoritative execution ledger, but
+humans usually read the Bead first. For Beads-backed work, mac mirrors key
+workflow milestones into Beads comments with the prefix `mac-ledger v1`.
+
+Mirrored milestones include:
+
+- `imported`: a ready Bead became a durable mac task.
+- `claimed`: an agent claimed the task and an attempt started.
+- `state_running`, `state_needs_review`, `state_reviewing`,
+  `state_failed`, `state_cancelled`, `state_open`: major task gates.
+- `evidence_added`: executor, review, artifact, test, publication, or log
+  evidence was recorded.
+- `review_requested`, `review_completed`, `review_retracted`: review gates and
+  reviewer changes.
+- `published`: publication target and publication id.
+- `retry_reopened`, `retry_exhausted`: Beads reconciliation decisions for
+  failed mapped tasks.
+
+Lease renewals are intentionally not mirrored to Beads; they remain in mac task
+history and observability so issue logs do not fill with heartbeat noise.
+Ledger comment failures are logged as `bridge.beads.ledger_failed` and do not
+roll back the primary mac task transition.
+
 ## AgentBus
 
 `/messages` remains the constrained structured control bus and still rejects
@@ -404,6 +440,29 @@ To broadcast a source update from the hub:
 ```bash
 mac --db ~/.mac/mac.db agentbus repo-update agent_rocky --all-agents
 ```
+
+## Roles, Workflows, and Provisioning
+
+Production mac includes an API-level organization model for coordinated work:
+
+- `/roles` stores the role catalog used to describe agent jobs, prompts,
+  required/default capabilities, optional hardware requirements, and tenant
+  scope. `/roles/seed` loads the built-in Loom-style role set.
+- `/agents/{id}/role` assigns a role to a registered agent. If the agent is
+  bound to a Hermes persona, role assignment respects that persona's allowlist.
+- `/provisioning/requests` records missing capacity requests when the fleet has
+  no suitable agent for a role/capability requirement.
+- `/workflows` stores versioned DAG definitions. `/workflows/import-yaml` and
+  `/workflows/seed` provide operator-friendly loading paths.
+- `/workflows/{id}/start`, `/workflows/runs`, and `/workflows/runs/tick` run
+  and sweep workflows. Each node creates a normal mac task, so dispatch,
+  evidence, review, publication, command audit, and Beads ledger behavior stay
+  the same as single-task work.
+
+`/dashboard/state` includes workflow-run summary data for UI clients. Full
+visual workflow authoring is still an operator-facing gap in the checked-in
+dashboard; use the API/CLI for workflow creation and editing until that UI is
+built.
 
 ## Docker / Podman
 

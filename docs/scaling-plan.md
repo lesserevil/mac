@@ -117,9 +117,36 @@ Make self-update safe:
 - Canary start and promotion require a runtime environment plus a verified
   `sha256:<digest>` artifact.
 
-## Near-Term Contract Tests
+### Phase 7: Organizational Workflows and Operator Visibility
 
-The next tests should make these risks explicit:
+Status: partially implemented.
+
+Move from single-task routing to coordinated agent work:
+
+- The role catalog is implemented, including seeded Loom-style roles, role
+  assignment, persona allowlists, role capability aggregation, and role-aware
+  task eligibility.
+- Provisioning requests are implemented as durable records so the control plane
+  can ask for missing role/capability capacity instead of silently waiting.
+- Data-driven workflows are implemented as versioned DAG definitions with
+  required roles, node instructions, timeout handling, YAML import, default
+  seeds for bug/feature/UI/self-improvement, and immutable run snapshots.
+- Workflow runs create real mac tasks, advance from task terminal states, and
+  keep append-only run history. Callers cannot forge membership by setting
+  `metadata.workflow_run_id`; only the `tasks.workflow_run_id` column written
+  by the runtime drives callbacks.
+- Observability now includes low-level metrics/logs, integration findings,
+  operator notifications, command audit, and Beads `mac-ledger v1` issue
+  comments for human-facing task milestones.
+
+The main remaining Phase 7 gap is the human workflow-creation dashboard:
+operators can use the API/CLI today, but the UI does not yet let a human build
+a multi-step plan visually, answer all agent questions up front, manually edit
+each step, and then materialize it into workflow-backed tasks.
+
+## Current Regression Coverage
+
+The current suite has regression coverage for these contracts:
 
 - API calls require scoped identity for mutating routes.
 - A worker cannot approve its own task.
@@ -129,6 +156,22 @@ The next tests should make these risks explicit:
 - Secret handles cannot be revealed without a granted audit.
 - Runtime manifests reject unpinned images and version ranges.
 - Rollouts cannot install or promote without verified artifacts and health gates.
+- Worker registration and dispatch run both in-process and through an
+  end-to-end uvicorn plus `mac-agent` subprocess path against a real SQLite DB.
+- Beads bridge imports use `bd ready --json` as canonical, detect JSONL drift,
+  bootstrap/pull registered repositories, and isolate bridge polling in managed
+  checkouts.
+- The default review workflow requires verifiable executor evidence, an
+  independent reviewer, signed verdict evidence, and publication evidence when
+  policy demands it.
+- Command audit, integration findings, operator notifications, Beads ledger
+  comments, and deploy-token redaction have regression tests.
+- Workflow definitions, YAML import, seed loading, run advancement, cancellation,
+  timeout ticks, and forged metadata rejection are covered.
+
+High-value remaining tests are mostly deployment matrix tests: macOS/Linux/WSL2
+fresh-host bootstrap for registered projects, multi-agent workflow runs over a
+live hub, and UI-driven workflow authoring once that UI exists.
 
 ## Success Definition
 

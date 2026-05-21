@@ -1575,6 +1575,20 @@ def create_app(
             )
         ]
 
+    @app.get("/workflows/runs")
+    def list_workflow_runs(
+        state: Optional[str] = Query(default=None),
+        workflow_id: Optional[str] = Query(default=None),
+        tenant_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            run.to_dict()
+            for run in cp.workflow_runtime.list_runs(
+                state=state, workflow_id=workflow_id, tenant_id=tenant_id, limit=limit
+            )
+        ]
+
     @app.get("/workflows/{workflow_id_or_slug}")
     def get_workflow(workflow_id_or_slug: str) -> Dict[str, Any]:
         return cp.workflows.get_workflow(workflow_id_or_slug).to_dict()
@@ -1633,20 +1647,6 @@ def create_app(
             input=body.input,
             tenant_id=body.tenant_id,
         ).to_dict()
-
-    @app.get("/workflows/runs")
-    def list_workflow_runs(
-        state: Optional[str] = Query(default=None),
-        workflow_id: Optional[str] = Query(default=None),
-        tenant_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=100),
-    ) -> List[Dict[str, Any]]:
-        return [
-            run.to_dict()
-            for run in cp.workflow_runtime.list_runs(
-                state=state, workflow_id=workflow_id, tenant_id=tenant_id, limit=limit
-            )
-        ]
 
     @app.get("/workflows/runs/{run_id}")
     def get_workflow_run(run_id: str) -> Dict[str, Any]:

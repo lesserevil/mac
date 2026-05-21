@@ -27,6 +27,12 @@ This project provides durable contracts for coordinating a fleet:
   content chunks with NDJSON tailing semantics.
 - Review and publication pipeline that requires typed evidence, independent
   approved review, and publication hashes when policy requires them.
+- Human-facing Beads ledger mirroring for imported issue work: mac keeps its
+  internal task history authoritative, and appends concise `mac-ledger v1`
+  comments back to the Bead for imports, claims, state gates, evidence, review,
+  publication, retry, and exhaustion milestones.
+- Short-retention command audit for worker subprocesses so operators can see
+  what agents actually ran without treating local shell history as evidence.
 - Optional scoped API bearer tokens for read/write/agent/dispatch/secret/admin access.
 - Tenant-scoped secret handles with audit records and redacted API/CLI output.
 - Reproducible runtime manifests with stable digests and secret-value checks.
@@ -35,6 +41,9 @@ This project provides durable contracts for coordinating a fleet:
 - Repository runtime contract enforcement for registered project checkouts so
   agents can bootstrap and test work on macOS, Linux, WSL2, or narrower
   declared host families without relying on accidental local state.
+- Role catalog, role assignment, provisioning requests, and data-driven DAG
+  workflows that turn multi-step plans into durable tasks with per-node role
+  requirements and run history.
 - Evaluation contract: named `eval_sets` (scoring direction, baseline, regression threshold) and `eval_runs` against rollout versions, runtime environments, or agent builds; rollouts can require a passing `eval_run` before `promote`.
 - FastAPI REST API and `mac` CLI.
 - Hermes-side `mac-hermes` adapter for registration, sanitized task creation, status replies, and memory write-back payloads.
@@ -111,10 +120,15 @@ Key route groups:
 - `/tenants`, `/users`, `/personas`
 - `/hermes-instances`, `/hermes-instances/{id}/context`, `/platform-bindings`
 - `/dashboard/state`, `/dashboard/agents/{id}`, `/dashboard/tasks/{id}/timeline`, `/dashboard/dispatch/explain`, `/dashboard/hermes/{id}/activity`, `/dashboard/rollouts/{id}/status`
-- `/tasks`, `/tasks/{id}/evidence`, `/tasks/{id}/reviews`
-- `/machines`, `/agents`, `/dispatch/tick`, `/dispatch/dead-letters`
+- `/tasks`, `/tasks/{id}/evidence`, `/tasks/{id}/reviews`, `/reviews/default/tick`, `/publications`
+- `/machines`, `/agents`, `/agents/{id}/heartbeat`, `/agents/{id}/claim-next`, `/dispatch/tick`, `/dispatch/dead-letters`
+- `/roles`, `/agents/{id}/role`, `/agents/{id}/identity`
+- `/provisioning/requests`
+- `/workflows`, `/workflows/import-yaml`, `/workflows/seed`, `/workflows/{id}/start`, `/workflows/runs`, `/workflows/runs/tick`
 - `/messages`
 - `/agentbus`, `/agentbus/streams`, `/agentbus/streams/{id}/chunks`, `/agentbus/streams/{id}/events`
+- `/agentbus/repo-update`
+- `/command-audit`, `/agents/{id}/command-audit`
 - `/secrets`, `/secrets/{id}/access`, `/secrets/{id}/reveal`, `/secret-audits`
 - `/runtimes`, `/runtime-runs`
 - `/artifacts`, `/artifacts/{id_or_digest}` — canonical record for deliverables (kind, digest, uri, sbom_uri, signers); re-registering the same digest augments signers/metadata
@@ -125,8 +139,60 @@ Key route groups:
 - `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-sets/{id}/events`, `/eval-runs`
 - `/events` — unified audit stream across task/rollout/eval_set/secret/environment/conversation_thread/vector_ref/agent surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
 - `/observability`, `/observability/metrics`, `/observability/logs`, `/observability/summary`, `/observability/stream` — low-level metric/log ingestion, query, summary, and NDJSON subscription across API, control-plane, worker, Hermes, deploy, and external-agent layers
+- `/notifications`, `/notifications/{id}/delivered`
+- `/integrations/findings`, `/integrations/observations`
 - `/agents/{id}/mood`, `/agents/{id}/mood/history` — agent-self-reported emotional state (warm/cheerful/sad/curt/cold/irritated/angry/enraged) with reason + optional TTL; transitions flow through `/events` as `subject_type=agent`
 - `/agents/{id}/nap-schedule`, `/agents/{id}/nap-schedule/next`, `/nap-schedules`, `/nap-runs`, `/nap-runs/{id}/complete`, `/nap-runs/{id}/fail` — daily memory-consolidation lifecycle. Offset defaults to `md5(agent.name) %% 360` minutes (spreads the fleet across the 0–6h UTC window). mac coordinates `begin → DRAINING → complete/fail`; summarization and vector storage are off-process and linked via `evidence` + `vector_refs`.
+
+## Current Task Workflow
+
+For Beads-backed repository work, the production path is:
+
+1. Rocky's hub polls registered Beads repositories and treats `bd ready --json`
+   as canonical when it is available.
+2. Each ready Bead becomes one durable mac task with repository contract,
+   execution contract, origin metadata, and Beads provenance.
+3. A healthy worker claims the task, works only in a task-owned git worktree,
+   renews its lease, and records command-audit rows for subprocesses.
+4. The executor records typed evidence with a `mac.worker_evidence.v1`
+   verification manifest. Repository work must report pushed/clean git state
+   and passing checks before it can enter review.
+5. The default review workflow assigns a healthy reviewer-capable agent that
+   has not owned the task, waits for signed `review_verdict` evidence, then
+   publishes only after executor and reviewer evidence both verify.
+6. Publication completes the mac task and syncs the backing Bead close. Failed
+   mapped tasks are reopened with a bounded retry policy; exhausted retries
+   remain failed and visible.
+
+mac records the complete internal ledger in task history, evidence, reviews,
+publications, command audit, observability, and notifications. For Beads-backed
+work it also writes concise Beads comments with the prefix `mac-ledger v1` so a
+human reading the Bead can see key milestones without opening the mac database.
+Lease renewals stay internal to avoid noisy issue logs.
+
+## Workflow Orchestration
+
+mac has an API-level workflow system for turning an agentic multi-step plan
+into durable tasks:
+
+- Roles define required capabilities, prompts, optional hardware needs, and
+  tenant scope. Agents can be assigned a role, and role assignment is checked
+  against the agent's Hermes persona allowlist when one exists.
+- Workflows are versioned DAGs of nodes and edges. Each node declares a required
+  role and can add instructions, capabilities, approval behavior, or timeout
+  policy.
+- Starting a workflow snapshots the current definition, creates the first task,
+  and stores the workflow linkage in task columns rather than trusting caller
+  metadata.
+- Terminal task transitions advance the run through matching edges, spawn the
+  next task, or mark the run completed/failed/cancelled with append-only run
+  history.
+- Default seed data exists for bug, feature, UI, and self-improvement flows.
+
+The REST API and CLI can create, import, seed, start, cancel, and tick workflow
+runs today, and `/dashboard/state` includes workflow-run summary data for UI
+clients. The checked-in dashboard does not yet provide a full visual workflow
+authoring UI for humans to edit plans and answer all agent questions up front.
 
 ## CLI Examples
 
@@ -248,4 +314,8 @@ Those files set the SSH target, OS kind, and
 
 - [Hermes Boundary](docs/hermes-boundary.md)
 - [Hermes Integration](docs/hermes-integration.md)
+- [Production Deployment](docs/production-deployment.md)
+- [Repository Runtime Contract](docs/repository-runtime-contract.md)
+- [Integration Authority Contract](docs/integration-authority-contract.md)
+- [Soul Preservation Runbook](docs/soul-preservation-runbook.md)
 - [Scaling Plan](docs/scaling-plan.md)
