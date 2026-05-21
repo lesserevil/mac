@@ -268,7 +268,7 @@ class MacWorker:
         self.require_canary = bool(require_canary)
         self.lease_renew_interval_seconds = lease_renew_interval_seconds
         self.agentbus_control_enabled = bool(agentbus_control_enabled)
-        self.self_update_repo = self_update_repo or _default_self_update_repo()
+        self.self_update_repo = (self_update_repo or _default_self_update_repo()).expanduser().resolve()
         self.agentbus_control_state_path = (
             agentbus_control_state_path
             if agentbus_control_state_path is not None
@@ -1649,7 +1649,9 @@ def _repository_source_candidates(origin: JsonDict, self_update_repo: Path) -> L
     source = str(origin.get("source") or "").strip()
     contract = origin.get("repository_contract")
     project = str(contract.get("project") or "").strip() if isinstance(contract, dict) else ""
-    if repository_name == "mac" or source == "repo-beads-mac" or project == "repo-beads-mac":
+    if repository_name == "mac" or source == "repo-beads-mac":
+        candidates.insert(0, self_update_repo.expanduser())
+    elif project == "repo-beads-mac":
         candidates.append(self_update_repo.expanduser())
 
     seen = set()
