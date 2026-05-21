@@ -356,12 +356,32 @@ def test_fastapi_serves_dashboard_shell_without_api_token():
     assert "/ui/assets/app.js" in ui_response.text
     assert 'data-view="observability"' in ui_response.text
 
+    # The dashboard is split into ES modules under src/mac/ui/modules/. The
+    # checked-in app.js is a thin entry point that boots the module tree; the
+    # actual behaviour lives in the split modules (api, actions, views/*).
     script_response = client.get("/ui/assets/app.js")
     assert script_response.status_code == 200
-    assert "requestJSON" in script_response.text
-    assert "data-action=\"dispatchTick\"" in script_response.text
-    assert "renderObservability" in script_response.text
-    assert "/observability/stream" in script_response.text
+    assert "bootstrap" in script_response.text
+    assert "./modules/bootstrap.js" in script_response.text
+
+    api_module = client.get("/ui/assets/modules/api.js")
+    assert api_module.status_code == 200
+    assert "requestJSON" in api_module.text
+
+    tasks_view = client.get("/ui/assets/modules/views/tasks.js")
+    assert tasks_view.status_code == 200
+
+    overview_view = client.get("/ui/assets/modules/views/overview.js")
+    assert overview_view.status_code == 200
+    assert 'data-action="dispatchTick"' in overview_view.text
+
+    observability_view = client.get("/ui/assets/modules/views/observability.js")
+    assert observability_view.status_code == 200
+    assert "renderObservability" in observability_view.text
+
+    observability_stream = client.get("/ui/assets/modules/observability_stream.js")
+    assert observability_stream.status_code == 200
+    assert "/observability/stream" in observability_stream.text
 
     assert client.get("/agents").status_code == 403
     assert client.get("/agents", headers={"Authorization": "Bearer reader"}).status_code == 200
