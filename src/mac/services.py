@@ -379,6 +379,7 @@ class ControlPlane:
             self.observability,
             get_role=self.roles.get_role,
             get_tenant=self.get_tenant,
+            create_task=self.create_task,
         )
         self.workflow_runtime = WorkflowRuntime(
             self.store,

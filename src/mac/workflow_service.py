@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from mac.models import (
     AgentRole,
@@ -54,11 +54,238 @@ class WorkflowService:
         *,
         get_role: Callable[..., AgentRole],
         get_tenant: Callable[[str], Tenant],
+        create_task: Callable[..., Any],
     ) -> None:
         self.store = store
         self.observability = observability
         self._get_role = get_role
         self._get_tenant = get_tenant
+        self._create_task = create_task
+
+    # Agentic planning --------------------------------------------------
+
+    def draft_plan(
+        self,
+        goal: str,
+        *,
+        planner_role: str = "planner",
+        created_by: str = "human",
+        tenant_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return an editable workflow plan draft without creating tasks.
+
+        The draft is intentionally plain JSON: a human can answer the
+        surfaced questions once, edit the proposed steps in-place, and then
+        submit the same object to ``create_from_plan_draft`` for durable
+        workflow + task materialisation.
+        """
+        goal_value = (goal or "").strip()
+        if not goal_value:
+            raise ValidationError("plan draft goal is required")
+        planner_slug = self._role_slug(planner_role, tenant_id=tenant_id)
+        questions = [
+            {
+                "id": "scope",
+                "question": "What exact scope should this workflow cover, and what is explicitly out of scope?",
+                "required": True,
+            },
+            {
+                "id": "success",
+                "question": "What observable outcome or acceptance criteria prove this workflow succeeded?",
+                "required": True,
+            },
+            {
+                "id": "constraints",
+                "question": "What constraints, dependencies, deadlines, or safety limits should agents respect?",
+                "required": True,
+            },
+        ]
+        return {
+            "schema": "mac.workflow_plan_draft.v1",
+            "status": "draft",
+            "goal": goal_value,
+            "created_by": (created_by or "human").strip() or "human",
+            "tenant_id": tenant_id,
+            "planner_role": planner_slug,
+            "questions": questions,
+            "steps": [
+                {
+                    "step_key": "clarify",
+                    "title": "Clarify and finalize plan",
+                    "description": "Resolve upfront questions, confirm scope, and keep the plan editable before execution.",
+                    "role_required": planner_slug,
+                    "required_capabilities": ["planning"],
+                },
+                {
+                    "step_key": "implement",
+                    "title": "Implement the accepted plan",
+                    "description": "Carry out the implementation steps from the edited plan.",
+                    "role_required": planner_slug,
+                    "required_capabilities": [],
+                },
+                {
+                    "step_key": "verify",
+                    "title": "Verify the workflow outcome",
+                    "description": "Run checks against the acceptance criteria and report evidence.",
+                    "role_required": planner_slug,
+                    "required_capabilities": ["test"],
+                },
+            ],
+        }
+
+    def create_from_plan_draft(
+        self,
+        draft: Dict[str, Any],
+        *,
+        answers: Dict[str, Any],
+        slug: str,
+        name: str,
+        workflow_type: str,
+        project: Optional[str] = None,
+        created_by: str = "human",
+        tenant_id: Optional[str] = None,
+        is_default: bool = False,
+    ) -> Tuple[Workflow, List[Any]]:
+        if not isinstance(draft, dict):
+            raise ValidationError("plan draft must be an object")
+        if draft.get("schema") != "mac.workflow_plan_draft.v1":
+            raise ValidationError("unsupported plan draft schema")
+        answers_obj = ensure_json_object(answers)
+        questions = self._draft_questions(draft)
+        missing = [q["id"] for q in questions if q.get("required") and not str(answers_obj.get(q["id"], "")).strip()]
+        if missing:
+            raise ValidationError("plan draft missing answers: %s" % ", ".join(missing))
+        steps = self._draft_steps(draft, tenant_id=tenant_id)
+        definition = self._steps_to_definition(steps)
+        plan_metadata = {
+            "schema": draft["schema"],
+            "goal": (draft.get("goal") or "").strip(),
+            "questions": questions,
+            "answers": answers_obj,
+            "steps": steps,
+        }
+        workflow = self.create_workflow(
+            slug=slug,
+            name=name,
+            description=plan_metadata["goal"],
+            workflow_type=workflow_type,
+            definition=definition,
+            created_by=created_by,
+            tenant_id=tenant_id,
+            is_default=is_default,
+            metadata={"plan_draft": plan_metadata},
+        )
+        tasks: List[Any] = []
+        previous_task_id: Optional[str] = None
+        for index, step in enumerate(steps, start=1):
+            metadata = {
+                "workflow_plan": {
+                    "workflow_id": workflow.id,
+                    "workflow_slug": workflow.slug,
+                    "workflow_version": workflow.version,
+                    "goal": plan_metadata["goal"],
+                    "answers": answers_obj,
+                    "step_key": step["step_key"],
+                    "step_index": index,
+                    "role_required": step["role_required"],
+                }
+            }
+            task = self._create_task(
+                step["title"],
+                description=step.get("description", ""),
+                project=project,
+                priority=int(step.get("priority", max(0, 100 - index))),
+                required_capabilities=step.get("required_capabilities", []),
+                dependencies=[previous_task_id] if previous_task_id else [],
+                metadata=metadata,
+                max_attempts=int(step.get("max_attempts", 1) or 1),
+                actor=created_by,
+            )
+            tasks.append(task)
+            previous_task_id = task.id
+        return workflow, tasks
+
+    def _draft_questions(self, draft: Dict[str, Any]) -> List[Dict[str, Any]]:
+        questions = draft.get("questions")
+        if not isinstance(questions, list) or not questions:
+            raise ValidationError("plan draft questions must be a non-empty list")
+        normalized: List[Dict[str, Any]] = []
+        for question in questions:
+            if not isinstance(question, dict):
+                raise ValidationError("plan draft question must be an object")
+            qid = (question.get("id") or "").strip()
+            text = (question.get("question") or "").strip()
+            if not qid or not text:
+                raise ValidationError("plan draft question requires id and question")
+            normalized.append({"id": qid, "question": text, "required": bool(question.get("required", True))})
+        return normalized
+
+    def _draft_steps(self, draft: Dict[str, Any], *, tenant_id: Optional[str]) -> List[Dict[str, Any]]:
+        raw_steps = draft.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValidationError("plan draft steps must be a non-empty list")
+        steps: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in raw_steps:
+            if not isinstance(raw, dict):
+                raise ValidationError("plan draft step must be an object")
+            step_key = self._safe_key(raw.get("step_key") or raw.get("title") or "step")
+            if step_key in seen:
+                raise ValidationError("duplicate plan step_key: %s" % step_key)
+            seen.add(step_key)
+            title = (raw.get("title") or "").strip()
+            if not title:
+                raise ValidationError("plan draft step %s missing title" % step_key)
+            role = self._role_slug(raw.get("role_required") or draft.get("planner_role") or "", tenant_id=tenant_id)
+            capabilities = raw.get("required_capabilities") or []
+            if not isinstance(capabilities, list):
+                raise ValidationError("plan draft step %s required_capabilities must be a list" % step_key)
+            steps.append(
+                {
+                    "step_key": step_key,
+                    "title": title,
+                    "description": (raw.get("description") or "").strip(),
+                    "role_required": role,
+                    "required_capabilities": [str(item) for item in capabilities if str(item).strip()],
+                    "max_attempts": int(raw.get("max_attempts", 1) or 1),
+                    "priority": int(raw.get("priority", 0) or 0),
+                }
+            )
+        return steps
+
+    def _steps_to_definition(self, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        nodes = [
+            {
+                "node_key": step["step_key"],
+                "node_type": "task",
+                "role_required": step["role_required"],
+                "max_attempts": step["max_attempts"],
+                "instructions": step["description"],
+            }
+            for step in steps
+        ]
+        edges: List[Dict[str, Any]] = [
+            {"from_node_key": "", "to_node_key": steps[0]["step_key"], "condition": "success", "priority": 100}
+        ]
+        for index, step in enumerate(steps):
+            to_key = steps[index + 1]["step_key"] if index + 1 < len(steps) else ""
+            edges.append({"from_node_key": step["step_key"], "to_node_key": to_key, "condition": "success", "priority": 100})
+        return {"nodes": nodes, "edges": edges}
+
+    def _role_slug(self, value: str, *, tenant_id: Optional[str]) -> str:
+        slug = (value or "").strip()
+        if not slug:
+            raise ValidationError("plan draft role is required")
+        try:
+            role = self._get_role(slug, tenant_id=tenant_id)
+        except TypeError:
+            role = self._get_role(slug)
+        return role.slug
+
+    def _safe_key(self, value: str) -> str:
+        import re
+
+        return re.sub(r"[^a-z0-9_-]+", "-", str(value).strip().lower()).strip("-") or "step"
 
     # CRUD ---------------------------------------------------------------
 

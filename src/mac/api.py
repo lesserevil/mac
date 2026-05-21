@@ -337,6 +337,25 @@ class WorkflowSeed(BaseModel):
     pass
 
 
+class WorkflowPlanDraftCreate(BaseModel):
+    goal: str
+    planner_role: str = "planner"
+    created_by: str = "human"
+    tenant_id: Optional[str] = None
+
+
+class WorkflowPlanDraftMaterialize(BaseModel):
+    draft: Dict[str, Any]
+    answers: Dict[str, Any]
+    slug: str
+    name: str
+    workflow_type: str
+    project: Optional[str] = None
+    created_by: str = "human"
+    tenant_id: Optional[str] = None
+    is_default: bool = False
+
+
 class WorkflowStart(BaseModel):
     started_by: str = "human"
     input: Dict[str, Any] = Field(default_factory=dict)
@@ -1598,6 +1617,38 @@ def create_app(
             tenant_id=body.tenant_id,
             is_default=body.is_default,
         ).to_dict()
+
+    @app.post("/workflows/plan-drafts")
+    def draft_workflow_plan(
+        body: WorkflowPlanDraftCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.workflows.draft_plan(
+            body.goal,
+            planner_role=body.planner_role,
+            created_by=body.created_by,
+            tenant_id=body.tenant_id,
+        )
+
+    @app.post("/workflows/from-plan-draft")
+    def create_workflow_from_plan_draft(
+        body: WorkflowPlanDraftMaterialize,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        workflow, tasks = cp.workflows.create_from_plan_draft(
+            body.draft,
+            answers=body.answers,
+            slug=body.slug,
+            name=body.name,
+            workflow_type=body.workflow_type,
+            project=body.project,
+            created_by=body.created_by,
+            tenant_id=body.tenant_id,
+            is_default=body.is_default,
+        )
+        return {"workflow": workflow.to_dict(), "tasks": [task.to_dict() for task in tasks]}
 
     @app.post("/workflows/seed")
     def seed_workflows(
