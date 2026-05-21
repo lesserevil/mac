@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 import shutil
@@ -47,6 +48,8 @@ from mac.models import (
     HealthStatus,
     HistoryEvent,
     HermesInstance,
+    IntegrationFinding,
+    IntegrationObservation,
     JsonDict,
     Lease,
     LeaseStatus,
@@ -1084,6 +1087,311 @@ class ControlPlane:
 
     def observability_summary(self, *args: Any, **kwargs: Any) -> JsonDict:
         return self.observability.summary(*args, **kwargs)
+
+    # Integration authority ledger -------------------------------------
+
+    def _integration_fingerprint(self, value: Any) -> str:
+        return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
+
+    def record_integration_observation(
+        self,
+        source_kind: str,
+        source_id: str,
+        authority: str,
+        status: str,
+        *,
+        fingerprint: Optional[str] = None,
+        cursor: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+        observed_at: Optional[str] = None,
+        observation_id: Optional[str] = None,
+    ) -> IntegrationObservation:
+        source_kind_value = str(source_kind or "").strip()
+        source_id_value = str(source_id or "").strip()
+        authority_value = str(authority or "").strip()
+        status_value = str(status or "").strip().lower()
+        if not source_kind_value:
+            raise ValidationError("integration observation source_kind is required")
+        if not source_id_value:
+            raise ValidationError("integration observation source_id is required")
+        if not authority_value:
+            raise ValidationError("integration observation authority is required")
+        if not status_value:
+            raise ValidationError("integration observation status is required")
+        row_id = observation_id or new_id("iobs")
+        now = observed_at or utcnow()
+        self.store.execute(
+            """
+            INSERT INTO integration_observations (
+                id, source_id, source_kind, authority, status, fingerprint,
+                cursor, detail, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_id,
+                source_id_value,
+                source_kind_value,
+                authority_value,
+                status_value,
+                str(fingerprint).strip() if fingerprint else None,
+                str(cursor).strip() if cursor else None,
+                json_dumps(ensure_json_object(detail)),
+                now,
+            ),
+        )
+        row = self.store.query_one("SELECT * FROM integration_observations WHERE id = ?", (row_id,))
+        return self._integration_observation_from_row(row)
+
+    def record_integration_finding(
+        self,
+        source_kind: str,
+        source_id: str,
+        finding_type: str,
+        title: str,
+        detail: Optional[Dict[str, Any]] = None,
+        *,
+        severity: str = "warning",
+        fingerprint: Optional[str] = None,
+        notify: bool = False,
+        channels: Optional[Iterable[str]] = None,
+        notification_body: Optional[str] = None,
+    ) -> IntegrationFinding:
+        source_kind_value = str(source_kind or "").strip()
+        source_id_value = str(source_id or "").strip()
+        finding_type_value = str(finding_type or "").strip()
+        title_value = str(title or "").strip()
+        severity_value = str(severity or "warning").strip().lower()
+        if not source_kind_value:
+            raise ValidationError("integration finding source_kind is required")
+        if not source_id_value:
+            raise ValidationError("integration finding source_id is required")
+        if not finding_type_value:
+            raise ValidationError("integration finding finding_type is required")
+        if not title_value:
+            raise ValidationError("integration finding title is required")
+        if severity_value not in {"info", "warning", "error", "critical"}:
+            raise ValidationError("unsupported integration finding severity: %s" % severity)
+        detail_value = ensure_json_object(detail)
+        fingerprint_value = str(fingerprint or "").strip()
+        if not fingerprint_value:
+            fingerprint_value = self._integration_fingerprint(
+                {
+                    "source_kind": source_kind_value,
+                    "source_id": source_id_value,
+                    "finding_type": finding_type_value,
+                    "detail": detail_value,
+                }
+            )
+        now = utcnow()
+        existing = self.store.query_one(
+            """
+            SELECT * FROM integration_findings
+            WHERE source_kind = ? AND source_id = ? AND finding_type = ? AND fingerprint = ?
+            """,
+            (source_kind_value, source_id_value, finding_type_value, fingerprint_value),
+        )
+        was_open = existing is not None and existing["status"] == "open"
+        if existing is None:
+            finding_id = new_id("ifnd")
+            self.store.execute(
+                """
+                INSERT INTO integration_findings (
+                    id, source_id, source_kind, finding_type, severity, status,
+                    title, detail, fingerprint, first_seen_at, last_seen_at,
+                    resolved_at, resolution
+                ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    finding_id,
+                    source_id_value,
+                    source_kind_value,
+                    finding_type_value,
+                    severity_value,
+                    title_value,
+                    json_dumps(detail_value),
+                    fingerprint_value,
+                    now,
+                    now,
+                ),
+            )
+            changed = True
+            transition = "opened"
+        else:
+            finding_id = existing["id"]
+            self.store.execute(
+                """
+                UPDATE integration_findings
+                SET severity = ?, status = 'open', title = ?, detail = ?,
+                    last_seen_at = ?, resolved_at = NULL, resolution = NULL
+                WHERE id = ?
+                """,
+                (
+                    severity_value,
+                    title_value,
+                    json_dumps(detail_value),
+                    now,
+                    finding_id,
+                ),
+            )
+            changed = not was_open
+            transition = "reopened" if changed else "refreshed"
+        finding = self.get_integration_finding(finding_id)
+        if changed:
+            level = "error" if severity_value in {"error", "critical"} else (
+                "warning" if severity_value == "warning" else "info"
+            )
+            self.record_log(
+                "integration.finding.%s" % transition,
+                layer="control_plane",
+                source="integration-ledger",
+                level=level,
+                subject_type=source_kind_value,
+                subject_id=source_id_value,
+                detail=finding.to_dict(),
+            )
+            if notify:
+                self.record_notification(
+                    "integration.%s" % finding_type_value,
+                    title_value,
+                    notification_body or title_value,
+                    subject_type=source_kind_value,
+                    subject_id=source_id_value,
+                    channels=channels or ["dashboard"],
+                    metadata={"finding": finding.to_dict()},
+                )
+        return finding
+
+    def get_integration_finding(self, finding_id: str) -> IntegrationFinding:
+        row = self.store.query_one(
+            "SELECT * FROM integration_findings WHERE id = ?", (finding_id,)
+        )
+        if row is None:
+            raise NotFoundError("integration finding not found: %s" % finding_id)
+        return self._integration_finding_from_row(row)
+
+    def list_integration_observations(
+        self,
+        source_kind: Optional[str] = None,
+        source_id: Optional[str] = None,
+        authority: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[IntegrationObservation]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if source_kind is not None:
+            clauses.append("source_kind = ?")
+            params.append(str(source_kind).strip())
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(str(source_id).strip())
+        if authority is not None:
+            clauses.append("authority = ?")
+            params.append(str(authority).strip())
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(str(status).strip().lower())
+        sql = "SELECT * FROM integration_observations"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY observed_at DESC, id DESC LIMIT ?"
+        params.append(min(max(1, int(limit)), 1000))
+        return [
+            self._integration_observation_from_row(row)
+            for row in self.store.query_all(sql, tuple(params))
+        ]
+
+    def list_integration_findings(
+        self,
+        source_kind: Optional[str] = None,
+        source_id: Optional[str] = None,
+        finding_type: Optional[str] = None,
+        status: Optional[str] = None,
+        severity: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[IntegrationFinding]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if source_kind is not None:
+            clauses.append("source_kind = ?")
+            params.append(str(source_kind).strip())
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(str(source_id).strip())
+        if finding_type is not None:
+            clauses.append("finding_type = ?")
+            params.append(str(finding_type).strip())
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(str(status).strip().lower())
+        if severity is not None:
+            clauses.append("severity = ?")
+            params.append(str(severity).strip().lower())
+        sql = "SELECT * FROM integration_findings"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += """
+            ORDER BY
+                CASE status WHEN 'open' THEN 0 WHEN 'suppressed' THEN 1 ELSE 2 END,
+                last_seen_at DESC,
+                id DESC
+            LIMIT ?
+        """
+        params.append(min(max(1, int(limit)), 1000))
+        return [
+            self._integration_finding_from_row(row)
+            for row in self.store.query_all(sql, tuple(params))
+        ]
+
+    def resolve_integration_finding(
+        self,
+        finding_id: str,
+        *,
+        resolution: str = "resolved",
+    ) -> IntegrationFinding:
+        finding = self.get_integration_finding(finding_id)
+        if finding.status == "resolved":
+            return finding
+        now = utcnow()
+        self.store.execute(
+            """
+            UPDATE integration_findings
+            SET status = 'resolved', resolved_at = ?, resolution = ?
+            WHERE id = ?
+            """,
+            (now, str(resolution or "resolved").strip(), finding_id),
+        )
+        resolved = self.get_integration_finding(finding_id)
+        self.record_log(
+            "integration.finding.resolved",
+            layer="control_plane",
+            source="integration-ledger",
+            level="info",
+            subject_type=resolved.source_kind,
+            subject_id=resolved.source_id,
+            detail=resolved.to_dict(),
+        )
+        return resolved
+
+    def _resolve_integration_findings_for_source(
+        self,
+        source_kind: str,
+        source_id: str,
+        finding_type: str,
+        *,
+        active_fingerprints: Optional[Iterable[str]] = None,
+        resolution: str = "no longer observed",
+    ) -> None:
+        active = {str(item) for item in (active_fingerprints or [])}
+        for finding in self.list_integration_findings(
+            source_kind=source_kind,
+            source_id=source_id,
+            finding_type=finding_type,
+            status="open",
+            limit=1000,
+        ):
+            if finding.fingerprint not in active:
+                self.resolve_integration_finding(finding.id, resolution=resolution)
 
     # Operator notifications ------------------------------------------
 
@@ -3315,7 +3623,12 @@ class ControlPlane:
                 }
             poll_path = Path(str(source_state.get("poll_path") or repo.path)).expanduser()
             repository_contract = self._repository_contract_for_beads_repo_at_path(repo, poll_path)
-            issues = self._ready_beads_issues(repo, poll_path=poll_path)
+            issues = self._ready_beads_issues(
+                repo,
+                poll_path=poll_path,
+                actor=actor,
+                source_state=source_state,
+            )
             imported = 0
             existing = 0
             reopened = 0
@@ -3842,12 +4155,27 @@ class ControlPlane:
         repo: BeadsRepository,
         *,
         poll_path: Optional[Path] = None,
+        actor: str = "beads-bridge",
+        source_state: Optional[JsonDict] = None,
     ) -> List[JsonDict]:
         repo_path = poll_path or Path(repo.path).expanduser()
         if not repo_path.exists():
             raise ValidationError("beads repository path does not exist: %s" % repo_path)
         if repo_path.is_file():
-            return self._ready_beads_issues_from_jsonl(repo_path)
+            issues = self._ready_beads_issues_from_jsonl(repo_path)
+            self._record_beads_authority_observation(
+                repo,
+                repo_path,
+                authority="tracked_jsonl",
+                status="ok",
+                mode="direct_jsonl",
+                canonical_ready_issues=[],
+                jsonl_ready_issues=issues,
+                actor=actor,
+                source_state=source_state,
+            )
+            return issues
+        completed: Optional[subprocess.CompletedProcess[str]]
         try:
             completed = subprocess.run(
                 [_beads_cli(), "ready", "--json"],
@@ -3861,24 +4189,83 @@ class ControlPlane:
             completed = None
         if completed is not None and completed.returncode == 0:
             output = completed.stdout.strip()
-            if not output:
-                return []
-            data = json_loads(output, [])
+            data = json_loads(output, []) if output else []
             if not isinstance(data, list):
                 raise ValidationError("bd ready --json did not return a list for %s" % repo.path)
-            return [issue for issue in data if self._bead_issue_is_importable(issue)]
-        return self._ready_beads_issues_from_jsonl(repo_path / ".beads" / "issues.jsonl")
+            canonical = [issue for issue in data if self._bead_issue_is_importable(issue)]
+            jsonl_ready: List[JsonDict] = []
+            jsonl_error: Optional[str] = None
+            jsonl_path = repo_path / ".beads" / "issues.jsonl"
+            if jsonl_path.exists():
+                try:
+                    jsonl_ready = self._ready_beads_issues_from_jsonl(jsonl_path)
+                except Exception as exc:  # noqa: BLE001 - DB authority can still poll.
+                    jsonl_error = str(exc)
+            observation = self._record_beads_authority_observation(
+                repo,
+                repo_path,
+                authority="beads_db",
+                status="ok" if not jsonl_error else "export_error",
+                mode="canonical_bd_ready",
+                canonical_ready_issues=canonical,
+                jsonl_ready_issues=jsonl_ready,
+                actor=actor,
+                source_state=source_state,
+                bd_returncode=completed.returncode,
+                jsonl_error=jsonl_error,
+            )
+            self._record_beads_export_findings(
+                repo,
+                repo_path,
+                canonical_ready_issues=canonical,
+                jsonl_ready_issues=jsonl_ready,
+                actor=actor,
+                source_state=source_state,
+                observation_id=observation.id,
+                jsonl_error=jsonl_error,
+            )
+            return canonical
+        fallback_path = repo_path / ".beads" / "issues.jsonl"
+        issues = self._ready_beads_issues_from_jsonl(fallback_path)
+        self._record_beads_authority_observation(
+            repo,
+            repo_path,
+            authority="tracked_jsonl",
+            status="fallback",
+            mode="bd_ready_unavailable_jsonl_fallback",
+            canonical_ready_issues=[],
+            jsonl_ready_issues=issues,
+            actor=actor,
+            source_state=source_state,
+            bd_returncode=completed.returncode if completed is not None else None,
+            bd_error=(
+                (completed.stderr or completed.stdout or "").strip()
+                if completed is not None
+                else "bd ready unavailable"
+            ),
+        )
+        return issues
 
-    def _ready_beads_issues_from_jsonl(self, issues_path: Path) -> List[JsonDict]:
+    def _read_beads_jsonl_issues(self, issues_path: Path) -> List[JsonDict]:
         if not issues_path.exists():
             raise ValidationError("beads issues file not found: %s" % issues_path)
         issues: List[JsonDict] = []
-        for raw in issues_path.read_text(encoding="utf-8").splitlines():
+        for line_number, raw in enumerate(issues_path.read_text(encoding="utf-8").splitlines(), 1):
             if not raw.strip():
                 continue
-            issue = json_loads(raw, {})
+            try:
+                issue = json_loads(raw, {})
+            except Exception as exc:  # noqa: BLE001 - annotate which export row is broken.
+                raise ValidationError(
+                    "beads issues file %s has invalid JSON on line %d: %s"
+                    % (issues_path, line_number, exc)
+                ) from exc
             if isinstance(issue, dict) and issue.get("_type", "issue") == "issue":
                 issues.append(issue)
+        return issues
+
+    def _ready_beads_issues_from_jsonl(self, issues_path: Path) -> List[JsonDict]:
+        issues = self._read_beads_jsonl_issues(issues_path)
         by_id = {str(issue.get("id")): issue for issue in issues if issue.get("id")}
         ready: List[JsonDict] = []
         for issue in issues:
@@ -3901,6 +4288,187 @@ class ControlPlane:
                 ready.append(issue)
         ready.sort(key=lambda item: (int(item.get("priority") or 2), str(item.get("created_at") or ""), str(item.get("id") or "")))
         return ready
+
+    def _beads_issue_ids(self, issues: Iterable[JsonDict]) -> List[str]:
+        return sorted({str(issue.get("id") or "").strip() for issue in issues if issue.get("id")})
+
+    def _record_beads_authority_observation(
+        self,
+        repo: BeadsRepository,
+        repo_path: Path,
+        *,
+        authority: str,
+        status: str,
+        mode: str,
+        canonical_ready_issues: List[JsonDict],
+        jsonl_ready_issues: List[JsonDict],
+        actor: str,
+        source_state: Optional[JsonDict],
+        bd_returncode: Optional[int] = None,
+        bd_error: Optional[str] = None,
+        jsonl_error: Optional[str] = None,
+    ) -> IntegrationObservation:
+        canonical_ids = self._beads_issue_ids(canonical_ready_issues)
+        jsonl_ids = self._beads_issue_ids(jsonl_ready_issues)
+        detail: JsonDict = {
+            "schema": "mac.integration.beads_authority_observation.v1",
+            "repository_id": repo.id,
+            "repository_name": repo.name,
+            "source": repo.source,
+            "project": repo.project,
+            "poll_path": str(repo_path),
+            "mode": mode,
+            "actor": actor,
+            "canonical_authority": "beads_db" if authority == "beads_db" else "tracked_jsonl",
+            "canonical_ready_count": len(canonical_ids),
+            "canonical_ready_ids": canonical_ids,
+            "jsonl_ready_count": len(jsonl_ids),
+            "jsonl_ready_ids": jsonl_ids,
+        }
+        if bd_returncode is not None:
+            detail["bd_ready_returncode"] = bd_returncode
+        if bd_error:
+            detail["bd_error"] = bd_error[:2000]
+        if jsonl_error:
+            detail["jsonl_error"] = jsonl_error[:2000]
+        fingerprint = self._integration_fingerprint(
+            {
+                "authority": authority,
+                "status": status,
+                "canonical_ready_ids": canonical_ids,
+                "jsonl_ready_ids": jsonl_ids,
+                "bd_error": bool(bd_error),
+                "jsonl_error": bool(jsonl_error),
+            }
+        )
+        observation = self.record_integration_observation(
+            "beads_repository",
+            repo.id,
+            authority,
+            status,
+            fingerprint=fingerprint,
+            cursor=str(repo_path),
+            detail=detail,
+        )
+        if source_state is not None:
+            source_state["authority"] = {
+                "schema": "mac.integration.beads_authority_summary.v1",
+                "authority": authority,
+                "status": status,
+                "mode": mode,
+                "observation_id": observation.id,
+                "canonical_ready_count": len(canonical_ids),
+                "jsonl_ready_count": len(jsonl_ids),
+                "canonical_ready_ids": canonical_ids[:50],
+                "jsonl_ready_ids": jsonl_ids[:50],
+            }
+            if bd_error:
+                source_state["authority"]["bd_error"] = bd_error[:1000]
+            if jsonl_error:
+                source_state["authority"]["jsonl_error"] = jsonl_error[:1000]
+        return observation
+
+    def _record_beads_export_findings(
+        self,
+        repo: BeadsRepository,
+        repo_path: Path,
+        *,
+        canonical_ready_issues: List[JsonDict],
+        jsonl_ready_issues: List[JsonDict],
+        actor: str,
+        source_state: Optional[JsonDict],
+        observation_id: str,
+        jsonl_error: Optional[str] = None,
+    ) -> None:
+        findings: List[JsonDict] = []
+        active_jsonl_only: List[str] = []
+        active_parse_error: List[str] = []
+        if jsonl_error:
+            fingerprint = self._integration_fingerprint(
+                {"finding_type": "beads.export_parse_error", "error": jsonl_error}
+            )
+            active_parse_error.append(fingerprint)
+            finding = self.record_integration_finding(
+                "beads_repository",
+                repo.id,
+                "beads.export_parse_error",
+                "Beads tracked export cannot be parsed",
+                {
+                    "schema": "mac.integration.beads_export_parse_error.v1",
+                    "repository": repo.to_dict(),
+                    "poll_path": str(repo_path),
+                    "observation_id": observation_id,
+                    "actor": actor,
+                    "error": jsonl_error,
+                },
+                severity="warning",
+                fingerprint=fingerprint,
+                notify=True,
+                channels=["dashboard", "hermes"],
+                notification_body=(
+                    "%s has an unreadable .beads/issues.jsonl export. "
+                    "mac is using canonical `bd ready --json` output for imports."
+                )
+                % repo.name,
+            )
+            findings.append(finding.to_dict())
+        self._resolve_integration_findings_for_source(
+            "beads_repository",
+            repo.id,
+            "beads.export_parse_error",
+            active_fingerprints=active_parse_error,
+        )
+
+        canonical_ids = self._beads_issue_ids(canonical_ready_issues)
+        jsonl_ids = self._beads_issue_ids(jsonl_ready_issues)
+        jsonl_only = sorted(set(jsonl_ids) - set(canonical_ids))
+        if jsonl_only:
+            fingerprint = self._integration_fingerprint(
+                {
+                    "finding_type": "beads.export_drift.jsonl_only_ready",
+                    "jsonl_only_ready_ids": jsonl_only,
+                }
+            )
+            active_jsonl_only.append(fingerprint)
+            finding = self.record_integration_finding(
+                "beads_repository",
+                repo.id,
+                "beads.export_drift.jsonl_only_ready",
+                "Beads tracked export has ready issues missing from canonical DB",
+                {
+                    "schema": "mac.integration.beads_export_drift.v1",
+                    "repository": repo.to_dict(),
+                    "poll_path": str(repo_path),
+                    "observation_id": observation_id,
+                    "actor": actor,
+                    "canonical_authority": "beads_db",
+                    "policy": "mac imports canonical `bd ready --json` output and never imports JSONL-only issues while the DB is readable",
+                    "canonical_ready_count": len(canonical_ids),
+                    "canonical_ready_ids": canonical_ids,
+                    "jsonl_ready_count": len(jsonl_ids),
+                    "jsonl_ready_ids": jsonl_ids,
+                    "jsonl_only_ready_count": len(jsonl_only),
+                    "jsonl_only_ready_ids": jsonl_only,
+                },
+                severity="warning",
+                fingerprint=fingerprint,
+                notify=True,
+                channels=["dashboard", "hermes"],
+                notification_body=(
+                    "%s has %d ready issue(s) present only in .beads/issues.jsonl. "
+                    "mac will not import them until Beads DB exposes them through `bd ready --json`."
+                )
+                % (repo.name, len(jsonl_only)),
+            )
+            findings.append(finding.to_dict())
+        self._resolve_integration_findings_for_source(
+            "beads_repository",
+            repo.id,
+            "beads.export_drift.jsonl_only_ready",
+            active_fingerprints=active_jsonl_only,
+        )
+        if source_state is not None:
+            source_state["authority_findings"] = findings
 
     def _bead_issue_is_importable(self, issue: Any) -> bool:
         if not isinstance(issue, dict):
@@ -4578,6 +5146,36 @@ class ControlPlane:
             row["status"],
             row["created_at"],
             row["delivered_at"],
+        )
+
+    def _integration_observation_from_row(self, row: Any) -> IntegrationObservation:
+        return IntegrationObservation(
+            row["id"],
+            row["source_id"],
+            row["source_kind"],
+            row["authority"],
+            row["status"],
+            row["fingerprint"],
+            row["cursor"],
+            json_loads(row["detail"], {}),
+            row["observed_at"],
+        )
+
+    def _integration_finding_from_row(self, row: Any) -> IntegrationFinding:
+        return IntegrationFinding(
+            row["id"],
+            row["source_id"],
+            row["source_kind"],
+            row["finding_type"],
+            row["severity"],
+            row["status"],
+            row["title"],
+            json_loads(row["detail"], {}),
+            row["fingerprint"],
+            row["first_seen_at"],
+            row["last_seen_at"],
+            row["resolved_at"],
+            row["resolution"],
         )
 
     def _lease_from_row(self, row: Any) -> Lease:

@@ -310,6 +310,8 @@ function renderObservability() {
   const counts = observability.counts || {};
   const commandAudit = data.command_audit || [];
   const notifications = data.notifications || [];
+  const integrationFindings = data.integration_findings || [];
+  const openIntegrationFindings = integrationFindings.filter((item) => item.status === "open");
   const pendingNotifications = notifications.filter((item) => item.status === "pending").length;
   const live = uniqueObservations([...state.observabilityLive, ...(observability.latest || [])]);
   const layerTotal = Object.values(observability.layers || {}).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -320,6 +322,7 @@ function renderObservability() {
       ${metric("Warnings", counts.warnings || 0, "warning observations")}
       ${metric("Errors", counts.errors || 0, "error observations")}
       ${metric("Notifications", notifications.length, `${pendingNotifications} pending`)}
+      ${metric("Integration Findings", integrationFindings.length, `${openIntegrationFindings.length} open`)}
       ${metric("Stream", state.observabilityStreamStatus, `${state.observabilityLive.length} live item(s)`)}
     </section>
     <section class="split">
@@ -346,6 +349,15 @@ function renderObservability() {
     </section>
     <section class="surface">
       <div class="surface-heading">
+        <h2>Integration Findings</h2>
+        ${chip(`${openIntegrationFindings.length} open`, openIntegrationFindings.length ? "warn" : "good")}
+      </div>
+      <div class="observability-feed">
+        ${integrationFindings.length ? integrationFindings.slice(0, 80).map(integrationFindingRecord).join("") : `<div class="empty-state">No integration findings</div>`}
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
         <h2>Command Audit</h2>
         ${chip(`${commandAudit.length}`, commandAudit.length ? "info" : "warn")}
       </div>
@@ -362,6 +374,24 @@ function renderObservability() {
         ${live.length ? live.slice(0, 80).map(observationRecord).join("") : `<div class="empty-state">No observations</div>`}
       </div>
     </section>
+  `;
+}
+
+function integrationFindingRecord(item) {
+  const repo = item.detail?.repository;
+  const sourceLabel = typeof repo?.name === "string" ? repo.name : item.source_id;
+  return `
+    <article class="feed-item">
+      <div>
+        <strong>${escapeHtml(item.title)}</strong>
+        <p class="muted small">${escapeHtml(item.finding_type)} · ${escapeHtml(sourceLabel)} · ${escapeHtml(formatAge(item.last_seen_at))}</p>
+        <p class="muted small mono">${escapeHtml(item.fingerprint.slice(0, 16))}</p>
+      </div>
+      <div class="chip-row">
+        ${chip(item.status, item.status === "open" ? "warn" : "good")}
+        ${chip(item.severity, item.severity === "critical" || item.severity === "error" ? "bad" : item.severity === "warning" ? "warn" : "info")}
+      </div>
+    </article>
   `;
 }
 

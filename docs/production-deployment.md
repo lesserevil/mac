@@ -336,6 +336,15 @@ no active blockers are imported; blocked
 Beads wait until their blockers close. Imports are idempotent through the
 `project_items(source, external_id)` unique key.
 
+When `bd ready --json` succeeds, the Beads database is treated as canonical.
+The tracked `.beads/issues.jsonl` export is still parsed as a derived copy and
+compared against the canonical ready IDs. If ready issues exist only in JSONL,
+mac opens an `integration_findings` row of type
+`beads.export_drift.jsonl_only_ready`, emits an operator notification, and does
+not import those export-only issues until the Beads DB exposes them. This keeps
+the bridge from silently choosing the wrong authority during DB/export drift.
+See [Integration Authority Contract](integration-authority-contract.md).
+
 The hub also advances the default review/publication workflow from heartbeat by
 default (`MAC_REVIEW_TICK_ON_HEARTBEAT=1`, `MAC_REVIEW_TICK_HUB_AGENT=rocky`).
 The tick only moves tasks when required evidence, reviewer verdicts, and
@@ -347,6 +356,7 @@ Useful operator commands:
 ```bash
 mac --db ~/.mac/mac.db bridge beads repos
 mac --db ~/.mac/mac.db bridge beads poll --force
+mac --db ~/.mac/mac.db integrations findings --source-kind beads_repository --status open
 ```
 
 Imported tasks keep Beads provenance in `task.metadata.origin` and

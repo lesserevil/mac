@@ -651,6 +651,37 @@ def cmd_bridge_beads_poll(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_integrations_findings(args: argparse.Namespace) -> None:
+    _print(
+        [
+            finding.to_dict()
+            for finding in _plane(args).list_integration_findings(
+                source_kind=args.source_kind,
+                source_id=args.source_id,
+                finding_type=args.finding_type,
+                status=args.status,
+                severity=args.severity,
+                limit=args.limit,
+            )
+        ]
+    )
+
+
+def cmd_integrations_observations(args: argparse.Namespace) -> None:
+    _print(
+        [
+            observation.to_dict()
+            for observation in _plane(args).list_integration_observations(
+                source_kind=args.source_kind,
+                source_id=args.source_id,
+                authority=args.authority,
+                status=args.status,
+                limit=args.limit,
+            )
+        ]
+    )
+
+
 def cmd_memory_add(args: argparse.Namespace) -> None:
     _print(
         _plane(args).add_memory(
@@ -1286,6 +1317,23 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_beads_poll.add_argument("--force", action="store_true")
     bridge_beads_poll.add_argument("--actor", default="beads-bridge")
     _set(cmd_bridge_beads_poll, bridge_beads_poll)
+
+    integrations = sub.add_parser("integrations", help="integration authority observations and findings").add_subparsers(dest="integrations_command", required=True)
+    integrations_findings = integrations.add_parser("findings")
+    integrations_findings.add_argument("--source-kind")
+    integrations_findings.add_argument("--source-id")
+    integrations_findings.add_argument("--finding-type")
+    integrations_findings.add_argument("--status")
+    integrations_findings.add_argument("--severity")
+    integrations_findings.add_argument("--limit", type=int, default=100)
+    _set(cmd_integrations_findings, integrations_findings)
+    integrations_observations = integrations.add_parser("observations")
+    integrations_observations.add_argument("--source-kind")
+    integrations_observations.add_argument("--source-id")
+    integrations_observations.add_argument("--authority")
+    integrations_observations.add_argument("--status")
+    integrations_observations.add_argument("--limit", type=int, default=100)
+    _set(cmd_integrations_observations, integrations_observations)
 
     memory = sub.add_parser("memory", help="memory and provenance commands").add_subparsers(dest="memory_command", required=True)
     memory_add = memory.add_parser("add")

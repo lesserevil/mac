@@ -1575,6 +1575,29 @@ def _write_repository_contract(repo_path, project="repo-beads-mac", include_test
     )
 
 
+def _write_fake_bd_cli(path, ready_path):
+    path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import pathlib",
+                "import sys",
+                "args = sys.argv[1:]",
+                "if args == ['ready', '--json']:",
+                "    sys.stdout.write(pathlib.Path(%r).read_text(encoding='utf-8'))" % str(ready_path),
+                "    sys.exit(0)",
+                "if args[:1] == ['bootstrap']:",
+                "    sys.exit(0)",
+                "sys.stderr.write('unsupported fake bd command: %s\\n' % ' '.join(args))",
+                "sys.exit(1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def test_beads_repository_registration_requires_runtime_contract(cp, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1652,6 +1675,58 @@ def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
     assert task.metadata["origin"]["repository_contract"]["project"] == "repo-beads-mac"
     assert task.metadata["acc_metadata"]["beads_sync_close_on_complete"] is True
     assert task.metadata["acc_metadata"]["repository_contract_schema"] == "mac.repository_contract.v1"
+
+
+def test_beads_bridge_records_authority_drift_when_jsonl_export_disagrees_with_db(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue = {
+        "_type": "issue",
+        "id": "mac-jsonl-only",
+        "title": "Export-only bead",
+        "description": "present in tracked JSONL but not canonical DB",
+        "status": "open",
+        "priority": 0,
+        "created_at": "2026-05-20T00:00:00Z",
+        "dependency_count": 0,
+    }
+    _write_beads(repo, [issue])
+    ready_path = tmp_path / "ready.json"
+    ready_path.write_text("[]", encoding="utf-8")
+    fake_bd = tmp_path / "bd"
+    _write_fake_bd_cli(fake_bd, ready_path)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    assert report["imported_count"] == 0
+    assert cp.list_project_items() == []
+    repo_report = report["repositories"][0]
+    assert repo_report["ready_count"] == 0
+    assert repo_report["source_state"]["authority"]["authority"] == "beads_db"
+    assert repo_report["source_state"]["authority"]["jsonl_ready_ids"] == ["mac-jsonl-only"]
+    assert repo_report["source_state"]["authority_findings"][0]["finding_type"] == "beads.export_drift.jsonl_only_ready"
+    findings = cp.list_integration_findings(status="open")
+    assert len(findings) == 1
+    assert findings[0].detail["jsonl_only_ready_ids"] == ["mac-jsonl-only"]
+    observations = cp.list_integration_observations(source_id=repo_record.id)
+    assert observations[0].authority == "beads_db"
+    assert observations[0].status == "ok"
+    assert observations[0].detail["canonical_ready_ids"] == []
+    notifications = cp.list_notifications(subject_id=repo_record.id)
+    assert notifications[0].event_type == "integration.beads.export_drift.jsonl_only_ready"
+    names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
+    assert "integration.finding.opened" in names
+
+    ready_path.write_text(json.dumps([issue]), encoding="utf-8")
+    second = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    assert second["imported_count"] == 1
+    assert cp.list_integration_findings(status="open") == []
+    resolved = cp.list_integration_findings(status="resolved")
+    assert len(resolved) == 1
+    assert resolved[0].resolution == "no longer observed"
 
 
 def test_direct_task_for_registered_project_gets_repository_execution_contract(cp, tmp_path):

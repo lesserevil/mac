@@ -1087,6 +1087,42 @@ class BeadsRepository:
 
 
 @dataclass
+class IntegrationObservation:
+    id: str
+    source_id: str
+    source_kind: str
+    authority: str
+    status: str
+    fingerprint: Optional[str]
+    cursor: Optional[str]
+    detail: JsonDict
+    observed_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class IntegrationFinding:
+    id: str
+    source_id: str
+    source_kind: str
+    finding_type: str
+    severity: str
+    status: str
+    title: str
+    detail: JsonDict
+    fingerprint: str
+    first_seen_at: str
+    last_seen_at: str
+    resolved_at: Optional[str]
+    resolution: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
 class MemoryRecord:
     id: str
     task_id: Optional[str]

@@ -410,6 +410,8 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert "observability" in state
     assert state["observability"]["counts"]["events"] >= 1
     assert "notifications" in state
+    assert "integration_findings" in state
+    assert "integration_observations" in state
 
     timeline = client.get("/dashboard/tasks/%s/timeline" % task["id"]).json()
     assert timeline["task"]["title"] == "Dashboard task"
@@ -441,6 +443,37 @@ def test_fastapi_exposes_operator_notifications():
     ).json()
     assert delivered["status"] == "delivered"
     assert delivered["delivered_at"] is not None
+
+
+def test_fastapi_exposes_integration_authority_ledger():
+    cp = ControlPlane.in_memory()
+    finding = cp.record_integration_finding(
+        "beads_repository",
+        "repo-1",
+        "beads.export_drift.jsonl_only_ready",
+        "Beads export drift",
+        {"jsonl_only_ready_ids": ["mac-test"]},
+        fingerprint="fp-test",
+    )
+    observation = cp.record_integration_observation(
+        "beads_repository",
+        "repo-1",
+        "beads_db",
+        "ok",
+        fingerprint="obs-test",
+        detail={"ready_count": 0},
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    findings = client.get("/integrations/findings", params={"status": "open"}).json()
+    observations = client.get("/integrations/observations", params={"authority": "beads_db"}).json()
+    state = client.get("/dashboard/state").json()
+
+    assert findings[0]["id"] == finding.id
+    assert findings[0]["detail"]["jsonl_only_ready_ids"] == ["mac-test"]
+    assert observations[0]["id"] == observation.id
+    assert state["integration_findings"][0]["id"] == finding.id
+    assert state["integration_observations"][0]["id"] == observation.id
 
 
 def test_events_endpoint_returns_unified_stream():

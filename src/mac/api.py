@@ -1008,6 +1008,13 @@ def _dashboard_state(
     secrets = [secret.to_dict() for secret in cp.list_secrets()]
     secret_audits = [audit.to_dict() for audit in cp.list_secret_audits()]
     runtime_runs = [run.to_dict() for run in cp.list_runtime_runs()]
+    integration_findings = [
+        finding.to_dict() for finding in cp.list_integration_findings(limit=120)
+    ]
+    integration_observations = [
+        observation.to_dict()
+        for observation in cp.list_integration_observations(limit=120)
+    ]
     task_details = [_dashboard_task(cp, task.id) for task in tasks]
     rollout_statuses = [_dashboard_rollout_status(cp, rollout.id) for rollout in rollouts]
     return {
@@ -1030,6 +1037,10 @@ def _dashboard_state(
                 "rollouts": len(rollouts),
                 "secrets": len(secrets),
                 "secret_audits": len(secret_audits),
+                "integration_findings": len(integration_findings),
+                "open_integration_findings": sum(
+                    1 for finding in integration_findings if finding["status"] == "open"
+                ),
             },
             "task_states": _state_counts(task_dicts, "state"),
             "agent_statuses": _state_counts([agent.to_dict() for agent in agents], "status"),
@@ -1051,6 +1062,8 @@ def _dashboard_state(
         "notifications": [
             notification.to_dict() for notification in cp.list_notifications(limit=120)
         ],
+        "integration_findings": integration_findings,
+        "integration_observations": integration_observations,
         "command_audit": [
             record.to_dict() for record in cp.list_command_audit(limit=120)
         ],
@@ -1918,6 +1931,46 @@ def create_app(
                 status=status,
                 subject_type=subject_type,
                 subject_id=subject_id,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/integrations/findings")
+    def list_integration_findings(
+        source_kind: Optional[str] = Query(default=None),
+        source_id: Optional[str] = Query(default=None),
+        finding_type: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        severity: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            finding.to_dict()
+            for finding in cp.list_integration_findings(
+                source_kind=source_kind,
+                source_id=source_id,
+                finding_type=finding_type,
+                status=status,
+                severity=severity,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/integrations/observations")
+    def list_integration_observations(
+        source_kind: Optional[str] = Query(default=None),
+        source_id: Optional[str] = Query(default=None),
+        authority: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            observation.to_dict()
+            for observation in cp.list_integration_observations(
+                source_kind=source_kind,
+                source_id=source_id,
+                authority=authority,
+                status=status,
                 limit=limit,
             )
         ]

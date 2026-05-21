@@ -602,6 +602,39 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_beads_repositories_enabled
                     ON beads_repositories (enabled, last_polled_at);
 
+                CREATE TABLE IF NOT EXISTS integration_observations (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    authority TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    fingerprint TEXT,
+                    cursor TEXT,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    observed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_integration_observations_source
+                    ON integration_observations (source_kind, source_id, observed_at);
+
+                CREATE TABLE IF NOT EXISTS integration_findings (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    finding_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    fingerprint TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolution TEXT,
+                    UNIQUE(source_kind, source_id, finding_type, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS idx_integration_findings_status
+                    ON integration_findings (status, severity, last_seen_at);
+
                 CREATE TABLE IF NOT EXISTS memory_records (
                     id TEXT PRIMARY KEY,
                     task_id TEXT,
