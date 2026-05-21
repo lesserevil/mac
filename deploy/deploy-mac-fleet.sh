@@ -175,6 +175,10 @@ WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}
 WORKER_ALLOWED_PROJECTS="${MAC_DEPLOY_WORKER_ALLOWED_PROJECTS:-}"
 WORKER_REQUIRED_METADATA="${MAC_DEPLOY_WORKER_REQUIRED_METADATA:-}"
 WORKER_REQUIRE_CANARY="${MAC_DEPLOY_WORKER_REQUIRE_CANARY:-1}"
+BACKUP_RETENTION_DAYS="${MAC_DEPLOY_BACKUP_RETENTION_DAYS:-14}"
+BACKUP_RETENTION_COUNT="${MAC_DEPLOY_BACKUP_RETENTION_COUNT:-3}"
+OBSOLETE_ARTIFACT_RETENTION_DAYS="${MAC_DEPLOY_OBSOLETE_ARTIFACT_RETENTION_DAYS:-30}"
+DISK_HYGIENE_DRY_RUN="${MAC_DEPLOY_DISK_HYGIENE_DRY_RUN:-0}"
 DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
 DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${MAC_DEPLOY_DRAIN_POLL_SECONDS:-10}"
@@ -192,6 +196,7 @@ ROLLBACK_SCRIPT="$LOG_DIR/rollback-${DEPLOY_TS}.sh"
 ROLLBACK_LATEST="$LOG_DIR/rollback-latest.sh"
 MANIFEST_PRE="$LOG_DIR/deploy-manifest-${DEPLOY_TS}-pre.json"
 MANIFEST_POST="$LOG_DIR/deploy-manifest-${DEPLOY_TS}-post.json"
+DISK_HYGIENE_REPORT="$LOG_DIR/disk-hygiene-${DEPLOY_TS}.json"
 MAC_SERVICE_NAME="mac.service"
 HERMES_SERVICE_NAME="mac-hermes-gateway.service"
 MAC_AGENT_SERVICE_NAME="mac-agent.service"
@@ -239,7 +244,7 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY BACKUP_RETENTION_DAYS BACKUP_RETENTION_COUNT OBSOLETE_ARTIFACT_RETENTION_DAYS DISK_HYGIENE_DRY_RUN DISK_HYGIENE_REPORT DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -436,6 +441,13 @@ manifest = {
             "timeout_seconds": int(os.environ.get("DRAIN_TIMEOUT_SECONDS") or 0),
             "poll_seconds": int(os.environ.get("DRAIN_POLL_SECONDS") or 0),
         },
+        "disk_hygiene": {
+            "backup_retention_days": int(os.environ.get("BACKUP_RETENTION_DAYS") or 0),
+            "backup_retention_count": int(os.environ.get("BACKUP_RETENTION_COUNT") or 0),
+            "obsolete_artifact_retention_days": int(os.environ.get("OBSOLETE_ARTIFACT_RETENTION_DAYS") or 0),
+            "dry_run": os.environ.get("DISK_HYGIENE_DRY_RUN") == "1",
+            "report": os.environ.get("DISK_HYGIENE_REPORT") or None,
+        },
         "beads_repo_url": os.environ.get("BEADS_REPO_URL") or None,
         "beads_ref": os.environ.get("BEADS_REF") or None,
     },
@@ -482,6 +494,9 @@ manifest = {
         ),
         "messaging_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-messaging-deps.json"),
         "log_summary": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-log-summary.json"),
+    },
+    "disk_hygiene": {
+        "report": file_ref(Path(os.environ["DISK_HYGIENE_REPORT"])),
     },
     "services": service_summary(),
     "backups": {
@@ -573,6 +588,248 @@ echo "rollback complete from $DEPLOY_TS"
 EOF
   chmod 700 "$ROLLBACK_SCRIPT"
   cp -f "$ROLLBACK_SCRIPT" "$ROLLBACK_LATEST"
+}
+
+
+run_disk_hygiene_cleanup() {
+  log "recording disk telemetry and pruning stale generated artifacts"
+  "$PY" - "$DISK_HYGIENE_REPORT" <<'PY'
+import json
+import os
+import shutil
+import time
+from collections import defaultdict
+from pathlib import Path
+
+report_path = Path(os.environ["DISK_HYGIENE_REPORT"])
+mac_home = Path(os.environ["MAC_HOME"])
+log_dir = Path(os.environ["LOG_DIR"])
+backup_dir = mac_home / "backups"
+now = time.time()
+backup_retention_days = int(os.environ.get("BACKUP_RETENTION_DAYS") or 14)
+backup_retention_count = int(os.environ.get("BACKUP_RETENTION_COUNT") or 3)
+obsolete_retention_days = int(os.environ.get("OBSOLETE_ARTIFACT_RETENTION_DAYS") or 30)
+dry_run = os.environ.get("DISK_HYGIENE_DRY_RUN") == "1"
+preserve_paths = {mac_home, Path(os.environ["SRC_DIR"]), Path(os.environ["VENV"]), Path(os.environ["HERMES_DIR"]), Path.home() / ".hermes", Path.home() / ".acc"}
+protected_acc_children = {Path.home() / ".acc" / "data"}
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def disk_usage(path: Path) -> dict:
+    probe = path if path.exists() else path.parent
+    try:
+        usage = shutil.disk_usage(probe)
+        used = usage.total - usage.free
+        return {
+            "path": str(probe),
+            "total_bytes": usage.total,
+            "used_bytes": used,
+            "free_bytes": usage.free,
+            "used_percent": round((used / usage.total) * 100, 2) if usage.total else None,
+        }
+    except OSError as exc:
+        return {"path": str(probe), "error": str(exc)}
+
+
+def tree_size(path: Path) -> int:
+    try:
+        if path.is_file() or path.is_symlink():
+            return path.lstat().st_size
+        total = 0
+        for child in path.rglob("*"):
+            try:
+                if child.is_file() or child.is_symlink():
+                    total += child.lstat().st_size
+            except OSError:
+                continue
+        return total
+    except OSError:
+        return 0
+
+
+def file_ref(path: Path) -> dict:
+    ref = {"path": str(path), "exists": path.exists()}
+    if ref["exists"]:
+        try:
+            st = path.lstat()
+            ref.update(
+                {
+                    "kind": "dir" if path.is_dir() else "file",
+                    "size_bytes": tree_size(path),
+                    "mtime_ns": st.st_mtime_ns,
+                    "age_days": round((now - st.st_mtime) / 86400, 2),
+                }
+            )
+        except OSError as exc:
+            ref["error"] = str(exc)
+    return ref
+
+
+def prefix_for_backup(path: Path) -> str:
+    name = path.name
+    parts = name.split(".")
+    if len(parts) >= 3 and parts[-1].startswith("20"):
+        return ".".join(parts[:-1])
+    if len(parts) >= 4 and parts[-2].startswith("20") and parts[-1] == "plist":
+        return ".".join(parts[:-2]) + ".plist"
+    return parts[0]
+
+
+def safe_to_delete(path: Path) -> bool:
+    if not path.exists():
+        return False
+    resolved = path.resolve()
+    if any(resolved == protected.resolve() for protected in preserve_paths):
+        return False
+    recursive_protect = {
+        Path(os.environ["SRC_DIR"]),
+        Path(os.environ["VENV"]),
+        Path(os.environ["HERMES_DIR"]),
+        Path.home() / ".hermes",
+    } | protected_acc_children
+    for protected in recursive_protect:
+        if is_relative_to(resolved, protected):
+            return False
+    return True
+
+
+def delete_path(path: Path) -> dict:
+    entry = file_ref(path)
+    entry["deleted"] = False
+    entry["dry_run"] = dry_run
+    if not safe_to_delete(path):
+        entry["skipped"] = "protected"
+        return entry
+    if dry_run:
+        return entry
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        entry["deleted"] = True
+    except OSError as exc:
+        entry["error"] = str(exc)
+    return entry
+
+
+def expired(path: Path, retention_days: int) -> bool:
+    try:
+        return (now - path.lstat().st_mtime) > retention_days * 86400
+    except OSError:
+        return False
+
+
+def backup_candidates() -> list[Path]:
+    if not backup_dir.exists():
+        return []
+    return [child for child in backup_dir.iterdir() if child.name.startswith(("mac-src.", "venv.", "hermes-agent.", "mac.service.", "mac-hermes-gateway.service.", "mac-agent.service.", "com.mac.")) or child.name.startswith("rollback-current.")]
+
+
+def prune_backups() -> dict:
+    groups: dict[str, list[Path]] = defaultdict(list)
+    for candidate in backup_candidates():
+        groups[prefix_for_backup(candidate)].append(candidate)
+    kept = []
+    deleted = []
+    for prefix, candidates in sorted(groups.items()):
+        ordered = sorted(candidates, key=lambda p: p.lstat().st_mtime if p.exists() else 0, reverse=True)
+        for index, candidate in enumerate(ordered):
+            should_delete = index >= backup_retention_count or expired(candidate, backup_retention_days)
+            if should_delete:
+                deleted.append(delete_path(candidate) | {"retention_group": prefix})
+            else:
+                kept.append(file_ref(candidate) | {"retention_group": prefix})
+    return {"kept_count": len(kept), "deleted_count": sum(1 for item in deleted if item.get("deleted")), "kept": kept, "deleted": deleted}
+
+
+def obsolete_acc_replacement_artifacts() -> list[Path]:
+    acc_home = Path.home() / ".acc"
+    candidates = [
+        acc_home / "hermes-agent",
+        acc_home / "hermes-agent.old",
+        acc_home / "venv",
+        acc_home / ".venv",
+        acc_home / "build",
+        acc_home / "dist",
+        acc_home / "logs",
+        acc_home / "deploy",
+        acc_home / "releases",
+        acc_home / "artifacts",
+        acc_home / "src" / "acc",
+        acc_home / "src" / "hermes-agent",
+    ]
+    migration_report = log_dir / "acc-migration-import.json"
+    if not migration_report.exists():
+        return []
+    return [candidate for candidate in candidates if candidate.exists() and expired(candidate, obsolete_retention_days)]
+
+
+def obsolete_agentfs_review_scratch() -> list[Path]:
+    agentfs = Path.home() / "AgentFS"
+    if not agentfs.exists():
+        return []
+    names = ("review", "reviews", "mac-review", "acc-review", "review-scratch")
+    return [candidate for candidate in agentfs.iterdir() if candidate.exists() and candidate.name.lower().startswith(names) and expired(candidate, obsolete_retention_days)]
+
+
+def old_deploy_logs() -> list[Path]:
+    if not log_dir.exists():
+        return []
+    prefixes = ("deploy-", "deploy-manifest-", "rollback-")
+    return [candidate for candidate in log_dir.iterdir() if candidate.name.startswith(prefixes) and candidate.name not in {"deploy-manifest-latest.json", "rollback-latest.sh"} and expired(candidate, obsolete_retention_days)]
+
+before = {
+    "mac_home": disk_usage(mac_home),
+    "home": disk_usage(Path.home()),
+    "notable_paths": [file_ref(path) for path in [mac_home, backup_dir, log_dir, Path.home() / ".acc", Path.home() / ".hermes", Path.home() / "AgentFS"]],
+}
+backup_cleanup = prune_backups()
+obsolete_targets = obsolete_acc_replacement_artifacts() + obsolete_agentfs_review_scratch() + old_deploy_logs()
+obsolete_deleted = [delete_path(candidate) for candidate in obsolete_targets]
+after = {
+    "mac_home": disk_usage(mac_home),
+    "home": disk_usage(Path.home()),
+    "notable_paths": [file_ref(path) for path in [mac_home, backup_dir, log_dir, Path.home() / ".acc", Path.home() / ".hermes", Path.home() / "AgentFS"]],
+}
+report = {
+    "schema": "mac.disk_hygiene_report.v1",
+    "status": "complete",
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "agent": os.environ["AGENT"],
+    "dry_run": dry_run,
+    "retention": {
+        "backup_days": backup_retention_days,
+        "backup_count": backup_retention_count,
+        "obsolete_artifact_days": obsolete_retention_days,
+    },
+    "disk_usage_before": before,
+    "disk_usage_after": after,
+    "backup_cleanup": backup_cleanup,
+    "obsolete_acc_replacement_artifacts": {
+        "candidate_count": len(obsolete_targets),
+        "deleted_count": sum(1 for item in obsolete_deleted if item.get("deleted")),
+        "deleted": obsolete_deleted,
+    },
+}
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(
+    "disk hygiene: backups_deleted=%d obsolete_deleted=%d dry_run=%s report=%s"
+    % (
+        report["backup_cleanup"]["deleted_count"],
+        report["obsolete_acc_replacement_artifacts"]["deleted_count"],
+        dry_run,
+        report_path,
+    )
+)
+PY
 }
 
 backup_existing_artifacts() {
@@ -1372,6 +1629,7 @@ log "deploy log: $DEPLOY_LOG"
 ensure_dns_resolution
 ensure_venv_support
 write_deploy_manifest "pre" "$MANIFEST_PRE"
+run_disk_hygiene_cleanup
 drain_mac_agent_before_deploy
 stop_existing_services_for_deploy
 backup_existing_artifacts
