@@ -863,8 +863,12 @@ install_github_cli() {
     log "ERROR: GitHub CLI (gh) is required for worker publication but could not be installed"
     exit 1
   fi
-  ln -sf "$existing" "$target" 2>/dev/null || cp -f "$existing" "$target"
-  chmod 0755 "$target"
+  if ln -sf "$existing" "$target" 2>/dev/null; then
+    :
+  else
+    cp -f "$existing" "$target"
+    chmod 0755 "$target"
+  fi
   "$target" --version > "$LOG_DIR/gh-version.txt"
   log "GitHub CLI ready at $target"
 }
