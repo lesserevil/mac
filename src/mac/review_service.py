@@ -53,6 +53,7 @@ class ReviewService:
         get_evidence: Callable[[str], Evidence],
         transition_task: Callable[..., Task],
         record_history: Callable[..., None],
+        enqueue_outbox: Optional[Callable[..., str]] = None,
     ) -> None:
         self.store = store
         self.observability = observability
@@ -62,6 +63,11 @@ class ReviewService:
         self._get_evidence = get_evidence
         self._transition_task = transition_task
         self._record_history = record_history
+        # `enqueue_outbox(conn, event_type, payload, task_id=...)` writes
+        # an intent row into the domain-event outbox in the same
+        # transaction as the caller. Optional so legacy callers and
+        # tests that construct ReviewService directly still work.
+        self._enqueue_outbox = enqueue_outbox
 
     # Reviews -----------------------------------------------------------
 
@@ -257,6 +263,34 @@ class ReviewService:
                     "UPDATE agents SET status = ?, current_task_id = NULL, updated_at = ? WHERE id = ?",
                     (AgentStatus.IDLE.value, now, owner_agent_id),
                 )
+            # Enqueue post-commit side effects in the same transaction as
+            # the COMPLETED transition so a crash between COMMIT and
+            # dispatch cannot leave Beads + workflow runtime out-of-sync
+            # with a published task. The drain happens in the caller
+            # (ControlPlane.publish_task).
+            if self._enqueue_outbox is not None:
+                self._enqueue_outbox(
+                    conn,
+                    "beads.close",
+                    {"task_id": task_id, "actor": created_by},
+                    task_id=task_id,
+                )
+                # publish_task is the only path that transitions a task
+                # to COMPLETED without going through transition_task, so
+                # we mirror its workflow-runtime hook here.
+                wfrow = conn.execute(
+                    "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if wfrow is not None and wfrow["workflow_run_id"]:
+                    self._enqueue_outbox(
+                        conn,
+                        "workflow.advance",
+                        {
+                            "task_id": task_id,
+                            "terminal_state": TaskState.COMPLETED.value,
+                        },
+                        task_id=task_id,
+                    )
         return self.get_publication(publication_id)
 
     def get_publication(self, publication_id: str) -> Publication:

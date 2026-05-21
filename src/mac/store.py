@@ -184,6 +184,41 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_task_history_task_created
                     ON task_history (task_id, created_at);
 
+                /*
+                 * Transactional outbox for domain events emitted by task
+                 * lifecycle transitions.
+                 *
+                 * Side effects of a transition that touch external systems
+                 * (Beads CLI, workflow runtime) used to fire after the core
+                 * UPDATE committed, so a crash between commit and side-effect
+                 * silently dropped the work. We now write an intent row into
+                 * this table inside the same transaction as the task UPDATE
+                 * and history row, and drain it post-commit. Rows that fail
+                 * to dispatch remain `pending` for the next drain pass (or
+                 * the next process start), giving us at-least-once delivery
+                 * without partial-state surprises.
+                 *
+                 * `event_type` is a stable string ('beads.claim',
+                 * 'beads.close', 'beads.reopen', 'workflow.advance', ...).
+                 * `payload` is opaque JSON the dispatcher knows how to
+                 * interpret per event_type.
+                 */
+                CREATE TABLE IF NOT EXISTS domain_events (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_domain_events_pending
+                    ON domain_events (status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_domain_events_task
+                    ON domain_events (task_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS evidence (
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
