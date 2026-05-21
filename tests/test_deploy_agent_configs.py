@@ -127,6 +127,18 @@ def test_fleet_deploy_installs_github_cli_for_workers():
     assert 'export PATH="$HOME/.mac/bin:$PATH"' in script
 
 
+def test_fleet_deploy_does_not_print_worker_token_in_systemd_status():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    agent_service = script.split("install_linux_agent_service() {", 1)[1].split(
+        "install_darwin_service() {", 1
+    )[0]
+
+    assert "systemctl show mac-agent.service" in agent_service
+    assert "systemctl --no-pager -l status mac-agent.service" not in agent_service
+    assert "-p ActiveState" in agent_service
+    assert "-p MainPID" in agent_service
+
+
 def test_fleet_deploy_applies_hermes_patch_set():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
     quench_patch = ROOT / "deploy" / "hermes" / "disable-shutdown-chat-notices.patch"

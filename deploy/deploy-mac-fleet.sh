@@ -2149,7 +2149,13 @@ EOF
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sudo systemctl restart mac-agent.service
   sleep 3
-  sudo systemctl --no-pager -l status mac-agent.service || true
+  sudo systemctl show mac-agent.service \
+    -p LoadState \
+    -p ActiveState \
+    -p SubState \
+    -p UnitFileState \
+    -p MainPID \
+    -p NRestarts || true
   sudo journalctl -u mac-agent.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
