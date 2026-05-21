@@ -2367,12 +2367,14 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
     cp.claim_task(task.id, worker.id)
     cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "canary failed"})
 
-    assert calls[0] == {
+    update_calls = [call for call in calls if call["command"][3] == "update"]
+    comment_calls = [call for call in calls if call["command"][3] == "comment"]
+    assert update_calls[0] == {
         "command": [bd_cli, "--actor", worker.id, "update", "mac-sync", "--claim"],
         "cwd": str(repo),
     }
-    assert calls[1]["cwd"] == str(repo)
-    assert calls[1]["command"][:7] == [
+    assert update_calls[1]["cwd"] == str(repo)
+    assert update_calls[1]["command"][:7] == [
         bd_cli,
         "--actor",
         worker.id,
@@ -2381,8 +2383,12 @@ def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch
         "--status",
         "open",
     ]
-    assert calls[1]["command"][7] == "--append-notes"
-    assert "canary failed" in calls[1]["command"][8]
+    assert update_calls[1]["command"][7] == "--append-notes"
+    assert "canary failed" in update_calls[1]["command"][8]
+    comments = "\n".join(call["command"][5] for call in comment_calls)
+    assert "event=claimed" in comments
+    assert "event=state_failed" in comments
+    assert "canary failed" in comments
 
 
 def test_beads_export_noise_can_be_restored_after_sync(cp, tmp_path, monkeypatch):
@@ -2595,22 +2601,33 @@ def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
     cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
 
+    close_calls = [call for call in calls if call["command"][3] == "close"]
+    comment_calls = [call for call in calls if call["command"][3] == "comment"]
     assert calls[0] == {
         "command": [bd_cli, "--actor", worker.id, "update", "mac-close", "--claim"],
         "cwd": str(repo),
     }
-    assert calls[1] == {
-        "command": [
-            bd_cli,
-            "--actor",
-            reviewer.id,
-            "close",
-            "mac-close",
-            "--reason",
-            "Completed by mac task %s" % task.id,
-        ],
-        "cwd": str(repo),
-    }
+    assert close_calls == [
+        {
+            "command": [
+                bd_cli,
+                "--actor",
+                reviewer.id,
+                "close",
+                "mac-close",
+                "--reason",
+                "Completed by mac task %s" % task.id,
+            ],
+            "cwd": str(repo),
+        }
+    ]
+    comments = "\n".join(call["command"][5] for call in comment_calls)
+    assert "event=claimed" in comments
+    assert "event=state_running" in comments
+    assert "event=evidence_added" in comments
+    assert "event=review_requested" in comments
+    assert "event=review_completed" in comments
+    assert "event=published" in comments
 
 
 def test_acc_migration_dry_run_reports_without_writing(cp, tmp_path):

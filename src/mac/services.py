@@ -117,6 +117,20 @@ def _state_value(state: Any) -> str:
     return state.value if hasattr(state, "value") else str(state)
 
 
+def _compact_beads_ledger_text(value: Any, *, limit: int = 180) -> str:
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    text = re.sub(r"Bearer\s+[-A-Za-z0-9._~+/=]+", "Bearer <redacted>", text)
+    text = re.sub(
+        r"(?i)(token|api[_-]?key|password|secret)=([^&\s]+)",
+        r"\1=<redacted>",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
+
+
 def _manifest_list(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
 
@@ -1770,6 +1784,7 @@ class ControlPlane:
                         "workflow runtime failed to advance on task %s", task_id
                     )
         transitioned = self.get_task(task_id)
+        self._sync_beads_transition_ledger(transitioned, actor, task.state, target, detail or {})
         if target in {TaskState.FAILED.value, TaskState.CANCELLED.value}:
             self._sync_beads_reopen(transitioned, actor, target, detail or {})
         return transitioned
@@ -1836,6 +1851,22 @@ class ControlPlane:
         )
         claimed_task = self.get_task(task_id)
         self._sync_beads_claim(claimed_task, agent_id)
+        acc_metadata = claimed_task.metadata.get("acc_metadata") if isinstance(claimed_task.metadata, dict) else {}
+        if not (
+            isinstance(acc_metadata, dict)
+            and acc_metadata.get("beads_sync_claim_on_claim") is False
+        ):
+            self._append_beads_ledger_comment(
+                claimed_task,
+                agent_id,
+                "claimed",
+                "claimed by %s" % agent_id,
+                fields={
+                    "lease": lease_id,
+                    "attempt": claimed_task.attempt_count,
+                    "leased_until": expires_at,
+                },
+            )
         return claimed_task, self.get_lease(lease_id)
 
     def start_task(self, task_id: str, agent_id: str) -> Task:
@@ -1912,7 +1943,19 @@ class ControlPlane:
                 {"evidence_id": evidence_id, "kind": kind, "uri": uri},
                 conn=conn,
             )
-        return self.get_evidence(evidence_id)
+        evidence = self.get_evidence(evidence_id)
+        self._append_beads_ledger_comment(
+            self.get_task(task_id),
+            created_by,
+            "evidence_added",
+            "%s evidence recorded" % kind,
+            fields={
+                "evidence": evidence_id,
+                "kind": kind,
+                "summary": summary,
+            },
+        )
+        return evidence
 
     def get_evidence(self, evidence_id: str) -> Evidence:
         row = self.store.query_one("SELECT * FROM evidence WHERE id = ?", (evidence_id,))
@@ -2754,10 +2797,44 @@ class ControlPlane:
     # Reviews + publication: thin facade over ``self.reviews``.
 
     def request_review(self, *args: Any, **kwargs: Any) -> Review:
-        return self.reviews.request_review(*args, **kwargs)
+        review = self.reviews.request_review(*args, **kwargs)
+        actor = kwargs.get("actor")
+        if actor is None and len(args) >= 3:
+            actor = args[2]
+        if actor is None:
+            actor = "dispatcher"
+        self._append_beads_ledger_comment(
+            self.get_task(review.task_id),
+            str(actor),
+            "review_requested",
+            "review requested",
+            fields={
+                "review": review.id,
+                "reviewer": review.reviewer_agent_id,
+            },
+        )
+        return review
 
     def submit_review(self, *args: Any, **kwargs: Any) -> Review:
-        return self.reviews.submit_review(*args, **kwargs)
+        review = self.reviews.submit_review(*args, **kwargs)
+        reviewer_agent_id = kwargs.get("reviewer_agent_id")
+        if reviewer_agent_id is None and len(args) >= 3:
+            reviewer_agent_id = args[2]
+        if reviewer_agent_id is None:
+            reviewer_agent_id = review.reviewer_agent_id
+        self._append_beads_ledger_comment(
+            self.get_task(review.task_id),
+            str(reviewer_agent_id),
+            "review_completed",
+            "review %s" % review.status,
+            fields={
+                "review": review.id,
+                "reviewer": review.reviewer_agent_id,
+                "reason": review.reason,
+                "evidence": review.evidence_id,
+            },
+        )
+        return review
 
     def get_review(self, review_id: str) -> Review:
         return self.reviews.get_review(review_id)
@@ -2773,6 +2850,18 @@ class ControlPlane:
         if task_id is not None:
             self._validate_publication_evidence(str(task_id), evidence_id)
         publication = self.reviews.publish_task(*args, **kwargs)
+        self._append_beads_ledger_comment(
+            self.get_task(publication.task_id),
+            publication.created_by,
+            "published",
+            "published to %s" % publication.target,
+            fields={
+                "publication": publication.id,
+                "target": publication.target,
+                "evidence": publication.evidence_id,
+                "status": publication.status,
+            },
+        )
         self._sync_beads_close(self.get_task(publication.task_id), publication.created_by)
         # publish_task transitions the underlying task to COMPLETED inside
         # its own transaction (bypassing transition_task), so we run the
@@ -3662,9 +3751,25 @@ class ControlPlane:
                     "SELECT id, task_id FROM project_items WHERE source = ? AND external_id = ?",
                     (repo.source, str(issue["id"])),
                 )
-                self._import_bead_issue(repo, issue, actor=actor, repository_contract=repository_contract)
+                item = self._import_bead_issue(
+                    repo,
+                    issue,
+                    actor=actor,
+                    repository_contract=repository_contract,
+                )
                 if prior is None:
                     imported += 1
+                    self._append_beads_ledger_comment(
+                        self.get_task(item.task_id),
+                        actor,
+                        "imported",
+                        "bead imported as mac task %s" % item.task_id,
+                        fields={
+                            "source": repo.source,
+                            "project": repo.project,
+                            "priority": self.get_task(item.task_id).priority,
+                        },
+                    )
                 else:
                     existing += 1
                     result = self._sync_existing_beads_task(
@@ -4837,7 +4942,7 @@ class ControlPlane:
             )
         except Exception as exc:  # noqa: BLE001 - Beads sync is secondary to task state.
             self.record_log(
-                "bridge.beads.sync_failed",
+                "bridge.beads.ledger_failed" if action == "ledger" else "bridge.beads.sync_failed",
                 layer="control_plane",
                 source=actor,
                 level="warning",
@@ -4850,6 +4955,91 @@ class ControlPlane:
                     "error": str(exc),
                 },
             )
+
+    def _append_beads_ledger_comment(
+        self,
+        task: Task,
+        actor: str,
+        event: str,
+        message: str,
+        *,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        binding = self._beads_binding_for_task(task)
+        if binding is None:
+            return
+        acc_metadata = task.metadata.get("acc_metadata") if isinstance(task.metadata, dict) else {}
+        if isinstance(acc_metadata, dict) and acc_metadata.get("beads_sync_ledger_comments") is False:
+            return
+        pieces = [
+            "mac-ledger v1",
+            "task=%s" % task.id,
+            "event=%s" % _compact_beads_ledger_text(event, limit=64),
+            "actor=%s" % _compact_beads_ledger_text(actor, limit=96),
+            _compact_beads_ledger_text(message, limit=220),
+        ]
+        for key, value in sorted(ensure_json_object(fields).items()):
+            if value is None or value == "":
+                continue
+            pieces.append(
+                "%s=%s"
+                % (
+                    _compact_beads_ledger_text(key, limit=40),
+                    _compact_beads_ledger_text(value, limit=160),
+                )
+            )
+        self._run_bd_for_task(
+            task,
+            ["comment", binding["bead_id"], " | ".join(pieces)],
+            actor,
+            "ledger",
+        )
+
+    def _sync_beads_transition_ledger(
+        self,
+        task: Task,
+        actor: str,
+        from_state: str,
+        to_state: str,
+        detail: Dict[str, Any],
+    ) -> None:
+        if to_state not in {
+            TaskState.RUNNING.value,
+            TaskState.NEEDS_REVIEW.value,
+            TaskState.REVIEWING.value,
+            TaskState.COMPLETED.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+            TaskState.OPEN.value,
+        }:
+            return
+        event = "state_%s" % to_state
+        reason = detail.get("reason") if isinstance(detail, dict) else None
+        fields: Dict[str, Any] = {"from": from_state, "to": to_state}
+        for key in (
+            "reason",
+            "evidence_id",
+            "review_id",
+            "reviewer_agent_id",
+            "publication_id",
+        ):
+            if isinstance(detail, dict) and detail.get(key):
+                fields[key] = detail.get(key)
+        problems = detail.get("problems") if isinstance(detail, dict) else None
+        if isinstance(problems, list) and problems:
+            fields["problems"] = "; ".join(str(item) for item in problems[:4])
+        self._append_beads_ledger_comment(
+            task,
+            actor,
+            event,
+            "state %s -> %s%s"
+            % (
+                from_state,
+                to_state,
+                (": %s" % reason) if reason else "",
+            ),
+            fields=fields,
+        )
 
     def _beads_sync_path_for_binding(self, binding: JsonDict, actor: str) -> Path:
         repo_id = str(binding.get("repository_id") or "").strip()
@@ -5087,6 +5277,13 @@ class ControlPlane:
             subject_id=task.id,
             detail=detail,
         )
+        self._append_beads_ledger_comment(
+            self.get_task(task.id),
+            actor,
+            "retry_reopened",
+            "failed mac task reopened because bead is still ready",
+            fields=detail,
+        )
         return "reopened"
 
     def _mark_failed_beads_task_retry_exhausted(
@@ -5143,6 +5340,13 @@ class ControlPlane:
             subject_type="task",
             subject_id=task.id,
             detail=detail,
+        )
+        self._append_beads_ledger_comment(
+            self.get_task(task.id),
+            actor,
+            "retry_exhausted",
+            "failed mac task exhausted automatic Beads retries",
+            fields=detail,
         )
         return True
 
@@ -6224,6 +6428,17 @@ class ControlPlane:
             {
                 "review_id": review.id,
                 "reviewer_agent_id": review.reviewer_agent_id,
+                "reason": reason,
+            },
+        )
+        self._append_beads_ledger_comment(
+            self.get_task(review.task_id),
+            actor,
+            "review_retracted",
+            "review retracted",
+            fields={
+                "review": review.id,
+                "reviewer": review.reviewer_agent_id,
                 "reason": reason,
             },
         )
