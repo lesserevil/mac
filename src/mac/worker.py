@@ -33,6 +33,8 @@ JsonDict = Dict[str, Any]
 Executor = Callable[[JsonDict, Path], "WorkerExecution"]
 CommandAuditSink = Callable[[JsonDict], None]
 SAFE_GIT_REF_RE = r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$"
+VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
+GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 @dataclass
@@ -400,6 +402,37 @@ class MacWorker:
                 )
             evidence = self._record_execution(task_id, task_dir, execution)
             if execution.succeeded:
+                submission_problems = self._execution_submission_problems(task_dir, evidence)
+                if submission_problems:
+                    self._observe_log(
+                        "worker.execution.verification_failed",
+                        level="error",
+                        subject_type="task",
+                        subject_id=task_id,
+                        detail={
+                            "evidence_id": evidence.get("id"),
+                            "problems": submission_problems,
+                        },
+                    )
+                    failed_task = self.client.post(
+                        "/tasks/%s/transition" % quote(task_id, safe=""),
+                        {
+                            "target_state": "failed",
+                            "actor": self.agent_id,
+                            "detail": {
+                                "reason": "verification_contract_failed",
+                                "evidence_id": evidence.get("id"),
+                                "problems": submission_problems,
+                            },
+                        },
+                    )
+                    return WorkerRunResult(
+                        status="failed",
+                        task=failed_task,
+                        lease=lease,
+                        evidence=evidence,
+                        error="; ".join(submission_problems[:4]),
+                    )
                 reviewed_task = self.client.post(
                     "/tasks/%s/submit-for-review?%s"
                     % (
@@ -1236,6 +1269,45 @@ class MacWorker:
             },
         )
 
+    def _execution_submission_problems(self, task_dir: Path, evidence: JsonDict) -> List[str]:
+        problems: List[str] = []
+        metadata = evidence.get("metadata") if isinstance(evidence, dict) else None
+        manifest = metadata.get("verification") if isinstance(metadata, dict) else None
+        if not isinstance(manifest, dict):
+            return ["evidence metadata lacks verification manifest"]
+        if str(manifest.get("schema") or "").strip() != VERIFICATION_SCHEMA:
+            problems.append("verification.schema must be %s" % VERIFICATION_SCHEMA)
+        if str(manifest.get("status") or "").strip().lower() != "complete":
+            problems.append('verification.status must be "complete"')
+        evidence_type = str(manifest.get("evidence_type") or "").strip().lower()
+        if not evidence_type:
+            problems.append("verification.evidence_type is required")
+        if not str(manifest.get("signed_by") or "").strip() or not str(manifest.get("signature") or "").strip():
+            problems.append("verification.signed_by and verification.signature are required")
+        if evidence_type:
+            problems.extend(_worker_verification_contract_problems(manifest, evidence_type))
+
+        repository_context = _load_repository_context(task_dir)
+        if repository_context:
+            worktree = Path(str(repository_context.get("repository_worktree") or ""))
+            if not worktree.exists():
+                problems.append("repository worktree is missing: %s" % worktree)
+            else:
+                dirty = _run_git(worktree, ["status", "--porcelain"])
+                if dirty.returncode != 0:
+                    problems.append(
+                        "could not inspect repository worktree status: %s"
+                        % ((dirty.stderr or dirty.stdout or "").strip() or worktree)
+                    )
+                elif dirty.stdout.strip():
+                    problems.append("repository worktree has uncommitted changes")
+                head = _run_git(worktree, ["rev-parse", "HEAD"])
+                repo = manifest.get("repo") if isinstance(manifest.get("repo"), dict) else {}
+                manifest_head = str(repo.get("head_sha") or "").strip() if isinstance(repo, dict) else ""
+                if head.returncode == 0 and manifest_head and head.stdout.strip() != manifest_head:
+                    problems.append("verification.repo.head_sha does not match worktree HEAD")
+        return problems
+
     def _record_review_execution(
         self,
         task_id: str,
@@ -1632,6 +1704,101 @@ def _repository_context_audit_metadata(context: JsonDict) -> JsonDict:
 
 def _safe_git_ref(value: str) -> bool:
     return bool(value and not value.startswith("-") and re.match(SAFE_GIT_REF_RE, value))
+
+
+def _manifest_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _worker_verification_contract_problems(manifest: JsonDict, evidence_type: str) -> List[str]:
+    if evidence_type == "repo_change":
+        return _worker_repo_verification_problems(manifest, require_tests=True)
+    if evidence_type == "documentation":
+        return _worker_repo_verification_problems(manifest, require_tests=False)
+    if evidence_type == "deployment":
+        problems = _worker_require_pushed_repo_anchor(manifest)
+        if _worker_passed_verification_check_count(manifest) < 1:
+            problems.append("deployment evidence requires at least one passing check")
+        if not (
+            _manifest_list(manifest.get("targets"))
+            or _manifest_list(manifest.get("services"))
+            or _manifest_list(manifest.get("artifacts"))
+        ):
+            problems.append("deployment evidence requires targets, services, or artifacts")
+        return problems
+    if evidence_type in {"test", "artifact"}:
+        problems = _worker_require_pushed_repo_anchor(manifest)
+        if _worker_passed_verification_check_count(manifest) < 1:
+            problems.append("%s evidence requires at least one passing check or test" % evidence_type)
+        if evidence_type == "artifact" and not _manifest_list(manifest.get("artifacts")):
+            problems.append("artifact evidence requires artifacts")
+        return problems
+    if evidence_type == "no_change":
+        problems = _worker_require_pushed_repo_anchor(manifest)
+        if not str(manifest.get("reason") or manifest.get("no_change_reason") or "").strip():
+            problems.append("no_change evidence requires a reason")
+        if _worker_passed_verification_check_count(manifest) < 1:
+            problems.append("no_change evidence requires at least one passing check")
+        return problems
+    if evidence_type == "review_verdict":
+        return []
+    return ["unsupported verification.evidence_type: %s" % evidence_type]
+
+
+def _worker_repo_verification_problems(manifest: JsonDict, require_tests: bool) -> List[str]:
+    problems = _worker_require_pushed_repo_anchor(manifest)
+    repo = manifest.get("repo") if isinstance(manifest.get("repo"), dict) else {}
+    files_changed = _manifest_list(repo.get("files_changed")) if isinstance(repo, dict) else []
+    if not files_changed:
+        problems.append("repo evidence requires changed files")
+    if require_tests and _worker_passed_verification_check_count(manifest) < 1:
+        problems.append("repo code evidence requires at least one passing test/check")
+    return problems
+
+
+def _worker_require_pushed_repo_anchor(manifest: JsonDict) -> List[str]:
+    repo = manifest.get("repo")
+    if not isinstance(repo, dict):
+        return ["repo evidence requires verification.repo object"]
+    problems: List[str] = []
+    head_sha = str(repo.get("head_sha") or "").strip()
+    if not GIT_SHA_RE.match(head_sha):
+        problems.append("repo.head_sha must be a git SHA")
+    dirty = repo.get("dirty")
+    if dirty not in {False, "false", "False", 0, "0"}:
+        problems.append("repo evidence must declare dirty=false")
+    pushed = repo.get("pushed") is True or str(repo.get("pushed") or "").lower() == "true"
+    remote_ref = str(repo.get("remote_ref") or "").strip()
+    pr_url = str(repo.get("pr_url") or "").strip()
+    if not (pushed and remote_ref) and not pr_url:
+        problems.append("repo evidence requires pushed=true with remote_ref, or pr_url")
+    return problems
+
+
+def _worker_passed_verification_check_count(manifest: JsonDict) -> int:
+    count = 0
+    for item in _manifest_list(manifest.get("tests")):
+        if _worker_verification_item_passed(item):
+            count += 1
+    for item in _manifest_list(manifest.get("checks")):
+        if _worker_verification_item_passed(item):
+            count += 1
+    return count
+
+
+def _worker_verification_item_passed(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if "returncode" in item:
+        try:
+            return int(item["returncode"]) == 0
+        except (TypeError, ValueError):
+            return False
+    return str(item.get("status") or "").strip().lower() == "pass"
 
 
 def _run_git(repo: Path, args: List[str]) -> subprocess.CompletedProcess[str]:

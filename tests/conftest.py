@@ -28,12 +28,18 @@ def submit_review_verdict(
     from mac.services import sign_verification_manifest
 
     key = cp._agent_attestation_key(reviewer_agent_id)
+    executor_evidence = cp.get_evidence(executor_evidence_id)
+    executor_manifest = executor_evidence.metadata.get("verification") or {}
+    repo = dict(executor_manifest.get("repo") or {})
     manifest = {
         "schema": "mac.worker_evidence.v1",
         "status": "complete",
         "evidence_type": "review_verdict",
         "verdict": verdict,
         "reviewed_evidence_id": executor_evidence_id,
+        "repo": repo,
+        "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+        "worktree_digest": "sha256:" + ("0" * 64),
     }
     manifest["signed_by"] = reviewer_agent_id
     manifest["signature"] = sign_verification_manifest(key, manifest)

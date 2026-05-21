@@ -166,6 +166,8 @@ def test_real_hub_and_mac_agent_process_execute_canary_without_touching_normal_t
             "python",
             "--workspace",
             str(workspace),
+            "--attestation-key-env",
+            str(tmp_path / "attestation.env"),
             "--allowed-projects",
             "mac-canary",
             "--require-canary",
@@ -203,6 +205,24 @@ assert envelope["lease"]["task_id"] == task["id"]
 assert os.environ["MAC_TASK_ID"] == task["id"]
 (workspace / "executor-ran.json").write_text(
     json.dumps({"task_id": task["id"], "title": task["title"]}, sort_keys=True),
+    encoding="utf-8",
+)
+(workspace / "mac-evidence.json").write_text(
+    json.dumps(
+        {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "test",
+            "repo": {
+                "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+                "pushed": True,
+                "remote_ref": "refs/heads/task/process-e2e",
+                "dirty": False,
+            },
+            "checks": [{"name": "executor", "returncode": 0}],
+        },
+        sort_keys=True,
+    ),
     encoding="utf-8",
 )
 print("executor completed " + task["id"])

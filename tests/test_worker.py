@@ -111,6 +111,47 @@ def _repository_task_metadata(repo: Path) -> Dict[str, Any]:
     }
 
 
+def _write_worker_manifest(
+    task_dir: Path,
+    *,
+    head_sha: str = "abcdef1234567890abcdef1234567890abcdef12",
+    evidence_type: str = "test",
+    remote_ref: str = "refs/heads/task/example",
+    files_changed: Optional[list[str]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    repo: Dict[str, Any] = {
+        "head_sha": head_sha,
+        "pushed": True,
+        "remote_ref": remote_ref,
+        "dirty": False,
+    }
+    if files_changed:
+        repo["files_changed"] = files_changed
+    manifest: Dict[str, Any] = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": evidence_type,
+        "repo": repo,
+        "checks": [{"name": "pytest", "returncode": 0}],
+    }
+    if extra:
+        manifest.update(extra)
+    (task_dir / "mac-evidence.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def _write_repo_worker_manifest(task_dir: Path, worktree: Path) -> Dict[str, Any]:
+    return _write_worker_manifest(
+        task_dir,
+        head_sha=_git(worktree, "rev-parse", "HEAD"),
+        remote_ref="refs/heads/%s" % (_git(worktree, "branch", "--show-current") or "task"),
+    )
+
+
 def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)
@@ -121,6 +162,7 @@ def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: P
     def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
         assert task_payload["id"] == task.id
         assert (task_dir / "task.json").exists()
+        _write_worker_manifest(task_dir)
         return WorkerExecution(0, "tests passed", stdout="tests passed\n")
 
     worker = MacWorker(
@@ -128,6 +170,7 @@ def test_mac_worker_claims_for_specific_agent_and_submits_for_review(tmp_path: P
         agent.id,
         tmp_path,
         executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -204,6 +247,9 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
             "verdict": "approved",
             "review_id": context["review_id"],
             "reviewed_evidence_id": context["executor_evidence_id"],
+            "repo": dict(executor_manifest["repo"]),
+            "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+            "worktree_digest": "sha256:" + ("0" * 64),
             "findings": ["executor evidence is signed and tests passed"],
         }
         (task_dir / "mac-evidence.json").write_text(
@@ -257,6 +303,27 @@ def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):
     assert evidence[0].metadata["returncode"] == 2
 
 
+def test_mac_worker_fails_successful_execution_without_verification_manifest(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    task = cp.create_task("Python task", required_capabilities=["python"])
+    client = TestClient(create_app(control_plane=cp))
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path,
+        lambda _task, _task_dir: WorkerExecution(0, "looked ok", stdout="ok\n"),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert "status" in (result.error or "")
+    assert cp.get_task(task.id).state == TaskState.FAILED.value
+    assert cp.list_evidence(task.id)[0].metadata["verification"]["status"] == "missing"
+
+
 def test_mac_worker_audits_subprocess_commands(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)
@@ -269,7 +336,18 @@ def test_mac_worker_audits_subprocess_commands(tmp_path: Path):
                 "from pathlib import Path",
                 "import json, os",
                 "workspace = Path(os.environ['MAC_TASK_WORKSPACE'])",
-                "manifest = {'schema': 'mac.worker_evidence.v1', 'status': 'complete', 'evidence_type': 'test'}",
+                "manifest = {",
+                "  'schema': 'mac.worker_evidence.v1',",
+                "  'status': 'complete',",
+                "  'evidence_type': 'test',",
+                "  'repo': {",
+                "    'head_sha': 'abcdef1234567890abcdef1234567890abcdef12',",
+                "    'pushed': True,",
+                "    'remote_ref': 'refs/heads/task/audit',",
+                "    'dirty': False,",
+                "  },",
+                "  'checks': [{'name': 'pytest', 'returncode': 0}],",
+                "}",
                 "(workspace / 'mac-evidence.json').write_text(json.dumps(manifest), encoding='utf-8')",
                 "print('audited command ran')",
             ]
@@ -281,6 +359,7 @@ def test_mac_worker_audits_subprocess_commands(tmp_path: Path):
         agent.id,
         tmp_path / "workspaces",
         SubprocessExecutor([sys.executable, str(executor_script)]),
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -326,6 +405,7 @@ def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
         assert _git(worktree, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
         assert _git(repo, "status", "--porcelain") == ""
         assert (task_dir / "repository-worktree.json").exists()
+        _write_repo_worker_manifest(task_dir, worktree)
         return WorkerExecution(0, "repo worktree prepared", stdout="ok\n")
 
     worker = MacWorker(
@@ -333,6 +413,7 @@ def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
         agent.id,
         tmp_path / "workspaces",
         executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -340,6 +421,38 @@ def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
     assert result.status == "submitted_for_review"
     observations = cp.list_observability(layer="worker", limit=20)
     assert any(item.name == "worker.repository.worktree_prepared" for item in observations)
+
+
+def test_mac_worker_fails_dirty_repository_worktree_after_success(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    task = cp.create_task(
+        "Dirty result task",
+        required_capabilities=["python"],
+        metadata=_repository_task_metadata(repo),
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        worktree = Path(task_payload["metadata"]["runtime"]["repository_worktree"])
+        _write_repo_worker_manifest(task_dir, worktree)
+        (worktree / "README.md").write_text("dirty output\n", encoding="utf-8")
+        return WorkerExecution(0, "left a dirty tree", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert "uncommitted changes" in (result.error or "")
+    assert cp.get_task(task.id).state == TaskState.FAILED.value
 
 
 def test_mac_worker_resolves_hub_repository_path_to_local_self_update_repo(tmp_path: Path):
@@ -360,7 +473,9 @@ def test_mac_worker_resolves_hub_repository_path_to_local_self_update_repo(tmp_p
         runtime = task_payload["metadata"]["runtime"]
         assert runtime["repository_declared_path"] == "/home/jkh/.mac/src/mac"
         assert runtime["repository_source_path"] == str(repo.resolve())
-        assert Path(runtime["repository_worktree"]).is_dir()
+        worktree = Path(runtime["repository_worktree"])
+        assert worktree.is_dir()
+        _write_repo_worker_manifest(_task_dir, worktree)
         return WorkerExecution(0, "repo worktree prepared", stdout="ok\n")
 
     worker = MacWorker(
@@ -369,6 +484,7 @@ def test_mac_worker_resolves_hub_repository_path_to_local_self_update_repo(tmp_p
         tmp_path / "workspaces",
         executor,
         self_update_repo=repo,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -391,16 +507,29 @@ def test_subprocess_executor_exports_repository_worktree_env(tmp_path: Path):
         "\n".join(
             [
                 "from pathlib import Path",
-                "import json, os",
+                "import json, os, subprocess",
                 "workspace = Path(os.environ['MAC_TASK_WORKSPACE'])",
+                "worktree = os.environ['MAC_TASK_REPO_WORKTREE']",
+                "head = subprocess.check_output(['git', '-C', worktree, 'rev-parse', 'HEAD'], text=True).strip()",
                 "payload = {",
-                "  'worktree': os.environ.get('MAC_TASK_REPO_WORKTREE'),",
+                "  'worktree': worktree,",
                 "  'source': os.environ.get('MAC_TASK_REPO_SOURCE'),",
                 "  'branch': os.environ.get('MAC_TASK_REPO_BRANCH'),",
                 "  'base_sha': os.environ.get('MAC_TASK_REPO_BASE_SHA'),",
                 "}",
                 "(workspace / 'env.json').write_text(json.dumps(payload), encoding='utf-8')",
-                "manifest = {'schema': 'mac.worker_evidence.v1', 'status': 'complete', 'evidence_type': 'test'}",
+                "manifest = {",
+                "  'schema': 'mac.worker_evidence.v1',",
+                "  'status': 'complete',",
+                "  'evidence_type': 'test',",
+                "  'repo': {",
+                "    'head_sha': head,",
+                "    'pushed': True,",
+                "    'remote_ref': 'refs/heads/%s' % os.environ.get('MAC_TASK_REPO_BRANCH'),",
+                "    'dirty': False,",
+                "  },",
+                "  'checks': [{'name': 'pytest', 'returncode': 0}],",
+                "}",
                 "(workspace / 'mac-evidence.json').write_text(json.dumps(manifest), encoding='utf-8')",
             ]
         ),
@@ -411,6 +540,7 @@ def test_subprocess_executor_exports_repository_worktree_env(tmp_path: Path):
         agent.id,
         tmp_path / "workspaces",
         SubprocessExecutor([sys.executable, str(executor_script)]),
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -480,6 +610,7 @@ def test_source_remediation_task_can_target_dirty_registered_checkout(tmp_path: 
     def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
         assert "runtime" not in task_payload["metadata"]
         assert not any(task_dir.glob("repo-*"))
+        _write_worker_manifest(task_dir)
         return WorkerExecution(0, "source repair inspected", stdout="ok\n")
 
     worker = MacWorker(
@@ -487,6 +618,7 @@ def test_source_remediation_task_can_target_dirty_registered_checkout(tmp_path: 
         agent.id,
         tmp_path / "workspaces",
         executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -502,6 +634,7 @@ def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
 
     def executor(_task_payload: Dict[str, Any], _task_dir: Path) -> WorkerExecution:
         time.sleep(0.05)
+        _write_worker_manifest(_task_dir)
         return WorkerExecution(0, "tests passed", stdout="ok\n")
 
     worker = MacWorker(
@@ -511,6 +644,7 @@ def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
         executor,
         lease_seconds=60,
         lease_renew_interval_seconds=0.01,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
 
     result = worker.run_once()
@@ -600,6 +734,7 @@ def test_mac_worker_run_forever_drains_queue_then_reports_offline(tmp_path: Path
     client = TestClient(create_app(control_plane=cp))
 
     def executor(_task_payload: Dict[str, Any], _task_dir: Path) -> WorkerExecution:
+        _write_worker_manifest(_task_dir)
         return WorkerExecution(0, "ok", stdout="ok\n")
 
     worker = MacWorker(
@@ -608,6 +743,7 @@ def test_mac_worker_run_forever_drains_queue_then_reports_offline(tmp_path: Path
         tmp_path,
         executor,
         poll_interval_seconds=0.0,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
     # max_iterations bounds the loop so the test doesn't hang.
     results = worker.run_forever(max_iterations=5)
@@ -677,8 +813,9 @@ def test_mac_worker_run_forever_tolerates_failing_offline_heartbeat(tmp_path: Pa
         MacApiClient("http://mac.test", transport=_FlakyTransport()),
         agent.id,
         tmp_path,
-        lambda _t, _d: WorkerExecution(0, "ok"),
+        lambda _t, _d: (_write_worker_manifest(_d), WorkerExecution(0, "ok"))[1],
         poll_interval_seconds=0.0,
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
     # Should not raise — _shutdown swallows transport errors.
     results = worker.run_forever(max_iterations=2)
@@ -778,6 +915,7 @@ def test_mac_worker_declares_running_digest_on_first_heartbeat(tmp_path: Path):
     client = TestClient(create_app(control_plane=cp))
 
     def executor(_t: Dict[str, Any], _d: Path) -> WorkerExecution:
+        _write_worker_manifest(_d)
         return WorkerExecution(0, "ok")
 
     worker = MacWorker(
@@ -814,7 +952,8 @@ def test_register_worker_creates_identity_then_worker_claims_tasks(tmp_path: Pat
         api,
         registered["id"],
         tmp_path,
-        lambda _t, _d: WorkerExecution(0, "ok", stdout="ok\n"),
+        lambda _t, _d: (_write_worker_manifest(_d), WorkerExecution(0, "ok", stdout="ok\n"))[1],
+        attestation_key=registered["attestation_key"],
     )
     result = worker.run_once()
 
@@ -889,7 +1028,8 @@ def test_mac_worker_completes_task_even_if_observability_writes_fail(tmp_path: P
         api,
         agent.id,
         tmp_path,
-        lambda _t, _d: WorkerExecution(0, "ok", stdout="ok\n"),
+        lambda _t, _d: (_write_worker_manifest(_d), WorkerExecution(0, "ok", stdout="ok\n"))[1],
+        attestation_key=cp._agent_attestation_key(agent.id),
     )
     result = worker.run_once()
 

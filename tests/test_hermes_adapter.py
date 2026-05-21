@@ -33,15 +33,40 @@ def register_agent(cp, name, capabilities):
 
 
 def finish_task(cp, task_id):
+    from mac.services import sign_verification_manifest
+    from tests.conftest import submit_review_verdict
+
     worker = register_agent(cp, "worker", ["ops"])
     reviewer = register_agent(cp, "reviewer", ["review"])
     task, _lease = cp.claim_task(task_id, worker.id)
     assert task.state == TaskState.CLAIMED.value
     cp.start_task(task_id, worker.id)
-    evidence = cp.add_evidence(task_id, "test", "artifact://pytest", "tests passed", worker.id)
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "test",
+        "repo": {
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "pushed": True,
+            "remote_ref": "refs/heads/task/example",
+            "dirty": False,
+        },
+        "checks": [{"name": "pytest", "returncode": 0}],
+    }
+    manifest["signed_by"] = worker.id
+    manifest["signature"] = sign_verification_manifest(cp._agent_attestation_key(worker.id), manifest)
+    evidence = cp.add_evidence(
+        task_id,
+        "test",
+        "artifact://pytest",
+        "tests passed",
+        worker.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
     cp.submit_for_review(task_id, worker.id)
     review = cp.request_review(task_id, reviewer.id)
-    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=evidence.id)
+    verdict_id = submit_review_verdict(cp, task_id, reviewer.id, evidence.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
     cp.publish_task(task_id, "git://main", reviewer.id, evidence_id=evidence.id)
 
 

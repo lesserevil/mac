@@ -91,21 +91,47 @@ def test_run_advances_on_task_completed_through_to_terminal(cp):
     cp.roles.assign_role(qa_agent.id, "qa")
     cp.claim_task(first_task.id, qa_agent.id)
     cp.start_task(first_task.id, qa_agent.id)
-    cp.add_evidence(first_task.id, "test", "file://t", "tests passed", "rocky")
+    from mac.services import sign_verification_manifest
+    from tests.conftest import submit_review_verdict
+
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "test",
+        "repo": {
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "pushed": True,
+            "remote_ref": "refs/heads/task/workflow",
+            "dirty": False,
+        },
+        "checks": [{"name": "pytest", "returncode": 0}],
+    }
+    manifest["signed_by"] = qa_agent.id
+    manifest["signature"] = sign_verification_manifest(
+        cp._agent_attestation_key(qa_agent.id), manifest
+    )
+    evidence = cp.add_evidence(
+        first_task.id,
+        "test",
+        "file://t",
+        "tests passed",
+        qa_agent.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
     cp.submit_for_review(first_task.id, qa_agent.id)
 
     # Reviewer registered separately so they can request + approve.
     # No role assignment so no soul is required.
     reviewer = cp.register_agent(machine.id, "reviewer", capabilities=["review"])
     review = cp.request_review(first_task.id, reviewer.id, "ops")
-    evidence = cp.list_evidence(first_task.id)[0]
+    verdict_id = submit_review_verdict(cp, first_task.id, reviewer.id, evidence.id)
     cp.submit_review(
         review.id,
         "approved",
         reviewer.id,
-        evidence_id=evidence.id,
+        evidence_id=verdict_id,
     )
-    cp.publish_task(first_task.id, "stdout", "ops")
+    cp.publish_task(first_task.id, "stdout", "ops", evidence_id=evidence.id)
 
     # The runtime should have spawned the next node when the first task
     # hit COMPLETED via publish_task.

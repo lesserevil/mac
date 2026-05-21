@@ -1403,8 +1403,8 @@ class ControlPlane:
         if task.state == target:
             return task
         validate_transition(task.state, target)
-        if target == TaskState.NEEDS_REVIEW.value and not self.list_evidence(task_id):
-            raise ValidationError("task needs evidence before review")
+        if target == TaskState.NEEDS_REVIEW.value:
+            self._require_review_ready(task)
         if target == TaskState.COMPLETED.value and not self.reviews.completion_authorized(task_id):
             raise ValidationError("task completion requires approved review and evidence")
         now = utcnow()
@@ -1540,8 +1540,23 @@ class ControlPlane:
         task = self.get_task(task_id)
         if task.owner_agent_id != agent_id:
             raise AuthorizationError("agent does not own task lease")
+        self._require_review_ready(task)
         reviewed = self.transition_task(task_id, TaskState.NEEDS_REVIEW.value, agent_id, {})
         return reviewed
+
+    def _require_review_ready(self, task: Task) -> None:
+        evidence, assessment = self._default_review_evidence(task)
+        if evidence is None:
+            problems: List[str] = []
+            for rejected in assessment.get("rejected_evidence", []) or []:
+                if isinstance(rejected, dict):
+                    problems.extend(str(item) for item in rejected.get("problems", []) or [])
+            if not problems:
+                problems = [str(assessment.get("reason") or "no verifiable evidence")]
+            raise ValidationError(
+                "task needs verifiable evidence before review: %s"
+                % "; ".join(problems[:8])
+            )
 
     def add_evidence(
         self,
@@ -2443,6 +2458,12 @@ class ControlPlane:
         return self.reviews.list_reviews(task_id)
 
     def publish_task(self, *args: Any, **kwargs: Any) -> Publication:
+        task_id = kwargs.get("task_id") if "task_id" in kwargs else (args[0] if args else None)
+        evidence_id = kwargs.get("evidence_id")
+        if evidence_id is None and len(args) >= 4:
+            evidence_id = args[3]
+        if task_id is not None:
+            self._validate_publication_evidence(str(task_id), evidence_id)
         publication = self.reviews.publish_task(*args, **kwargs)
         self._sync_beads_close(self.get_task(publication.task_id), publication.created_by)
         # publish_task transitions the underlying task to COMPLETED inside
@@ -2463,6 +2484,122 @@ class ControlPlane:
                     "workflow runtime failed to advance after publish_task"
                 )
         return publication
+
+    def _validate_publication_evidence(self, task_id: str, evidence_id: Optional[str]) -> None:
+        if evidence_id is None:
+            raise ValidationError("publication requires evidence")
+        task = self.get_task(task_id)
+        evidence = self.get_evidence(str(evidence_id))
+        if evidence.task_id != task_id:
+            raise ValidationError("publication evidence must belong to task")
+        if self.reviews.task_requires_publication_evidence(task):
+            if evidence.kind != "publication":
+                raise ValidationError("publication policy requires publication evidence")
+            if not evidence.checksum:
+                raise ValidationError("publication evidence requires a checksum")
+            review_problems = self._publication_review_executor_problems(task_id)
+            if review_problems:
+                raise ValidationError(
+                    "publication review evidence is not verifiable: %s"
+                    % ", ".join(review_problems)
+                )
+            return
+        assessment = self._assess_default_review_evidence(task, evidence)
+        if not assessment.get("valid"):
+            raise ValidationError(
+                "publication evidence is not verifiable: %s"
+                % ", ".join(str(item) for item in assessment.get("problems", []))
+            )
+        review_problems = self._publication_review_problems(task_id, evidence.id)
+        if review_problems:
+            raise ValidationError(
+                "publication review evidence is not verifiable: %s"
+                % ", ".join(review_problems)
+            )
+
+    def _publication_review_executor_problems(self, task_id: str) -> List[str]:
+        task = self.get_task(task_id)
+        approved = [
+            review
+            for review in self.list_reviews(task_id)
+            if review.status == ReviewStatus.APPROVED.value
+        ]
+        if not approved:
+            return ["publication requires an approved review"]
+        problems: List[str] = []
+        for review in approved:
+            if not review.evidence_id:
+                problems.append("review %s lacks review evidence" % review.id)
+                continue
+            try:
+                verdict = self.get_evidence(review.evidence_id)
+            except NotFoundError:
+                problems.append("review %s references missing evidence" % review.id)
+                continue
+            manifest = verdict.metadata.get("verification")
+            if not isinstance(manifest, dict):
+                problems.append("review %s evidence lacks verification manifest" % review.id)
+                continue
+            executor_evidence_id = str(manifest.get("reviewed_evidence_id") or "").strip()
+            if not executor_evidence_id:
+                problems.append("review %s verdict lacks reviewed_evidence_id" % review.id)
+                continue
+            try:
+                executor_evidence = self.get_evidence(executor_evidence_id)
+            except NotFoundError:
+                problems.append("review %s references missing executor evidence" % review.id)
+                continue
+            assessment = self._assess_default_review_evidence(task, executor_evidence)
+            if not assessment.get("valid"):
+                problems.append(
+                    "review %s executor evidence is not verifiable: %s"
+                    % (
+                        review.id,
+                        ", ".join(str(item) for item in assessment.get("problems", [])),
+                    )
+                )
+                continue
+            verdict_evidence, verdict_problems = self._find_review_verdict_evidence(
+                task_id,
+                review.reviewer_agent_id,
+                executor_evidence_id=executor_evidence.id,
+            )
+            if verdict_evidence is not None and verdict_evidence.id == review.evidence_id:
+                if self._verdict_value(verdict_evidence) == "approved":
+                    return []
+                problems.append("review %s verdict is not approved" % review.id)
+                continue
+            problems.append(
+                "review %s lacks verifiable signed review_verdict evidence" % review.id
+            )
+            problems.extend(verdict_problems[:5])
+        return problems
+
+    def _publication_review_problems(self, task_id: str, executor_evidence_id: str) -> List[str]:
+        approved = [
+            review
+            for review in self.list_reviews(task_id)
+            if review.status == ReviewStatus.APPROVED.value
+        ]
+        if not approved:
+            return ["publication requires an approved review"]
+        problems: List[str] = []
+        for review in approved:
+            verdict_evidence, verdict_problems = self._find_review_verdict_evidence(
+                task_id,
+                review.reviewer_agent_id,
+                executor_evidence_id=executor_evidence_id,
+            )
+            if verdict_evidence is not None and verdict_evidence.id == review.evidence_id:
+                if self._verdict_value(verdict_evidence) == "approved":
+                    return []
+                problems.append("review %s verdict is not approved" % review.id)
+                continue
+            problems.append(
+                "review %s lacks verifiable signed review_verdict evidence" % review.id
+            )
+            problems.extend(verdict_problems[:5])
+        return problems
 
     def get_publication(self, publication_id: str) -> Publication:
         return self.reviews.get_publication(publication_id)
@@ -4530,18 +4667,9 @@ class ControlPlane:
         if evidence_type == "repo_change":
             return self._repo_verification_problems(manifest, require_tests=True)
         if evidence_type == "documentation":
-            repo_problems = self._repo_verification_problems(manifest, require_tests=False)
-            if not repo_problems:
-                return []
-            artifacts = _manifest_list(manifest.get("artifacts"))
-            if artifacts and self._passed_verification_check_count(manifest) > 0:
-                return []
-            return [
-                "documentation evidence requires a pushed repo artifact "
-                "or explicit artifacts plus passing checks"
-            ]
+            return self._repo_verification_problems(manifest, require_tests=False)
         if evidence_type == "deployment":
-            problems: List[str] = []
+            problems = self._require_pushed_repo_anchor(manifest)
             if self._passed_verification_check_count(manifest) < 1:
                 problems.append("deployment evidence requires at least one passing check")
             if not (
@@ -4552,21 +4680,32 @@ class ControlPlane:
                 problems.append("deployment evidence requires targets, services, or artifacts")
             return problems
         if evidence_type in {"test", "artifact"}:
-            problems = []
+            problems = self._require_pushed_repo_anchor(manifest)
             if self._passed_verification_check_count(manifest) < 1:
                 problems.append("%s evidence requires at least one passing check or test" % evidence_type)
             if evidence_type == "artifact" and not _manifest_list(manifest.get("artifacts")):
                 problems.append("artifact evidence requires artifacts")
             return problems
         if evidence_type == "no_change":
+            problems = self._require_pushed_repo_anchor(manifest)
             if not str(manifest.get("reason") or manifest.get("no_change_reason") or "").strip():
-                return ["no_change evidence requires a reason"]
+                problems.append("no_change evidence requires a reason")
             if self._passed_verification_check_count(manifest) < 1:
-                return ["no_change evidence requires at least one passing check"]
-            return []
+                problems.append("no_change evidence requires at least one passing check")
+            return problems
         return ["unsupported verification.evidence_type: %s" % evidence_type]
 
     def _repo_verification_problems(self, manifest: JsonDict, require_tests: bool) -> List[str]:
+        problems = self._require_pushed_repo_anchor(manifest)
+        repo = manifest.get("repo") if isinstance(manifest.get("repo"), dict) else {}
+        files_changed = _manifest_list(repo.get("files_changed")) if isinstance(repo, dict) else []
+        if not files_changed:
+            problems.append("repo evidence requires changed files")
+        if require_tests and self._passed_verification_check_count(manifest) < 1:
+            problems.append("repo code evidence requires at least one passing test/check")
+        return problems
+
+    def _require_pushed_repo_anchor(self, manifest: JsonDict) -> List[str]:
         # Canonical field names only (mac-q38). The previous code
         # accepted ``git``/``commit``/``commit_sha``/``changed_files``/
         # ``pushed_ref``/``pull_request_url``/etc. — each alias is a
@@ -4580,9 +4719,6 @@ class ControlPlane:
         head_sha = str(repo.get("head_sha") or "").strip()
         if not _GIT_SHA_RE.match(head_sha):
             problems.append("repo.head_sha must be a git SHA")
-        files_changed = _manifest_list(repo.get("files_changed"))
-        if not files_changed:
-            problems.append("repo evidence requires changed files")
         dirty = repo.get("dirty")
         if dirty not in {False, "false", "False", 0, "0"}:
             problems.append("repo evidence must declare dirty=false")
@@ -4591,8 +4727,6 @@ class ControlPlane:
         pr_url = str(repo.get("pr_url") or "").strip()
         if not (pushed and remote_ref) and not pr_url:
             problems.append("repo evidence requires pushed=true with remote_ref, or pr_url")
-        if require_tests and self._passed_verification_check_count(manifest) < 1:
-            problems.append("repo code evidence requires at least one passing test/check")
         return problems
 
     def _passed_verification_check_count(self, manifest: JsonDict) -> int:
@@ -4715,6 +4849,30 @@ class ControlPlane:
                 continue
             if not verify_verification_manifest_signature(key, manifest, signature):
                 problems.append("verdict %s signature does not verify" % evidence.id)
+                continue
+            executor_evidence = self.get_evidence(executor_evidence_id)
+            executor_manifest = executor_evidence.metadata.get("verification") or {}
+            if not isinstance(executor_manifest, dict):
+                problems.append("verdict %s cannot resolve executor verification manifest" % evidence.id)
+                continue
+            repo_problems = self._require_pushed_repo_anchor(manifest)
+            if repo_problems:
+                problems.extend("verdict %s %s" % (evidence.id, problem) for problem in repo_problems)
+                continue
+            reviewed_sha = str((manifest.get("repo") or {}).get("head_sha") or "").strip()
+            executor_sha = str((executor_manifest.get("repo") or {}).get("head_sha") or "").strip()
+            if reviewed_sha != executor_sha:
+                problems.append(
+                    "verdict %s repo.head_sha does not match executor evidence: %s != %s"
+                    % (evidence.id, reviewed_sha, executor_sha)
+                )
+                continue
+            if self._passed_verification_check_count(manifest) < 1:
+                problems.append("verdict %s requires at least one independent passing check" % evidence.id)
+                continue
+            digest = str(manifest.get("worktree_digest") or "").strip()
+            if not re.match(r"^sha256:[0-9a-f]{64}$", digest):
+                problems.append("verdict %s requires worktree_digest sha256" % evidence.id)
                 continue
             return evidence, []
         return None, problems

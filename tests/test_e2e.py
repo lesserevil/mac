@@ -79,12 +79,20 @@ def _post_review_verdict(
     """
     from mac.services import sign_verification_manifest
 
+    task_detail = client.get("/tasks/%s" % task_id).json()
+    executor_evidence = next(
+        item for item in task_detail["evidence"] if item["id"] == executor_evidence_id
+    )
+    executor_manifest = executor_evidence["metadata"]["verification"]
     manifest: Dict[str, Any] = {
         "schema": "mac.worker_evidence.v1",
         "status": "complete",
         "evidence_type": "review_verdict",
         "verdict": verdict,
         "reviewed_evidence_id": executor_evidence_id,
+        "repo": dict(executor_manifest["repo"]),
+        "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+        "worktree_digest": "sha256:" + ("0" * 64),
     }
     manifest["signed_by"] = reviewer_id
     manifest["signature"] = sign_verification_manifest(reviewer_attestation_key, manifest)
