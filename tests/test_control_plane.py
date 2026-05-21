@@ -1811,6 +1811,101 @@ def test_beads_bridge_resets_dirty_managed_checkout_before_poll(cp, tmp_path, mo
     assert [item.external_id for item in cp.list_project_items()] == ["mac-old", "mac-new"]
 
 
+def test_beads_bridge_reopens_failed_existing_task_while_bead_ready(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-retry",
+                "title": "Retry failed work",
+                "description": "still ready",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    monkeypatch.setenv("MAC_BEADS_CLI", str(tmp_path / "missing-bd"))
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "verification failed"})
+
+    report = cp.poll_beads_repositories(force=True, actor="bridge")
+
+    assert report["reopened_count"] == 1
+    assert report["repositories"][0]["existing_sync_results"]["reopened"] == 1
+    reopened = cp.get_task(task.id)
+    assert reopened.state == TaskState.OPEN.value
+    assert reopened.metadata["beads_reconciliation"]["failed_task_reopen_count"] == 1
+    assert reopened.metadata["beads_reconciliation"]["last_reopened_bead_id"] == "mac-retry"
+    assert cp.claim_next_for_agent(worker.id)["task"]["id"] == task.id
+
+
+def test_beads_bridge_failed_task_reopen_limit_is_bounded(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-limited",
+                "title": "Bounded retry",
+                "description": "do not loop forever",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    monkeypatch.setenv("MAC_BEADS_CLI", str(tmp_path / "missing-bd"))
+    monkeypatch.setenv("MAC_BEADS_FAILED_TASK_REOPEN_LIMIT", "1")
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "first failure"})
+    cp.store.execute(
+        "UPDATE tasks SET attempt_count = ?, max_attempts = ? WHERE id = ?",
+        (3, 3, task.id),
+    )
+
+    first = cp.poll_beads_repositories(force=True, actor="bridge")
+    reopened = cp.get_task(task.id)
+
+    assert first["reopened_count"] == 1
+    assert reopened.state == TaskState.OPEN.value
+    assert reopened.max_attempts == 4
+
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.transition_task(task.id, TaskState.FAILED.value, worker.id, {"reason": "second failure"})
+    second = cp.poll_beads_repositories(force=True, actor="bridge")
+    exhausted = cp.get_task(task.id)
+
+    assert second["reopened_count"] == 0
+    assert second["retry_exhausted_count"] == 1
+    assert exhausted.state == TaskState.FAILED.value
+    assert exhausted.metadata["beads_reconciliation"]["failed_task_reopen_count"] == 1
+    assert exhausted.metadata["beads_reconciliation"]["failed_task_reopen_limit"] == 1
+    assert exhausted.metadata["beads_reconciliation"]["retry_exhausted_at"]
+    assert any(
+        event.event_type == "task.beads_retry_exhausted"
+        for event in cp.task_history(task.id)
+    )
+
+
 def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

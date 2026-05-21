@@ -3220,6 +3220,8 @@ class ControlPlane:
             "repository_count": len(repos),
             "imported_count": 0,
             "existing_count": 0,
+            "reopened_count": 0,
+            "retry_exhausted_count": 0,
             "skipped_count": 0,
             "error_count": 0,
             "repositories": [],
@@ -3229,6 +3231,8 @@ class ControlPlane:
             report["repositories"].append(repo_report)
             report["imported_count"] += int(repo_report.get("imported_count", 0))
             report["existing_count"] += int(repo_report.get("existing_count", 0))
+            report["reopened_count"] += int(repo_report.get("reopened_count", 0))
+            report["retry_exhausted_count"] += int(repo_report.get("retry_exhausted_count", 0))
             report["skipped_count"] += int(repo_report.get("skipped_count", 0))
             if repo_report.get("status") in {
                 "error",
@@ -3236,7 +3240,7 @@ class ControlPlane:
                 "source_refresh_error",
             }:
                 report["error_count"] += 1
-        if report["imported_count"] or report["error_count"]:
+        if report["imported_count"] or report["reopened_count"] or report["error_count"]:
             self.record_log(
                 "bridge.beads.poll",
                 layer="control_plane",
@@ -3314,6 +3318,9 @@ class ControlPlane:
             issues = self._ready_beads_issues(repo, poll_path=poll_path)
             imported = 0
             existing = 0
+            reopened = 0
+            retry_exhausted = 0
+            existing_sync_results: Dict[str, int] = {}
             for issue in issues:
                 prior = self.store.query_one(
                     "SELECT id, task_id FROM project_items WHERE source = ? AND external_id = ?",
@@ -3324,11 +3331,20 @@ class ControlPlane:
                     imported += 1
                 else:
                     existing += 1
-                    self._sync_existing_beads_task(self.get_task(prior["task_id"]), actor)
+                    result = self._sync_existing_beads_task(
+                        self.get_task(prior["task_id"]),
+                        actor,
+                        issue=issue,
+                    )
+                    existing_sync_results[result] = existing_sync_results.get(result, 0) + 1
+                    if result == "reopened":
+                        reopened += 1
+                    elif result == "retry_exhausted":
+                        retry_exhausted += 1
             self._update_beads_repository_poll_state(
                 repo.id,
                 now,
-                last_imported_at=now if imported else repo.last_imported_at,
+                last_imported_at=now if imported or reopened else repo.last_imported_at,
                 last_error=None,
             )
             return {
@@ -3338,6 +3354,9 @@ class ControlPlane:
                 "ready_count": len(issues),
                 "imported_count": imported,
                 "existing_count": existing,
+                "reopened_count": reopened,
+                "retry_exhausted_count": retry_exhausted,
+                "existing_sync_results": existing_sync_results,
                 "skipped_count": 0,
                 "repository_contract_schema": repository_contract["schema"],
                 "source_state": source_state,
@@ -4139,15 +4158,189 @@ class ControlPlane:
             return
         self._run_bd_for_task(task, ["update", binding["bead_id"], "--claim"], actor, "claim")
 
-    def _sync_existing_beads_task(self, task: Task, actor: str) -> None:
-        if task.state not in {
+    def _sync_existing_beads_task(
+        self,
+        task: Task,
+        actor: str,
+        *,
+        issue: Optional[JsonDict] = None,
+    ) -> str:
+        if task.state == TaskState.OPEN.value:
+            return "open"
+        if task.state in {
             TaskState.CLAIMED.value,
             TaskState.RUNNING.value,
             TaskState.NEEDS_REVIEW.value,
             TaskState.REVIEWING.value,
         }:
-            return
-        self._sync_beads_claim(task, task.owner_agent_id or actor)
+            self._sync_beads_claim(task, task.owner_agent_id or actor)
+            return "active_claim_synced"
+        if task.state == TaskState.FAILED.value:
+            return self._reopen_failed_beads_task(task, actor, issue=issue)
+        if task.state in TERMINAL_TASK_STATES:
+            return "terminal_ignored"
+        return "inactive_ignored"
+
+    def _reopen_failed_beads_task(
+        self,
+        task: Task,
+        actor: str,
+        *,
+        issue: Optional[JsonDict] = None,
+    ) -> str:
+        metadata = ensure_json_object(task.metadata)
+        reconciliation = ensure_json_object(metadata.get("beads_reconciliation"))
+        retry_count = int(reconciliation.get("failed_task_reopen_count") or 0)
+        retry_limit = self._beads_failed_task_reopen_limit()
+        origin = metadata.get("origin") if isinstance(metadata.get("origin"), dict) else {}
+        acc_metadata = (
+            metadata.get("acc_metadata") if isinstance(metadata.get("acc_metadata"), dict) else {}
+        )
+        bead_id = str(
+            (issue or {}).get("id")
+            or origin.get("bead_id")
+            or acc_metadata.get("beads_id")
+            or ""
+        )
+        if retry_count >= retry_limit:
+            if not self._mark_failed_beads_task_retry_exhausted(
+                task,
+                actor,
+                metadata,
+                reconciliation,
+                retry_count,
+                retry_limit,
+                bead_id,
+            ):
+                return "race_lost"
+            return "retry_exhausted"
+
+        now = utcnow()
+        next_count = retry_count + 1
+        new_max_attempts = max(int(task.max_attempts), int(task.attempt_count) + 1)
+        reconciliation.update(
+            {
+                "schema": "mac.beads_reconciliation.v1",
+                "failed_task_reopen_count": next_count,
+                "failed_task_reopen_limit": retry_limit,
+                "last_reopened_at": now,
+                "last_reopened_by": actor,
+                "last_reopened_bead_id": bead_id,
+                "last_reopen_reason": "bead_still_ready",
+            }
+        )
+        reconciliation.pop("retry_exhausted_at", None)
+        metadata["beads_reconciliation"] = reconciliation
+        detail = {
+            "reason": "bead_still_ready",
+            "bead_id": bead_id,
+            "failed_task_reopen_count": next_count,
+            "failed_task_reopen_limit": retry_limit,
+            "attempt_count": task.attempt_count,
+            "previous_max_attempts": task.max_attempts,
+            "max_attempts": new_max_attempts,
+        }
+        with self.store.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL,
+                    max_attempts = ?, metadata = ?, updated_at = ?
+                WHERE id = ? AND state = ?
+                """,
+                (
+                    TaskState.OPEN.value,
+                    new_max_attempts,
+                    json_dumps(metadata),
+                    now,
+                    task.id,
+                    TaskState.FAILED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return "race_lost"
+            self._record_history(
+                task.id,
+                "task.transitioned",
+                actor,
+                TaskState.FAILED.value,
+                TaskState.OPEN.value,
+                detail,
+                conn=conn,
+            )
+        self.record_log(
+            "bridge.beads.reopened_failed_task",
+            layer="control_plane",
+            source=actor,
+            subject_type="task",
+            subject_id=task.id,
+            detail=detail,
+        )
+        return "reopened"
+
+    def _mark_failed_beads_task_retry_exhausted(
+        self,
+        task: Task,
+        actor: str,
+        metadata: JsonDict,
+        reconciliation: JsonDict,
+        retry_count: int,
+        retry_limit: int,
+        bead_id: str,
+    ) -> bool:
+        if reconciliation.get("retry_exhausted_at"):
+            return True
+        now = utcnow()
+        reconciliation.update(
+            {
+                "schema": "mac.beads_reconciliation.v1",
+                "failed_task_reopen_count": retry_count,
+                "failed_task_reopen_limit": retry_limit,
+                "retry_exhausted_at": now,
+                "retry_exhausted_by": actor,
+                "retry_exhausted_bead_id": bead_id,
+            }
+        )
+        metadata["beads_reconciliation"] = reconciliation
+        detail = {
+            "reason": "beads_failed_task_retry_limit",
+            "bead_id": bead_id,
+            "failed_task_reopen_count": retry_count,
+            "failed_task_reopen_limit": retry_limit,
+        }
+        with self.store.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND state = ?",
+                (json_dumps(metadata), now, task.id, TaskState.FAILED.value),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._record_history(
+                task.id,
+                "task.beads_retry_exhausted",
+                actor,
+                TaskState.FAILED.value,
+                TaskState.FAILED.value,
+                detail,
+                conn=conn,
+            )
+        self.record_log(
+            "bridge.beads.failed_task_retry_exhausted",
+            layer="control_plane",
+            source=actor,
+            level="warning",
+            subject_type="task",
+            subject_id=task.id,
+            detail=detail,
+        )
+        return True
+
+    def _beads_failed_task_reopen_limit(self) -> int:
+        raw = os.environ.get("MAC_BEADS_FAILED_TASK_REOPEN_LIMIT", "3")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 3
 
     def _sync_beads_close(self, task: Task, actor: str) -> None:
         binding = self._beads_binding_for_task(task)
