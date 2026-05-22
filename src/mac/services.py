@@ -2459,6 +2459,8 @@ class ControlPlane:
                 name = excluded.name,
                 capabilities = excluded.capabilities,
                 resources = excluded.resources,
+                status = excluded.status,
+                health_status = excluded.health_status,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at,
                 hermes_instance_id = excluded.hermes_instance_id,
