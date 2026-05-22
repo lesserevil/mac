@@ -551,7 +551,7 @@ reconcile_remote_deploy() {
   last_index=$((${#ssh_parts[@]} - 1))
   ssh_target="${ssh_parts[$last_index]}"
   ssh_args=("${ssh_parts[@]:0:$last_index}")
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_TS=$(shell_quote "$TS") bash -s" <<'REMOTE'
 set -euo pipefail
 agent="${MAC_DEPLOY_AGENT:?}"
@@ -4059,7 +4059,7 @@ install_reverse_tunnel_on_hub() {
     tunnel_host="$worker_target"
   fi
   # Pass values to the remote inline; quoting handled by shell_quote
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     "TUNNEL_WORKER_AGENT=$(shell_quote "$worker_agent") TUNNEL_HOST=$(shell_quote "$tunnel_host") TUNNEL_FLEET_NAME=$(shell_quote "$fleet_name_local") bash -s" <<'HUBSCRIPT'
 set -euo pipefail
 worker_agent="${TUNNEL_WORKER_AGENT:?}"
