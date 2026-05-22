@@ -185,11 +185,6 @@ def main(argv: List[str]) -> int:
         help="Path to the home-scoped multi-fleet registry.",
     )
     parser.add_argument(
-        "--site-config",
-        dest="fleets_config",
-        help="Deprecated alias for --fleets-config.",
-    )
-    parser.add_argument(
         "--env-file",
         default=str(Path.home() / ".mac" / ".env"),
         help="Path to write caller-machine deploy env/secrets.",
@@ -367,13 +362,13 @@ def main(argv: List[str]) -> int:
         print(env_content, end="")
         return 0
 
-    site_backup = backup_existing(fleets_config)
+    fleets_backup = backup_existing(fleets_config)
     env_backup = backup_existing(env_file)
     atomic_write(fleets_config, config_content, 0o600)
     atomic_write(env_file, env_content, 0o600)
 
-    if site_backup:
-        print("Backed up previous fleet registry to %s" % site_backup)
+    if fleets_backup:
+        print("Backed up previous fleet registry to %s" % fleets_backup)
     if env_backup:
         print("Backed up previous env file to %s" % env_backup)
     print("Wrote %s" % fleets_config)

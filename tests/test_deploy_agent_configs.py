@@ -23,7 +23,7 @@ def load_sample_fleet_config():
     return yaml.safe_load((ROOT / "deploy" / "fleet" / "config.yaml").read_text(encoding="utf-8"))
 
 
-def test_sample_fleet_config_is_generic_and_site_local():
+def test_sample_fleet_config_is_generic_and_externalized():
     cfg = load_sample_fleet_config()
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     rendered = "\n".join(
@@ -31,13 +31,18 @@ def test_sample_fleet_config_is_generic_and_site_local():
             (ROOT / "deploy" / "fleet" / "config.yaml").read_text(encoding="utf-8"),
             (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8"),
             (ROOT / "deploy" / "systemd" / "mac.env.example").read_text(encoding="utf-8"),
+            (ROOT / "scripts" / "setup-fleet.py").read_text(encoding="utf-8"),
         ]
     )
 
     assert cfg["sample"] is True
     assert cfg["hub_agent"] == "hub"
     assert cfg["shared_services_manager_agent"] == "hub"
-    assert "deploy/fleet/config-site.yaml" in gitignore
+    assert not (ROOT / "deploy" / "fleet" / "config-site.yaml").exists()
+    assert "config-site" not in gitignore
+    assert "config-site" not in rendered
+    assert "~/.mac/fleets.yaml" in rendered
+    assert "--hub <hub-node>" in rendered
     assert "deploy/agents/" not in rendered
     assert "rocky" not in rendered.lower()
     assert "natasha" not in rendered.lower()
@@ -187,8 +192,21 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
 
 
-def test_setup_fleet_wizard_writes_site_config_and_env(tmp_path):
-    site_config = tmp_path / "config-site.yaml"
+def test_fleet_deploy_uses_home_scoped_registry_not_legacy_site_config():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert "$HOME/.mac/fleets.yaml" in script
+    assert "MAC_DEPLOY_FLEETS_CONFIG" in script
+    assert "--fleets-config" in script
+    assert "--hub <hub-node>" in script
+    assert "multiple fleets are configured" in script
+    assert "--site-config" not in script
+    assert "MAC_DEPLOY_FLEET_SITE_CONFIG" not in script
+    assert "FLEET_SITE_CONFIG" not in script
+
+
+def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
+    fleets_config = tmp_path / ".mac" / "fleets.yaml"
     env_file = tmp_path / ".mac" / ".env"
     answers = "\n".join(
         [
@@ -205,6 +223,7 @@ def test_setup_fleet_wizard_writes_site_config_and_env(tmp_path):
             "y",
             "",
             "",
+            "",
             "n",
             "n",
             "n",
@@ -217,8 +236,8 @@ def test_setup_fleet_wizard_writes_site_config_and_env(tmp_path):
             sys.executable,
             str(ROOT / "scripts" / "setup-fleet.py"),
             "--force",
-            "--site-config",
-            str(site_config),
+            "--fleets-config",
+            str(fleets_config),
             "--env-file",
             str(env_file),
         ],
@@ -229,8 +248,10 @@ def test_setup_fleet_wizard_writes_site_config_and_env(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr + result.stdout
-    cfg = yaml.safe_load(site_config.read_text(encoding="utf-8"))
+    registry = yaml.safe_load(fleets_config.read_text(encoding="utf-8"))
+    cfg = registry["fleets"]["hub"]
     env = env_file.read_text(encoding="utf-8")
+    assert registry["version"] == 1
     assert cfg["sample"] is False
     assert cfg["fleet_name"] == "test-fleet"
     assert cfg["hub_agent"] == "hub"
@@ -238,8 +259,10 @@ def test_setup_fleet_wizard_writes_site_config_and_env(tmp_path):
     assert cfg["defaults"]["hermes"]["slack_home_channel_name"] == "ops"
     assert cfg["defaults"]["qdrant"]["required"] is True
     assert cfg["defaults"]["qdrant"]["url"] == "http://hub.example.internal:6333"
-    assert "MAC_DEPLOY_FLEET_SITE_CONFIG=" in env
+    assert "MAC_DEPLOY_FLEETS_CONFIG=" in env
     assert "MAC_DEPLOY_HUB_AGENT=hub" in env
+    assert "MAC_DEPLOY_FLEET_SITE_CONFIG=" not in env
+    assert "MAC_DEPLOY_HUB_URL=" not in env
     assert "MAC_SECRET_KEY" not in env
     assert "MAC_API_TOKEN" not in env
 

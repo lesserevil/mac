@@ -1,22 +1,23 @@
 ---
 name: setup-mac-fleet
-description: Use when a user asks to set up, bootstrap, deploy, or configure a new mac agent fleet. Runs the first-time setup wizard, writes site-local fleet config, and keeps fleet-specific data out of Git.
+description: Use when a user asks to set up, bootstrap, deploy, or configure a new mac agent fleet. Runs the first-time setup wizard, writes a home-scoped multi-fleet registry, and keeps fleet-specific data out of Git.
 ---
 
 # Setup Mac Fleet
 
 Use this skill when the user asks to set up or deploy a new mac fleet and
-`deploy/fleet/config-site.yaml` or `~/.mac/.env` is missing.
+`~/.mac/fleets.yaml` or `~/.mac/.env` is missing.
 
 ## Rules
 
 - Do not invent agent names, hostnames, IP addresses, Slack channel names, or
   model selectors.
-- Do not commit `deploy/fleet/config-site.yaml` or `~/.mac/.env`.
+- Do not commit fleet topology or secrets. Fleet topology belongs in
+  `~/.mac/fleets.yaml`; local deploy secrets belong in `~/.mac/.env`.
 - Do not put upstream provider API keys in mac config. Those belong in
   TokenHub or the site's secret store.
 - Keep committed fleet examples generic. Personal fleets must live only in the
-  ignored site config.
+  home-scoped fleet registry.
 
 ## Workflow
 
@@ -29,7 +30,7 @@ Use this skill when the user asks to set up or deploy a new mac fleet and
 2. If the user wants a non-default path, pass explicit paths:
 
    ```bash
-   bash setup.sh --site-config /path/to/config-site.yaml --env-file ~/.mac/.env
+   bash setup.sh --fleets-config ~/.mac/fleets.yaml --env-file ~/.mac/.env
    ```
 
 3. The wizard asks for fleet topology, hub, supervisor, Slack home channel,
@@ -40,11 +41,11 @@ Use this skill when the user asks to set up or deploy a new mac fleet and
 
    ```bash
    set -a; . ~/.mac/.env; set +a
-   bash deploy/deploy-mac-fleet.sh
+   bash deploy/deploy-mac-fleet.sh --hub <hub-node>
    ```
 
 5. If asked to inspect or edit the fleet later, edit
-   `deploy/fleet/config-site.yaml`, not `deploy/fleet/config.yaml`.
+   `~/.mac/fleets.yaml`, not `deploy/fleet/config.yaml`.
 
 ## Validation
 

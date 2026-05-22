@@ -18,13 +18,12 @@ esac
 GIT_BRANCH="${MAC_DEPLOY_GIT_BRANCH:-main}"
 FLEET_CONFIG="${MAC_DEPLOY_FLEET_CONFIG:-$ROOT/deploy/fleet/config.yaml}"
 FLEET_REGISTRY_CONFIG="${MAC_DEPLOY_FLEETS_CONFIG:-${MAC_FLEETS_CONFIG:-$HOME/.mac/fleets.yaml}}"
-FLEET_SITE_CONFIG="${MAC_DEPLOY_FLEET_SITE_CONFIG:-}"
 HUB_SELECTOR="${MAC_DEPLOY_HUB_AGENT:-}"
 REQUESTED_AGENTS=()
 
 usage() {
   cat <<'USAGE'
-Usage: deploy/deploy-mac-fleet.sh --hub <hub-agent> [agent ...]
+Usage: deploy/deploy-mac-fleet.sh --hub <hub-node> [agent ...]
 
 Deploy mac as the local ACC replacement to a fleet declared in
 ~/.mac/fleets.yaml, or in MAC_DEPLOY_FLEETS_CONFIG. Real fleet topology must
@@ -45,8 +44,7 @@ Each host gets:
 
 The hub name selects the fleet. Agent arguments may be agent names from that
 fleet. With no agent arguments, all enabled agents in the selected fleet are
-deployed. MAC_DEPLOY_FLEET_SITE_CONFIG remains as an explicit legacy
-single-fleet compatibility path.
+deployed.
 USAGE
 }
 
@@ -80,18 +78,6 @@ while [ "$#" -gt 0 ]; do
       FLEET_REGISTRY_CONFIG="${1#--fleets-config=}"
       shift
       ;;
-    --site-config)
-      if [ "$#" -lt 2 ]; then
-        echo "ERROR: --site-config requires a path" >&2
-        exit 2
-      fi
-      FLEET_SITE_CONFIG="$2"
-      shift 2
-      ;;
-    --site-config=*)
-      FLEET_SITE_CONFIG="${1#--site-config=}"
-      shift
-      ;;
     --)
       shift
       REQUESTED_AGENTS+=("$@")
@@ -112,7 +98,7 @@ done
 fleet_config_query() {
   local mode="$1"
   shift || true
-  python3 - "$mode" "$FLEET_CONFIG" "$FLEET_REGISTRY_CONFIG" "$FLEET_SITE_CONFIG" "$HUB_SELECTOR" "$@" <<'PY'
+  python3 - "$mode" "$FLEET_CONFIG" "$FLEET_REGISTRY_CONFIG" "$HUB_SELECTOR" "$@" <<'PY'
 from __future__ import annotations
 
 import os
@@ -209,10 +195,8 @@ def agent_map(items: Any) -> Dict[str, Dict[str, Any]]:
 mode = sys.argv[1]
 base_path = Path(sys.argv[2])
 registry_path = Path(sys.argv[3]).expanduser()
-site_path_arg = sys.argv[4]
-site_path = Path(site_path_arg).expanduser() if site_path_arg else None
-hub_selector = sys.argv[5].strip()
-requested = sys.argv[6:]
+hub_selector = sys.argv[4].strip()
+requested = sys.argv[5:]
 
 base = load_yaml(base_path)
 
@@ -251,7 +235,6 @@ def normalize_fleets(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 registry_present = registry_path.exists()
-site_present = site_path is not None and site_path.exists()
 if registry_present:
     registry = load_yaml(registry_path)
     fleets = normalize_fleets(registry)
@@ -271,17 +254,13 @@ if registry_present:
         fleet = next(iter(fleets.values()))
     else:
         print(
-            "ERROR: multiple fleets are configured in %s; pass --hub <hub-agent>. Known hubs: %s"
+            "ERROR: multiple fleets are configured in %s; pass --hub <hub-node>. Known hubs: %s"
             % (registry_path, ", ".join(sorted(fleets))),
             file=sys.stderr,
         )
         raise SystemExit(2)
     cfg = merge_dicts(base, {k: v for k, v in fleet.items() if k != "agents"})
     cfg["agents"] = list(agent_map(fleet.get("agents") if "agents" in fleet else base.get("agents")).values())
-elif site_present:
-    site = load_yaml(site_path) if site_path is not None else {}
-    cfg = merge_dicts(base, {k: v for k, v in site.items() if k != "agents"})
-    cfg["agents"] = list(agent_map(site.get("agents") if "agents" in site else base.get("agents")).values())
 else:
     if base.get("sample") and os.environ.get("MAC_DEPLOY_ALLOW_SAMPLE_CONFIG") != "1":
         print(

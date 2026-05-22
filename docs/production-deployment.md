@@ -100,14 +100,14 @@ The wizard asks for the hub, agents, SSH targets, OS families, supervisors,
 Slack home channel, per-agent Hermes model selectors, worker mode, canary
 policy, Qdrant shared-memory endpoint, and optional hub token. It writes:
 
-- `deploy/fleet/config-site.yaml`: site-local fleet topology, ignored by Git.
+- `~/.mac/fleets.yaml`: home-scoped multi-fleet topology, keyed by hub node.
 - `~/.mac/.env`: caller-machine deploy settings and local secrets, mode 0600.
 
 To deploy after the wizard:
 
 ```bash
 set -a; . ~/.mac/.env; set +a
-bash deploy/deploy-mac-fleet.sh
+bash deploy/deploy-mac-fleet.sh --hub <hub-node>
 ```
 
 The checked-in `deploy/fleet/config.yaml` is a generic sample only. It is
@@ -119,12 +119,13 @@ it unless `MAC_DEPLOY_ALLOW_SAMPLE_CONFIG=1` is set explicitly for tests.
 For a configured fleet, use the fleet deploy script:
 
 ```bash
-bash deploy/deploy-mac-fleet.sh
+bash deploy/deploy-mac-fleet.sh --hub <hub-node>
 ```
 
-Fleet deploy reads `deploy/fleet/config-site.yaml` by default. Override
-`MAC_DEPLOY_FLEET_SITE_CONFIG` to test another site file. Host-local secret env
-files still own tokens and provider credentials.
+Fleet deploy reads `~/.mac/fleets.yaml` by default. Override
+`MAC_DEPLOY_FLEETS_CONFIG` when a different registry path is required. The hub
+node name selects the fleet. Host-local secret env files still own tokens and
+provider credentials.
 
 Fleet deploy is supervisor-driven, not Linux-systemd-only. Set
 `MAC_DEPLOY_SUPERVISOR=auto` unless a host needs an explicit override. Auto

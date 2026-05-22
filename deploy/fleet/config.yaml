@@ -1,9 +1,9 @@
 # Sample mac fleet configuration.
 #
-# Copy this file to deploy/fleet/config-site.yaml and edit it for your own
-# machines before running deploy/deploy-mac-fleet.sh. The site file is ignored
-# by Git. Do not put bearer tokens or provider keys in this YAML; use
-# ~/.mac/.env and host-local secret stores for secrets.
+# This file is a checked-in schema/defaults sample only. Real fleet topology
+# lives outside Git in ~/.mac/fleets.yaml, keyed by hub node name. Do not put
+# bearer tokens or provider keys in YAML; use ~/.mac/.env and host-local secret
+# stores for secrets.
 
 sample: true
 fleet_name: example

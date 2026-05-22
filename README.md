@@ -312,10 +312,10 @@ mac-hermes --url http://127.0.0.1:8000 writeback hermes_... task_...
 ```
 
 Fleet deployment reads generic defaults from `deploy/fleet/config.yaml` and
-site-specific topology from the ignored `deploy/fleet/config-site.yaml`.
-Run `bash setup.sh` to create the site file and `~/.mac/.env`; those files set
-the SSH targets, OS kinds, supervisors, Slack home channel, shared Qdrant
-endpoint, and per-agent Hermes model selectors.
+real topology from the home-scoped registry `~/.mac/fleets.yaml`. Run
+`bash setup.sh` to create `~/.mac/fleets.yaml` and `~/.mac/.env`. Each fleet is
+keyed by its hub node name; deploy with
+`bash deploy/deploy-mac-fleet.sh --hub <hub-node>`.
 
 ## Design Docs
 
