@@ -4009,19 +4009,12 @@ install_reverse_tunnel_on_hub() {
   last_index=$((${#ssh_parts[@]} - 1))
   ssh_target="${ssh_parts[$last_index]}"
   ssh_args=("${ssh_parts[@]:0:$last_index}")
-  # Extract just the hostname part of the worker target for SSH within the cluster
-  tunnel_host="$(python3 - "$worker_target" <<'PY'
-import sys
-t = sys.argv[1].strip()
-# Strip user@ prefix if present
-if '@' in t:
-    t = t.split('@', 1)[1]
-# Strip :port suffix if present
-if t.count(':') == 1 and not t.endswith(':'):
-    t = t.rsplit(':', 1)[0]
-print(t)
-PY
-)"
+  # Resolve the worker's actual SSH hostname from local ~/.ssh/config so the hub
+  # (which has no local SSH aliases) can reach it by FQDN within the cluster.
+  tunnel_host="$(ssh -G "$worker_target" 2>/dev/null | awk '/^hostname / {print $2; exit}')"
+  if [ -z "$tunnel_host" ]; then
+    tunnel_host="$worker_target"
+  fi
   # Pass values to the remote inline; quoting handled by shell_quote
   ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     "TUNNEL_WORKER_AGENT=$(shell_quote "$worker_agent") TUNNEL_HOST=$(shell_quote "$tunnel_host") TUNNEL_FLEET_NAME=$(shell_quote "$fleet_name_local") bash -s" <<'HUBSCRIPT'
