@@ -363,8 +363,6 @@ hub_agent = (
 hub_url = os.environ.get("MAC_DEPLOY_HUB_URL") or text_field(cfg.get("hub_url"))
 fleet_name = os.environ.get("MAC_DEPLOY_FLEET_NAME") or text_field(cfg.get("fleet_name")) or "mac"
 control_port = os.environ.get("MAC_DEPLOY_CONTROL_PORT") or text_field(cfg.get("control_port")) or "8789"
-fleet_hub_tunnel = os.environ.get("MAC_DEPLOY_HUB_TUNNEL") or text_field(cfg.get("hub_tunnel")) or "none"
-fleet_hub_tunnel_port = os.environ.get("MAC_DEPLOY_HUB_TUNNEL_PORT") or text_field(cfg.get("hub_tunnel_port")) or "18789"
 shared_services_manager = (
     os.environ.get("MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT")
     or text_field(cfg.get("shared_services_manager_agent"))
@@ -401,60 +399,7 @@ for name in selected:
     worker = merge_dicts(defaults.get("worker", {}) if isinstance(defaults.get("worker"), dict) else {}, agent.get("worker", {}) if isinstance(agent.get("worker"), dict) else {})
     qdrant = merge_dicts(defaults.get("qdrant", {}) if isinstance(defaults.get("qdrant"), dict) else {}, agent.get("qdrant", {}) if isinstance(agent.get("qdrant"), dict) else {})
     firecrawl = merge_dicts(defaults.get("firecrawl", {}) if isinstance(defaults.get("firecrawl"), dict) else {}, agent.get("firecrawl", {}) if isinstance(agent.get("firecrawl"), dict) else {})
-    legacy_tailscale = merge_dicts(
-        defaults.get("tailscale", {}) if isinstance(defaults.get("tailscale"), dict) else {},
-        agent.get("tailscale", {}) if isinstance(agent.get("tailscale"), dict) else {},
-    )
-    network = merge_dicts(
-        defaults.get("network", {}) if isinstance(defaults.get("network"), dict) else {},
-        agent.get("network", {}) if isinstance(agent.get("network"), dict) else {},
-    )
-    network_provider = text_field(network.get("provider"))
-    if not network_provider:
-        legacy_headscale = legacy_tailscale.get("headscale")
-        if legacy_headscale is None:
-            network_provider = "tailscale"
-        else:
-            legacy_text = text_field(legacy_headscale).lower()
-            if legacy_text in {"1", "true", "yes", "on"}:
-                network_provider = "headscale"
-            elif legacy_text in {"0", "false", "no", "off", "none", "disabled"}:
-                network_provider = "tailscale"
-            else:
-                network_provider = "headscale" if not os.environ.get("MAC_DEPLOY_TAILSCALE_AUTH_KEY") else "tailscale"
-    network_provider = network_provider.lower()
-    if network_provider not in {"tailscale", "headscale", "none"}:
-        print("ERROR: network.provider must be tailscale, headscale, or none", file=sys.stderr)
-        raise SystemExit(2)
-    network_install = text_field(network.get("install") if "install" in network else legacy_tailscale.get("install") or "auto")
-    network_hostname_prefix = text_field(
-        network.get("hostname_prefix") if "hostname_prefix" in network else legacy_tailscale.get("hostname_prefix")
-    )
-    network_tailscale = network.get("tailscale") if isinstance(network.get("tailscale"), dict) else {}
-    network_headscale = network.get("headscale") if isinstance(network.get("headscale"), dict) else {}
-    headscale_manage = bool_field(network_headscale.get("manage"), False)
-    headscale_login_server = text_field(
-        network_headscale.get("login_server")
-        or network_headscale.get("url")
-        or network.get("login_server")
-        or legacy_tailscale.get("headscale_login_server")
-    )
-    headscale_health_url = text_field(
-        network_headscale.get("health_url")
-        or network.get("health_url")
-        or legacy_tailscale.get("headscale_health_url")
-    )
-    headscale_preauth_key_env = text_field(network_headscale.get("preauth_key_env") or "MAC_DEPLOY_HEADSCALE_PREAUTHKEY")
-    headscale_preauth_key_source = text_field(
-        network_headscale.get("preauth_key_source")
-        or ("hub-managed" if headscale_manage == "1" else "env")
-    )
-    headscale_port = text_field(network_headscale.get("port") or legacy_tailscale.get("headscale_port") or "8080")
-    headscale_public_addr = text_field(network_headscale.get("public_addr") or legacy_tailscale.get("headscale_public_addr"))
-    headscale_dns = text_field(network_headscale.get("dns") or "magicdns")
-    headscale_ip_prefix = text_field(network_headscale.get("ip_prefix") or "100.64.0.0/10")
     qdrant_data_dir = text_field(qdrant.get("data_dir"))
-    tailscale_auth_key_env = text_field(network_tailscale.get("auth_key_env") or "MAC_DEPLOY_TAILSCALE_AUTH_KEY")
     target = text_field(agent.get("target"))
     os_kind = text_field(agent.get("os"))
     if not target or not os_kind:
@@ -487,29 +432,14 @@ for name in selected:
         text_field(qdrant.get("port") or "6333"),
         text_field(qdrant.get("image") or "docker.io/qdrant/qdrant:latest"),
         text_field(qdrant.get("memory_limit") or "2g"),
-        network_provider,
-        network_install,
-        network_hostname_prefix,
-        tailscale_auth_key_env,
-        headscale_manage,
-        headscale_login_server,
-        headscale_health_url,
-        headscale_preauth_key_env,
-        headscale_preauth_key_source,
-        headscale_port,
-        headscale_public_addr,
-        headscale_dns,
         fleet_name,
         control_port,
-        headscale_ip_prefix,
         qdrant_data_dir,
         text_field(firecrawl.get("url")),
         text_field(firecrawl.get("install") or "auto"),
         bool_field(firecrawl.get("required"), True),
         text_field(firecrawl.get("bind_addr")),
         text_field(firecrawl.get("port") or "3002"),
-        text_field(agent.get("hub_tunnel") or defaults.get("hub_tunnel") or fleet_hub_tunnel),
-        text_field(agent.get("hub_tunnel_port") or defaults.get("hub_tunnel_port") or fleet_hub_tunnel_port),
     ]
     require_no_pipe(fields)
     print("|".join(fields))
@@ -637,10 +567,8 @@ REMOTE
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port hub_tunnel hub_tunnel_port tailscale_auth_key configured_headscale_preauthkey remote_archive ssh_args scp_args ssh_target scp_target
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port hub_tunnel hub_tunnel_port <<<"$spec"
-  tailscale_auth_key="$(env_value_or_empty "$tailscale_auth_key_env")"
-  configured_headscale_preauthkey="${headscale_preauthkey:-$(env_value_or_empty "$headscale_preauth_key_env")}"
+  local spec="$1" hub_token="${2:-}" hub_tunnel_pubkey="${3:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit fleet_name control_port qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port remote_archive ssh_args scp_args ssh_target scp_target
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit fleet_name control_port qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
   local ssh_parts=() scp_parts=() last_index
   while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
@@ -657,7 +585,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   if ! ssh -A -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "$tailscale_auth_key") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$configured_headscale_preauthkey") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_FIRECRAWL_URL=$(shell_quote "$firecrawl_url") MAC_DEPLOY_FIRECRAWL_INSTALL=$(shell_quote "$firecrawl_install") MAC_DEPLOY_REQUIRE_FIRECRAWL=$(shell_quote "$firecrawl_required") MAC_DEPLOY_FIRECRAWL_BIND_ADDR=$(shell_quote "$firecrawl_bind_addr") MAC_DEPLOY_FIRECRAWL_PORT=$(shell_quote "$firecrawl_port") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") MAC_DEPLOY_HUB_TUNNEL=$(shell_quote "$hub_tunnel") MAC_DEPLOY_HUB_TUNNEL_PORT=$(shell_quote "$hub_tunnel_port") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_FIRECRAWL_URL=$(shell_quote "$firecrawl_url") MAC_DEPLOY_FIRECRAWL_INSTALL=$(shell_quote "$firecrawl_install") MAC_DEPLOY_REQUIRE_FIRECRAWL=$(shell_quote "$firecrawl_required") MAC_DEPLOY_FIRECRAWL_BIND_ADDR=$(shell_quote "$firecrawl_bind_addr") MAC_DEPLOY_FIRECRAWL_PORT=$(shell_quote "$firecrawl_port") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") MAC_DEPLOY_HUB_TUNNEL_PUBKEY=$(shell_quote "$hub_tunnel_pubkey") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -694,26 +622,8 @@ FIRECRAWL_INSTALL="${MAC_DEPLOY_FIRECRAWL_INSTALL:-auto}"
 FIRECRAWL_REQUIRE="${MAC_DEPLOY_REQUIRE_FIRECRAWL:-1}"
 FIRECRAWL_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_BIND_ADDR:-}"
 FIRECRAWL_PORT_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_PORT:-3002}"
-NETWORK_PROVIDER="${MAC_DEPLOY_NETWORK_PROVIDER:-tailscale}"
-NETWORK_INSTALL="${MAC_DEPLOY_NETWORK_INSTALL:-${MAC_DEPLOY_TAILSCALE_INSTALL:-auto}}"
-NETWORK_HOSTNAME_PREFIX="${MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX:-${MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX:-}}"
-TAILSCALE_AUTH_KEY="${MAC_DEPLOY_TAILSCALE_AUTH_KEY:-}"
-TAILSCALE_AUTH_KEY_ENV="${MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV:-MAC_DEPLOY_TAILSCALE_AUTH_KEY}"
-HEADSCALE_MANAGE="${MAC_DEPLOY_HEADSCALE_MANAGE:-0}"
-HEADSCALE_LOGIN_SERVER="${MAC_DEPLOY_HEADSCALE_LOGIN_SERVER:-${MAC_DEPLOY_TAILSCALE_HEADSCALE_LOGIN_SERVER:-}}"
-HEADSCALE_HEALTH_URL="${MAC_DEPLOY_HEADSCALE_HEALTH_URL:-${MAC_DEPLOY_TAILSCALE_HEADSCALE_HEALTH_URL:-}}"
-HEADSCALE_PREAUTH_KEY_ENV="${MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV:-MAC_DEPLOY_HEADSCALE_PREAUTHKEY}"
-HEADSCALE_PREAUTH_KEY_SOURCE="${MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE:-env}"
-HEADSCALE_PORT="${MAC_DEPLOY_HEADSCALE_PORT:-${MAC_DEPLOY_TAILSCALE_HEADSCALE_PORT:-8080}}"
-HEADSCALE_PUBLIC_ADDR="${MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR:-${MAC_DEPLOY_TAILSCALE_HEADSCALE_PUBLIC_ADDR:-}}"
-HEADSCALE_DNS="${MAC_DEPLOY_HEADSCALE_DNS:-magicdns}"
-HEADSCALE_IP_PREFIX="${MAC_DEPLOY_HEADSCALE_IP_PREFIX:-100.64.0.0/10}"
-# Headscale credentials: pre-populated for workers from hub mac.env or caller env.
-HEADSCALE_FLEET_URL="${MAC_DEPLOY_HEADSCALE_FLEET_URL:-}"
-HEADSCALE_PREAUTHKEY="${MAC_DEPLOY_HEADSCALE_PREAUTHKEY:-}"
 QDRANT_DATA_DIR_CONFIGURED="${MAC_DEPLOY_QDRANT_DATA_DIR:-}"
-HUB_TUNNEL="${MAC_DEPLOY_HUB_TUNNEL:-none}"
-HUB_TUNNEL_PORT="${MAC_DEPLOY_HUB_TUNNEL_PORT:-18789}"
+HUB_TUNNEL_PUBKEY="${MAC_DEPLOY_HUB_TUNNEL_PUBKEY:-}"
 MAC_DEPLOY_TARGET="${MAC_DEPLOY_TARGET:-}"
 DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
 DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
@@ -806,7 +716,7 @@ PY
 PY="$(python_bin)"
 HERMES_PY="$(hermes_python_bin "$PY")"
 SUPERVISOR_KIND=""
-export AGENT FLEET_NAME OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL HUB_TUNNEL HUB_TUNNEL_PORT CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED QDRANT_DATA_DIR_CONFIGURED NETWORK_PROVIDER NETWORK_INSTALL NETWORK_HOSTNAME_PREFIX TAILSCALE_AUTH_KEY TAILSCALE_AUTH_KEY_ENV HEADSCALE_MANAGE HEADSCALE_LOGIN_SERVER HEADSCALE_HEALTH_URL HEADSCALE_PREAUTH_KEY_ENV HEADSCALE_PREAUTH_KEY_SOURCE HEADSCALE_PORT HEADSCALE_PUBLIC_ADDR HEADSCALE_DNS HEADSCALE_IP_PREFIX HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT MAC_SERVICE_NAME HERMES_SERVICE_NAME MAC_AGENT_SERVICE_NAME MAC_LAUNCHD_LABEL HERMES_LAUNCHD_LABEL MAC_AGENT_LAUNCHD_LABEL MAC_SUPERVISORD_PROG HERMES_SUPERVISORD_PROG AGENT_SUPERVISORD_PROG MAC_SUPERVISORD_CONF_NAME SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY HERMES_PY
+export AGENT FLEET_NAME OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL HUB_TUNNEL_PUBKEY CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED QDRANT_DATA_DIR_CONFIGURED DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT MAC_SERVICE_NAME HERMES_SERVICE_NAME MAC_AGENT_SERVICE_NAME MAC_LAUNCHD_LABEL HERMES_LAUNCHD_LABEL MAC_AGENT_LAUNCHD_LABEL MAC_SUPERVISORD_PROG HERMES_SUPERVISORD_PROG AGENT_SUPERVISORD_PROG MAC_SUPERVISORD_CONF_NAME SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY HERMES_PY
 
 disk_hygiene_report() {
   local stage="$1" path="$2"
@@ -1097,123 +1007,27 @@ firecrawl_install_enabled() {
   esac
 }
 
-network_provider() {
-  case "${NETWORK_PROVIDER:-tailscale}" in
-    tailscale|headscale|none) printf '%s\n' "$NETWORK_PROVIDER" ;;
-    *)
-      log "ERROR: unsupported network.provider value: $NETWORK_PROVIDER"
-      exit 1
-      ;;
-  esac
-}
-
-network_install_enabled() {
-  local provider
-  provider="$(network_provider)"
-  [ "$provider" != "none" ] || return 1
-  case "${NETWORK_INSTALL:-auto}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
-    0|false|FALSE|no|NO|off|OFF|none|disabled) return 1 ;;
-    auto|"")
-      case "$provider" in
-        headscale) return 0 ;;
-        tailscale) [ -n "$TAILSCALE_AUTH_KEY" ]; return ;;
-      esac
-      ;;
-    *)
-      log "ERROR: unsupported network.install value: $NETWORK_INSTALL"
-      exit 1
-      ;;
-  esac
-}
-
-headscale_managed_by_hub() {
-  truthy "$HEADSCALE_MANAGE" && [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]
-}
-
-headscale_health_check() {
-  local url="${1:-}"
-  [ -n "$url" ] || return 0
-  log "checking headscale health at $url"
-  if curl -fsS --connect-timeout 3 --max-time 8 "$url" >/dev/null; then
-    return 0
+ensure_hub_tunnel_key() {
+  local key_file="$HOME/.ssh/mac_tunnel_id"
+  if [ ! -f "$key_file" ]; then
+    log "generating hub SSH tunnel keypair at $key_file"
+    ssh-keygen -t ed25519 -f "$key_file" -N "" -C "mac-hub-tunnel@${AGENT}" -q
   fi
-  log "ERROR: headscale health check failed at $url"
-  exit 1
+  chmod 600 "$key_file"
+  log "hub tunnel public key: $(cat "${key_file}.pub")"
 }
 
-install_fleet_networking() {
-  local provider
-  provider="$(network_provider)"
-  if ! network_install_enabled; then
-    log "fleet networking skipped (provider=${provider}, install=${NETWORK_INSTALL:-auto})"
-    return
+install_hub_tunnel_pubkey() {
+  [ -n "$HUB_TUNNEL_PUBKEY" ] || return 0
+  local auth_keys="$HOME/.ssh/authorized_keys"
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  touch "$auth_keys"
+  chmod 600 "$auth_keys"
+  if ! grep -qF "$HUB_TUNNEL_PUBKEY" "$auth_keys" 2>/dev/null; then
+    log "adding hub tunnel public key to authorized_keys"
+    printf '%s\n' "$HUB_TUNNEL_PUBKEY" >> "$auth_keys"
   fi
-
-  case "$provider" in
-    tailscale)
-      if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-        log "ERROR: Tailscale provider requires $TAILSCALE_AUTH_KEY_ENV"
-        exit 1
-      fi
-      unset HEADSCALE_URL
-      unset HEADSCALE_PREAUTHKEY
-      ;;
-    headscale)
-      if [ -z "$HEADSCALE_LOGIN_SERVER" ] && [ -z "$HEADSCALE_FLEET_URL" ]; then
-        log "ERROR: Headscale provider requires network.headscale.login_server"
-        exit 1
-      fi
-      if [ -z "$HEADSCALE_HEALTH_URL" ]; then
-        log "ERROR: Headscale provider requires network.headscale.health_url"
-        exit 1
-      fi
-      if headscale_managed_by_hub; then
-        log "installing managed headscale control plane on hub"
-        AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
-          ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
-          FLEET_NAME="$FLEET_NAME" \
-          HEADSCALE_FLEET_URL="$HEADSCALE_LOGIN_SERVER" \
-          HEADSCALE_PUBLIC_ADDR="$HEADSCALE_PUBLIC_ADDR" \
-          HEADSCALE_PORT="$HEADSCALE_PORT" \
-          HEADSCALE_DNS="$HEADSCALE_DNS" \
-          HEADSCALE_IP_PREFIX="$HEADSCALE_IP_PREFIX" \
-          MAC_SUPERVISOR_KIND="$SUPERVISOR_KIND" \
-          bash "$SRC_DIR/deploy/install-headscale.sh"
-        set -a
-        . "$ENV_FILE"
-        set +a
-        export HEADSCALE_URL="${HEADSCALE_URL:-http://127.0.0.1:${HEADSCALE_PORT}}"
-      else
-        export HEADSCALE_URL="${HEADSCALE_LOGIN_SERVER:-${HEADSCALE_FLEET_URL:-}}"
-      fi
-      export HEADSCALE_PREAUTHKEY="${HEADSCALE_PREAUTHKEY:-}"
-      if [ -z "$HEADSCALE_URL" ]; then
-        log "ERROR: Headscale provider requires network.headscale.login_server or hub-managed fleet URL"
-        exit 1
-      fi
-      if [ -z "$HEADSCALE_PREAUTHKEY" ]; then
-        log "ERROR: Headscale provider requires enrollment key from $HEADSCALE_PREAUTH_KEY_ENV or hub-managed preauth key"
-        exit 1
-      fi
-      headscale_health_check "$HEADSCALE_HEALTH_URL"
-      ;;
-  esac
-
-  log "installing fleet mesh networking with provider=${provider}"
-  AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
-    ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
-    FLEET_NAME="$FLEET_NAME" \
-    HEADSCALE_URL="${HEADSCALE_URL:-}" \
-    HEADSCALE_PREAUTHKEY="${HEADSCALE_PREAUTHKEY:-}" \
-    MAC_DEPLOY_TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}" \
-    TAILSCALE_HOSTNAME_PREFIX="$NETWORK_HOSTNAME_PREFIX" \
-    MAC_SUPERVISOR_KIND="$SUPERVISOR_KIND" \
-    bash "$SRC_DIR/deploy/install-tailscale.sh"
-  # Reload mac.env so QDRANT bind-addr detection picks up MAC_TAILSCALE_IP.
-  set -a
-  . "$ENV_FILE"
-  set +a
 }
 
 validate_qdrant_endpoint() {
@@ -2935,12 +2749,9 @@ if configured_worker_mode == "loop":
     # Hub nodes connect to their own local control plane; the external service
     # DNS may not expose the API port (e.g. K8s Service without port mapping).
     values["MAC_HUB_URL"] = f"http://127.0.0.1:{port}"
-elif os.environ.get("MAC_DEPLOY_HUB_TUNNEL") == "ssh":
-    # Workers using an SSH tunnel reach the hub via a local port forward.
-    tunnel_port = os.environ.get("MAC_DEPLOY_HUB_TUNNEL_PORT") or "18789"
-    values["MAC_HUB_URL"] = f"http://127.0.0.1:{tunnel_port}"
 else:
-    values["MAC_HUB_URL"] = configured_hub_url or values.get("MAC_HUB_URL", "http://127.0.0.1:8789")
+    # Workers reach hub via hub-managed reverse SSH tunnel on local port 18789
+    values["MAC_HUB_URL"] = "http://127.0.0.1:18789"
 values["MAC_SUPERVISOR_KIND"] = supervisor_kind
 values["HERMES_HOME"] = str(home / ".hermes")
 values["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
@@ -3097,7 +2908,11 @@ set -a
 set +a
 [ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories || true
 [ -x "$MAC_HOME/bin/bd" ] && restore_beads_tracked_exports || true
-install_fleet_networking
+if [ "$WORKER_MODE" = "loop" ]; then
+  ensure_hub_tunnel_key
+else
+  install_hub_tunnel_pubkey
+fi
 install_or_validate_shared_services
 write_hermes_memory_topology
 sync_hermes_home_channels
@@ -3781,35 +3596,6 @@ EOF
   sudo journalctl -u "$MAC_AGENT_SERVICE_NAME" --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
-install_hub_ssh_tunnel() {
-  local hub_ssh_host tunnel_conf
-  hub_ssh_host="$(python3 -c "
-from urllib.parse import urlparse
-print(urlparse('${HUB_URL}').hostname or '')
-" 2>/dev/null || true)"
-  if [ -z "$hub_ssh_host" ]; then
-    log "WARNING: hub_tunnel=ssh but cannot parse hostname from HUB_URL=$HUB_URL; skipping tunnel"
-    return 0
-  fi
-  local conf_dir
-  conf_dir="$(supervisord_conf_dir)"
-  tunnel_conf="$conf_dir/${FLEET_NAME}-hub-tunnel.conf"
-  log "installing hub SSH tunnel 127.0.0.1:${HUB_TUNNEL_PORT} -> ${hub_ssh_host}:${MAC_PORT}"
-  sudo install -d -m 0755 "$conf_dir"
-  sudo tee "$tunnel_conf" >/dev/null <<EOF
-[program:${FLEET_NAME}-hub-tunnel]
-command=ssh -N -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -L 127.0.0.1:${HUB_TUNNEL_PORT}:127.0.0.1:${MAC_PORT} $USER@${hub_ssh_host}
-directory=$HOME
-user=$USER
-autostart=true
-autorestart=true
-startsecs=5
-stopwaitsecs=10
-stdout_logfile=$LOG_DIR/hub-tunnel.log
-stderr_logfile=$LOG_DIR/hub-tunnel.log
-environment=HOME="$HOME"
-EOF
-}
 
 install_supervisord_service() {
   local conf_dir conf restart_since
@@ -3863,16 +3649,9 @@ stdout_logfile=$LOG_DIR/mac-agent.log
 stderr_logfile=$LOG_DIR/mac-agent.log
 environment=HOME="$HOME"
 EOF
-  if [ "$HUB_TUNNEL" = "ssh" ] && [ "$WORKER_MODE" != "loop" ]; then
-    install_hub_ssh_tunnel
-  fi
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   run_supervisorctl reread >/dev/null
   run_supervisorctl update >/dev/null
-  if [ "$HUB_TUNNEL" = "ssh" ] && [ "$WORKER_MODE" != "loop" ]; then
-    run_supervisorctl restart "${FLEET_NAME}-hub-tunnel" >/dev/null 2>&1 || run_supervisorctl start "${FLEET_NAME}-hub-tunnel" >/dev/null
-    sleep 5
-  fi
   run_supervisorctl restart "$MAC_SUPERVISORD_PROG" >/dev/null 2>&1 || run_supervisorctl start "$MAC_SUPERVISORD_PROG" >/dev/null
   sleep 3
   run_supervisorctl restart "$HERMES_SUPERVISORD_PROG" >/dev/null 2>&1 || run_supervisorctl start "$HERMES_SUPERVISORD_PROG" >/dev/null
@@ -4208,7 +3987,7 @@ read_hub_token() {
     'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${MAC_API_TOKEN:?}"'
 }
 
-read_headscale_fleet_url() {
+read_hub_tunnel_pubkey() {
   local target ssh_parts=() ssh_args=() ssh_target item last_index
   target="$(hub_target)"
   while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
@@ -4216,51 +3995,82 @@ read_headscale_fleet_url() {
   ssh_target="${ssh_parts[$last_index]}"
   ssh_args=("${ssh_parts[@]:0:$last_index}")
   ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
-    'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${HEADSCALE_FLEET_URL:-}"'
+    "cat \"\$HOME/.ssh/mac_tunnel_id.pub\" 2>/dev/null || true"
 }
 
-read_headscale_preauthkey() {
-  local target ssh_parts=() ssh_args=() ssh_target item last_index
-  target="$(hub_target)"
-  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+install_reverse_tunnel_on_hub() {
+  local worker_agent="$1" worker_target="$2" hub_target_str="$3" fleet_name_arg="${4:-mac}"
+  local ssh_parts=() ssh_args=() ssh_target item last_index tunnel_host fleet_name_local
+  fleet_name_local="${fleet_name_arg:-mac}"
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$hub_target_str")
   last_index=$((${#ssh_parts[@]} - 1))
   ssh_target="${ssh_parts[$last_index]}"
   ssh_args=("${ssh_parts[@]:0:$last_index}")
+  # Extract just the hostname part of the worker target for SSH within the cluster
+  tunnel_host="$(python3 - "$worker_target" <<'PY'
+import sys
+t = sys.argv[1].strip()
+# Strip user@ prefix if present
+if '@' in t:
+    t = t.split('@', 1)[1]
+# Strip :port suffix if present
+if t.count(':') == 1 and not t.endswith(':'):
+    t = t.rsplit(':', 1)[0]
+print(t)
+PY
+)"
+  # Pass values to the remote inline; quoting handled by shell_quote
   ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
-    'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${HEADSCALE_PREAUTHKEY:-}"'
+    "TUNNEL_WORKER_AGENT=$(shell_quote "$worker_agent") TUNNEL_HOST=$(shell_quote "$tunnel_host") TUNNEL_FLEET_NAME=$(shell_quote "$fleet_name_local") bash -s" <<'HUBSCRIPT'
+set -euo pipefail
+worker_agent="${TUNNEL_WORKER_AGENT:?}"
+tunnel_host="${TUNNEL_HOST:?}"
+fleet_name="${TUNNEL_FLEET_NAME:-mac}"
+conf_dir="$(ls -d /etc/supervisor/conf.d 2>/dev/null || ls -d /etc/supervisord.d 2>/dev/null || echo '/etc/supervisor/conf.d')"
+sudo tee "$conf_dir/${fleet_name}-tunnel-${worker_agent}.conf" > /dev/null <<EOF
+[program:${fleet_name}-tunnel-${worker_agent}]
+command=ssh -N -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i $HOME/.ssh/mac_tunnel_id -R 127.0.0.1:18789:127.0.0.1:8789 horde@${tunnel_host}
+directory=$HOME
+user=$(whoami)
+autostart=true
+autorestart=true
+startsecs=5
+stopwaitsecs=10
+stdout_logfile=$HOME/.mac/logs/tunnel-${worker_agent}.log
+stderr_logfile=$HOME/.mac/logs/tunnel-${worker_agent}.log
+EOF
+supervisorctl reread >/dev/null 2>&1 || sudo supervisorctl reread >/dev/null 2>&1 || true
+supervisorctl update >/dev/null 2>&1 || sudo supervisorctl update >/dev/null 2>&1 || true
+supervisorctl restart "${fleet_name}-tunnel-${worker_agent}" >/dev/null 2>&1 \
+  || supervisorctl start "${fleet_name}-tunnel-${worker_agent}" >/dev/null 2>&1 \
+  || sudo supervisorctl start "${fleet_name}-tunnel-${worker_agent}" >/dev/null 2>&1 \
+  || true
+HUBSCRIPT
 }
 
 main() {
   make_archive
-  local spec agent hub_agent hub_token headscale_fleet_url headscale_preauthkey network_provider headscale_manage headscale_preauth_key_source
+  local spec agent hub_agent hub_token hub_target_str hub_tunnel_pubkey local_target fleet_name_field
   hub_agent="$(fleet_hub_agent)"
+  hub_target_str="$(fleet_hub_target)"
   hub_token="${MAC_DEPLOY_HUB_TOKEN:-}"
-  headscale_fleet_url="${MAC_DEPLOY_HEADSCALE_FLEET_URL:-}"
-  headscale_preauthkey="${MAC_DEPLOY_HEADSCALE_PREAUTHKEY:-}"
+  hub_tunnel_pubkey=""
   while IFS= read -r spec; do
     IFS='|' read -r -a spec_fields <<<"$spec"
     agent="${spec_fields[0]}"
-    network_provider="${spec_fields[23]:-tailscale}"
-    headscale_manage="${spec_fields[27]:-0}"
-    headscale_preauth_key_source="${spec_fields[31]:-env}"
+    local_target="${spec_fields[1]}"
+    fleet_name_field="${spec_fields[23]:-mac}"
     if [ "$agent" != "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
     fi
-    if [ "$agent" != "$hub_agent" ] && [ "$network_provider" = "headscale" ] \
-      && { [ "$headscale_preauth_key_source" = "hub-managed" ] || [ "$headscale_manage" = "1" ]; } \
-      && [ -z "$headscale_fleet_url" ]; then
-      headscale_fleet_url="$(read_headscale_fleet_url)"
-      headscale_preauthkey="$(read_headscale_preauthkey)"
-    fi
-    deploy_host "$spec" "$hub_token" "$headscale_fleet_url" "$headscale_preauthkey"
-    if [ "$agent" = "$hub_agent" ] && [ -z "$hub_token" ]; then
-      hub_token="$(read_hub_token)"
-    fi
-    if [ "$agent" = "$hub_agent" ] && [ "$network_provider" = "headscale" ] \
-      && { [ "$headscale_preauth_key_source" = "hub-managed" ] || [ "$headscale_manage" = "1" ]; } \
-      && [ -z "$headscale_fleet_url" ]; then
-      headscale_fleet_url="$(read_headscale_fleet_url)"
-      headscale_preauthkey="$(read_headscale_preauthkey)"
+    deploy_host "$spec" "$hub_token" "$hub_tunnel_pubkey"
+    if [ "$agent" = "$hub_agent" ]; then
+      if [ -z "$hub_token" ]; then
+        hub_token="$(read_hub_token)"
+      fi
+      hub_tunnel_pubkey="$(read_hub_tunnel_pubkey)"
+    else
+      install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
     fi
   done < <(selected_hosts "${REQUESTED_AGENTS[@]}")
   rm -rf "$TMPDIR_LOCAL"
