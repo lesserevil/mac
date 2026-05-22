@@ -422,6 +422,24 @@ class HistoryEvent:
 
 
 @dataclass
+class TaskTransitionOutbox:
+    id: str
+    task_id: str
+    event_type: str
+    actor: str
+    from_state: Optional[str]
+    to_state: Optional[str]
+    detail: JsonDict
+    status: str
+    attempts: int
+    created_at: str
+    processed_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
 class Evidence:
     id: str
     task_id: str
@@ -637,6 +655,26 @@ class WorkflowRun:
 
 
 @dataclass
+class WorkflowDraft:
+    id: str
+    tenant_id: Optional[str]
+    goal: str
+    status: str
+    proposed_steps: List[JsonDict]
+    questions: List[JsonDict]
+    answers: JsonDict
+    edit_history: List[JsonDict]
+    compiled_workflow_id: Optional[str]
+    created_by: str
+    created_at: str
+    updated_at: str
+    approved_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
 class WorkflowRunHistory:
     """Append-only transition log for a workflow run."""
 
@@ -773,6 +811,22 @@ class OperatorNotification:
     status: str
     created_at: str
     delivered_at: Optional[str]
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
+class NotifierChannel:
+    id: str
+    name: str
+    channel_type: str
+    enabled: bool
+    event_types: List[str]
+    target: JsonDict
+    metadata: JsonDict
+    created_at: str
+    updated_at: str
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

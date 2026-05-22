@@ -1,10 +1,13 @@
 // Maintained dashboard source. The browser module is checked in as app.js so
 // mac does not require Node.js/npm to serve or install the UI.
+import { createDashboardApi } from "./dashboard_api.js";
+
 type ViewKey =
   | "overview"
   | "map"
   | "agents"
   | "tasks"
+  | "workflows"
   | "hermes"
   | "ops"
   | "integrations"
@@ -161,6 +164,26 @@ interface OperatorNotification extends ApiRecord {
   delivered_at?: string | null;
 }
 
+interface WorkflowDraftRecord extends ApiRecord {
+  tenant_id?: string | null;
+  goal: string;
+  status: string;
+  proposed_steps?: JsonObject[];
+  questions?: JsonObject[];
+  answers?: JsonObject;
+  compiled_workflow_id?: string | null;
+  updated_at?: string;
+}
+
+interface NotifierChannelRecord extends ApiRecord {
+  name: string;
+  channel_type: string;
+  enabled: boolean;
+  event_types?: string[];
+  target?: JsonObject;
+  updated_at?: string;
+}
+
 interface IntegrationFinding extends ApiRecord {
   source_id: string;
   source_kind: string;
@@ -207,7 +230,9 @@ interface DashboardData {
   dispatch: { open_task_count: number; tasks: DispatchTask[] };
   messages: ApiRecord[];
   notifications: OperatorNotification[];
+  notifier_channels: NotifierChannelRecord[];
   workflows: ApiRecord[];
+  workflow_drafts: WorkflowDraftRecord[];
   workflow_runs: { counts?: Record<string, number>; total?: number; latest?: ApiRecord[] };
   agentbus_streams: ApiRecord[];
   artifacts: ApiRecord[];
@@ -277,6 +302,7 @@ const VIEW_TITLES: Record<ViewKey, string> = {
   map: "Map",
   agents: "Agents",
   tasks: "Tasks",
+  workflows: "Workflows",
   hermes: "Hermes",
   ops: "Operations",
   integrations: "Integrations",
@@ -315,6 +341,7 @@ const nodes: DashboardNodes = {
   tokenInput: requiredElement("#tokenInput"),
   clearToken: requiredElement("#clearTokenButton"),
 };
+const api = createDashboardApi(() => state.token);
 
 nodes.tokenInput.value = state.token;
 bindEvents();
@@ -363,21 +390,7 @@ async function loadDashboard(): Promise<void> {
 }
 
 async function requestJSON(path: string, init: RequestInit = {}): Promise<unknown> {
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (init.body) headers["Content-Type"] = "application/json";
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const response = await fetch(path, { ...init, headers });
-  if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: string };
-      detail = body.detail || detail;
-    } catch {
-      detail = response.statusText;
-    }
-    throw new Error(`${response.status} ${detail}`);
-  }
-  return response.json();
+  return api.request(path, init);
 }
 
 function render(): void {
@@ -403,19 +416,21 @@ function render(): void {
       ? renderAgents()
       : state.activeView === "tasks"
         ? renderTasks()
-        : state.activeView === "hermes"
-          ? renderHermes()
-          : state.activeView === "ops"
-            ? renderOperations()
-            : state.activeView === "integrations"
-              ? renderIntegrations()
-              : state.activeView === "runtime"
-                ? renderRuntime()
-                : state.activeView === "observability"
-                  ? renderObservability()
-                  : state.activeView === "secrets"
-                    ? renderSecrets()
-                    : renderOverview();
+        : state.activeView === "workflows"
+          ? renderWorkflows()
+          : state.activeView === "hermes"
+            ? renderHermes()
+            : state.activeView === "ops"
+              ? renderOperations()
+              : state.activeView === "integrations"
+                ? renderIntegrations()
+                : state.activeView === "runtime"
+                  ? renderRuntime()
+                  : state.activeView === "observability"
+                    ? renderObservability()
+                    : state.activeView === "secrets"
+                      ? renderSecrets()
+                      : renderOverview();
   nodes.content.innerHTML = `${action}${body}`;
   bindViewControls();
   syncObservabilitySubscription();
@@ -611,6 +626,166 @@ function renderTasks(): string {
         .map((taskState) => taskLane(taskState, tasks, data.agents))
         .join("")}
     </section>
+  `;
+}
+
+function renderWorkflows(): string {
+  const data = mustData();
+  const running = Number(data.workflow_runs.counts?.running || 0);
+  const pendingDrafts = data.workflow_drafts.filter((draft) => draft.status !== "compiled" && draft.status !== "cancelled");
+  return `
+    <section class="metric-grid">
+      ${metric("Definitions", data.workflows.length, `${data.workflow_runs.total || 0} total runs`)}
+      ${metric("Running", running, "active workflow runs")}
+      ${metric("Drafts", data.workflow_drafts.length, `${pendingDrafts.length} pending`)}
+      ${metric("Notifier Channels", data.notifier_channels.length, "task progress sinks")}
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Workflow Graph</h2>
+        ${workflowGraph(data.workflows[0])}
+      </div>
+      <div class="surface">
+        <h2>Create Draft</h2>
+        <form class="action-form" data-action="workflowDraftCreate">
+          <label>Goal <textarea name="goal" required></textarea></label>
+          <label>Steps JSON <textarea name="proposed_steps" placeholder='[{"node_key":"step_1","role_required":"dev","instructions":"Do the work"}]'></textarea></label>
+          <label>Questions JSON <textarea name="questions" placeholder="[]"></textarea></label>
+          <label>Answers JSON <textarea name="answers" placeholder="{}"></textarea></label>
+          <button type="submit">Create Draft</button>
+        </form>
+      </div>
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Workflows</h2>
+        <div class="record-list">
+          ${data.workflows.length ? data.workflows.map(workflowRecord).join("") : `<div class="empty-state">No workflows</div>`}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>Drafts</h2>
+        <div class="record-list">
+          ${data.workflow_drafts.length ? data.workflow_drafts.map(workflowDraftRecord).join("") : `<div class="empty-state">No workflow drafts</div>`}
+        </div>
+      </div>
+    </section>
+    <section class="surface">
+      <h2>Notifier Channels</h2>
+      <form class="action-form compact" data-action="notifierConfigure">
+        <label>Name <input name="name" placeholder="ops-slack"></label>
+        <label>Type ${select("channel_type", ["slack", "telegram", "hermes"], "slack")}</label>
+        <label>Events <input name="event_types" value="task.*"></label>
+        <label>Target JSON <textarea name="target" placeholder='{"platform":"slack"}'></textarea></label>
+        <button type="submit">Save Channel</button>
+      </form>
+      <form class="action-form compact" data-action="notifierDeliver">
+        <label>Limit <input name="limit" type="number" min="1" value="50"></label>
+        <button type="submit">Deliver Pending</button>
+      </form>
+      <div class="record-list">
+        ${data.notifier_channels.length ? data.notifier_channels.map(notifierChannelRecord).join("") : `<div class="empty-state">No notifier channels</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function workflowRecord(workflow: ApiRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(workflow.id))}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(workflow.name || workflow.slug || workflow.id)}</h3><p class="muted small mono">${escapeHtml(workflow.id)}</p></div>
+        <div class="chip-row">${chip(`v${workflow.version || 1}`, "info")}${chip(workflow.workflow_type || "workflow", "good")}</div>
+      </div>
+      <div class="row-grid compact-grid">
+        ${field("Slug", workflow.slug)}
+        ${field("Tenant", workflow.tenant_id || "global")}
+        ${field("Nodes", ((workflow.definition as JsonObject | undefined)?.nodes as unknown[] | undefined)?.length || 0)}
+        ${field("Enabled", workflow.enabled ? "yes" : "no")}
+      </div>
+      <form class="action-form compact" data-action="workflowPreview" data-workflow-id="${escapeHtml(workflow.id)}">
+        <label>Input JSON <textarea name="input" placeholder="{}"></textarea></label>
+        <button type="submit">Preview</button>
+      </form>
+      <form class="action-form compact" data-action="workflowStart" data-workflow-id="${escapeHtml(workflow.id)}">
+        <label>Started by <input name="started_by" value="human"></label>
+        <label>Input JSON <textarea name="input" placeholder="{}"></textarea></label>
+        <button type="submit">Start</button>
+      </form>
+    </article>
+  `;
+}
+
+function workflowDraftRecord(draft: WorkflowDraftRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(draft.id))}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(draft.goal)}</h3><p class="muted small mono">${escapeHtml(draft.id)}</p></div>
+        ${chip(draft.status, draft.status === "compiled" ? "good" : "warn")}
+      </div>
+      <div class="row-grid compact-grid">
+        ${field("Steps", draft.proposed_steps?.length || 0)}
+        ${field("Questions", draft.questions?.length || 0)}
+        ${field("Compiled", draft.compiled_workflow_id || "none")}
+        ${field("Updated", formatAge(draft.updated_at))}
+      </div>
+      <form class="action-form compact" data-action="workflowDraftPreview" data-draft-id="${escapeHtml(draft.id)}">
+        <label>Input JSON <textarea name="input" placeholder="{}"></textarea></label>
+        <button type="submit">Preview</button>
+      </form>
+      <form class="action-form compact" data-action="workflowDraftApprove" data-draft-id="${escapeHtml(draft.id)}">
+        <label>Slug <input name="slug" value="${escapeHtml(String(draft.goal || draft.id).toLowerCase().replaceAll(" ", "-").replace(/[^a-z0-9-]/g, ""))}"></label>
+        <label>Name <input name="name" value="${escapeHtml(draft.goal)}"></label>
+        <button type="submit">Approve</button>
+      </form>
+    </article>
+  `;
+}
+
+function workflowGraph(workflow: ApiRecord | undefined): string {
+  const definition = workflow?.definition as JsonObject | undefined;
+  const nodes = (definition?.nodes as JsonObject[] | undefined) || [];
+  const edges = (definition?.edges as JsonObject[] | undefined) || [];
+  if (!workflow || !nodes.length) return `<div class="empty-state">No workflow graph</div>`;
+  const width = 720;
+  const height = Math.max(180, nodes.length * 70 + 60);
+  const nodePositions = new Map(nodes.map((node, index) => [String(node.node_key), { x: 120 + (index % 3) * 240, y: 70 + Math.floor(index / 3) * 110 }]));
+  const edgeSvg = edges.map((edge) => {
+    const from = nodePositions.get(String(edge.from_node_key || ""));
+    const to = nodePositions.get(String(edge.to_node_key || ""));
+    if (!from || !to) return "";
+    return `<path class="graph-edge graph-edge-dependency" d="M${from.x + 82},${from.y} C${from.x + 150},${from.y} ${to.x - 150},${to.y} ${to.x - 82},${to.y}"></path>`;
+  }).join("");
+  const nodeSvg = nodes.map((node) => {
+    const pos = nodePositions.get(String(node.node_key)) || { x: 120, y: 70 };
+    return `
+      <g class="graph-node graph-node-task" transform="translate(${pos.x},${pos.y})">
+        <rect x="-86" y="-24" width="172" height="48" rx="8"></rect>
+        <text text-anchor="middle" y="-3">${escapeHtml(truncate(node.node_key, 20))}</text>
+        <text class="graph-column-label" text-anchor="middle" y="15">${escapeHtml(truncate(node.role_required, 18))}</text>
+      </g>
+    `;
+  }).join("");
+  return `
+    <div class="graph-wrap">
+      <svg class="relationship-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="Workflow graph">
+        ${edgeSvg}
+        ${nodeSvg}
+      </svg>
+    </div>
+  `;
+}
+
+function notifierChannelRecord(channel: NotifierChannelRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header">
+        <div><h3>${escapeHtml(channel.name)}</h3><p class="muted small mono">${escapeHtml(channel.id)}</p></div>
+        <div class="chip-row">${chip(channel.channel_type, "info")}${chip(channel.enabled ? "enabled" : "disabled", channel.enabled ? "good" : "warn")}</div>
+      </div>
+      <p class="muted small">${escapeHtml((channel.event_types || []).join(", ") || "task.*")}</p>
+      <p class="muted small mono">${escapeHtml(jsonSummary(channel.target))}</p>
+    </article>
   `;
 }
 
@@ -1549,6 +1724,50 @@ async function runAction(action: string, form: HTMLFormElement, values: JsonObje
       ttl_seconds: numberValue(values.ttl_seconds, 300),
     });
   }
+  if (action === "workflowDraftCreate") {
+    return postJSON("/workflows/drafts", {
+      goal: requiredString(values.goal),
+      proposed_steps: parseJsonArray(values.proposed_steps),
+      questions: parseJsonArray(values.questions),
+      answers: parseJsonObject(values.answers),
+    });
+  }
+  if (action === "workflowDraftPreview") {
+    return postJSON(`/workflows/drafts/${encodeURIComponent(requiredDataset(form, "draftId"))}/preview`, {
+      input: parseJsonObject(values.input),
+    });
+  }
+  if (action === "workflowDraftApprove") {
+    return postJSON(`/workflows/drafts/${encodeURIComponent(requiredDataset(form, "draftId"))}/approve`, {
+      slug: requiredString(values.slug),
+      name: requiredString(values.name),
+    });
+  }
+  if (action === "workflowPreview") {
+    return postJSON(`/workflows/${encodeURIComponent(requiredDataset(form, "workflowId"))}/preview`, {
+      input: parseJsonObject(values.input),
+    });
+  }
+  if (action === "workflowStart") {
+    return postJSON(`/workflows/${encodeURIComponent(requiredDataset(form, "workflowId"))}/start`, {
+      started_by: requiredString(values.started_by),
+      input: parseJsonObject(values.input),
+    });
+  }
+  if (action === "notifierConfigure") {
+    return postJSON("/notifier/channels", {
+      name: requiredString(values.name),
+      channel_type: requiredString(values.channel_type),
+      event_types: String(values.event_types || "").split(",").map((item) => item.trim()).filter(Boolean),
+      target: parseJsonObject(values.target),
+      enabled: true,
+    });
+  }
+  if (action === "notifierDeliver") {
+    return postJSON("/notifier/deliver", {
+      limit: numberValue(values.limit, 50),
+    });
+  }
   throw new Error(`unsupported action: ${action}`);
 }
 
@@ -1743,6 +1962,16 @@ function parseJsonObject(value: unknown): JsonObject {
     throw new Error("expected a JSON object");
   }
   return parsed as JsonObject;
+}
+
+function parseJsonArray(value: unknown): JsonObject[] {
+  const text = String(value || "").trim();
+  if (!text) return [];
+  const parsed = JSON.parse(text);
+  if (!Array.isArray(parsed)) {
+    throw new Error("expected a JSON array");
+  }
+  return parsed as JsonObject[];
 }
 
 function requiredString(value: unknown): string {

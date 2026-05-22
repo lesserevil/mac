@@ -153,6 +153,61 @@ def test_workflow_definition_change_bumps_version(cp):
     assert wf3.version == 2
 
 
+def test_workflow_definition_serializes_with_versioned_typed_shape(cp):
+    wf = cp.workflows.create_workflow(
+        slug="typed",
+        name="Typed",
+        description="typed",
+        workflow_type="bug",
+        definition=_two_node_definition(),
+        created_by="h",
+    )
+
+    assert wf.definition["schema_version"] == 1
+    assert wf.definition["nodes"][0]["node_key"] == "investigate"
+    preview = cp.preview_workflow(wf.id, input={"ticket": "mac-123"})
+    assert preview["schema"] == "mac.workflow.preview.v1"
+    assert preview["task_count"] == 2
+    assert preview["tasks"][1]["dependencies"] == ["investigate"]
+    assert preview["tasks"][0]["metadata"]["inherited_context"]["ticket"] == "mac-123"
+
+
+def test_workflow_draft_can_be_previewed_and_approved(cp):
+    draft = cp.create_workflow_draft(
+        "Investigate then fix",
+        proposed_steps=[
+            {
+                "node_key": "investigate",
+                "role_required": "qa",
+                "instructions": "Find the issue",
+            },
+            {
+                "node_key": "fix",
+                "role_required": "dev",
+                "instructions": "Patch the issue",
+            },
+        ],
+        questions=[{"id": "scope", "prompt": "What scope?"}],
+        answers={"scope": "tests"},
+    )
+
+    preview = cp.preview_workflow_draft(draft.id)
+    assert preview["draft_id"] == draft.id
+    assert [task["node_key"] for task in preview["tasks"]] == ["investigate", "fix"]
+
+    updated = cp.update_workflow_draft(draft.id, answers={"scope": "tests only"}, actor="human")
+    assert updated.edit_history[-1]["patch"]["answers"] == {"scope": "tests only"}
+
+    workflow = cp.approve_workflow_draft(
+        draft.id,
+        slug="draft-workflow",
+        name="Draft Workflow",
+        approved_by="human",
+    )
+    assert workflow.metadata["draft_id"] == draft.id
+    assert cp.get_workflow_draft(draft.id).status == "compiled"
+
+
 def test_delete_workflow_refuses_when_runs_in_flight(cp):
     wf = cp.workflows.create_workflow(
         slug="bug",

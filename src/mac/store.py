@@ -184,6 +184,24 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_task_history_task_created
                     ON task_history (task_id, created_at);
 
+                CREATE TABLE IF NOT EXISTS task_transition_outbox (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    from_state TEXT,
+                    to_state TEXT,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_transition_outbox_status
+                    ON task_transition_outbox (status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_task_transition_outbox_task
+                    ON task_transition_outbox (task_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS evidence (
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -326,6 +344,20 @@ class SQLiteStore:
                     ON operator_notifications (status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_operator_notifications_subject
                     ON operator_notifications (subject_type, subject_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS notifier_channels (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    channel_type TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    event_types TEXT NOT NULL DEFAULT '[]',
+                    target TEXT NOT NULL DEFAULT '{}',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_notifier_channels_type_enabled
+                    ON notifier_channels (channel_type, enabled);
 
                 CREATE TABLE IF NOT EXISTS command_audit (
                     id TEXT PRIMARY KEY,
@@ -763,6 +795,26 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_workflows_type_enabled
                     ON workflows (workflow_type, enabled);
+
+                CREATE TABLE IF NOT EXISTS workflow_drafts (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+                    goal TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    proposed_steps TEXT NOT NULL DEFAULT '[]',
+                    questions TEXT NOT NULL DEFAULT '[]',
+                    answers TEXT NOT NULL DEFAULT '{}',
+                    edit_history TEXT NOT NULL DEFAULT '[]',
+                    compiled_workflow_id TEXT REFERENCES workflows(id) ON DELETE SET NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    approved_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_workflow_drafts_status
+                    ON workflow_drafts (status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_drafts_tenant
+                    ON workflow_drafts (tenant_id, updated_at);
 
                 CREATE TABLE IF NOT EXISTS workflow_runs (
                     id TEXT PRIMARY KEY,

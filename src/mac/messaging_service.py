@@ -50,6 +50,7 @@ MESSAGE_TYPE_REQUIRED_FIELDS: Dict[str, Tuple[str, ...]] = {
     MessageType.NUDGE.value: ("task_id",),
     MessageType.DECISION_RECORD.value: ("summary",),
 }
+SYSTEM_SENDERS = {"dispatcher", "notifier"}
 
 
 def _state_value(state: Any) -> str:
@@ -59,9 +60,8 @@ def _state_value(state: Any) -> str:
 class MessagingService:
     """Per-agent control-message queue with schema validation.
 
-    The ``"dispatcher"`` sender ID is a reserved system sender for messages
-    raised by the control plane itself (e.g., when a lease expires); it
-    bypasses the get_agent existence check because no row exists for it.
+    System sender IDs bypass the get_agent existence check because no row
+    exists for control-plane generated messages.
     """
 
     def __init__(
@@ -85,7 +85,7 @@ class MessagingService:
         payload: Dict[str, Any],
         task_id: Optional[str] = None,
     ) -> AgentMessage:
-        if sender_agent_id != "dispatcher":
+        if sender_agent_id not in SYSTEM_SENDERS:
             self._get_agent(sender_agent_id)
         if recipient_agent_id is not None:
             self._get_agent(recipient_agent_id)

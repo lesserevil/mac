@@ -465,6 +465,103 @@ def test_fastapi_exposes_operator_notifications():
     assert delivered["delivered_at"] is not None
 
 
+def test_fastapi_exposes_agent_crud_operations():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "crud-host"}).json()
+    agent = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+
+    shown = client.get("/agents/%s" % agent["id"])
+    assert shown.status_code == 200
+    assert shown.json()["name"] == "worker"
+
+    updated = client.put(
+        "/agents/%s" % agent["id"],
+        json={
+            "name": "worker-renamed",
+            "capabilities": ["python", "ops"],
+            "resources": {"cpu": 8},
+            "health_status": "healthy",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "worker-renamed"
+    assert updated.json()["capabilities"] == ["ops", "python"]
+
+    disabled = client.post("/agents/%s/disable" % agent["id"])
+    assert disabled.status_code == 200
+    assert disabled.json()["status"] == "offline"
+
+    deleted = client.delete("/agents/%s" % agent["id"])
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": agent["id"]}
+    assert client.get("/agents/%s" % agent["id"]).status_code == 404
+
+
+def test_fastapi_exposes_workflow_drafts_preview_and_notifier_channels():
+    cp = ControlPlane.in_memory()
+    cp.roles.create_role(
+        slug="qa",
+        name="QA",
+        description="quality",
+        system_prompt="review carefully",
+        level="ic",
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    draft = client.post(
+        "/workflows/drafts",
+        json={
+            "goal": "Check a release",
+            "proposed_steps": [
+                {
+                    "node_key": "check_release",
+                    "role_required": "qa",
+                    "instructions": "Run release checks",
+                    "required_capabilities": ["python"],
+                }
+            ],
+            "questions": [{"id": "target", "prompt": "Which release?"}],
+            "answers": {"target": "v1"},
+        },
+    )
+    assert draft.status_code == 200, draft.text
+    draft_body = draft.json()
+    assert draft_body["status"] == "draft"
+
+    preview = client.post("/workflows/drafts/%s/preview" % draft_body["id"], json={})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["tasks"][0]["node_key"] == "check_release"
+
+    approved = client.post(
+        "/workflows/drafts/%s/approve" % draft_body["id"],
+        json={"slug": "release-check", "name": "Release Check"},
+    )
+    assert approved.status_code == 200, approved.text
+    workflow = approved.json()
+    assert workflow["metadata"]["draft_id"] == draft_body["id"]
+
+    workflow_preview = client.post("/workflows/%s/preview" % workflow["id"], json={})
+    assert workflow_preview.status_code == 200, workflow_preview.text
+    assert workflow_preview.json()["workflow_id"] == workflow["id"]
+
+    notifier = client.post(
+        "/notifier/channels",
+        json={
+            "name": "ops-slack",
+            "channel_type": "slack",
+            "event_types": ["task.failed", "task.completed"],
+            "target": {"platform": "slack"},
+        },
+    )
+    assert notifier.status_code == 200, notifier.text
+    state = client.get("/dashboard/state").json()
+    assert state["workflow_drafts"]
+    assert state["notifier_channels"][0]["name"] == "ops-slack"
+
+
 def test_fastapi_exposes_integration_authority_ledger():
     cp = ControlPlane.in_memory()
     finding = cp.record_integration_finding(
@@ -758,8 +855,15 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
 
     assert (root / "src/mac/ui/app.ts").exists()
     assert (root / "src/mac/ui/app.js").exists()
-    assert "URLSearchParams" in (root / "src/mac/ui/app.js").read_text(encoding="utf-8")
-    assert 'data-view="map"' in (root / "src/mac/ui/index.html").read_text(encoding="utf-8")
+    assert (root / "src/mac/ui/dashboard_api.ts").exists()
+    app_js = (root / "src/mac/ui/app.js").read_text(encoding="utf-8")
+    index_html = (root / "src/mac/ui/index.html").read_text(encoding="utf-8")
+    assert "URLSearchParams" in app_js
+    assert "createDashboardApi" in app_js
+    assert "renderWorkflows" in app_js
+    assert "workflowGraph" in app_js
+    assert 'data-view="map"' in index_html
+    assert 'data-view="workflows"' in index_html
     assert not (root / "package.json").exists()
     assert not (root / "package-lock.json").exists()
 

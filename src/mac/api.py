@@ -247,6 +247,15 @@ class AgentRegister(BaseModel):
     hermes_instance_id: Optional[str] = None
 
 
+class AgentUpdate(BaseModel):
+    name: Optional[str] = None
+    capabilities: Optional[List[str]] = None
+    resources: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    health_status: Optional[str] = None
+    hermes_instance_id: Optional[str] = None
+
+
 class RoleCreate(BaseModel):
     slug: str
     name: str
@@ -341,6 +350,38 @@ class WorkflowStart(BaseModel):
     started_by: str = "human"
     input: Dict[str, Any] = Field(default_factory=dict)
     tenant_id: Optional[str] = None
+
+
+class WorkflowPreview(BaseModel):
+    definition: Optional[Dict[str, Any]] = None
+    input: Dict[str, Any] = Field(default_factory=dict)
+    tenant_id: Optional[str] = None
+
+
+class WorkflowDraftCreate(BaseModel):
+    goal: str
+    created_by: str = "human"
+    tenant_id: Optional[str] = None
+    proposed_steps: List[Dict[str, Any]] = Field(default_factory=list)
+    questions: List[Dict[str, Any]] = Field(default_factory=list)
+    answers: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowDraftUpdate(BaseModel):
+    goal: Optional[str] = None
+    proposed_steps: Optional[List[Dict[str, Any]]] = None
+    questions: Optional[List[Dict[str, Any]]] = None
+    answers: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    actor: str = "human"
+
+
+class WorkflowDraftApprove(BaseModel):
+    slug: str
+    name: str
+    workflow_type: str = "custom"
+    approved_by: str = "human"
+    is_default: bool = False
 
 
 class WorkflowCancel(BaseModel):
@@ -464,6 +505,20 @@ class ObservabilityLogCreate(BaseModel):
 
 class NotificationDelivery(BaseModel):
     status: str = "delivered"
+
+
+class NotifierChannelConfig(BaseModel):
+    name: str
+    channel_type: str
+    enabled: bool = True
+    event_types: List[str] = Field(default_factory=list)
+    target: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class NotifierDeliveryRun(BaseModel):
+    limit: int = 50
+    notification_id: Optional[str] = None
 
 
 class ReviewRequest(BaseModel):
@@ -1013,7 +1068,9 @@ def _dashboard_state(
     secrets = [secret.to_dict() for secret in cp.list_secrets()]
     secret_audits = [audit.to_dict() for audit in cp.list_secret_audits()]
     workflows = [workflow.to_dict() for workflow in cp.list_workflows()]
+    workflow_drafts = [draft.to_dict() for draft in cp.list_workflow_drafts(limit=120)]
     workflow_runs = cp.workflow_runs_summary()
+    notifier_channels = [channel.to_dict() for channel in cp.list_notifier_channels()]
     agentbus_streams = [
         stream.to_dict() for stream in cp.list_agentbus_streams(limit=120)
     ]
@@ -1062,7 +1119,9 @@ def _dashboard_state(
                     1 for request in provisioning_requests if request["status"] == "pending"
                 ),
                 "workflows": len(workflows),
+                "workflow_drafts": len(workflow_drafts),
                 "workflow_runs": workflow_runs.get("total", 0),
+                "notifier_channels": len(notifier_channels),
                 "agentbus_streams": len(agentbus_streams),
                 "artifacts": len(artifacts),
                 "beads_repositories": len(beads_repositories),
@@ -1094,7 +1153,9 @@ def _dashboard_state(
         "notifications": [
             notification.to_dict() for notification in cp.list_notifications(limit=120)
         ],
+        "notifier_channels": notifier_channels,
         "workflows": workflows,
+        "workflow_drafts": workflow_drafts,
         "workflow_runs": workflow_runs,
         "agentbus_streams": agentbus_streams,
         "artifacts": artifacts,
@@ -1480,6 +1541,39 @@ def create_app(
     def list_agents() -> List[Dict[str, Any]]:
         return [agent.to_dict() for agent in cp.list_agents()]
 
+    @app.get("/agents/{agent_id}")
+    def get_agent(agent_id: str) -> Dict[str, Any]:
+        return cp.get_agent(agent_id).to_dict()
+
+    @app.put("/agents/{agent_id}")
+    def update_agent(
+        agent_id: str,
+        body: AgentUpdate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        data = _data(body)
+        if data.get("resources") is not None:
+            _ensure_payload_bounded(data["resources"], "agent.resources")
+        return cp.update_agent(agent_id, **data).to_dict()
+
+    @app.post("/agents/{agent_id}/disable")
+    def disable_agent(
+        agent_id: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        return cp.disable_agent(agent_id).to_dict()
+
+    @app.delete("/agents/{agent_id}")
+    def delete_agent(
+        agent_id: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        cp.delete_agent(agent_id)
+        return {"deleted": agent_id}
+
     # Agent roles (persona catalog) ---------------------------------
 
     @app.post("/roles")
@@ -1627,6 +1721,78 @@ def create_app(
             )
         ]
 
+    @app.post("/workflows/preview")
+    def preview_workflow_definition(
+        body: WorkflowPreview,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        if body.tenant_id is not None:
+            principal.assert_tenant(body.tenant_id)
+        if body.definition is None:
+            raise ValidationError("workflow preview requires definition")
+        return cp.preview_workflow_definition(
+            body.definition,
+            tenant_id=body.tenant_id,
+            input=body.input,
+        )
+
+    @app.post("/workflows/drafts")
+    def create_workflow_draft(
+        body: WorkflowDraftCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.assert_tenant(body.tenant_id)
+        return cp.create_workflow_draft(**_data(body)).to_dict()
+
+    @app.get("/workflows/drafts")
+    def list_workflow_drafts(
+        tenant_id: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> List[Dict[str, Any]]:
+        return [
+            draft.to_dict()
+            for draft in cp.list_workflow_drafts(
+                tenant_id=tenant_id,
+                status=status,
+                limit=limit,
+            )
+        ]
+
+    @app.get("/workflows/drafts/{draft_id}")
+    def get_workflow_draft(draft_id: str) -> Dict[str, Any]:
+        return cp.get_workflow_draft(draft_id).to_dict()
+
+    @app.put("/workflows/drafts/{draft_id}")
+    def update_workflow_draft(
+        draft_id: str,
+        body: WorkflowDraftUpdate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        draft = cp.get_workflow_draft(draft_id)
+        principal.assert_tenant(draft.tenant_id)
+        return cp.update_workflow_draft(draft_id, **_data(body)).to_dict()
+
+    @app.post("/workflows/drafts/{draft_id}/preview")
+    def preview_workflow_draft(
+        draft_id: str,
+        body: WorkflowPreview,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        draft = cp.get_workflow_draft(draft_id)
+        principal.assert_tenant(draft.tenant_id)
+        return cp.preview_workflow_draft(draft_id, input=body.input)
+
+    @app.post("/workflows/drafts/{draft_id}/approve")
+    def approve_workflow_draft(
+        draft_id: str,
+        body: WorkflowDraftApprove,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        draft = cp.get_workflow_draft(draft_id)
+        principal.assert_tenant(draft.tenant_id)
+        return cp.approve_workflow_draft(draft_id, **_data(body)).to_dict()
+
     @app.get("/workflows/runs")
     def list_workflow_runs(
         state: Optional[str] = Query(default=None),
@@ -1644,6 +1810,20 @@ def create_app(
     @app.get("/workflows/{workflow_id_or_slug}")
     def get_workflow(workflow_id_or_slug: str) -> Dict[str, Any]:
         return cp.workflows.get_workflow(workflow_id_or_slug).to_dict()
+
+    @app.post("/workflows/{workflow_id_or_slug}/preview")
+    def preview_workflow(
+        workflow_id_or_slug: str,
+        body: WorkflowPreview,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        if body.tenant_id is not None:
+            principal.assert_tenant(body.tenant_id)
+        return cp.preview_workflow(
+            workflow_id_or_slug,
+            tenant_id=body.tenant_id,
+            input=body.input,
+        )
 
     @app.put("/workflows/{workflow_id}")
     def update_workflow(
@@ -2049,6 +2229,51 @@ def create_app(
         body: NotificationDelivery,
     ) -> Dict[str, Any]:
         return cp.mark_notification_delivered(notification_id, status=body.status).to_dict()
+
+    @app.post("/notifier/channels")
+    def configure_notifier_channel(
+        body: NotifierChannelConfig,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        return cp.configure_notifier_channel(**_data(body)).to_dict()
+
+    @app.get("/notifier/channels")
+    def list_notifier_channels(
+        enabled: Optional[bool] = Query(default=None),
+        channel_type: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [
+            channel.to_dict()
+            for channel in cp.list_notifier_channels(
+                enabled=enabled,
+                channel_type=channel_type,
+            )
+        ]
+
+    @app.get("/notifier/channels/{channel_id_or_name}")
+    def get_notifier_channel(channel_id_or_name: str) -> Dict[str, Any]:
+        return cp.get_notifier_channel(channel_id_or_name).to_dict()
+
+    @app.delete("/notifier/channels/{channel_id_or_name}")
+    def delete_notifier_channel(
+        channel_id_or_name: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        cp.delete_notifier_channel(channel_id_or_name)
+        return {"deleted": channel_id_or_name}
+
+    @app.post("/notifier/deliver")
+    def deliver_notifications(
+        body: NotifierDeliveryRun,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        return cp.deliver_pending_notifications(
+            limit=body.limit,
+            notification_id=body.notification_id,
+        )
 
     @app.get("/observability/summary")
     def observability_summary(limit: int = Query(default=80)) -> Dict[str, Any]:

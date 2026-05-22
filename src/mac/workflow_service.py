@@ -24,6 +24,7 @@ from mac.models import (
     Tenant,
     ValidationError,
     Workflow,
+    WorkflowDraft,
     ensure_json_object,
     json_dumps,
     json_loads,
@@ -31,19 +32,9 @@ from mac.models import (
     utcnow,
 )
 from mac.observability_service import ObservabilityService
+from mac.workflow_models import WorkflowDefinition
 
 SEED_DIR = Path(__file__).resolve().parent / "data" / "workflows"
-
-NODE_TYPES = {"task", "approval", "commit", "verify"}
-EDGE_CONDITIONS = {
-    "success",
-    "approved",
-    "rejected",
-    "failure",
-    "timeout",
-    "escalated",
-    "cancelled",
-}
 
 
 class WorkflowService:
@@ -87,7 +78,8 @@ class WorkflowService:
             raise ValidationError("workflow_type is required")
         if tenant_id is not None:
             self._get_tenant(tenant_id)
-        self._validate_definition(definition, tenant_id=tenant_id)
+        parsed_definition = self._validate_definition(definition, tenant_id=tenant_id)
+        normalized_definition = parsed_definition.to_dict()
 
         existing = self.store.query_all(
             """
@@ -102,7 +94,7 @@ class WorkflowService:
         version = 1
         if existing_row is not None:
             existing_definition = json_loads(existing_row["definition"], {})
-            if existing_definition == definition:
+            if existing_definition == normalized_definition:
                 # Same definition: keep the existing row, just update
                 # mutable metadata fields.
                 self.store.execute(
@@ -143,7 +135,7 @@ class WorkflowService:
                 workflow_type_value,
                 1 if is_default else 0,
                 version,
-                json_dumps(definition),
+                json_dumps(normalized_definition),
                 tenant_id,
                 json_dumps(ensure_json_object(metadata)),
                 created_by,
@@ -269,6 +261,262 @@ class WorkflowService:
             )
         self.store.execute("DELETE FROM workflows WHERE id = ?", (wf.id,))
 
+    # Draft planning + dry-run preview ------------------------------------
+
+    def create_draft(
+        self,
+        goal: str,
+        *,
+        created_by: str = "human",
+        tenant_id: Optional[str] = None,
+        proposed_steps: Optional[List[Dict[str, Any]]] = None,
+        questions: Optional[List[Dict[str, Any]]] = None,
+        answers: Optional[Dict[str, Any]] = None,
+        draft_id: Optional[str] = None,
+    ) -> WorkflowDraft:
+        goal_value = str(goal or "").strip()
+        if not goal_value:
+            raise ValidationError("workflow draft goal is required")
+        if tenant_id is not None:
+            self._get_tenant(tenant_id)
+        now = utcnow()
+        did = draft_id or new_id("wfdraft")
+        self.store.execute(
+            """
+            INSERT INTO workflow_drafts (
+                id, tenant_id, goal, status, proposed_steps, questions, answers,
+                edit_history, compiled_workflow_id, created_by, created_at,
+                updated_at, approved_at
+            ) VALUES (?, ?, ?, 'draft', ?, ?, ?, '[]', NULL, ?, ?, ?, NULL)
+            """,
+            (
+                did,
+                tenant_id,
+                goal_value,
+                json_dumps(list(proposed_steps or [])),
+                json_dumps(list(questions or [])),
+                json_dumps(ensure_json_object(answers)),
+                created_by,
+                now,
+                now,
+            ),
+        )
+        return self.get_draft(did)
+
+    def update_draft(
+        self,
+        draft_id: str,
+        *,
+        goal: Optional[str] = None,
+        proposed_steps: Optional[List[Dict[str, Any]]] = None,
+        questions: Optional[List[Dict[str, Any]]] = None,
+        answers: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+        actor: str = "human",
+    ) -> WorkflowDraft:
+        draft = self.get_draft(draft_id)
+        status_value = (status or draft.status).strip().lower()
+        if status_value not in {"draft", "questions", "approved", "compiled", "cancelled"}:
+            raise ValidationError("unsupported workflow draft status: %s" % status)
+        now = utcnow()
+        history = list(draft.edit_history)
+        patch: JsonDict = {}
+        if goal is not None:
+            patch["goal"] = str(goal).strip()
+        if proposed_steps is not None:
+            patch["proposed_steps"] = list(proposed_steps)
+        if questions is not None:
+            patch["questions"] = list(questions)
+        if answers is not None:
+            patch["answers"] = ensure_json_object(answers)
+        if status is not None:
+            patch["status"] = status_value
+        history.append({"actor": actor, "at": now, "patch": patch})
+        self.store.execute(
+            """
+            UPDATE workflow_drafts
+            SET goal = ?, status = ?, proposed_steps = ?, questions = ?,
+                answers = ?, edit_history = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                patch.get("goal", draft.goal),
+                status_value,
+                json_dumps(patch.get("proposed_steps", draft.proposed_steps)),
+                json_dumps(patch.get("questions", draft.questions)),
+                json_dumps(patch.get("answers", draft.answers)),
+                json_dumps(history),
+                now,
+                draft.id,
+            ),
+        )
+        return self.get_draft(draft.id)
+
+    def get_draft(self, draft_id: str) -> WorkflowDraft:
+        row = self.store.query_one("SELECT * FROM workflow_drafts WHERE id = ?", (draft_id,))
+        if row is None:
+            raise NotFoundError("workflow draft not found: %s" % draft_id)
+        return self._draft_from_row(row)
+
+    def list_drafts(
+        self,
+        *,
+        tenant_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[WorkflowDraft]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if tenant_id is not None:
+            clauses.append("(tenant_id = ? OR tenant_id IS NULL)")
+            params.append(tenant_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        sql = "SELECT * FROM workflow_drafts"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params.append(min(max(1, int(limit)), 1000))
+        return [self._draft_from_row(row) for row in self.store.query_all(sql, tuple(params))]
+
+    def preview_definition(
+        self,
+        definition: Dict[str, Any],
+        *,
+        tenant_id: Optional[str] = None,
+        input: Optional[Dict[str, Any]] = None,
+    ) -> JsonDict:
+        parsed = self._validate_definition(definition, tenant_id=tenant_id)
+        return parsed.task_preview(input)
+
+    def preview_workflow(
+        self,
+        workflow_id_or_slug: str,
+        *,
+        tenant_id: Optional[str] = None,
+        input: Optional[Dict[str, Any]] = None,
+    ) -> JsonDict:
+        workflow = self.get_workflow(workflow_id_or_slug, tenant_id=tenant_id)
+        preview = self.preview_definition(workflow.definition, tenant_id=workflow.tenant_id, input=input)
+        preview["workflow_id"] = workflow.id
+        preview["workflow_version"] = workflow.version
+        preview["snapshot_sha256"] = self._definition_fingerprint(workflow.definition)
+        return preview
+
+    def preview_draft(
+        self,
+        draft_id: str,
+        *,
+        workflow_type: str = "custom",
+        input: Optional[Dict[str, Any]] = None,
+    ) -> JsonDict:
+        draft = self.get_draft(draft_id)
+        definition = self.definition_from_draft(draft, workflow_type=workflow_type)
+        preview = self.preview_definition(definition, tenant_id=draft.tenant_id, input=input)
+        preview["draft_id"] = draft.id
+        return preview
+
+    def approve_draft(
+        self,
+        draft_id: str,
+        *,
+        slug: str,
+        name: str,
+        workflow_type: str = "custom",
+        approved_by: str = "human",
+        is_default: bool = False,
+    ) -> Workflow:
+        draft = self.get_draft(draft_id)
+        definition = self.definition_from_draft(draft, workflow_type=workflow_type)
+        workflow = self.create_workflow(
+            slug=slug,
+            name=name,
+            description=draft.goal,
+            workflow_type=workflow_type,
+            definition=definition,
+            created_by=approved_by,
+            tenant_id=draft.tenant_id,
+            is_default=is_default,
+            metadata={"draft_id": draft.id, "answers": draft.answers},
+        )
+        now = utcnow()
+        history = list(draft.edit_history)
+        history.append(
+            {
+                "actor": approved_by,
+                "at": now,
+                "patch": {"status": "compiled", "compiled_workflow_id": workflow.id},
+            }
+        )
+        self.store.execute(
+            """
+            UPDATE workflow_drafts
+            SET status = 'compiled', compiled_workflow_id = ?, edit_history = ?,
+                approved_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (workflow.id, json_dumps(history), now, now, draft.id),
+        )
+        return workflow
+
+    def definition_from_draft(
+        self,
+        draft: WorkflowDraft,
+        *,
+        workflow_type: str = "custom",
+    ) -> JsonDict:
+        if not draft.proposed_steps:
+            raise ValidationError("workflow draft has no proposed_steps")
+        nodes: List[JsonDict] = []
+        edges: List[JsonDict] = []
+        previous = ""
+        for index, step in enumerate(draft.proposed_steps):
+            key = str(step.get("node_key") or step.get("key") or "step_%d" % (index + 1)).strip()
+            role = str(step.get("role_required") or step.get("role") or "").strip()
+            if not role:
+                raise ValidationError("workflow draft step %s missing role_required" % key)
+            node = {
+                "node_key": key,
+                "node_type": str(step.get("node_type") or "task").strip().lower(),
+                "role_required": role,
+                "instructions": str(step.get("instructions") or step.get("title") or "").strip(),
+                "max_attempts": int(step.get("max_attempts") or 1),
+                "timeout_minutes": int(step.get("timeout_minutes") or 0),
+                "metadata": {
+                    "draft_id": draft.id,
+                    "draft_goal": draft.goal,
+                    "draft_answers": draft.answers,
+                    **ensure_json_object(step.get("metadata")),
+                },
+            }
+            if step.get("required_capabilities"):
+                node["required_capabilities"] = list(step.get("required_capabilities") or [])
+            nodes.append(node)
+            edges.append(
+                {
+                    "from_node_key": previous,
+                    "to_node_key": key,
+                    "condition": "success",
+                    "priority": 100 - index,
+                }
+            )
+            previous = key
+        edges.append(
+            {
+                "from_node_key": previous,
+                "to_node_key": "",
+                "condition": "success",
+                "priority": 1,
+            }
+        )
+        return {"metadata": {"draft_id": draft.id, "workflow_type": workflow_type}, "nodes": nodes, "edges": edges}
+
+    def _definition_fingerprint(self, definition: Dict[str, Any]) -> str:
+        import hashlib
+
+        return "sha256:" + hashlib.sha256(json_dumps(definition).encode("utf-8")).hexdigest()
+
     # YAML import + seed -----------------------------------------------
 
     def import_yaml(
@@ -320,87 +568,19 @@ class WorkflowService:
 
     def _validate_definition(
         self, definition: Any, *, tenant_id: Optional[str] = None
-    ) -> None:
-        if not isinstance(definition, dict):
-            raise ValidationError("workflow definition must be an object")
-        nodes = definition.get("nodes")
-        edges = definition.get("edges")
-        if not isinstance(nodes, list) or not nodes:
-            raise ValidationError("workflow definition.nodes must be a non-empty list")
-        if not isinstance(edges, list):
-            raise ValidationError("workflow definition.edges must be a list")
-
-        node_keys: List[str] = []
-        for node in nodes:
-            if not isinstance(node, dict):
-                raise ValidationError("workflow node must be an object")
-            key = (node.get("node_key") or "").strip()
-            if not key:
-                raise ValidationError("workflow node missing node_key")
-            if key in node_keys:
-                raise ValidationError("duplicate workflow node_key: %s" % key)
-            node_keys.append(key)
-            node_type = (node.get("node_type") or "task").strip().lower()
-            if node_type not in NODE_TYPES:
-                raise ValidationError(
-                    "unsupported node_type %s (allowed: %s)"
-                    % (node_type, ", ".join(sorted(NODE_TYPES)))
-                )
-            role_slug = (node.get("role_required") or "").strip()
-            if not role_slug:
-                raise ValidationError(
-                    "workflow node %s missing role_required" % key
-                )
+    ) -> WorkflowDefinition:
+        parsed = WorkflowDefinition.parse(definition)
+        for node in parsed.nodes:
             try:
-                self._get_role(role_slug, tenant_id=tenant_id)
+                self._get_role(node.role_required, tenant_id=tenant_id)
             except TypeError:
-                self._get_role(role_slug)
+                self._get_role(node.role_required)
             except NotFoundError:
                 raise ValidationError(
-                    "workflow node %s references unknown role: %s" % (key, role_slug)
+                    "workflow node %s references unknown role: %s"
+                    % (node.node_key, node.role_required)
                 )
-            if not isinstance(node.get("max_attempts", 1), int) or node.get("max_attempts", 1) < 1:
-                raise ValidationError(
-                    "workflow node %s max_attempts must be a positive integer" % key
-                )
-
-        start_edges = 0
-        valid_targets = set(node_keys) | {""}
-        inbound: Dict[str, int] = {key: 0 for key in node_keys}
-        for edge in edges:
-            if not isinstance(edge, dict):
-                raise ValidationError("workflow edge must be an object")
-            from_key = edge.get("from_node_key") or ""
-            to_key = edge.get("to_node_key") or ""
-            condition = (edge.get("condition") or "success").strip().lower()
-            if condition not in EDGE_CONDITIONS:
-                raise ValidationError(
-                    "unsupported edge condition %s (allowed: %s)"
-                    % (condition, ", ".join(sorted(EDGE_CONDITIONS)))
-                )
-            if from_key not in valid_targets:
-                raise ValidationError(
-                    "edge from_node_key %r does not match any node" % from_key
-                )
-            if to_key not in valid_targets:
-                raise ValidationError(
-                    "edge to_node_key %r does not match any node" % to_key
-                )
-            if from_key == "":
-                start_edges += 1
-            if to_key:
-                inbound[to_key] = inbound.get(to_key, 0) + 1
-        if start_edges != 1:
-            raise ValidationError(
-                "workflow definition must have exactly one start edge"
-                " (from_node_key=''); got %d" % start_edges
-            )
-        # Every non-start node should have at least one inbound edge.
-        for key in node_keys:
-            if inbound.get(key, 0) == 0:
-                raise ValidationError(
-                    "workflow node %s is unreachable (no inbound edge)" % key
-                )
+        return parsed
 
     def _yaml_to_definition(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         nodes: List[Dict[str, Any]] = []
@@ -456,4 +636,21 @@ class WorkflowService:
             created_by=row["created_by"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def _draft_from_row(self, row: Any) -> WorkflowDraft:
+        return WorkflowDraft(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            goal=row["goal"],
+            status=row["status"],
+            proposed_steps=json_loads(row["proposed_steps"], []),
+            questions=json_loads(row["questions"], []),
+            answers=json_loads(row["answers"], {}),
+            edit_history=json_loads(row["edit_history"], []),
+            compiled_workflow_id=row["compiled_workflow_id"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            approved_at=row["approved_at"],
         )

@@ -794,6 +794,45 @@ def cmd_command_audit_list(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_notifier_configure(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).configure_notifier_channel(
+            args.name,
+            args.channel_type,
+            event_types=_csv(args.event_types),
+            target=_json_arg(args.target, {}),
+            metadata=_json_arg(args.metadata, {}),
+            enabled=not args.disabled,
+        )
+    )
+
+
+def cmd_notifier_list(args: argparse.Namespace) -> None:
+    _print(
+        [
+            channel.to_dict()
+            for channel in _plane(args).list_notifier_channels(
+                enabled=args.enabled,
+                channel_type=args.channel_type,
+            )
+        ]
+    )
+
+
+def cmd_notifier_delete(args: argparse.Namespace) -> None:
+    _plane(args).delete_notifier_channel(args.channel_id_or_name)
+    _print({"deleted": args.channel_id_or_name})
+
+
+def cmd_notifier_deliver(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).deliver_pending_notifications(
+            limit=args.limit,
+            notification_id=args.notification_id,
+        )
+    )
+
+
 def cmd_rollout_list(args: argparse.Namespace) -> None:
     _print([rollout.to_dict() for rollout in _plane(args).list_rollouts(args.tenant_id, args.channel)])
 
@@ -1432,6 +1471,29 @@ def build_parser() -> argparse.ArgumentParser:
     command_audit_list.add_argument("--until", help="ISO timestamp upper bound")
     command_audit_list.add_argument("--limit", type=int, default=100)
     _set(cmd_command_audit_list, command_audit_list)
+
+    notifier = sub.add_parser(
+        "notifier", help="operator notification channel configuration"
+    ).add_subparsers(dest="notifier_command", required=True)
+    notifier_configure = notifier.add_parser("configure")
+    notifier_configure.add_argument("name")
+    notifier_configure.add_argument("channel_type", choices=("hermes", "slack", "telegram"))
+    notifier_configure.add_argument("--event-types", default="task.*")
+    notifier_configure.add_argument("--target", default="{}")
+    notifier_configure.add_argument("--metadata", default="{}")
+    notifier_configure.add_argument("--disabled", action="store_true")
+    _set(cmd_notifier_configure, notifier_configure)
+    notifier_list = notifier.add_parser("list")
+    notifier_list.add_argument("--enabled", action=argparse.BooleanOptionalAction)
+    notifier_list.add_argument("--channel-type", choices=("hermes", "slack", "telegram"))
+    _set(cmd_notifier_list, notifier_list)
+    notifier_delete = notifier.add_parser("delete")
+    notifier_delete.add_argument("channel_id_or_name")
+    _set(cmd_notifier_delete, notifier_delete)
+    notifier_deliver = notifier.add_parser("deliver")
+    notifier_deliver.add_argument("--limit", type=int, default=50)
+    notifier_deliver.add_argument("--notification-id")
+    _set(cmd_notifier_deliver, notifier_deliver)
 
     migrate = sub.add_parser(
         "migrate",

@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+
+from mac.models import JsonDict, ValidationError, ensure_json_object
+
+
+GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+WORKTREE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class VerificationRepoAnchor:
+    head_sha: str
+    dirty: Any
+    pushed: bool
+    remote_ref: str
+    pr_url: str
+    files_changed: List[Any]
+
+    @classmethod
+    def parse(cls, manifest: Mapping[str, Any]) -> Optional["VerificationRepoAnchor"]:
+        repo = manifest.get("repo")
+        if not isinstance(repo, dict):
+            return None
+        return cls(
+            head_sha=str(repo.get("head_sha") or "").strip(),
+            dirty=repo.get("dirty"),
+            pushed=repo.get("pushed") is True
+            or str(repo.get("pushed") or "").lower() == "true",
+            remote_ref=str(repo.get("remote_ref") or "").strip(),
+            pr_url=str(repo.get("pr_url") or "").strip(),
+            files_changed=_manifest_list(repo.get("files_changed")),
+        )
+
+
+@dataclass(frozen=True)
+class VerificationManifest:
+    raw: JsonDict
+    schema: str
+    status: str
+    evidence_type: str
+    repo: Optional[VerificationRepoAnchor]
+
+    @classmethod
+    def parse(cls, raw: Any) -> "VerificationManifest":
+        if not isinstance(raw, dict):
+            raise ValidationError("verification manifest must be an object")
+        data = ensure_json_object(raw)
+        return cls(
+            raw=data,
+            schema=str(data.get("schema") or "").strip(),
+            status=str(data.get("status") or "").strip().lower(),
+            evidence_type=str(data.get("evidence_type") or "").strip().lower(),
+            repo=VerificationRepoAnchor.parse(data),
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceValidationContext:
+    passed_check_count: Callable[[JsonDict], int]
+
+
+class EvidenceValidator:
+    evidence_type = ""
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        raise NotImplementedError
+
+    def require_pushed_repo_anchor(self, manifest: VerificationManifest) -> List[str]:
+        repo = manifest.repo
+        if repo is None:
+            return ["repo evidence requires verification.repo object"]
+        problems: List[str] = []
+        if not GIT_SHA_RE.match(repo.head_sha):
+            problems.append("repo.head_sha must be a git SHA")
+        if repo.dirty not in {False, "false", "False", 0, "0"}:
+            problems.append("repo evidence must declare dirty=false")
+        if not (repo.pushed and repo.remote_ref) and not repo.pr_url:
+            problems.append("repo evidence requires pushed=true with remote_ref, or pr_url")
+        return problems
+
+    def passed_checks(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> int:
+        return context.passed_check_count(manifest.raw)
+
+
+class RepoChangeValidator(EvidenceValidator):
+    evidence_type = "repo_change"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        if manifest.repo is not None and not manifest.repo.files_changed:
+            problems.append("repo evidence requires changed files")
+        if self.passed_checks(manifest, context) < 1:
+            problems.append("repo code evidence requires at least one passing test/check")
+        return problems
+
+
+class DocumentationValidator(RepoChangeValidator):
+    evidence_type = "documentation"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        if manifest.repo is not None and not manifest.repo.files_changed:
+            problems.append("repo evidence requires changed files")
+        return problems
+
+
+class DeploymentValidator(EvidenceValidator):
+    evidence_type = "deployment"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        if self.passed_checks(manifest, context) < 1:
+            problems.append("deployment evidence requires at least one passing check")
+        if not (
+            _manifest_list(manifest.raw.get("targets"))
+            or _manifest_list(manifest.raw.get("services"))
+            or _manifest_list(manifest.raw.get("artifacts"))
+        ):
+            problems.append("deployment evidence requires targets, services, or artifacts")
+        return problems
+
+
+class TestValidator(EvidenceValidator):
+    evidence_type = "test"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        if self.passed_checks(manifest, context) < 1:
+            problems.append("test evidence requires at least one passing check or test")
+        return problems
+
+
+class ArtifactValidator(TestValidator):
+    evidence_type = "artifact"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        if self.passed_checks(manifest, context) < 1:
+            problems.append("artifact evidence requires at least one passing check or test")
+        if not _manifest_list(manifest.raw.get("artifacts")):
+            problems.append("artifact evidence requires artifacts")
+        return problems
+
+
+class NoChangeValidator(EvidenceValidator):
+    evidence_type = "no_change"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        if not str(manifest.raw.get("reason") or manifest.raw.get("no_change_reason") or "").strip():
+            problems.append("no_change evidence requires a reason")
+        if self.passed_checks(manifest, context) < 1:
+            problems.append("no_change evidence requires at least one passing check")
+        return problems
+
+
+class ReviewVerdictValidator(EvidenceValidator):
+    evidence_type = "review_verdict"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        problems = self.require_pushed_repo_anchor(manifest)
+        verdict = str(manifest.raw.get("verdict") or "").strip().lower()
+        if verdict not in {"approved", "rejected"}:
+            problems.append("review_verdict evidence requires verdict approved or rejected")
+        if not str(manifest.raw.get("reviewed_evidence_id") or "").strip():
+            problems.append("review_verdict evidence requires reviewed_evidence_id")
+        if self.passed_checks(manifest, context) < 1:
+            problems.append("review_verdict evidence requires at least one independent passing check")
+        digest = str(manifest.raw.get("worktree_digest") or "").strip()
+        if not WORKTREE_DIGEST_RE.match(digest):
+            problems.append("review_verdict evidence requires worktree_digest sha256")
+        return problems
+
+
+VALIDATORS: Dict[str, EvidenceValidator] = {
+    validator.evidence_type: validator
+    for validator in (
+        RepoChangeValidator(),
+        DocumentationValidator(),
+        DeploymentValidator(),
+        TestValidator(),
+        ArtifactValidator(),
+        NoChangeValidator(),
+        ReviewVerdictValidator(),
+    )
+}
+
+
+def registered_evidence_types() -> List[str]:
+    return sorted(VALIDATORS)
+
+
+def validate_evidence_type(
+    evidence_type: str,
+    manifest: Any,
+    *,
+    passed_check_count: Callable[[JsonDict], int],
+) -> List[str]:
+    typed = VerificationManifest.parse(manifest)
+    validator = VALIDATORS.get(str(evidence_type or "").strip().lower())
+    if validator is None:
+        return ["unsupported verification.evidence_type: %s" % evidence_type]
+    return validator.validate(typed, EvidenceValidationContext(passed_check_count=passed_check_count))
+
+
+def _manifest_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []

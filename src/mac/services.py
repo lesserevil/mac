@@ -58,6 +58,7 @@ from mac.models import (
     MemoryRecord,
     MessageType,
     NotFoundError,
+    NotifierChannel,
     ObservabilityEvent,
     OperatorNotification,
     Persona,
@@ -80,6 +81,7 @@ from mac.models import (
     SecretRecord,
     Task,
     TaskState,
+    TaskTransitionOutbox,
     Tenant,
     TERMINAL_TASK_STATES,
     TransitionError,
@@ -94,14 +96,18 @@ from mac.models import (
     parse_time,
     utcnow,
     validate_transition,
+    WorkflowDraft,
 )
 from mac.agent_state_service import AgentStateService
 from mac.agentbus_service import AgentBusService
+from mac.beads_bridge_service import BeadsBridgeService
 from mac.deploy_service import DeployService
+from mac.evidence_validators import validate_evidence_type
 from mac.eval_service import EvalService
 from mac.identity_service import IdentityService
 from mac.memory_service import MemoryService
 from mac.messaging_service import MessagingService
+from mac.notifier_service import NotifierService
 from mac.observability_service import ObservabilityService
 from mac.provisioning_service import ProvisioningService
 from mac.review_service import ReviewService
@@ -109,6 +115,7 @@ from mac.roles_service import RolesService
 from mac.rollout_service import RolloutService
 from mac.secrets_service import SecretsService
 from mac.store import SQLiteStore
+from mac.task_lifecycle import DispatchService, TaskLedgerService
 from mac.workflow_runtime import WorkflowRuntime
 from mac.workflow_service import WorkflowService
 
@@ -156,6 +163,10 @@ def _beads_cli() -> str:
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
     return "bd"
+
+
+def _run_beads_command(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(*args, **kwargs)
 
 
 def _safe_slug(value: str) -> str:
@@ -378,6 +389,9 @@ class ControlPlane:
         self._fernet = Fernet(base64.urlsafe_b64encode(fernet_key))
         # Domain sub-services. New domains should land here as their own
         # service classes rather than as more methods on ControlPlane.
+        self.task_ledger = TaskLedgerService(self.store)
+        self.dispatch = DispatchService(self)
+        self.beads_bridge = BeadsBridgeService(_beads_cli, runner=_run_beads_command)
         self.identity = IdentityService(self.store)
         self.observability = ObservabilityService(self.store)
         self.agentbus = AgentBusService(self.store, self.observability)
@@ -426,6 +440,15 @@ class ControlPlane:
             self.store,
             get_agent=self.get_agent,
             get_task=self.get_task,
+        )
+        self.notifiers = NotifierService(
+            self.store,
+            list_agents=self.list_agents,
+            get_agent=self.get_agent,
+            list_platform_bindings=self.identity.list_platform_bindings,
+            get_platform_binding=self.identity.get_platform_binding,
+            send_message=self.send_message,
+            record_log=self.record_log,
         )
         self.evaluations = EvalService(
             self.store,
@@ -665,6 +688,30 @@ class ControlPlane:
 
     def seed_default_workflows(self, *args: Any, **kwargs: Any) -> List[Workflow]:
         return self.workflows.seed_defaults(*args, **kwargs)
+
+    def create_workflow_draft(self, *args: Any, **kwargs: Any) -> WorkflowDraft:
+        return self.workflows.create_draft(*args, **kwargs)
+
+    def update_workflow_draft(self, *args: Any, **kwargs: Any) -> WorkflowDraft:
+        return self.workflows.update_draft(*args, **kwargs)
+
+    def get_workflow_draft(self, draft_id: str) -> WorkflowDraft:
+        return self.workflows.get_draft(draft_id)
+
+    def list_workflow_drafts(self, *args: Any, **kwargs: Any) -> List[WorkflowDraft]:
+        return self.workflows.list_drafts(*args, **kwargs)
+
+    def preview_workflow(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.workflows.preview_workflow(*args, **kwargs)
+
+    def preview_workflow_definition(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.workflows.preview_definition(*args, **kwargs)
+
+    def preview_workflow_draft(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.workflows.preview_draft(*args, **kwargs)
+
+    def approve_workflow_draft(self, *args: Any, **kwargs: Any) -> Workflow:
+        return self.workflows.approve_draft(*args, **kwargs)
 
     def start_workflow(self, *args: Any, **kwargs: Any) -> WorkflowRun:
         return self.workflow_runtime.start_run(*args, **kwargs)
@@ -1529,6 +1576,21 @@ class ControlPlane:
         )
         return self.get_notification(notification_id)
 
+    def configure_notifier_channel(self, *args: Any, **kwargs: Any) -> NotifierChannel:
+        return self.notifiers.configure_channel(*args, **kwargs)
+
+    def get_notifier_channel(self, channel_id_or_name: str) -> NotifierChannel:
+        return self.notifiers.get_channel(channel_id_or_name)
+
+    def list_notifier_channels(self, *args: Any, **kwargs: Any) -> List[NotifierChannel]:
+        return self.notifiers.list_channels(*args, **kwargs)
+
+    def delete_notifier_channel(self, channel_id_or_name: str) -> None:
+        return self.notifiers.delete_channel(channel_id_or_name)
+
+    def deliver_pending_notifications(self, *args: Any, **kwargs: Any) -> JsonDict:
+        return self.notifiers.deliver_pending(*args, **kwargs)
+
     # Short-retention command audit -------------------------------------
 
     def record_command_audit(
@@ -1765,28 +1827,63 @@ class ControlPlane:
             self._record_history(
                 task_id, "task.transitioned", actor, task.state, target, detail or {}, conn=conn
             )
-        # Workflow-runtime hook. The link is the `tasks.workflow_run_id`
-        # *column* (never the caller-supplied metadata), so a forged
-        # `metadata.workflow_run_id` cannot push a free-floating task
-        # into the workflow state machine. Runs in terminal states are
-        # short-circuited inside `on_task_completed`.
-        if target in TERMINAL_TASK_STATES:
-            row = self.store.query_one(
-                "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
+            self.task_ledger.enqueue_outbox(
+                conn,
+                task_id=task_id,
+                event_type="task.lifecycle",
+                actor=actor,
+                from_state=task.state,
+                to_state=target,
+                detail=detail or {},
+                created_at=now,
             )
-            if row is not None and row["workflow_run_id"]:
-                try:
-                    self.workflow_runtime.on_task_completed(task_id, target)
-                except Exception:  # noqa: BLE001 - runtime side-effects must not abort the transition
-                    import logging
-
-                    logging.getLogger(__name__).exception(
-                        "workflow runtime failed to advance on task %s", task_id
+            if target in TERMINAL_TASK_STATES:
+                row = conn.execute(
+                    "SELECT workflow_run_id FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if row is not None and row["workflow_run_id"]:
+                    self.task_ledger.enqueue_outbox(
+                        conn,
+                        task_id=task_id,
+                        event_type="workflow.advance",
+                        actor=actor,
+                        from_state=task.state,
+                        to_state=target,
+                        detail=detail or {},
+                        created_at=now,
                     )
+            if target in {
+                TaskState.RUNNING.value,
+                TaskState.NEEDS_REVIEW.value,
+                TaskState.REVIEWING.value,
+                TaskState.COMPLETED.value,
+                TaskState.FAILED.value,
+                TaskState.CANCELLED.value,
+                TaskState.OPEN.value,
+            }:
+                self.task_ledger.enqueue_outbox(
+                    conn,
+                    task_id=task_id,
+                    event_type="beads.ledger",
+                    actor=actor,
+                    from_state=task.state,
+                    to_state=target,
+                    detail=detail or {},
+                    created_at=now,
+                )
+            if target in {TaskState.FAILED.value, TaskState.CANCELLED.value}:
+                self.task_ledger.enqueue_outbox(
+                    conn,
+                    task_id=task_id,
+                    event_type="beads.reopen",
+                    actor=actor,
+                    from_state=task.state,
+                    to_state=target,
+                    detail=detail or {},
+                    created_at=now,
+                )
+        self.drain_task_transition_outbox(task_id=task_id, limit=20)
         transitioned = self.get_task(task_id)
-        self._sync_beads_transition_ledger(transitioned, actor, task.state, target, detail or {})
-        if target in {TaskState.FAILED.value, TaskState.CANCELLED.value}:
-            self._sync_beads_reopen(transitioned, actor, target, detail or {})
         return transitioned
 
     def claim_task(
@@ -1848,17 +1945,29 @@ class ControlPlane:
                 """,
                 (AgentStatus.BUSY.value, task_id, now, now, agent_id),
             )
-        self._record_history(
-            task_id,
-            "task.claimed",
-            agent_id,
-            task.state,
-            TaskState.CLAIMED.value,
-            {"lease_id": lease_id, "expires_at": expires_at},
-        )
+            detail = {"lease_id": lease_id, "expires_at": expires_at}
+            self._record_history(
+                task_id,
+                "task.claimed",
+                agent_id,
+                task.state,
+                TaskState.CLAIMED.value,
+                detail,
+                conn=conn,
+            )
+            self.task_ledger.enqueue_outbox(
+                conn,
+                task_id=task_id,
+                event_type="beads.claim",
+                actor=agent_id,
+                from_state=task.state,
+                to_state=TaskState.CLAIMED.value,
+                detail=detail,
+                created_at=now,
+            )
         claimed_task = self.get_task(task_id)
         if sync_beads:
-            self.sync_claim_side_effects(claimed_task.id, agent_id, lease_id, expires_at)
+            self.drain_task_transition_outbox(task_id=task_id, limit=20)
         return claimed_task, self.get_lease(lease_id)
 
     def sync_claim_side_effects(
@@ -1897,6 +2006,75 @@ class ControlPlane:
                     "leased_until": expires_at,
                 },
             )
+
+    def list_task_transition_outbox(
+        self,
+        *,
+        status: str = "pending",
+        task_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[TaskTransitionOutbox]:
+        return self.task_ledger.list_outbox(status=status, task_id=task_id, limit=limit)
+
+    def drain_task_transition_outbox(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> JsonDict:
+        processed = []
+        for item in self.task_ledger.list_outbox(task_id=task_id, limit=limit):
+            try:
+                self._process_task_transition_outbox_item(item)
+            except Exception as exc:  # noqa: BLE001 - one failed side effect must not block later rows.
+                self.task_ledger.mark_outbox_failed(item.id, str(exc))
+                self.record_log(
+                    "task.transition_outbox.failed",
+                    layer="control_plane",
+                    source="task-ledger",
+                    level="warning",
+                    subject_type="task",
+                    subject_id=item.task_id,
+                    detail={"outbox_id": item.id, "event_type": item.event_type, "error": str(exc)},
+                )
+                processed.append({"id": item.id, "event_type": item.event_type, "status": "failed"})
+                continue
+            self.task_ledger.mark_outbox_processed(item.id)
+            processed.append({"id": item.id, "event_type": item.event_type, "status": "delivered"})
+        return {"processed": processed, "count": len(processed)}
+
+    def _process_task_transition_outbox_item(self, item: TaskTransitionOutbox) -> None:
+        if item.event_type == "task.lifecycle":
+            return
+        task = self.get_task(item.task_id)
+        if item.event_type == "workflow.advance":
+            # Workflow-runtime hook. The link is the `tasks.workflow_run_id`
+            # column (never caller metadata), so forged task metadata cannot
+            # push a free-floating task into the workflow state machine.
+            if item.to_state in TERMINAL_TASK_STATES:
+                self.workflow_runtime.on_task_completed(item.task_id, item.to_state or "")
+            return
+        if item.event_type == "beads.ledger":
+            self._sync_beads_transition_ledger(
+                task,
+                item.actor,
+                item.from_state or "",
+                item.to_state or "",
+                item.detail,
+            )
+            return
+        if item.event_type == "beads.reopen":
+            self._sync_beads_reopen(task, item.actor, item.to_state or "", item.detail)
+            return
+        if item.event_type == "beads.claim":
+            self.sync_claim_side_effects(
+                item.task_id,
+                item.actor,
+                str(item.detail.get("lease_id") or ""),
+                str(item.detail.get("expires_at") or ""),
+            )
+            return
+        raise ValidationError("unsupported task transition outbox event: %s" % item.event_type)
 
     def start_task(self, task_id: str, agent_id: str) -> Task:
         task = self.get_task(task_id)
@@ -2092,15 +2270,28 @@ class ControlPlane:
                     """,
                     (AgentStatus.IDLE.value, timestamp, lease.agent_id, task.id),
                 )
-            self._record_history(
-                task.id,
-                "task.lease_expired",
-                "dispatcher",
-                task.state,
-                next_state,
-                {"lease_id": lease.id, "agent_id": lease.agent_id},
-            )
+                detail = {"lease_id": lease.id, "agent_id": lease.agent_id}
+                self._record_history(
+                    task.id,
+                    "task.lease_expired",
+                    "dispatcher",
+                    task.state,
+                    next_state,
+                    detail,
+                    conn=conn,
+                )
+                self.task_ledger.enqueue_outbox(
+                    conn,
+                    task_id=task.id,
+                    event_type="beads.ledger",
+                    actor="dispatcher",
+                    from_state=task.state,
+                    to_state=next_state,
+                    detail=detail,
+                    created_at=timestamp,
+                )
             recovered.append(self.get_task(task.id))
+            self.drain_task_transition_outbox(task_id=task.id, limit=20)
         return recovered
 
     def release_lease(self, lease_id: str, agent_id: str) -> Task:
@@ -2126,7 +2317,27 @@ class ControlPlane:
                 "UPDATE agents SET status = ?, current_task_id = NULL, updated_at = ? WHERE id = ?",
                 (AgentStatus.IDLE.value, now, agent_id),
             )
-        self._record_history(task.id, "task.lease_released", agent_id, task.state, TaskState.OPEN.value, {"lease_id": lease_id})
+            detail = {"lease_id": lease_id}
+            self._record_history(
+                task.id,
+                "task.lease_released",
+                agent_id,
+                task.state,
+                TaskState.OPEN.value,
+                detail,
+                conn=conn,
+            )
+            self.task_ledger.enqueue_outbox(
+                conn,
+                task_id=task.id,
+                event_type="beads.ledger",
+                actor=agent_id,
+                from_state=task.state,
+                to_state=TaskState.OPEN.value,
+                detail=detail,
+                created_at=now,
+            )
+        self.drain_task_transition_outbox(task_id=task.id, limit=20)
         return self.get_task(task.id)
 
     # Fleet registry
@@ -2322,6 +2533,92 @@ class ControlPlane:
     def list_agents(self) -> List[Agent]:
         rows = self.store.query_all("SELECT * FROM agents ORDER BY name, id")
         return [self._agent_from_row(row) for row in rows]
+
+    def update_agent(
+        self,
+        agent_id: str,
+        *,
+        name: Optional[str] = None,
+        capabilities: Optional[Iterable[str]] = None,
+        resources: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+        health_status: Optional[str] = None,
+        hermes_instance_id: Optional[str] = None,
+    ) -> Agent:
+        self.get_agent(agent_id)
+        updates: List[str] = []
+        params: List[Any] = []
+        if name is not None:
+            name_value = name.strip()
+            if not name_value:
+                raise ValidationError("agent name is required")
+            updates.append("name = ?")
+            params.append(name_value)
+        if capabilities is not None:
+            updates.append("capabilities = ?")
+            params.append(json_dumps(coerce_list(capabilities)))
+        if resources is not None:
+            updates.append("resources = ?")
+            params.append(json_dumps(ensure_json_object(resources)))
+        if status is not None:
+            status_value = _state_value(status)
+            try:
+                AgentStatus(status_value)
+            except ValueError:
+                raise ValidationError("unsupported agent status: %s" % status_value)
+            if status_value == AgentStatus.IDLE.value and self._agent_has_active_lease(agent_id):
+                raise ValidationError("agent cannot be set idle while holding an active lease")
+            if status_value == AgentStatus.OFFLINE.value:
+                self._expire_agent_active_leases(agent_id, utcnow(), "agent_update_offline")
+            updates.append("status = ?")
+            params.append(status_value)
+            if status_value in {AgentStatus.IDLE.value, AgentStatus.OFFLINE.value}:
+                updates.append("current_task_id = NULL")
+        if health_status is not None:
+            health_value = _state_value(health_status)
+            try:
+                HealthStatus(health_value)
+            except ValueError:
+                raise ValidationError("unsupported agent health_status: %s" % health_value)
+            updates.append("health_status = ?")
+            params.append(health_value)
+        if hermes_instance_id is not None:
+            hermes_value = hermes_instance_id.strip()
+            if hermes_value:
+                self.identity.get_hermes_instance(hermes_value)
+                updates.append("hermes_instance_id = ?")
+                params.append(hermes_value)
+            else:
+                updates.append("hermes_instance_id = NULL")
+        if not updates:
+            return self.get_agent(agent_id)
+        updates.append("updated_at = ?")
+        params.append(utcnow())
+        params.append(agent_id)
+        self.store.execute(
+            "UPDATE agents SET %s WHERE id = ?" % ", ".join(updates),
+            tuple(params),
+        )
+        return self.get_agent(agent_id)
+
+    def disable_agent(self, agent_id: str) -> Agent:
+        return self.update_agent(
+            agent_id,
+            status=AgentStatus.OFFLINE.value,
+            health_status=HealthStatus.DEGRADED.value,
+        )
+
+    def delete_agent(self, agent_id: str) -> None:
+        agent = self.get_agent(agent_id)
+        if self._agent_has_active_lease(agent_id):
+            raise ValidationError("agent cannot be deleted while holding an active lease")
+        with self.store.transaction() as conn:
+            conn.execute("DELETE FROM mood_overlays WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM nap_schedules WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM nap_runs WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM agent_events WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM messages WHERE sender_agent_id = ? OR recipient_agent_id = ?", (agent_id, agent_id))
+            conn.execute("DELETE FROM agents WHERE id = ?", (agent.id,))
 
     def heartbeat_agent(
         self,
@@ -2579,6 +2876,16 @@ class ControlPlane:
         lease_seconds: int = 900,
         skip_tenants: Optional[Iterable[str]] = None,
     ) -> Optional[JsonDict]:
+        return self.dispatch.dispatch_once(
+            lease_seconds=lease_seconds,
+            skip_tenants=skip_tenants,
+        )
+
+    def _dispatch_once_impl(
+        self,
+        lease_seconds: int = 900,
+        skip_tenants: Optional[Iterable[str]] = None,
+    ) -> Optional[JsonDict]:
         self.expire_leases()
         self._unblock_ready_tasks()
         skipped = set(skip_tenants or [])
@@ -2642,6 +2949,26 @@ class ControlPlane:
         )
 
     def claim_next_for_agent(
+        self,
+        agent_id: str,
+        lease_seconds: int = 900,
+        allowed_projects: Optional[Iterable[str]] = None,
+        required_metadata: Optional[Dict[str, Any]] = None,
+        require_canary: bool = False,
+        dry_run: bool = False,
+        sync_beads: bool = True,
+    ) -> Optional[JsonDict]:
+        return self.dispatch.claim_next_for_agent(
+            agent_id,
+            lease_seconds=lease_seconds,
+            allowed_projects=allowed_projects,
+            required_metadata=required_metadata,
+            require_canary=require_canary,
+            dry_run=dry_run,
+            sync_beads=sync_beads,
+        )
+
+    def _claim_next_for_agent_impl(
         self,
         agent_id: str,
         lease_seconds: int = 900,
@@ -4498,16 +4825,9 @@ class ControlPlane:
                 source_state=source_state,
             )
             return issues
-        completed: Optional[subprocess.CompletedProcess[str]]
+        completed: Any = None
         try:
-            completed = subprocess.run(
-                [_beads_cli(), "ready", "--json"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
+            completed = self.beads_bridge.run(["ready", "--json"], cwd=repo_path, timeout=15)
         except (OSError, subprocess.SubprocessError):
             completed = None
         if completed is not None and completed.returncode == 0:
@@ -4946,17 +5266,15 @@ class ControlPlane:
             return False
         registered_path = Path(str(binding["repo_path"])).expanduser()
         try:
-            completed = subprocess.run(
-                [_beads_cli(), "--actor", actor, *args],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
+            completed = self.beads_bridge.run(
+                args,
+                cwd=repo_path,
+                actor=actor,
                 timeout=20,
-                check=False,
             )
             self._restore_beads_tracked_exports(repo_path, actor, task.id, action)
             if completed.returncode != 0:
-                output = (completed.stderr or completed.stdout or "").strip()
+                output = completed.output
                 if action == "claim" and "already claimed" in output.lower():
                     self.record_log(
                         "bridge.beads.sync.claim_existing",
@@ -4972,13 +5290,11 @@ class ControlPlane:
                     )
                     return True
                 if registered_path.exists() and registered_path.resolve() != repo_path.resolve():
-                    fallback = subprocess.run(
-                        [_beads_cli(), "--actor", actor, *args],
-                        cwd=str(registered_path),
-                        capture_output=True,
-                        text=True,
+                    fallback = self.beads_bridge.run(
+                        args,
+                        cwd=registered_path,
+                        actor=actor,
                         timeout=20,
-                        check=False,
                     )
                     self._restore_beads_tracked_exports(
                         registered_path,
@@ -5008,7 +5324,7 @@ class ControlPlane:
                             },
                         )
                         return True
-                    fallback_output = (fallback.stderr or fallback.stdout or "").strip()
+                    fallback_output = fallback.output
                     if fallback_output:
                         output = "%s; registered checkout fallback failed: %s" % (
                             output,
@@ -5053,13 +5369,10 @@ class ControlPlane:
     ) -> bool:
         if not _truthy_env("MAC_BEADS_PUSH_WRITEBACKS", "1"):
             return True
-        completed = subprocess.run(
-            [_beads_cli(), "dolt", "push"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
+        completed = self.beads_bridge.run(
+            ["dolt", "push"],
+            cwd=repo_path,
             timeout=60,
-            check=False,
         )
         if completed.returncode == 0:
             self.record_log(
@@ -5071,7 +5384,7 @@ class ControlPlane:
                 detail={"action": action, "bead_id": bead_id, "repo_path": str(repo_path)},
             )
             return True
-        output = (completed.stderr or completed.stdout or "").strip()
+        output = completed.output
         self.record_log(
             "bridge.beads.writeback_push_failed",
             layer="control_plane",
@@ -6113,7 +6426,7 @@ class ControlPlane:
                 "title": "Evidence recorded",
                 "body": "%s added %s evidence for %s"
                 % (actor, detail.get("kind", "task"), task_title),
-                "channels": ["dashboard"],
+                "channels": ["dashboard", "hermes"],
                 "metadata": metadata,
             }
         if event_type == "task.review_requested":
@@ -6161,16 +6474,7 @@ class ControlPlane:
                 "event_type": "task.%s" % to_state,
                 "title": "Task %s" % to_state.replace("_", " "),
                 "body": "%s moved to %s" % (task_title, to_state),
-                "channels": ["dashboard", "hermes"]
-                if to_state
-                in {
-                    TaskState.NEEDS_REVIEW.value,
-                    TaskState.REVIEWING.value,
-                    TaskState.COMPLETED.value,
-                    TaskState.FAILED.value,
-                    TaskState.CANCELLED.value,
-                }
-                else ["dashboard"],
+                "channels": ["dashboard", "hermes"],
                 "metadata": metadata,
             }
         return None
@@ -6391,6 +6695,13 @@ class ControlPlane:
                 "evidence_type": evidence_type or None,
                 "problems": problems,
             }
+        if evidence_type == "review_verdict":
+            return {
+                "valid": False,
+                "reason": "review_verdict_is_not_executor_evidence",
+                "evidence_type": evidence_type,
+                "problems": ["review_verdict evidence only satisfies the reviewer verdict gate"],
+            }
         # Root of trust (mac-ng2). The verification manifest must carry
         # ``signed_by`` (an agent_id) and ``signature`` (HMAC v1) made
         # with that agent's attestation key. Without this any executor
@@ -6443,39 +6754,11 @@ class ControlPlane:
         manifest: JsonDict,
         evidence_type: str,
     ) -> List[str]:
-        # Canonical evidence_type vocabulary (mac-q38):
-        #   repo_change | documentation | deployment | test | artifact | no_change
-        # Aliases (code/git/investigation/decision_record) are rejected.
-        if evidence_type == "repo_change":
-            return self._repo_verification_problems(manifest, require_tests=True)
-        if evidence_type == "documentation":
-            return self._repo_verification_problems(manifest, require_tests=False)
-        if evidence_type == "deployment":
-            problems = self._require_pushed_repo_anchor(manifest)
-            if self._passed_verification_check_count(manifest) < 1:
-                problems.append("deployment evidence requires at least one passing check")
-            if not (
-                _manifest_list(manifest.get("targets"))
-                or _manifest_list(manifest.get("services"))
-                or _manifest_list(manifest.get("artifacts"))
-            ):
-                problems.append("deployment evidence requires targets, services, or artifacts")
-            return problems
-        if evidence_type in {"test", "artifact"}:
-            problems = self._require_pushed_repo_anchor(manifest)
-            if self._passed_verification_check_count(manifest) < 1:
-                problems.append("%s evidence requires at least one passing check or test" % evidence_type)
-            if evidence_type == "artifact" and not _manifest_list(manifest.get("artifacts")):
-                problems.append("artifact evidence requires artifacts")
-            return problems
-        if evidence_type == "no_change":
-            problems = self._require_pushed_repo_anchor(manifest)
-            if not str(manifest.get("reason") or manifest.get("no_change_reason") or "").strip():
-                problems.append("no_change evidence requires a reason")
-            if self._passed_verification_check_count(manifest) < 1:
-                problems.append("no_change evidence requires at least one passing check")
-            return problems
-        return ["unsupported verification.evidence_type: %s" % evidence_type]
+        return validate_evidence_type(
+            evidence_type,
+            manifest,
+            passed_check_count=self._passed_verification_check_count,
+        )
 
     def _repo_verification_problems(self, manifest: JsonDict, require_tests: bool) -> List[str]:
         problems = self._require_pushed_repo_anchor(manifest)
@@ -7106,46 +7389,29 @@ class ControlPlane:
                     """,
                     (next_state, timestamp, row["task_id"], row["lease_id"]),
                 )
-                conn.execute(
-                    """
-                    INSERT INTO task_history (id, task_id, event_type, actor, from_state, to_state, detail, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        new_id("hist"),
-                        row["task_id"],
-                        "task.lease_expired",
-                        "dispatcher",
-                        row["task_state"],
-                        next_state,
-                        json_dumps(
-                            {
-                                "lease_id": row["lease_id"],
-                                "agent_id": agent_id,
-                                "reason": reason,
-                            }
-                        ),
-                        timestamp,
-                    ),
-                )
-                self.observability.insert_observation(
-                    conn,
-                    "log",
-                    "task.lease_expired",
-                    "control_plane",
-                    "task",
-                    "warning",
-                    None,
-                    "",
-                    "task",
+                detail = {
+                    "lease_id": row["lease_id"],
+                    "agent_id": agent_id,
+                    "reason": reason,
+                }
+                self._record_history(
                     row["task_id"],
-                    {
-                        "actor": "dispatcher",
-                        "from_state": row["task_state"],
-                        "to_state": next_state,
-                        "lease_id": row["lease_id"],
-                        "agent_id": agent_id,
-                        "reason": reason,
-                    },
-                    timestamp,
+                    "task.lease_expired",
+                    "dispatcher",
+                    row["task_state"],
+                    next_state,
+                    detail,
+                    conn,
                 )
+                self.task_ledger.enqueue_outbox(
+                    conn,
+                    task_id=row["task_id"],
+                    event_type="beads.ledger",
+                    actor="dispatcher",
+                    from_state=row["task_state"],
+                    to_state=next_state,
+                    detail=detail,
+                    created_at=timestamp,
+                )
+        for row in rows:
+            self.drain_task_transition_outbox(task_id=row["task_id"], limit=20)

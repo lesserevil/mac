@@ -11,6 +11,7 @@ from mac.models import (
     AuthorizationError,
     HealthStatus,
     LeaseStatus,
+    MessageType,
     NotFoundError,
     PublicationStatus,
     ReviewStatus,
@@ -2379,6 +2380,74 @@ def test_operator_notifications_track_task_lifecycle(cp):
     delivered = cp.mark_notification_delivered(pending[0].id)
     assert delivered.status == "delivered"
     assert delivered.delivered_at is not None
+
+
+def test_task_notifier_delivers_task_progress_to_configured_slack_home_channel(cp):
+    tenant = cp.register_tenant("ops")
+    persona = cp.register_persona(
+        tenant.id,
+        "Rocky",
+        soul_ref="hermes://ops/rocky/SOUL.md",
+        memory_scope="hermes://ops/rocky/memory",
+    )
+    hermes = cp.register_hermes_instance(
+        tenant.id,
+        "rocky",
+        persona_id=persona.id,
+        home_ref="hermes://ops/rocky",
+    )
+    binding = cp.register_platform_binding(
+        tenant.id,
+        hermes.id,
+        "slack",
+        "T123/C456",
+        display_name="#mac-home",
+        scopes={"channels": ["C456"]},
+    )
+    machine = cp.register_machine("host")
+    agent = cp.register_agent(
+        machine.id,
+        "worker",
+        capabilities=["python"],
+        hermes_instance_id=hermes.id,
+    )
+    cp.configure_notifier_channel(
+        "slack-home",
+        "slack",
+        event_types=["task.*"],
+        target={"platform_binding_id": binding.id},
+    )
+
+    task = cp.create_task("notify progress", required_capabilities=["python"])
+    cp.claim_task(task.id, agent.id)
+    cp.start_task(task.id, agent.id)
+
+    result = cp.deliver_pending_notifications(limit=20)
+
+    assert result["delivered"] >= 2
+    messages = cp.list_messages(agent.id)
+    assert {message.sender_agent_id for message in messages} == {"notifier"}
+    assert {message.message_type for message in messages} == {MessageType.STATUS_UPDATE.value}
+    assert {message.payload["notification"]["event_type"] for message in messages} >= {
+        "task.claimed",
+        "task.running",
+    }
+    assert all(message.payload["target"]["platform_binding_id"] == binding.id for message in messages)
+
+
+def test_task_claim_records_history_and_outbox_in_same_transaction(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    task = cp.create_task("atomic claim", required_capabilities=["python"])
+
+    claimed, lease = cp.claim_task(task.id, worker.id, sync_beads=False)
+
+    history = cp.task_history(task.id)
+    outbox = cp.list_task_transition_outbox(task_id=task.id)
+    assert claimed.lease_id == lease.id
+    assert history[-1].event_type == "task.claimed"
+    assert history[-1].to_state == TaskState.CLAIMED.value
+    assert [item.event_type for item in outbox] == ["beads.claim"]
+    assert outbox[0].detail["lease_id"] == lease.id
 
 
 def test_beads_bridge_syncs_claim_and_failure_to_beads(cp, tmp_path, monkeypatch):

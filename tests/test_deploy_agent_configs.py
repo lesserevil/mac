@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from mac.fleet_deploy import cleanup_path_strings, parse_ssh_target
 import yaml
 
 
@@ -132,9 +133,9 @@ def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     assert "bootstrap_beads_repositories" in env_source_block
     assert "restore_beads_tracked_exports" in env_source_block
     assert 'values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")' in script
-    assert '[_beads_cli(), "ready", "--json"]' in (
-        ROOT / "src" / "mac" / "services.py"
-    ).read_text(encoding="utf-8")
+    services_text = (ROOT / "src" / "mac" / "services.py").read_text(encoding="utf-8")
+    assert "BeadsBridgeService(_beads_cli, runner=_run_beads_command)" in services_text
+    assert 'self.beads_bridge.run(["ready", "--json"]' in services_text
 
 
 def test_fleet_deploy_installs_github_cli_for_workers():
@@ -397,6 +398,88 @@ def test_setup_fleet_wizard_can_write_explicit_headscale_provider(tmp_path):
     assert network["headscale"]["preauth_key_env"] == "MAC_DEPLOY_HEADSCALE_PREAUTHKEY"
     assert network["headscale"]["dns"] == "magicdns"
     assert "MAC_DEPLOY_HEADSCALE_PREAUTHKEY=hs-preauth-key" in env
+
+
+def test_ssh_target_parser_supports_inline_and_explicit_ports():
+    target = parse_ssh_target("horde@20.115.163.162:2201")
+    assert target.user_host == "horde@20.115.163.162"
+    assert target.port == 2201
+    assert target.ssh_args() == ["-p", "2201"]
+    assert target.scp_args() == ["-P", "2201"]
+
+    override = parse_ssh_target("operator@hub.example.internal", port=2222)
+    assert override.user_host == "operator@hub.example.internal"
+    assert override.port == 2222
+
+
+def test_setup_fleet_wizard_new_hub_is_noninteractive_and_custom_port_aware(tmp_path):
+    fleets_config = tmp_path / ".mac" / "fleets.yaml"
+    env_file = tmp_path / ".mac" / ".env"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "setup-fleet.py"),
+            "--force",
+            "--new-hub",
+            "horde",
+            "--target",
+            "horde@20.115.163.162:2201",
+            "--fleet-name",
+            "horde-fleet",
+            "--fleets-config",
+            str(fleets_config),
+            "--env-file",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    registry = yaml.safe_load(fleets_config.read_text(encoding="utf-8"))
+    cfg = registry["fleets"]["horde"]
+    assert cfg["fleet_name"] == "horde-fleet"
+    assert cfg["hub_agent"] == "horde"
+    assert cfg["agents"][0]["target"] == "horde@20.115.163.162:2201"
+    assert cfg["agents"][0]["worker"]["mode"] == "loop"
+    assert cfg["agents"][0]["control_bind_host"] == "0.0.0.0"
+    assert "MAC_SECRET_KEY=" in env_file.read_text(encoding="utf-8")
+
+
+def test_fleet_deploy_handles_custom_ssh_ports_reconciliation_and_disk_hygiene():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    cleanup_plan = "\n".join(cleanup_path_strings(Path.home(), Path.home() / ".mac"))
+
+    assert "--ssh-port <port>" in script
+    assert "parse_ssh_target_fields()" in script
+    assert 'scp -q -o BatchMode=yes -o ConnectTimeout=10 "${scp_args[@]}"' in script
+    assert 'ssh -A -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}"' in script
+    assert "reconcile_remote_deploy()" in script
+    assert "remote reconciliation succeeded" in script
+    assert "disk_hygiene_report" in script
+    assert "cleanup_obsolete_deploy_artifacts" in script
+    assert "obsolete ACC-derived artifact" in script
+    assert "disk-before-cleanup" in script
+    assert "disk_after_cleanup" in script
+    assert "generated MAC deploy backups" in cleanup_plan
+    assert ".acc/build" in cleanup_plan
+    assert ".acc/deploy" in cleanup_plan
+    assert ".acc/logs" in cleanup_plan
+    assert ".acc/hermes-agent" in cleanup_plan
+
+
+def test_launchd_worker_wrapper_marks_agent_offline_on_controlled_shutdown():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    wrapper = script.split("install_mac_agent_wrapper() {", 1)[1].split(
+        'cat > "$executor" <<', 1
+    )[0]
+
+    assert "mark_worker_offline()" in wrapper
+    assert "stable_agent_id()" in wrapper
+    assert 'trap mark_worker_offline TERM INT' in wrapper
+    assert '{"status":"offline","health_status":"degraded"}' in wrapper
 
 
 def test_executor_prompt_includes_repository_runtime_contract():
