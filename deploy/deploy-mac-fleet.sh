@@ -3692,6 +3692,8 @@ stdout_logfile=$LOG_DIR/mac-agent.log
 stderr_logfile=$LOG_DIR/mac-agent.log
 environment=HOME="$HOME"
 EOF
+  # Remove stale worker-side hub tunnel conf from previous deploy approach
+  sudo rm -f "$conf_dir/${FLEET_NAME}-hub-tunnel.conf" 2>/dev/null || true
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   run_supervisorctl reread >/dev/null
   run_supervisorctl update >/dev/null
@@ -4114,15 +4116,22 @@ main() {
     else
       install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
       echo "==> ${agent}: waiting for hub reverse tunnel to establish"
-      local attempt
+      local attempt tunnel_ok=0
       for attempt in $(seq 1 6); do
         sleep 5
         if ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$local_target" \
-          "curl -fsS --max-time 3 http://127.0.0.1:18789/healthz >/dev/null 2>&1" 2>/dev/null; then
+          "curl -fsS --max-time 3 http://127.0.0.1:18789/health >/dev/null 2>&1" 2>/dev/null; then
           echo "==> ${agent}: hub tunnel reachable after $((attempt * 5))s"
+          tunnel_ok=1
           break
         fi
       done
+      if [ "$tunnel_ok" = "1" ]; then
+        local agent_prog="${fleet_name_field}-agent"
+        ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$local_target" \
+          "sudo supervisorctl restart '$agent_prog' >/dev/null 2>&1 || sudo supervisorctl start '$agent_prog' >/dev/null 2>&1 || true" 2>/dev/null || true
+        echo "==> ${agent}: restarted mac-agent with tunnel now available"
+      fi
     fi
   done < <(selected_hosts "${REQUESTED_AGENTS[@]}")
   rm -rf "$TMPDIR_LOCAL"
