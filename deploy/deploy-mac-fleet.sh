@@ -19,11 +19,17 @@ GIT_BRANCH="${MAC_DEPLOY_GIT_BRANCH:-main}"
 FLEET_CONFIG="${MAC_DEPLOY_FLEET_CONFIG:-$ROOT/deploy/fleet/config.yaml}"
 FLEET_REGISTRY_CONFIG="${MAC_DEPLOY_FLEETS_CONFIG:-${MAC_FLEETS_CONFIG:-$HOME/.mac/fleets.yaml}}"
 HUB_SELECTOR="${MAC_DEPLOY_HUB_AGENT:-}"
+SSH_PORT_OVERRIDE="${MAC_DEPLOY_SSH_PORT:-}"
+NEW_HUB_NAME=""
+NEW_HUB_TARGET=""
+NEW_HUB_OS="${MAC_DEPLOY_NEW_HUB_OS:-linux}"
 REQUESTED_AGENTS=()
 
 usage() {
   cat <<'USAGE'
-Usage: deploy/deploy-mac-fleet.sh --hub <hub-node> [agent ...]
+Usage:
+  deploy/deploy-mac-fleet.sh --hub <hub-node> [--ssh-port <port>] [agent ...]
+  deploy/deploy-mac-fleet.sh --new-hub <hub-node> --target user@host[:port] [--ssh-port <port>]
 
 Deploy mac as the local ACC replacement to a fleet declared in
 ~/.mac/fleets.yaml, or in MAC_DEPLOY_FLEETS_CONFIG. Real fleet topology must
@@ -78,6 +84,56 @@ while [ "$#" -gt 0 ]; do
       FLEET_REGISTRY_CONFIG="${1#--fleets-config=}"
       shift
       ;;
+    --ssh-port)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --ssh-port requires a port" >&2
+        exit 2
+      fi
+      SSH_PORT_OVERRIDE="$2"
+      shift 2
+      ;;
+    --ssh-port=*)
+      SSH_PORT_OVERRIDE="${1#--ssh-port=}"
+      shift
+      ;;
+    --new-hub)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --new-hub requires a hub agent name" >&2
+        exit 2
+      fi
+      NEW_HUB_NAME="$2"
+      HUB_SELECTOR="$2"
+      shift 2
+      ;;
+    --new-hub=*)
+      NEW_HUB_NAME="${1#--new-hub=}"
+      HUB_SELECTOR="$NEW_HUB_NAME"
+      shift
+      ;;
+    --target)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --target requires user@host[:port]" >&2
+        exit 2
+      fi
+      NEW_HUB_TARGET="$2"
+      shift 2
+      ;;
+    --target=*)
+      NEW_HUB_TARGET="${1#--target=}"
+      shift
+      ;;
+    --hub-os)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --hub-os requires linux or darwin" >&2
+        exit 2
+      fi
+      NEW_HUB_OS="$2"
+      shift 2
+      ;;
+    --hub-os=*)
+      NEW_HUB_OS="${1#--hub-os=}"
+      shift
+      ;;
     --)
       shift
       REQUESTED_AGENTS+=("$@")
@@ -94,6 +150,27 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$NEW_HUB_NAME" ]; then
+  if [ -z "$NEW_HUB_TARGET" ]; then
+    echo "ERROR: --new-hub requires --target user@host[:port]" >&2
+    exit 2
+  fi
+  setup_args=(
+    "$ROOT/scripts/setup-fleet.py"
+    --force
+    --new-hub "$NEW_HUB_NAME"
+    --target "$NEW_HUB_TARGET"
+    --hub-os "$NEW_HUB_OS"
+    --fleets-config "$FLEET_REGISTRY_CONFIG"
+    --env-file "${MAC_DEPLOY_ENV_FILE:-$HOME/.mac/.env}"
+  )
+  if [ -n "$SSH_PORT_OVERRIDE" ]; then
+    setup_args+=(--ssh-port "$SSH_PORT_OVERRIDE")
+  fi
+  python3 "${setup_args[@]}"
+  REQUESTED_AGENTS=("$NEW_HUB_NAME")
+fi
 
 fleet_config_query() {
   local mode="$1"
@@ -286,6 +363,8 @@ hub_agent = (
 hub_url = os.environ.get("MAC_DEPLOY_HUB_URL") or text_field(cfg.get("hub_url"))
 fleet_name = os.environ.get("MAC_DEPLOY_FLEET_NAME") or text_field(cfg.get("fleet_name")) or "mac"
 control_port = os.environ.get("MAC_DEPLOY_CONTROL_PORT") or text_field(cfg.get("control_port")) or "8789"
+fleet_hub_tunnel = os.environ.get("MAC_DEPLOY_HUB_TUNNEL") or text_field(cfg.get("hub_tunnel")) or "none"
+fleet_hub_tunnel_port = os.environ.get("MAC_DEPLOY_HUB_TUNNEL_PORT") or text_field(cfg.get("hub_tunnel_port")) or "18789"
 shared_services_manager = (
     os.environ.get("MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT")
     or text_field(cfg.get("shared_services_manager_agent"))
@@ -429,8 +508,8 @@ for name in selected:
         bool_field(firecrawl.get("required"), True),
         text_field(firecrawl.get("bind_addr")),
         text_field(firecrawl.get("port") or "3002"),
-        text_field(agent.get("hub_tunnel") or defaults.get("hub_tunnel") or "none"),
-        text_field(agent.get("hub_tunnel_port") or defaults.get("hub_tunnel_port") or "18789"),
+        text_field(agent.get("hub_tunnel") or defaults.get("hub_tunnel") or fleet_hub_tunnel),
+        text_field(agent.get("hub_tunnel_port") or defaults.get("hub_tunnel_port") or fleet_hub_tunnel_port),
     ]
     require_no_pipe(fields)
     print("|".join(fields))
@@ -458,6 +537,44 @@ shell_quote() {
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
 }
 
+parse_ssh_target_fields() {
+  local raw_target="$1"
+  python3 - "$raw_target" "${SSH_PORT_OVERRIDE:-}" <<'PY'
+import sys
+
+text = (sys.argv[1] or "").strip()
+port_override = int(sys.argv[2]) if sys.argv[2] else None
+user_host = text
+parsed_port = port_override
+if text.count(":") == 1 and not text.endswith(":"):
+    candidate_host, candidate_port = text.rsplit(":", 1)
+    if candidate_port.isdigit():
+        user_host = candidate_host
+        parsed_port = parsed_port if parsed_port is not None else int(candidate_port)
+print("%s|%s" % (user_host, parsed_port or ""))
+PY
+}
+
+ssh_target_args() {
+  local raw_target="$1" ssh_target ssh_port
+  IFS='|' read -r ssh_target ssh_port < <(parse_ssh_target_fields "$raw_target")
+  if [ -n "$ssh_port" ]; then
+    printf '%s\0%s\0%s\0' "-p" "$ssh_port" "$ssh_target"
+  else
+    printf '%s\0' "$ssh_target"
+  fi
+}
+
+scp_target_args() {
+  local raw_target="$1" ssh_target ssh_port
+  IFS='|' read -r ssh_target ssh_port < <(parse_ssh_target_fields "$raw_target")
+  if [ -n "$ssh_port" ]; then
+    printf '%s\0%s\0%s\0' "-P" "$ssh_port" "$ssh_target"
+  else
+    printf '%s\0' "$ssh_target"
+  fi
+}
+
 env_value_or_empty() {
   local key="$1"
   if [ -z "$key" ]; then
@@ -471,18 +588,75 @@ make_archive() {
   git -C "$ROOT" archive --format=tar.gz --output="$ARCHIVE" HEAD
 }
 
+reconcile_remote_deploy() {
+  local agent="$1" target="$2" ssh_parts=() ssh_args=() ssh_target item last_index
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+  last_index=$((${#ssh_parts[@]} - 1))
+  ssh_target="${ssh_parts[$last_index]}"
+  ssh_args=("${ssh_parts[@]:0:$last_index}")
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_TS=$(shell_quote "$TS") bash -s" <<'REMOTE'
+set -euo pipefail
+agent="${MAC_DEPLOY_AGENT:?}"
+deploy_ts="${MAC_DEPLOY_TS:?}"
+mac_home="${MAC_HOME:-$HOME/.mac}"
+log_dir="$mac_home/logs"
+manifest="$log_dir/deploy-manifest-${deploy_ts}-post.json"
+latest="$log_dir/deploy-manifest-latest.json"
+deploy_log="$log_dir/deploy-${deploy_ts}.log"
+if [ ! -s "$manifest" ]; then
+  echo "remote reconciliation failed: missing post manifest $manifest" >&2
+  exit 1
+fi
+if [ ! -s "$latest" ]; then
+  echo "remote reconciliation failed: missing latest manifest $latest" >&2
+  exit 1
+fi
+if ! grep -q "deploy complete" "$deploy_log"; then
+  echo "remote reconciliation failed: deploy log lacks completion marker" >&2
+  exit 1
+fi
+python3 - "$manifest" "$agent" <<'PY'
+import json
+import sys
+manifest_path, expected_agent = sys.argv[1], sys.argv[2]
+data = json.load(open(manifest_path, encoding="utf-8"))
+if data.get("stage") != "post":
+    raise SystemExit("remote reconciliation failed: manifest stage is %r" % data.get("stage"))
+if data.get("agent") != expected_agent:
+    raise SystemExit("remote reconciliation failed: manifest agent is %r" % data.get("agent"))
+PY
+if [ -f "$mac_home/mac.env" ]; then
+  set -a
+  . "$mac_home/mac.env"
+  set +a
+  curl -fsS --max-time 10 "http://127.0.0.1:${MAC_PORT:-8789}/health" >/dev/null
+fi
+echo "remote reconciliation succeeded for $agent"
+REMOTE
+}
+
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port hub_tunnel hub_tunnel_port tailscale_auth_key configured_headscale_preauthkey remote_archive
+  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port hub_tunnel hub_tunnel_port tailscale_auth_key configured_headscale_preauthkey remote_archive ssh_args scp_args ssh_target scp_target
   IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port hub_tunnel hub_tunnel_port <<<"$spec"
   tailscale_auth_key="$(env_value_or_empty "$tailscale_auth_key_env")"
   configured_headscale_preauthkey="${headscale_preauthkey:-$(env_value_or_empty "$headscale_preauth_key_env")}"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
+  local ssh_parts=() scp_parts=() last_index
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+  while IFS= read -r -d '' item; do scp_parts+=("$item"); done < <(scp_target_args "$target")
+  last_index=$((${#ssh_parts[@]} - 1))
+  ssh_target="${ssh_parts[$last_index]}"
+  ssh_args=("${ssh_parts[@]:0:$last_index}")
+  last_index=$((${#scp_parts[@]} - 1))
+  scp_target="${scp_parts[$last_index]}"
+  scp_args=("${scp_parts[@]:0:$last_index}")
 
   echo "==> ${agent}: copying mac release archive"
-  scp -q -o BatchMode=yes -o ConnectTimeout=10 "$ARCHIVE" "${target}:${remote_archive}"
+  scp -q -o BatchMode=yes -o ConnectTimeout=10 "${scp_args[@]}" "$ARCHIVE" "${scp_target}:${remote_archive}"
 
   echo "==> ${agent}: running one-time deploy"
-  ssh -A -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  if ! ssh -A -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "$tailscale_auth_key") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$configured_headscale_preauthkey") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_FIRECRAWL_URL=$(shell_quote "$firecrawl_url") MAC_DEPLOY_FIRECRAWL_INSTALL=$(shell_quote "$firecrawl_install") MAC_DEPLOY_REQUIRE_FIRECRAWL=$(shell_quote "$firecrawl_required") MAC_DEPLOY_FIRECRAWL_BIND_ADDR=$(shell_quote "$firecrawl_bind_addr") MAC_DEPLOY_FIRECRAWL_PORT=$(shell_quote "$firecrawl_port") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") MAC_DEPLOY_HUB_TUNNEL=$(shell_quote "$hub_tunnel") MAC_DEPLOY_HUB_TUNNEL_PORT=$(shell_quote "$hub_tunnel_port") bash -s" <<'REMOTE'
 set -euo pipefail
 
@@ -633,6 +807,170 @@ PY="$(python_bin)"
 HERMES_PY="$(hermes_python_bin "$PY")"
 SUPERVISOR_KIND=""
 export AGENT FLEET_NAME OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL HUB_TUNNEL HUB_TUNNEL_PORT CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED QDRANT_DATA_DIR_CONFIGURED NETWORK_PROVIDER NETWORK_INSTALL NETWORK_HOSTNAME_PREFIX TAILSCALE_AUTH_KEY TAILSCALE_AUTH_KEY_ENV HEADSCALE_MANAGE HEADSCALE_LOGIN_SERVER HEADSCALE_HEALTH_URL HEADSCALE_PREAUTH_KEY_ENV HEADSCALE_PREAUTH_KEY_SOURCE HEADSCALE_PORT HEADSCALE_PUBLIC_ADDR HEADSCALE_DNS HEADSCALE_IP_PREFIX HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT MAC_SERVICE_NAME HERMES_SERVICE_NAME MAC_AGENT_SERVICE_NAME MAC_LAUNCHD_LABEL HERMES_LAUNCHD_LABEL MAC_AGENT_LAUNCHD_LABEL MAC_SUPERVISORD_PROG HERMES_SUPERVISORD_PROG AGENT_SUPERVISORD_PROG MAC_SUPERVISORD_CONF_NAME SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY HERMES_PY
+
+disk_hygiene_report() {
+  local stage="$1" path="$2"
+  "$PY" - "$stage" "$path" <<'PY'
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+stage, output = sys.argv[1], Path(sys.argv[2])
+home = Path.home()
+mac_home = Path(os.environ["MAC_HOME"])
+
+def du(path: Path) -> dict:
+    try:
+        exists = path.exists()
+    except OSError:
+        exists = False
+    result = {"path": str(path), "exists": exists, "bytes": 0}
+    if not exists:
+        return result
+    try:
+        if path.is_file() or path.is_symlink():
+            result["bytes"] = path.stat().st_size
+            return result
+        total = 0
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [name for name in dirs if name not in {".git", ".venv", "node_modules"}]
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+        result["bytes"] = total
+    except OSError as exc:
+        result["error"] = str(exc)
+    return result
+
+usage = shutil.disk_usage(home)
+paths = [
+    mac_home / "backups",
+    mac_home / "logs",
+    mac_home / "agent-workspaces",
+    home / ".acc" / "build",
+    home / ".acc" / "dist",
+    home / ".acc" / "deploy",
+    home / ".acc" / "logs",
+    home / ".acc" / "hermes-agent",
+    home / ".agentfs" / "reviews",
+    home / "AgentFS" / "reviews",
+]
+report = {
+    "schema": "mac.deploy.disk_hygiene.v1",
+    "stage": stage,
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "filesystem": {"total": usage.total, "used": usage.used, "free": usage.free},
+    "paths": [du(path) for path in paths],
+}
+output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(
+    "disk hygiene %s: free_gb=%.2f report=%s"
+    % (stage, usage.free / (1024 ** 3), output)
+)
+PY
+}
+
+cleanup_obsolete_deploy_artifacts() {
+  "$PY" - "$LOG_DIR/disk-cleanup-${DEPLOY_TS}.json" <<'PY'
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+output = Path(sys.argv[1])
+home = Path.home()
+mac_home = Path(os.environ["MAC_HOME"])
+now = time.time()
+
+obsolete_acc_paths = [
+    home / ".acc" / "build",
+    home / ".acc" / "dist",
+    home / ".acc" / "deploy",
+    home / ".acc" / "logs",
+    home / ".acc" / ".pytest_cache",
+    home / ".acc" / "hermes-agent",
+    home / ".agentfs" / "reviews",
+    home / "AgentFS" / "reviews",
+]
+retained_roots = [
+    (mac_home / "backups", 14, "generated MAC deploy backups"),
+    (mac_home / "logs", 30, "generated MAC deploy logs"),
+]
+tmp_patterns = [Path("/tmp").glob("mac-*.tar.gz"), Path("/tmp").glob("mac-fleet-deploy-*")]
+
+def size(path: Path) -> int:
+    try:
+        if path.is_file() or path.is_symlink():
+            return path.stat().st_size
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+def remove(path: Path, reason: str) -> dict:
+    entry = {"path": str(path), "reason": reason, "bytes": size(path)}
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        entry["removed"] = True
+    except FileNotFoundError:
+        entry["removed"] = False
+    except OSError as exc:
+        entry["removed"] = False
+        entry["error"] = str(exc)
+    return entry
+
+removed = []
+for path in obsolete_acc_paths:
+    if path.exists():
+        removed.append(remove(path, "obsolete ACC-derived artifact"))
+
+for root, retain_days, reason in retained_roots:
+    if not root.exists():
+        continue
+    cutoff = now - retain_days * 86400
+    for child in root.iterdir():
+        try:
+            if child.stat().st_mtime < cutoff:
+                removed.append(remove(child, "%s older than %d days" % (reason, retain_days)))
+        except OSError as exc:
+            removed.append({"path": str(child), "reason": reason, "removed": False, "error": str(exc)})
+
+tmp_cutoff = now - 2 * 86400
+for pattern in tmp_patterns:
+    for path in pattern:
+        try:
+            if path.stat().st_mtime < tmp_cutoff:
+                removed.append(remove(path, "stale MAC deploy temp artifact older than 2 days"))
+        except OSError:
+            pass
+
+report = {
+    "schema": "mac.deploy.disk_cleanup.v1",
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "removed": removed,
+    "removed_count": sum(1 for item in removed if item.get("removed")),
+    "removed_bytes": sum(int(item.get("bytes") or 0) for item in removed if item.get("removed")),
+}
+output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print("disk cleanup: removed=%d bytes=%d report=%s" % (report["removed_count"], report["removed_bytes"], output))
+PY
+}
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -1418,6 +1756,9 @@ manifest = {
         "beads_cli": file_ref(mac_home / "bin" / "bd"),
         "hermes_state": file_ref(Path.home() / ".hermes"),
         "acc_state": file_ref(Path.home() / ".acc"),
+        "disk_before_cleanup": file_ref(Path(os.environ["LOG_DIR"]) / ("disk-before-cleanup-%s.json" % os.environ["DEPLOY_TS"])),
+        "disk_after_cleanup": file_ref(Path(os.environ["LOG_DIR"]) / ("disk-after-cleanup-%s.json" % os.environ["DEPLOY_TS"])),
+        "disk_cleanup_report": file_ref(Path(os.environ["LOG_DIR"]) / ("disk-cleanup-%s.json" % os.environ["DEPLOY_TS"])),
     },
     "acc": {
         "candidate_databases": [file_ref(path) for path in acc_candidates],
@@ -2518,6 +2859,9 @@ ensure_venv_support
 SUPERVISOR_KIND="$(detect_supervisor)"
 export SUPERVISOR_KIND
 log "selected supervisor: $SUPERVISOR_KIND (requested: ${SUPERVISOR_REQUESTED:-auto})"
+disk_hygiene_report "before-cleanup" "$LOG_DIR/disk-before-cleanup-${DEPLOY_TS}.json"
+cleanup_obsolete_deploy_artifacts
+disk_hygiene_report "after-cleanup" "$LOG_DIR/disk-after-cleanup-${DEPLOY_TS}.json"
 write_deploy_manifest "pre" "$MANIFEST_PRE"
 drain_mac_agent_before_deploy
 stop_existing_services_for_deploy
@@ -2999,6 +3343,26 @@ workspace="${MAC_WORKER_WORKSPACE:-$HOME/.mac/agent-workspaces}"
 mode="${MAC_WORKER_MODE:-heartbeat}"
 capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl}"
 mkdir -p "$workspace"
+
+stable_agent_id() {
+  "$HOME/.mac/venv/bin/python" - "$agent_name" <<'PY'
+import re
+import sys
+safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", sys.argv[1].lower()).strip("_") or "default"
+print("agent_%s" % safe)
+PY
+}
+
+mark_worker_offline() {
+  local agent_id
+  agent_id="${MAC_WORKER_AGENT_ID:-$(stable_agent_id)}"
+  curl -fsS --max-time 10 -X POST \
+    -H "Authorization: Bearer $MAC_WORKER_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data '{"status":"offline","health_status":"degraded"}' \
+    "$MAC_HUB_URL/agents/$agent_id/heartbeat" >/dev/null || true
+}
+trap mark_worker_offline TERM INT
 
 common=(
   "$HOME/.mac/venv/bin/mac-agent"
@@ -3823,6 +4187,10 @@ write_deploy_manifest "post" "$MANIFEST_POST"
 cp -f "$MANIFEST_POST" "$LOG_DIR/deploy-manifest-latest.json"
 log "deploy complete"
 REMOTE
+  then
+    echo "==> ${agent}: ssh exited non-zero; reconciling remote deploy state"
+    reconcile_remote_deploy "$agent" "$target"
+  fi
 }
 
 hub_target() {
@@ -3830,23 +4198,35 @@ hub_target() {
 }
 
 read_hub_token() {
-  local target
+  local target ssh_parts=() ssh_args=() ssh_target item last_index
   target="$(hub_target)"
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+  last_index=$((${#ssh_parts[@]} - 1))
+  ssh_target="${ssh_parts[$last_index]}"
+  ssh_args=("${ssh_parts[@]:0:$last_index}")
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${MAC_API_TOKEN:?}"'
 }
 
 read_headscale_fleet_url() {
-  local target
+  local target ssh_parts=() ssh_args=() ssh_target item last_index
   target="$(hub_target)"
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+  last_index=$((${#ssh_parts[@]} - 1))
+  ssh_target="${ssh_parts[$last_index]}"
+  ssh_args=("${ssh_parts[@]:0:$last_index}")
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${HEADSCALE_FLEET_URL:-}"'
 }
 
 read_headscale_preauthkey() {
-  local target
+  local target ssh_parts=() ssh_args=() ssh_target item last_index
   target="$(hub_target)"
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+  last_index=$((${#ssh_parts[@]} - 1))
+  ssh_target="${ssh_parts[$last_index]}"
+  ssh_args=("${ssh_parts[@]:0:$last_index}")
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
     'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${HEADSCALE_PREAUTHKEY:-}"'
 }
 
