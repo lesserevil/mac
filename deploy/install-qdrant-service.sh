@@ -106,8 +106,19 @@ if [ "${1:-}" = "--print-bind-addr" ]; then
   exit 0
 fi
 
-if ! command -v podman >/dev/null 2>&1; then
-  echo "[qdrant] ERROR: podman is required for mac-qdrant.service" >&2
+CONTAINER_CMD=""
+for _candidate in podman docker; do
+  if command -v "$_candidate" >/dev/null 2>&1; then
+    CONTAINER_CMD="$_candidate"
+    break
+  fi
+done
+if [ -z "$CONTAINER_CMD" ] && command -v apt-get >/dev/null 2>&1; then
+  echo "[qdrant] podman not found; installing via apt"
+  sudo apt-get install -y podman >/dev/null 2>&1 && CONTAINER_CMD="podman" || true
+fi
+if [ -z "$CONTAINER_CMD" ]; then
+  echo "[qdrant] ERROR: podman or docker is required for mac-qdrant.service" >&2
   exit 1
 fi
 
@@ -169,7 +180,7 @@ set +a
 : "\${QDRANT_PORT:=6333}"
 : "\${QDRANT_DATA_DIR:=/var/lib/${FLEET_NAME}/qdrant}"
 : "\${QDRANT_MEMORY_LIMIT:=2g}"
-exec podman run --rm --name "\$QDRANT_CONTAINER_NAME" --pull=missing \
+exec ${CONTAINER_CMD} run --rm --name "\$QDRANT_CONTAINER_NAME" --pull=missing \
   --security-opt=no-new-privileges --pids-limit=512 \
   --memory="\$QDRANT_MEMORY_LIMIT" \
   -p "\$QDRANT_BIND_ADDR:\$QDRANT_PORT:6333" \
