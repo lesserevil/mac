@@ -9,9 +9,10 @@ set -euo pipefail
 MAC_HOME="${MAC_HOME:-$HOME/.mac}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 WORKSPACE="${WORKSPACE:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+FLEET_NAME="${FLEET_NAME:-mac}"
 UNIT_TEMPLATE="${WORKSPACE}/deploy/systemd/mac-qdrant.service"
-UNIT_DEST="/etc/systemd/system/mac-qdrant.service"
-ENV_DEST="/etc/mac/qdrant.env"
+UNIT_DEST="/etc/systemd/system/${FLEET_NAME}-qdrant.service"
+ENV_DEST="/etc/${FLEET_NAME}/qdrant.env"
 SUPERVISOR_KIND="${QDRANT_SUPERVISOR:-${MAC_SUPERVISOR_KIND:-auto}}"
 
 QDRANT_IMAGE="${QDRANT_IMAGE:-docker.io/qdrant/qdrant:latest}"
@@ -34,9 +35,9 @@ default_qdrant_bind_addr() {
 
 QDRANT_BIND_ADDR="${QDRANT_BIND_ADDR:-$(default_qdrant_bind_addr)}"
 QDRANT_PORT="${QDRANT_PORT:-6333}"
-QDRANT_DATA_DIR="${QDRANT_DATA_DIR:-/var/lib/mac/qdrant}"
+QDRANT_DATA_DIR="${QDRANT_DATA_DIR:-/var/lib/${FLEET_NAME}/qdrant}"
 QDRANT_MEMORY_LIMIT="${QDRANT_MEMORY_LIMIT:-2g}"
-QDRANT_CONTAINER_NAME="${QDRANT_CONTAINER_NAME:-mac-qdrant}"
+QDRANT_CONTAINER_NAME="${QDRANT_CONTAINER_NAME:-${FLEET_NAME}-qdrant}"
 LOG_DIR="${LOG_DIR:-$MAC_HOME/logs}"
 
 detect_supervisor() {
@@ -130,7 +131,7 @@ service_url="http://${QDRANT_BIND_ADDR}:${QDRANT_PORT}"
 
 echo "[qdrant] Installing Qdrant under ${SUPERVISOR_KIND}"
 echo "[qdrant] Binding Qdrant to ${QDRANT_BIND_ADDR}:${QDRANT_PORT}"
-sudo install -d -m 0755 /etc/mac
+sudo install -d -m 0755 "/etc/${FLEET_NAME}"
 sudo install -d -m 0750 "$QDRANT_DATA_DIR"
 sudo chown "$USER" "$QDRANT_DATA_DIR" || true
 mkdir -p "$MAC_HOME/bin" "$LOG_DIR"
@@ -155,24 +156,24 @@ set_env_key "${MAC_HOME}/mac.env" MAC_QDRANT_MEMORY_ROLE "shared_level2"
 
 write_qdrant_wrapper() {
   local wrapper="$MAC_HOME/bin/mac-qdrant-run"
-  cat > "$wrapper" <<'EOF'
+  cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 set -a
-[ -f /etc/mac/qdrant.env ] && . /etc/mac/qdrant.env
-[ -f "$HOME/.mac/qdrant.env" ] && . "$HOME/.mac/qdrant.env"
+[ -f ${ENV_DEST} ] && . ${ENV_DEST}
+[ -f "\$HOME/.mac/qdrant.env" ] && . "\$HOME/.mac/qdrant.env"
 set +a
-: "${QDRANT_IMAGE:=docker.io/qdrant/qdrant:latest}"
-: "${QDRANT_CONTAINER_NAME:=mac-qdrant}"
-: "${QDRANT_BIND_ADDR:=127.0.0.1}"
-: "${QDRANT_PORT:=6333}"
-: "${QDRANT_DATA_DIR:=/var/lib/mac/qdrant}"
-: "${QDRANT_MEMORY_LIMIT:=2g}"
-exec podman run --rm --name "$QDRANT_CONTAINER_NAME" --pull=missing \
+: "\${QDRANT_IMAGE:=docker.io/qdrant/qdrant:latest}"
+: "\${QDRANT_CONTAINER_NAME:=${FLEET_NAME}-qdrant}"
+: "\${QDRANT_BIND_ADDR:=127.0.0.1}"
+: "\${QDRANT_PORT:=6333}"
+: "\${QDRANT_DATA_DIR:=/var/lib/${FLEET_NAME}/qdrant}"
+: "\${QDRANT_MEMORY_LIMIT:=2g}"
+exec podman run --rm --name "\$QDRANT_CONTAINER_NAME" --pull=missing \
   --security-opt=no-new-privileges --pids-limit=512 \
-  --memory="$QDRANT_MEMORY_LIMIT" \
-  -p "$QDRANT_BIND_ADDR:$QDRANT_PORT:6333" \
-  -v "$QDRANT_DATA_DIR:/qdrant/storage" "$QDRANT_IMAGE"
+  --memory="\$QDRANT_MEMORY_LIMIT" \
+  -p "\$QDRANT_BIND_ADDR:\$QDRANT_PORT:6333" \
+  -v "\$QDRANT_DATA_DIR:/qdrant/storage" "\$QDRANT_IMAGE"
 EOF
   chmod 700 "$wrapper"
 }
@@ -182,17 +183,17 @@ case "$SUPERVISOR_KIND" in
     echo "[qdrant] Installing systemd unit"
     sudo install -m 0644 "$UNIT_TEMPLATE" "$UNIT_DEST"
     sudo systemctl daemon-reload
-    sudo systemctl enable mac-qdrant.service >/dev/null
-    echo "[qdrant] Starting mac-qdrant.service"
-    sudo systemctl restart mac-qdrant.service
+    sudo systemctl enable "${FLEET_NAME}-qdrant.service" >/dev/null
+    echo "[qdrant] Starting ${FLEET_NAME}-qdrant.service"
+    sudo systemctl restart "${FLEET_NAME}-qdrant.service"
     ;;
   supervisord)
     echo "[qdrant] Installing supervisord program"
     write_qdrant_wrapper
     conf_dir="$(supervisord_conf_dir)"
     sudo install -d -m 0755 "$conf_dir"
-    sudo tee "$conf_dir/mac-qdrant.conf" >/dev/null <<EOF
-[program:mac-qdrant]
+    sudo tee "$conf_dir/${FLEET_NAME}-qdrant.conf" >/dev/null <<EOF
+[program:${FLEET_NAME}-qdrant]
 command=$MAC_HOME/bin/mac-qdrant-run
 directory=$MAC_HOME
 user=$USER
@@ -206,12 +207,12 @@ environment=HOME="$HOME"
 EOF
     run_supervisorctl reread >/dev/null
     run_supervisorctl update >/dev/null
-    run_supervisorctl restart mac-qdrant >/dev/null 2>&1 || run_supervisorctl start mac-qdrant >/dev/null
+    run_supervisorctl restart "${FLEET_NAME}-qdrant" >/dev/null 2>&1 || run_supervisorctl start "${FLEET_NAME}-qdrant" >/dev/null
     ;;
   launchd)
     echo "[qdrant] Installing launchd agent"
     write_qdrant_wrapper
-    plist="$HOME/Library/LaunchAgents/com.mac.qdrant.plist"
+    plist="$HOME/Library/LaunchAgents/com.${FLEET_NAME}.qdrant.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -219,7 +220,7 @@ EOF
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.mac.qdrant</string>
+  <key>Label</key><string>com.${FLEET_NAME}.qdrant</string>
   <key>ProgramArguments</key>
   <array><string>$MAC_HOME/bin/mac-qdrant-run</string></array>
   <key>RunAtLoad</key><true/>
@@ -235,10 +236,10 @@ EOF
     fi
     uid="$(id -u)"
     launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
-    launchctl bootout "gui/$uid/com.mac.qdrant" >/dev/null 2>&1 || true
-    launchctl enable "gui/$uid/com.mac.qdrant"
+    launchctl bootout "gui/$uid/com.${FLEET_NAME}.qdrant" >/dev/null 2>&1 || true
+    launchctl enable "gui/$uid/com.${FLEET_NAME}.qdrant"
     if ! launchctl bootstrap "gui/$uid" "$plist"; then
-      launchctl kickstart -k "gui/$uid/com.mac.qdrant"
+      launchctl kickstart -k "gui/$uid/com.${FLEET_NAME}.qdrant"
     fi
     ;;
 esac
@@ -254,8 +255,8 @@ done
 
 echo "[qdrant] ERROR: Qdrant did not become ready at $health_url" >&2
 case "$SUPERVISOR_KIND" in
-  systemd) systemctl status mac-qdrant.service --no-pager -n 40 >&2 || true ;;
-  supervisord) supervisorctl status mac-qdrant >&2 || true ;;
-  launchd) launchctl list com.mac.qdrant >&2 || true ;;
+  systemd) systemctl status "${FLEET_NAME}-qdrant.service" --no-pager -n 40 >&2 || true ;;
+  supervisord) supervisorctl status "${FLEET_NAME}-qdrant" >&2 || true ;;
+  launchd) launchctl list "com.${FLEET_NAME}.qdrant" >&2 || true ;;
 esac
 exit 1

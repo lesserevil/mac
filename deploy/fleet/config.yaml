@@ -10,6 +10,7 @@ fleet_name: example
 
 hub_agent: hub
 hub_url: http://hub.example.internal:8789
+control_port: 8789
 shared_services_manager_agent: hub
 
 defaults:
@@ -34,6 +35,7 @@ defaults:
     url: ""
     bind_addr: ""
     port: 6333
+    data_dir: ""
     image: docker.io/qdrant/qdrant:latest
     memory_limit: 2g
   network:
@@ -55,6 +57,7 @@ defaults:
       port: 8080
       public_addr: ""
       dns: magicdns
+      ip_prefix: "100.64.0.0/10"
 
 agents:
   - name: hub

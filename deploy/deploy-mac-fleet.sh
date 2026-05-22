@@ -284,6 +284,8 @@ hub_agent = (
     or text_field(agents[0].get("name"))
 )
 hub_url = os.environ.get("MAC_DEPLOY_HUB_URL") or text_field(cfg.get("hub_url"))
+fleet_name = os.environ.get("MAC_DEPLOY_FLEET_NAME") or text_field(cfg.get("fleet_name")) or "mac"
+control_port = os.environ.get("MAC_DEPLOY_CONTROL_PORT") or text_field(cfg.get("control_port")) or "8789"
 shared_services_manager = (
     os.environ.get("MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT")
     or text_field(cfg.get("shared_services_manager_agent"))
@@ -370,6 +372,8 @@ for name in selected:
     headscale_port = text_field(network_headscale.get("port") or legacy_tailscale.get("headscale_port") or "8080")
     headscale_public_addr = text_field(network_headscale.get("public_addr") or legacy_tailscale.get("headscale_public_addr"))
     headscale_dns = text_field(network_headscale.get("dns") or "magicdns")
+    headscale_ip_prefix = text_field(network_headscale.get("ip_prefix") or "100.64.0.0/10")
+    qdrant_data_dir = text_field(qdrant.get("data_dir"))
     tailscale_auth_key_env = text_field(network_tailscale.get("auth_key_env") or "MAC_DEPLOY_TAILSCALE_AUTH_KEY")
     target = text_field(agent.get("target"))
     os_kind = text_field(agent.get("os"))
@@ -415,6 +419,10 @@ for name in selected:
         headscale_port,
         headscale_public_addr,
         headscale_dns,
+        fleet_name,
+        control_port,
+        headscale_ip_prefix,
+        qdrant_data_dir,
     ]
     require_no_pipe(fields)
     print("|".join(fields))
@@ -456,8 +464,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns tailscale_auth_key configured_headscale_preauthkey remote_archive
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns <<<"$spec"
+  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir tailscale_auth_key configured_headscale_preauthkey remote_archive
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir <<<"$spec"
   tailscale_auth_key="$(env_value_or_empty "$tailscale_auth_key_env")"
   configured_headscale_preauthkey="${headscale_preauthkey:-$(env_value_or_empty "$headscale_preauth_key_env")}"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
@@ -467,10 +475,11 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -A -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "$tailscale_auth_key") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$configured_headscale_preauthkey") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_TARGET=$(shell_quote "$target") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "$tailscale_auth_key") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$configured_headscale_preauthkey") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
+FLEET_NAME="${MAC_DEPLOY_FLEET_NAME:-mac}"
 OS_KIND="${MAC_DEPLOY_OS:?}"
 ARCHIVE="${MAC_DEPLOY_ARCHIVE:?}"
 DEPLOY_TS="${MAC_DEPLOY_TS:?}"
@@ -511,15 +520,17 @@ HEADSCALE_PREAUTH_KEY_SOURCE="${MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE:-env}"
 HEADSCALE_PORT="${MAC_DEPLOY_HEADSCALE_PORT:-${MAC_DEPLOY_TAILSCALE_HEADSCALE_PORT:-8080}}"
 HEADSCALE_PUBLIC_ADDR="${MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR:-${MAC_DEPLOY_TAILSCALE_HEADSCALE_PUBLIC_ADDR:-}}"
 HEADSCALE_DNS="${MAC_DEPLOY_HEADSCALE_DNS:-magicdns}"
+HEADSCALE_IP_PREFIX="${MAC_DEPLOY_HEADSCALE_IP_PREFIX:-100.64.0.0/10}"
 # Headscale credentials: pre-populated for workers from hub mac.env or caller env.
 HEADSCALE_FLEET_URL="${MAC_DEPLOY_HEADSCALE_FLEET_URL:-}"
 HEADSCALE_PREAUTHKEY="${MAC_DEPLOY_HEADSCALE_PREAUTHKEY:-}"
+QDRANT_DATA_DIR_CONFIGURED="${MAC_DEPLOY_QDRANT_DATA_DIR:-}"
 MAC_DEPLOY_TARGET="${MAC_DEPLOY_TARGET:-}"
 DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
 DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${MAC_DEPLOY_DRAIN_POLL_SECONDS:-10}"
 MAC_HOME="${MAC_HOME:-$HOME/.mac}"
-MAC_PORT="${MAC_PORT:-8789}"
+MAC_PORT="${MAC_DEPLOY_CONTROL_PORT:-${MAC_PORT:-8789}}"
 SRC_DIR="$MAC_HOME/src/mac"
 VENV="$MAC_HOME/venv"
 HERMES_DIR="$MAC_HOME/hermes-agent"
@@ -532,12 +543,16 @@ ROLLBACK_SCRIPT="$LOG_DIR/rollback-${DEPLOY_TS}.sh"
 ROLLBACK_LATEST="$LOG_DIR/rollback-latest.sh"
 MANIFEST_PRE="$LOG_DIR/deploy-manifest-${DEPLOY_TS}-pre.json"
 MANIFEST_POST="$LOG_DIR/deploy-manifest-${DEPLOY_TS}-post.json"
-MAC_SERVICE_NAME="mac.service"
-HERMES_SERVICE_NAME="mac-hermes-gateway.service"
-MAC_AGENT_SERVICE_NAME="mac-agent.service"
-MAC_LAUNCHD_LABEL="com.mac.control-plane"
-HERMES_LAUNCHD_LABEL="com.mac.hermes-gateway"
-MAC_AGENT_LAUNCHD_LABEL="com.mac.agent"
+MAC_SERVICE_NAME="${FLEET_NAME}.service"
+HERMES_SERVICE_NAME="${FLEET_NAME}-hermes-gateway.service"
+MAC_AGENT_SERVICE_NAME="${FLEET_NAME}-agent.service"
+MAC_LAUNCHD_LABEL="com.${FLEET_NAME}.control-plane"
+HERMES_LAUNCHD_LABEL="com.${FLEET_NAME}.hermes-gateway"
+MAC_AGENT_LAUNCHD_LABEL="com.${FLEET_NAME}.agent"
+MAC_SUPERVISORD_PROG="${FLEET_NAME}-control-plane"
+HERMES_SUPERVISORD_PROG="${FLEET_NAME}-hermes-gateway"
+AGENT_SUPERVISORD_PROG="${FLEET_NAME}-agent"
+MAC_SUPERVISORD_CONF_NAME="${FLEET_NAME}-fleet.conf"
 SRC_BACKUP=""
 VENV_BACKUP=""
 HERMES_BACKUP=""
@@ -580,7 +595,7 @@ PY
 
 PY="$(python_bin)"
 SUPERVISOR_KIND=""
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED NETWORK_PROVIDER NETWORK_INSTALL NETWORK_HOSTNAME_PREFIX TAILSCALE_AUTH_KEY TAILSCALE_AUTH_KEY_ENV HEADSCALE_MANAGE HEADSCALE_LOGIN_SERVER HEADSCALE_HEALTH_URL HEADSCALE_PREAUTH_KEY_ENV HEADSCALE_PREAUTH_KEY_SOURCE HEADSCALE_PORT HEADSCALE_PUBLIC_ADDR HEADSCALE_DNS HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT FLEET_NAME OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED QDRANT_DATA_DIR_CONFIGURED NETWORK_PROVIDER NETWORK_INSTALL NETWORK_HOSTNAME_PREFIX TAILSCALE_AUTH_KEY TAILSCALE_AUTH_KEY_ENV HEADSCALE_MANAGE HEADSCALE_LOGIN_SERVER HEADSCALE_HEALTH_URL HEADSCALE_PREAUTH_KEY_ENV HEADSCALE_PREAUTH_KEY_SOURCE HEADSCALE_PORT HEADSCALE_PUBLIC_ADDR HEADSCALE_DNS HEADSCALE_IP_PREFIX HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT MAC_SERVICE_NAME HERMES_SERVICE_NAME MAC_AGENT_SERVICE_NAME MAC_LAUNCHD_LABEL HERMES_LAUNCHD_LABEL MAC_AGENT_LAUNCHD_LABEL MAC_SUPERVISORD_PROG HERMES_SUPERVISORD_PROG AGENT_SUPERVISORD_PROG MAC_SUPERVISORD_CONF_NAME SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -770,10 +785,12 @@ install_fleet_networking() {
         log "installing managed headscale control plane on hub"
         AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
           ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
+          FLEET_NAME="$FLEET_NAME" \
           HEADSCALE_FLEET_URL="$HEADSCALE_LOGIN_SERVER" \
           HEADSCALE_PUBLIC_ADDR="$HEADSCALE_PUBLIC_ADDR" \
           HEADSCALE_PORT="$HEADSCALE_PORT" \
           HEADSCALE_DNS="$HEADSCALE_DNS" \
+          HEADSCALE_IP_PREFIX="$HEADSCALE_IP_PREFIX" \
           MAC_SUPERVISOR_KIND="$SUPERVISOR_KIND" \
           bash "$SRC_DIR/deploy/install-headscale.sh"
         set -a
@@ -799,6 +816,7 @@ install_fleet_networking() {
   log "installing fleet mesh networking with provider=${provider}"
   AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
     ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
+    FLEET_NAME="$FLEET_NAME" \
     HEADSCALE_URL="${HEADSCALE_URL:-}" \
     HEADSCALE_PREAUTHKEY="${HEADSCALE_PREAUTHKEY:-}" \
     MAC_DEPLOY_TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}" \
@@ -859,7 +877,11 @@ install_or_validate_shared_services() {
     export QDRANT_PORT="$QDRANT_PORT_CONFIGURED"
     export QDRANT_IMAGE="$QDRANT_IMAGE_CONFIGURED"
     export QDRANT_MEMORY_LIMIT="$QDRANT_MEMORY_LIMIT_CONFIGURED"
-    export QDRANT_CONTAINER_NAME="mac-qdrant"
+    export QDRANT_CONTAINER_NAME="${FLEET_NAME}-qdrant"
+    if [ -n "$QDRANT_DATA_DIR_CONFIGURED" ]; then
+      export QDRANT_DATA_DIR="$QDRANT_DATA_DIR_CONFIGURED"
+    fi
+    export FLEET_NAME="$FLEET_NAME"
     export QDRANT_SUPERVISOR="$SUPERVISOR_KIND"
     MAC_HOME="$MAC_HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" WORKSPACE="$SRC_DIR" \
       bash "$SRC_DIR/deploy/install-qdrant-service.sh"
@@ -1013,6 +1035,10 @@ write_deploy_manifest() {
   MAC_AGENT_UNIT_BACKUP="$MAC_AGENT_UNIT_BACKUP" \
   MAC_PLIST_BACKUP="$MAC_PLIST_BACKUP" HERMES_PLIST_BACKUP="$HERMES_PLIST_BACKUP" \
   MAC_AGENT_PLIST_BACKUP="$MAC_AGENT_PLIST_BACKUP" \
+  FLEET_NAME="$FLEET_NAME" \
+  MAC_SERVICE_NAME="$MAC_SERVICE_NAME" HERMES_SERVICE_NAME="$HERMES_SERVICE_NAME" MAC_AGENT_SERVICE_NAME="$MAC_AGENT_SERVICE_NAME" \
+  MAC_LAUNCHD_LABEL="$MAC_LAUNCHD_LABEL" HERMES_LAUNCHD_LABEL="$HERMES_LAUNCHD_LABEL" MAC_AGENT_LAUNCHD_LABEL="$MAC_AGENT_LAUNCHD_LABEL" \
+  MAC_SUPERVISORD_PROG="$MAC_SUPERVISORD_PROG" HERMES_SUPERVISORD_PROG="$HERMES_SUPERVISORD_PROG" AGENT_SUPERVISORD_PROG="$AGENT_SUPERVISORD_PROG" \
   "$PY" - "$stage" "$path" <<'PY'
 import json
 import os
@@ -1070,15 +1096,27 @@ def service_summary():
     supervisor = os.environ.get("SUPERVISOR_KIND") or (
         "launchd" if os.environ["OS_KIND"] == "darwin" else "systemd"
     )
+    fleet = os.environ.get("FLEET_NAME", "mac")
+    mac_svc = os.environ.get("MAC_SERVICE_NAME", fleet + ".service")
+    hermes_svc = os.environ.get("HERMES_SERVICE_NAME", fleet + "-hermes-gateway.service")
+    agent_svc = os.environ.get("MAC_AGENT_SERVICE_NAME", fleet + "-agent.service")
+    mac_label = os.environ.get("MAC_LAUNCHD_LABEL", "com." + fleet + ".control-plane")
+    hermes_label = os.environ.get("HERMES_LAUNCHD_LABEL", "com." + fleet + ".hermes-gateway")
+    agent_label = os.environ.get("MAC_AGENT_LAUNCHD_LABEL", "com." + fleet + ".agent")
+    qdrant_label = "com." + fleet + ".qdrant"
+    mac_prog = os.environ.get("MAC_SUPERVISORD_PROG", fleet + "-control-plane")
+    hermes_prog = os.environ.get("HERMES_SUPERVISORD_PROG", fleet + "-hermes-gateway")
+    agent_prog = os.environ.get("AGENT_SUPERVISORD_PROG", fleet + "-agent")
+    qdrant_prog = fleet + "-qdrant"
     if supervisor == "systemd":
         result = run(
             [
                 "systemctl",
                 "show",
-                "mac.service",
-                "mac-hermes-gateway.service",
-                "mac-agent.service",
-                "mac-qdrant.service",
+                mac_svc,
+                hermes_svc,
+                agent_svc,
+                fleet + "-qdrant.service",
                 "-p",
                 "Id",
                 "-p",
@@ -1099,10 +1137,10 @@ def service_summary():
     if supervisor == "launchd":
         return {
             "manager": "launchd",
-            "control_plane": run(["launchctl", "list", "com.mac.control-plane"]),
-            "hermes_gateway": run(["launchctl", "list", "com.mac.hermes-gateway"]),
-            "mac_agent": run(["launchctl", "list", "com.mac.agent"]),
-            "qdrant": run(["launchctl", "list", "com.mac.qdrant"]),
+            "control_plane": run(["launchctl", "list", mac_label]),
+            "hermes_gateway": run(["launchctl", "list", hermes_label]),
+            "mac_agent": run(["launchctl", "list", agent_label]),
+            "qdrant": run(["launchctl", "list", qdrant_label]),
         }
     if supervisor == "supervisord":
         return {
@@ -1111,10 +1149,10 @@ def service_summary():
                 [
                     "supervisorctl",
                     "status",
-                    "mac-control-plane",
-                    "mac-hermes-gateway",
-                    "mac-agent",
-                    "mac-qdrant",
+                    mac_prog,
+                    hermes_prog,
+                    agent_prog,
+                    qdrant_prog,
                 ]
             ),
         }
@@ -1298,6 +1336,15 @@ MAC_AGENT_UNIT_BACKUP='$MAC_AGENT_UNIT_BACKUP'
 MAC_PLIST_BACKUP='$MAC_PLIST_BACKUP'
 HERMES_PLIST_BACKUP='$HERMES_PLIST_BACKUP'
 MAC_AGENT_PLIST_BACKUP='$MAC_AGENT_PLIST_BACKUP'
+MAC_SERVICE_NAME='$MAC_SERVICE_NAME'
+HERMES_SERVICE_NAME='$HERMES_SERVICE_NAME'
+MAC_AGENT_SERVICE_NAME='$MAC_AGENT_SERVICE_NAME'
+MAC_LAUNCHD_LABEL='$MAC_LAUNCHD_LABEL'
+HERMES_LAUNCHD_LABEL='$HERMES_LAUNCHD_LABEL'
+MAC_AGENT_LAUNCHD_LABEL='$MAC_AGENT_LAUNCHD_LABEL'
+MAC_SUPERVISORD_PROG='$MAC_SUPERVISORD_PROG'
+HERMES_SUPERVISORD_PROG='$HERMES_SUPERVISORD_PROG'
+AGENT_SUPERVISORD_PROG='$AGENT_SUPERVISORD_PROG'
 ROLLBACK_TS="\$(date -u +%Y%m%dT%H%M%SZ)"
 
 restore_dir() {
@@ -1313,17 +1360,17 @@ restore_dir() {
 
 case "\${SUPERVISOR_KIND:-\$OS_KIND}" in
   systemd|linux)
-    sudo systemctl stop mac-agent.service mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
+    sudo systemctl stop "\$MAC_AGENT_SERVICE_NAME" "\$HERMES_SERVICE_NAME" "\$MAC_SERVICE_NAME" >/dev/null 2>&1 || true
     ;;
   supervisord)
-    supervisorctl stop mac-agent mac-hermes-gateway mac-control-plane >/dev/null 2>&1 || true
-    sudo supervisorctl stop mac-agent mac-hermes-gateway mac-control-plane >/dev/null 2>&1 || true
+    supervisorctl stop "\$AGENT_SUPERVISORD_PROG" "\$HERMES_SUPERVISORD_PROG" "\$MAC_SUPERVISORD_PROG" >/dev/null 2>&1 || true
+    sudo supervisorctl stop "\$AGENT_SUPERVISORD_PROG" "\$HERMES_SUPERVISORD_PROG" "\$MAC_SUPERVISORD_PROG" >/dev/null 2>&1 || true
     ;;
   launchd|darwin)
     uid="\$(id -u)"
-    launchctl bootout "gui/\$uid/com.mac.agent" >/dev/null 2>&1 || true
-    launchctl bootout "gui/\$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
-    launchctl bootout "gui/\$uid/com.mac.control-plane" >/dev/null 2>&1 || true
+    launchctl bootout "gui/\$uid/\$MAC_AGENT_LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "gui/\$uid/\$HERMES_LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "gui/\$uid/\$MAC_LAUNCHD_LABEL" >/dev/null 2>&1 || true
     ;;
 esac
 
@@ -1333,27 +1380,27 @@ restore_dir "\$HERMES_BACKUP" "\$HERMES_DIR"
 
 case "\${SUPERVISOR_KIND:-\$OS_KIND}" in
   systemd|linux)
-    [ -n "\$MAC_UNIT_BACKUP" ] && [ -f "\$MAC_UNIT_BACKUP" ] && sudo cp -f "\$MAC_UNIT_BACKUP" /etc/systemd/system/mac.service
-    [ -n "\$HERMES_UNIT_BACKUP" ] && [ -f "\$HERMES_UNIT_BACKUP" ] && sudo cp -f "\$HERMES_UNIT_BACKUP" /etc/systemd/system/mac-hermes-gateway.service
-    [ -n "\$MAC_AGENT_UNIT_BACKUP" ] && [ -f "\$MAC_AGENT_UNIT_BACKUP" ] && sudo cp -f "\$MAC_AGENT_UNIT_BACKUP" /etc/systemd/system/mac-agent.service
+    [ -n "\$MAC_UNIT_BACKUP" ] && [ -f "\$MAC_UNIT_BACKUP" ] && sudo cp -f "\$MAC_UNIT_BACKUP" /etc/systemd/system/\$MAC_SERVICE_NAME
+    [ -n "\$HERMES_UNIT_BACKUP" ] && [ -f "\$HERMES_UNIT_BACKUP" ] && sudo cp -f "\$HERMES_UNIT_BACKUP" /etc/systemd/system/\$HERMES_SERVICE_NAME
+    [ -n "\$MAC_AGENT_UNIT_BACKUP" ] && [ -f "\$MAC_AGENT_UNIT_BACKUP" ] && sudo cp -f "\$MAC_AGENT_UNIT_BACKUP" /etc/systemd/system/\$MAC_AGENT_SERVICE_NAME
     sudo systemctl daemon-reload
-    sudo systemctl restart mac.service mac-hermes-gateway.service mac-agent.service
+    sudo systemctl restart "\$MAC_SERVICE_NAME" "\$HERMES_SERVICE_NAME" "\$MAC_AGENT_SERVICE_NAME"
     ;;
   supervisord)
     supervisorctl reread >/dev/null 2>&1 || sudo supervisorctl reread >/dev/null 2>&1 || true
     supervisorctl update >/dev/null 2>&1 || sudo supervisorctl update >/dev/null 2>&1 || true
-    supervisorctl restart mac-control-plane mac-hermes-gateway mac-agent >/dev/null 2>&1 || \
-      sudo supervisorctl restart mac-control-plane mac-hermes-gateway mac-agent >/dev/null 2>&1 || true
+    supervisorctl restart "\$MAC_SUPERVISORD_PROG" "\$HERMES_SUPERVISORD_PROG" "\$AGENT_SUPERVISORD_PROG" >/dev/null 2>&1 || \
+      sudo supervisorctl restart "\$MAC_SUPERVISORD_PROG" "\$HERMES_SUPERVISORD_PROG" "\$AGENT_SUPERVISORD_PROG" >/dev/null 2>&1 || true
     ;;
   launchd|darwin)
     mkdir -p "\$HOME/Library/LaunchAgents"
-    [ -n "\$MAC_PLIST_BACKUP" ] && [ -f "\$MAC_PLIST_BACKUP" ] && cp -f "\$MAC_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.control-plane.plist"
-    [ -n "\$HERMES_PLIST_BACKUP" ] && [ -f "\$HERMES_PLIST_BACKUP" ] && cp -f "\$HERMES_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist"
-    [ -n "\$MAC_AGENT_PLIST_BACKUP" ] && [ -f "\$MAC_AGENT_PLIST_BACKUP" ] && cp -f "\$MAC_AGENT_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.agent.plist"
+    [ -n "\$MAC_PLIST_BACKUP" ] && [ -f "\$MAC_PLIST_BACKUP" ] && cp -f "\$MAC_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/\$MAC_LAUNCHD_LABEL.plist"
+    [ -n "\$HERMES_PLIST_BACKUP" ] && [ -f "\$HERMES_PLIST_BACKUP" ] && cp -f "\$HERMES_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/\$HERMES_LAUNCHD_LABEL.plist"
+    [ -n "\$MAC_AGENT_PLIST_BACKUP" ] && [ -f "\$MAC_AGENT_PLIST_BACKUP" ] && cp -f "\$MAC_AGENT_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/\$MAC_AGENT_LAUNCHD_LABEL.plist"
     uid="\$(id -u)"
-    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/com.mac.control-plane.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/com.mac.control-plane"
-    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/com.mac.hermes-gateway"
-    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/com.mac.agent.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/com.mac.agent"
+    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/\$MAC_LAUNCHD_LABEL.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/\$MAC_LAUNCHD_LABEL"
+    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/\$HERMES_LAUNCHD_LABEL.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/\$HERMES_LAUNCHD_LABEL"
+    launchctl bootstrap "gui/\$uid" "\$HOME/Library/LaunchAgents/\$MAC_AGENT_LAUNCHD_LABEL.plist" >/dev/null 2>&1 || launchctl kickstart -k "gui/\$uid/\$MAC_AGENT_LAUNCHD_LABEL"
     ;;
 esac
 
@@ -1386,17 +1433,17 @@ stop_existing_services_for_deploy() {
   log "stopping existing mac services for artifact replacement"
   case "$SUPERVISOR_KIND" in
     systemd)
-      sudo systemctl stop mac-agent.service mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
+      sudo systemctl stop "$MAC_AGENT_SERVICE_NAME" "$HERMES_SERVICE_NAME" "$MAC_SERVICE_NAME" >/dev/null 2>&1 || true
       ;;
     supervisord)
-      run_supervisorctl stop mac-agent mac-hermes-gateway mac-control-plane >/dev/null 2>&1 || true
+      run_supervisorctl stop "$AGENT_SUPERVISORD_PROG" "$HERMES_SUPERVISORD_PROG" "$MAC_SUPERVISORD_PROG" >/dev/null 2>&1 || true
       ;;
     launchd)
       local uid
       uid="$(id -u)"
-      launchctl bootout "gui/$uid/com.mac.agent" >/dev/null 2>&1 || true
-      launchctl bootout "gui/$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
-      launchctl bootout "gui/$uid/com.mac.control-plane" >/dev/null 2>&1 || true
+      launchctl bootout "gui/$uid/$MAC_AGENT_LAUNCHD_LABEL" >/dev/null 2>&1 || true
+      launchctl bootout "gui/$uid/$HERMES_LAUNCHD_LABEL" >/dev/null 2>&1 || true
+      launchctl bootout "gui/$uid/$MAC_LAUNCHD_LABEL" >/dev/null 2>&1 || true
       ;;
   esac
 }
@@ -2495,12 +2542,12 @@ EOF
 }
 
 install_linux_service() {
-  local unit="/etc/systemd/system/mac.service" restart_since
+  local unit="/etc/systemd/system/${MAC_SERVICE_NAME}" restart_since
   log "installing systemd service $unit"
   install_hermes_gateway_wrapper
   install_mac_agent_wrapper
   if sudo test -f "$unit"; then
-    MAC_UNIT_BACKUP="$MAC_HOME/backups/mac.service.${AGENT}.${DEPLOY_TS}"
+    MAC_UNIT_BACKUP="$MAC_HOME/backups/${MAC_SERVICE_NAME}.${AGENT}.${DEPLOY_TS}"
     sudo cp -f "$unit" "$MAC_UNIT_BACKUP"
     sudo chown "$USER" "$MAC_UNIT_BACKUP" || true
     write_rollback_script
@@ -2526,12 +2573,12 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable mac.service
+  sudo systemctl enable "$MAC_SERVICE_NAME"
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sudo systemctl restart mac.service
+  sudo systemctl restart "$MAC_SERVICE_NAME"
   sleep 3
-  sudo systemctl --no-pager -l status mac.service || true
-  sudo journalctl -u mac.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
+  sudo systemctl --no-pager -l status "$MAC_SERVICE_NAME" || true
+  sudo journalctl -u "$MAC_SERVICE_NAME" --since "$restart_since" --no-pager > "$LOG_DIR/mac-service-journal.txt" || true
   install_linux_hermes_service
 }
 
@@ -2917,10 +2964,10 @@ PY
 }
 
 install_linux_hermes_service() {
-  local unit="/etc/systemd/system/mac-hermes-gateway.service" restart_since
+  local unit="/etc/systemd/system/${HERMES_SERVICE_NAME}" restart_since
   log "installing systemd service $unit"
   if sudo test -f "$unit"; then
-    HERMES_UNIT_BACKUP="$MAC_HOME/backups/mac-hermes-gateway.service.${AGENT}.${DEPLOY_TS}"
+    HERMES_UNIT_BACKUP="$MAC_HOME/backups/${HERMES_SERVICE_NAME}.${AGENT}.${DEPLOY_TS}"
     sudo cp -f "$unit" "$HERMES_UNIT_BACKUP"
     sudo chown "$USER" "$HERMES_UNIT_BACKUP" || true
     write_rollback_script
@@ -2928,7 +2975,7 @@ install_linux_hermes_service() {
   sudo tee "$unit" >/dev/null <<EOF
 [Unit]
 Description=mac-managed Hermes gateway
-After=network-online.target mac.service
+After=network-online.target $MAC_SERVICE_NAME
 Wants=network-online.target
 StartLimitIntervalSec=0
 
@@ -2954,20 +3001,20 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable mac-hermes-gateway.service
+  sudo systemctl enable "$HERMES_SERVICE_NAME"
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sudo systemctl restart mac-hermes-gateway.service
+  sudo systemctl restart "$HERMES_SERVICE_NAME"
   sleep 5
-  sudo systemctl --no-pager -l status mac-hermes-gateway.service || true
-  sudo journalctl -u mac-hermes-gateway.service --since "$restart_since" --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
+  sudo systemctl --no-pager -l status "$HERMES_SERVICE_NAME" || true
+  sudo journalctl -u "$HERMES_SERVICE_NAME" --since "$restart_since" --no-pager > "$LOG_DIR/hermes-gateway-journal.txt" || true
   install_linux_agent_service
 }
 
 install_linux_agent_service() {
-  local unit="/etc/systemd/system/mac-agent.service" restart_since
+  local unit="/etc/systemd/system/${MAC_AGENT_SERVICE_NAME}" restart_since
   log "installing systemd service $unit"
   if sudo test -f "$unit"; then
-    MAC_AGENT_UNIT_BACKUP="$MAC_HOME/backups/mac-agent.service.${AGENT}.${DEPLOY_TS}"
+    MAC_AGENT_UNIT_BACKUP="$MAC_HOME/backups/${MAC_AGENT_SERVICE_NAME}.${AGENT}.${DEPLOY_TS}"
     sudo cp -f "$unit" "$MAC_AGENT_UNIT_BACKUP"
     sudo chown "$USER" "$MAC_AGENT_UNIT_BACKUP" || true
     write_rollback_script
@@ -2975,7 +3022,7 @@ install_linux_agent_service() {
   sudo tee "$unit" >/dev/null <<EOF
 [Unit]
 Description=mac worker agent registration loop
-After=network-online.target mac.service
+After=network-online.target $MAC_SERVICE_NAME
 Wants=network-online.target
 StartLimitIntervalSec=0
 
@@ -2996,37 +3043,37 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable mac-agent.service
+  sudo systemctl enable "$MAC_AGENT_SERVICE_NAME"
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sudo systemctl restart mac-agent.service
+  sudo systemctl restart "$MAC_AGENT_SERVICE_NAME"
   sleep 3
-  sudo systemctl show mac-agent.service \
+  sudo systemctl show "$MAC_AGENT_SERVICE_NAME" \
     -p LoadState \
     -p ActiveState \
     -p SubState \
     -p UnitFileState \
     -p MainPID \
     -p NRestarts || true
-  sudo journalctl -u mac-agent.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
+  sudo journalctl -u "$MAC_AGENT_SERVICE_NAME" --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
 install_supervisord_service() {
   local conf_dir conf restart_since
   conf_dir="$(supervisord_conf_dir)"
-  conf="$conf_dir/mac-fleet.conf"
+  conf="$conf_dir/$MAC_SUPERVISORD_CONF_NAME"
   log "installing supervisord programs in $conf"
   install_mac_control_wrapper
   install_hermes_gateway_wrapper
   install_mac_agent_wrapper
   if sudo test -f "$conf"; then
-    MAC_UNIT_BACKUP="$MAC_HOME/backups/supervisord-mac-fleet.${AGENT}.${DEPLOY_TS}.conf"
+    MAC_UNIT_BACKUP="$MAC_HOME/backups/${MAC_SUPERVISORD_CONF_NAME}.${AGENT}.${DEPLOY_TS}"
     sudo cp -f "$conf" "$MAC_UNIT_BACKUP"
     sudo chown "$USER" "$MAC_UNIT_BACKUP" || true
     write_rollback_script
   fi
   sudo install -d -m 0755 "$conf_dir"
   sudo tee "$conf" >/dev/null <<EOF
-[program:mac-control-plane]
+[program:$MAC_SUPERVISORD_PROG]
 command=$MAC_HOME/bin/mac-service
 directory=$MAC_HOME
 user=$USER
@@ -3038,7 +3085,7 @@ stdout_logfile=$LOG_DIR/mac-service.log
 stderr_logfile=$LOG_DIR/mac-service.log
 environment=HOME="$HOME"
 
-[program:mac-hermes-gateway]
+[program:$HERMES_SUPERVISORD_PROG]
 command=$MAC_HOME/bin/hermes-gateway
 directory=$HERMES_DIR
 user=$USER
@@ -3050,7 +3097,7 @@ stdout_logfile=$LOG_DIR/hermes-gateway.log
 stderr_logfile=$LOG_DIR/hermes-gateway.log
 environment=HOME="$HOME"
 
-[program:mac-agent]
+[program:$AGENT_SUPERVISORD_PROG]
 command=$MAC_HOME/bin/mac-agent-service
 directory=$MAC_HOME
 user=$USER
@@ -3065,26 +3112,26 @@ EOF
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   run_supervisorctl reread >/dev/null
   run_supervisorctl update >/dev/null
-  run_supervisorctl restart mac-control-plane >/dev/null 2>&1 || run_supervisorctl start mac-control-plane >/dev/null
+  run_supervisorctl restart "$MAC_SUPERVISORD_PROG" >/dev/null 2>&1 || run_supervisorctl start "$MAC_SUPERVISORD_PROG" >/dev/null
   sleep 3
-  run_supervisorctl restart mac-hermes-gateway >/dev/null 2>&1 || run_supervisorctl start mac-hermes-gateway >/dev/null
+  run_supervisorctl restart "$HERMES_SUPERVISORD_PROG" >/dev/null 2>&1 || run_supervisorctl start "$HERMES_SUPERVISORD_PROG" >/dev/null
   sleep 5
-  run_supervisorctl restart mac-agent >/dev/null 2>&1 || run_supervisorctl start mac-agent >/dev/null
+  run_supervisorctl restart "$AGENT_SUPERVISORD_PROG" >/dev/null 2>&1 || run_supervisorctl start "$AGENT_SUPERVISORD_PROG" >/dev/null
   sleep 3
-  run_supervisorctl status mac-control-plane mac-hermes-gateway mac-agent > "$LOG_DIR/supervisord-services.txt" || true
+  run_supervisorctl status "$MAC_SUPERVISORD_PROG" "$HERMES_SUPERVISORD_PROG" "$AGENT_SUPERVISORD_PROG" > "$LOG_DIR/supervisord-services.txt" || true
   printf 'supervisord restarted at %s\n' "$restart_since" >> "$LOG_DIR/supervisord-services.txt"
 }
 
 install_darwin_service() {
   local uid plist wrapper
   uid="$(id -u)"
-  plist="$HOME/Library/LaunchAgents/com.mac.control-plane.plist"
+  plist="$HOME/Library/LaunchAgents/${MAC_LAUNCHD_LABEL}.plist"
   wrapper="$MAC_HOME/bin/mac-service"
   install_hermes_gateway_wrapper
   install_mac_agent_wrapper
   mkdir -p "$MAC_HOME/bin" "$HOME/Library/LaunchAgents"
   if [ -f "$plist" ]; then
-    MAC_PLIST_BACKUP="$MAC_HOME/backups/com.mac.control-plane.${AGENT}.${DEPLOY_TS}.plist"
+    MAC_PLIST_BACKUP="$MAC_HOME/backups/${MAC_LAUNCHD_LABEL}.${AGENT}.${DEPLOY_TS}.plist"
     cp -f "$plist" "$MAC_PLIST_BACKUP"
     write_rollback_script
   fi
@@ -3105,7 +3152,7 @@ EOF
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.mac.control-plane</string>
+  <key>Label</key><string>$MAC_LAUNCHD_LABEL</string>
   <key>ProgramArguments</key>
   <array><string>$wrapper</string></array>
   <key>RunAtLoad</key><true/>
@@ -3120,22 +3167,22 @@ EOF
     plutil -lint "$plist"
   fi
   launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$uid/com.mac.control-plane" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$uid/$MAC_LAUNCHD_LABEL" >/dev/null 2>&1 || true
   : > "$LOG_DIR/mac-service.log"
-  launchctl enable "gui/$uid/com.mac.control-plane"
+  launchctl enable "gui/$uid/$MAC_LAUNCHD_LABEL"
   if ! launchctl bootstrap "gui/$uid" "$plist"; then
-    launchctl kickstart -k "gui/$uid/com.mac.control-plane"
+    launchctl kickstart -k "gui/$uid/$MAC_LAUNCHD_LABEL"
   fi
   sleep 3
-  launchctl list com.mac.control-plane || true
+  launchctl list "$MAC_LAUNCHD_LABEL" || true
   install_darwin_hermes_service "$uid"
   install_darwin_agent_service "$uid"
 }
 
 install_darwin_hermes_service() {
-  local uid="$1" plist="$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist"
+  local uid="$1" plist="$HOME/Library/LaunchAgents/${HERMES_LAUNCHD_LABEL}.plist"
   if [ -f "$plist" ]; then
-    HERMES_PLIST_BACKUP="$MAC_HOME/backups/com.mac.hermes-gateway.${AGENT}.${DEPLOY_TS}.plist"
+    HERMES_PLIST_BACKUP="$MAC_HOME/backups/${HERMES_LAUNCHD_LABEL}.${AGENT}.${DEPLOY_TS}.plist"
     cp -f "$plist" "$HERMES_PLIST_BACKUP"
     write_rollback_script
   fi
@@ -3145,7 +3192,7 @@ install_darwin_hermes_service() {
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.mac.hermes-gateway</string>
+  <key>Label</key><string>$HERMES_LAUNCHD_LABEL</string>
   <key>ProgramArguments</key>
   <array><string>$MAC_HOME/bin/hermes-gateway</string></array>
   <key>RunAtLoad</key><true/>
@@ -3160,21 +3207,21 @@ EOF
     plutil -lint "$plist"
   fi
   launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$uid/$HERMES_LAUNCHD_LABEL" >/dev/null 2>&1 || true
   : > "$LOG_DIR/hermes-gateway.log"
-  launchctl enable "gui/$uid/com.mac.hermes-gateway"
+  launchctl enable "gui/$uid/$HERMES_LAUNCHD_LABEL"
   if ! launchctl bootstrap "gui/$uid" "$plist"; then
-    launchctl kickstart -k "gui/$uid/com.mac.hermes-gateway"
+    launchctl kickstart -k "gui/$uid/$HERMES_LAUNCHD_LABEL"
   fi
   sleep 5
-  launchctl list com.mac.hermes-gateway || true
+  launchctl list "$HERMES_LAUNCHD_LABEL" || true
 }
 
 install_darwin_agent_service() {
-  local uid="$1" plist="$HOME/Library/LaunchAgents/com.mac.agent.plist"
+  local uid="$1" plist="$HOME/Library/LaunchAgents/${MAC_AGENT_LAUNCHD_LABEL}.plist"
   log "installing launchd agent $plist"
   if [ -f "$plist" ]; then
-    MAC_AGENT_PLIST_BACKUP="$MAC_HOME/backups/com.mac.agent.${AGENT}.${DEPLOY_TS}.plist"
+    MAC_AGENT_PLIST_BACKUP="$MAC_HOME/backups/${MAC_AGENT_LAUNCHD_LABEL}.${AGENT}.${DEPLOY_TS}.plist"
     cp -f "$plist" "$MAC_AGENT_PLIST_BACKUP"
     write_rollback_script
   fi
@@ -3184,7 +3231,7 @@ install_darwin_agent_service() {
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.mac.agent</string>
+  <key>Label</key><string>$MAC_AGENT_LAUNCHD_LABEL</string>
   <key>ProgramArguments</key>
   <array><string>$MAC_HOME/bin/mac-agent-service</string></array>
   <key>RunAtLoad</key><true/>
@@ -3199,14 +3246,14 @@ EOF
     plutil -lint "$plist"
   fi
   launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$uid/com.mac.agent" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$uid/$MAC_AGENT_LAUNCHD_LABEL" >/dev/null 2>&1 || true
   : > "$LOG_DIR/mac-agent.log"
-  launchctl enable "gui/$uid/com.mac.agent"
+  launchctl enable "gui/$uid/$MAC_AGENT_LAUNCHD_LABEL"
   if ! launchctl bootstrap "gui/$uid" "$plist"; then
-    launchctl kickstart -k "gui/$uid/com.mac.agent"
+    launchctl kickstart -k "gui/$uid/$MAC_AGENT_LAUNCHD_LABEL"
   fi
   sleep 3
-  launchctl list com.mac.agent || true
+  launchctl list "$MAC_AGENT_LAUNCHD_LABEL" || true
 }
 
 classify_gateway_logs() {

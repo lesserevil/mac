@@ -15,6 +15,7 @@ MAC_HOME="${MAC_HOME:-$HOME/.mac}"
 LOG_DIR="${LOG_DIR:-$MAC_HOME/logs}"
 ENV_FILE="${ENV_FILE:-$MAC_HOME/mac.env}"
 SUPERVISOR_KIND="${TAILSCALE_SUPERVISOR:-${MAC_SUPERVISOR_KIND:-auto}}"
+FLEET_NAME="${FLEET_NAME:-mac}"
 
 # Headscale mode (preferred): point tailscale at a self-hosted control plane
 HEADSCALE_URL="${HEADSCALE_URL:-}"
@@ -160,10 +161,10 @@ case "$SUPERVISOR_KIND" in
   supervisord)
     conf_dir="$(supervisord_conf_dir)"
     sudo install -d -m 0755 "$conf_dir"
-    sudo tee "$conf_dir/tailscaled.conf" >/dev/null <<EOF
-[program:tailscaled]
-command=/usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641
-directory=/var/lib/tailscale
+    sudo tee "$conf_dir/${FLEET_NAME}-tailscaled.conf" >/dev/null <<EOF
+[program:${FLEET_NAME}-tailscaled]
+command=/usr/sbin/tailscaled --state=/var/lib/${FLEET_NAME}/tailscale/tailscaled.state --socket=/run/tailscale/${FLEET_NAME}.sock --port=41641
+directory=/var/lib/${FLEET_NAME}/tailscale
 user=root
 autostart=true
 autorestart=true
@@ -172,11 +173,11 @@ stopwaitsecs=15
 stdout_logfile=$LOG_DIR/tailscaled.log
 stderr_logfile=$LOG_DIR/tailscaled.log
 EOF
-    sudo mkdir -p /var/lib/tailscale /run/tailscale
+    sudo mkdir -p /var/lib/${FLEET_NAME}/tailscale /run/tailscale
     run_supervisorctl reread >/dev/null
     run_supervisorctl update >/dev/null
-    run_supervisorctl restart tailscaled >/dev/null 2>&1 \
-      || run_supervisorctl start tailscaled >/dev/null
+    run_supervisorctl restart "${FLEET_NAME}-tailscaled" >/dev/null 2>&1 \
+      || run_supervisorctl start "${FLEET_NAME}-tailscaled" >/dev/null
     ;;
   launchd)
     sudo launchctl enable system/com.tailscale.tailscaled 2>/dev/null || true

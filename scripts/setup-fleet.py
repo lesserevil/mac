@@ -56,11 +56,11 @@ def host_from_target(target: str) -> str:
     return host or "127.0.0.1"
 
 
-def qdrant_url_from_hub(hub_url: str) -> str:
+def qdrant_url_from_hub(hub_url: str, qdrant_port: int = 6333) -> str:
     if hub_url.startswith("http://") or hub_url.startswith("https://"):
         scheme, rest = hub_url.split("://", 1)
         host = rest.split("/", 1)[0].rsplit(":", 1)[0]
-        return "%s://%s:6333" % (scheme, host)
+        return "%s://%s:%d" % (scheme, host, qdrant_port)
     return ""
 
 
@@ -208,9 +208,11 @@ def main(argv: List[str]) -> int:
     hub_name = prompt("Hub node name", required=True)
     hub_target = prompt("Hub SSH target (user@host or host)", required=True)
     hub_os = prompt("Hub OS", default="linux", choices=["linux", "darwin"])
+    control_port_str = prompt("Hub control plane port", default="8789")
+    control_port = int(control_port_str) if control_port_str.isdigit() else 8789
     hub_url = prompt(
         "Hub URL agents should use",
-        default="http://%s:8789" % host_from_target(hub_target),
+        default="http://%s:%d" % (host_from_target(hub_target), control_port),
         required=True,
     )
     supervisor = prompt("Default supervisor", default="auto", choices=["auto", "systemd", "launchd", "supervisord"])
@@ -219,11 +221,14 @@ def main(argv: List[str]) -> int:
     hub_worker_mode = prompt("Hub worker mode", default="loop", choices=["heartbeat", "dry-run", "loop"])
     hub_require_canary = prompt_bool("Require canary metadata on hub tasks?", default=False)
     qdrant_required = prompt_bool("Require shared Qdrant memory readiness?", default=True)
+    qdrant_port_str = prompt("Qdrant port", default="6333")
+    qdrant_port = int(qdrant_port_str) if qdrant_port_str.isdigit() else 6333
     qdrant_url = prompt(
         "Shared Qdrant URL",
-        default=qdrant_url_from_hub(hub_url) if qdrant_required else "",
+        default=qdrant_url_from_hub(hub_url, qdrant_port) if qdrant_required else "",
     )
     qdrant_bind_addr = prompt("Hub Qdrant bind address override (blank for Tailscale/loopback auto)", default="")
+    qdrant_data_dir = prompt("Qdrant data directory override (blank for default /var/lib/<fleet>/qdrant)", default="")
 
     print("")
     print("Fleet mesh networking connects agents across networks without manual VPN config.")
@@ -241,6 +246,7 @@ def main(argv: List[str]) -> int:
     headscale_port = "8080"
     headscale_public_addr = ""
     headscale_dns = "magicdns"
+    headscale_ip_prefix = "100.64.0.0/10"
 
     if network_provider == "tailscale":
         tailscale_auth_key = prompt("Tailscale auth key (blank to skip automatic mesh join)", default="")
@@ -251,15 +257,15 @@ def main(argv: List[str]) -> int:
             )
             ts_hub_name = "%s%s" % (network_hostname_prefix, hub_name)
             if prompt_bool(
-                "Set hub URL to Tailscale MagicDNS name http://%s:8789?" % ts_hub_name,
+                "Set hub URL to Tailscale MagicDNS name http://%s:%d?" % (ts_hub_name, control_port),
                 default=True,
             ):
-                hub_url = "http://%s:8789" % ts_hub_name
+                hub_url = "http://%s:%d" % (ts_hub_name, control_port)
                 if prompt_bool(
-                    "Set Qdrant URL to http://%s:6333?" % ts_hub_name,
+                    "Set Qdrant URL to http://%s:%d?" % (ts_hub_name, qdrant_port),
                     default=True,
                 ):
-                    qdrant_url = "http://%s:6333" % ts_hub_name
+                    qdrant_url = "http://%s:%d" % (ts_hub_name, qdrant_port)
     elif network_provider == "headscale":
         print("Headscale requires a reachable login server and an enrollment key source.")
         headscale_mode = prompt("Headscale mode", default="external", choices=["external", "managed-hub"])
@@ -294,21 +300,22 @@ def main(argv: List[str]) -> int:
                     default="",
                 )
         headscale_dns = prompt("Headscale DNS assumption", default="magicdns", choices=["magicdns", "none"])
+        headscale_ip_prefix = prompt("Headscale IP prefix (CGNAT range for fleet mesh)", default="100.64.0.0/10")
         network_hostname_prefix = prompt(
             "Tailscale hostname prefix for fleet agents (blank for none)",
             default="",
         )
         hs_host = "%s%s" % (network_hostname_prefix, hub_name)
         if headscale_dns == "magicdns" and prompt_bool(
-            "Set hub URL to Headscale MagicDNS name http://%s.mac.internal:8789?" % hs_host,
+            "Set hub URL to Headscale MagicDNS name http://%s.mac.internal:%d?" % (hs_host, control_port),
             default=False,
         ):
-            hub_url = "http://%s.mac.internal:8789" % hs_host
+            hub_url = "http://%s.mac.internal:%d" % (hs_host, control_port)
             if prompt_bool(
-                "Set Qdrant URL to http://%s.mac.internal:6333?" % hs_host,
+                "Set Qdrant URL to http://%s.mac.internal:%d?" % (hs_host, qdrant_port),
                 default=False,
             ):
-                qdrant_url = "http://%s.mac.internal:6333" % hs_host
+                qdrant_url = "http://%s.mac.internal:%d" % (hs_host, qdrant_port)
 
     agents = [
         build_agent(
@@ -347,6 +354,7 @@ def main(argv: List[str]) -> int:
         "fleet_name": fleet_name,
         "hub_agent": hub_name,
         "hub_url": hub_url,
+        "control_port": control_port,
         "shared_services_manager_agent": hub_name,
         "defaults": {
             "supervisor": supervisor,
@@ -367,7 +375,8 @@ def main(argv: List[str]) -> int:
                 "required": qdrant_required,
                 "url": qdrant_url,
                 "bind_addr": qdrant_bind_addr,
-                "port": 6333,
+                "port": qdrant_port,
+                "data_dir": qdrant_data_dir,
                 "image": "docker.io/qdrant/qdrant:latest",
                 "memory_limit": "2g",
             },
@@ -387,6 +396,7 @@ def main(argv: List[str]) -> int:
                     "port": int(headscale_port) if str(headscale_port).isdigit() else 8080,
                     "public_addr": headscale_public_addr,
                     "dns": headscale_dns,
+                    "ip_prefix": headscale_ip_prefix,
                 },
             },
         },

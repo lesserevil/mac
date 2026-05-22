@@ -15,17 +15,18 @@ WORKSPACE="${WORKSPACE:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 LOG_DIR="${LOG_DIR:-$MAC_HOME/logs}"
 ENV_FILE="${ENV_FILE:-$MAC_HOME/mac.env}"
 SUPERVISOR_KIND="${HEADSCALE_SUPERVISOR:-${MAC_SUPERVISOR_KIND:-auto}}"
+FLEET_NAME="${FLEET_NAME:-mac}"
 
 HEADSCALE_VERSION="${HEADSCALE_VERSION:-0.25.1}"
 HEADSCALE_PORT="${HEADSCALE_PORT:-8080}"
 # The address workers use to reach headscale (hub's publicly routable addr)
 HEADSCALE_PUBLIC_ADDR="${HEADSCALE_PUBLIC_ADDR:-}"
 HEADSCALE_FLEET_URL="${HEADSCALE_FLEET_URL:-}"
-HEADSCALE_USER="${HEADSCALE_USER:-mac-fleet}"
+HEADSCALE_USER="${HEADSCALE_USER:-${FLEET_NAME}-fleet}"
 HEADSCALE_IP_PREFIX="${HEADSCALE_IP_PREFIX:-100.64.0.0/10}"
 HEADSCALE_DNS="${HEADSCALE_DNS:-magicdns}"
-HEADSCALE_DATA_DIR="${HEADSCALE_DATA_DIR:-/var/lib/headscale}"
-HEADSCALE_CONFIG_DIR="${HEADSCALE_CONFIG_DIR:-/etc/headscale}"
+HEADSCALE_DATA_DIR="${HEADSCALE_DATA_DIR:-/var/lib/${FLEET_NAME}/headscale}"
+HEADSCALE_CONFIG_DIR="${HEADSCALE_CONFIG_DIR:-/etc/${FLEET_NAME}/headscale}"
 HEADSCALE_BIN="${HEADSCALE_BIN:-/usr/local/bin/headscale}"
 
 set_env_key() {
@@ -199,8 +200,8 @@ EOF
   supervisord)
     conf_dir="$(supervisord_conf_dir)"
     sudo install -d -m 0755 "$conf_dir"
-    sudo tee "$conf_dir/headscale.conf" >/dev/null <<EOF
-[program:headscale]
+    sudo tee "$conf_dir/${FLEET_NAME}-headscale.conf" >/dev/null <<EOF
+[program:${FLEET_NAME}-headscale]
 command=${HEADSCALE_BIN} serve
 directory=${HEADSCALE_DATA_DIR}
 user=root
@@ -213,11 +214,11 @@ stderr_logfile=$LOG_DIR/headscale.log
 EOF
     run_supervisorctl reread >/dev/null
     run_supervisorctl update >/dev/null
-    run_supervisorctl restart headscale >/dev/null 2>&1 \
-      || run_supervisorctl start headscale >/dev/null
+    run_supervisorctl restart "${FLEET_NAME}-headscale" >/dev/null 2>&1 \
+      || run_supervisorctl start "${FLEET_NAME}-headscale" >/dev/null
     ;;
   launchd)
-    plist="$HOME/Library/LaunchAgents/com.mac.headscale.plist"
+    plist="$HOME/Library/LaunchAgents/com.${FLEET_NAME}.headscale.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -225,7 +226,7 @@ EOF
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.mac.headscale</string>
+  <key>Label</key><string>com.${FLEET_NAME}.headscale</string>
   <key>ProgramArguments</key>
   <array><string>${HEADSCALE_BIN}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
@@ -236,7 +237,7 @@ EOF
 </plist>
 EOF
     uid="$(id -u)"
-    launchctl bootout "gui/$uid/com.mac.headscale" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$uid/com.${FLEET_NAME}.headscale" >/dev/null 2>&1 || true
     launchctl bootstrap "gui/$uid" "$plist"
     ;;
 esac
