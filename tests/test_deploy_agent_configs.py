@@ -254,6 +254,12 @@ def test_fleet_deploy_network_provider_contract_is_explicit():
     assert "Headscale provider requires network.headscale.login_server" in script
     assert "HEADSCALE_HEALTH_URL" in script
     assert "MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE" in script
+    assert 'network_provider = os.environ.get("NETWORK_PROVIDER", "tailscale").strip().lower()' in script
+    assert 'elif network_provider in {"tailscale", "headscale"} and configured_hub_url:' in script
+    assert 'values["MAC_HUB_URL"] = configured_hub_url.rstrip("/")' in script
+    assert "uses_direct_mesh_hub()" in script
+    assert 'uses_direct_mesh_hub "$network_provider_field" "$hub_url_field"' in script
+    assert "skipping reverse tunnel" in script
     assert "network:" in sample
     assert "provider: tailscale" in sample
     assert "provider: headscale" in sample
