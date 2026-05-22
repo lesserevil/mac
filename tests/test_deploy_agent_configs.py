@@ -100,7 +100,7 @@ def test_fleet_deploy_drain_agent_lookup_does_not_pipe_json_into_python_stdin():
 def test_fleet_deploy_bootstraps_beads_cli_for_bridge():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 
-    assert "BEADS_REPO_URL=\"${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}\"" in script
+    assert "BEADS_REPO_URL=\"${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/gastownhall/beads.git}\"" in script
     assert "install_beads_cli()" in script
     assert '"$HOME/.local/bin/bd"' in script
     assert '"$HOME/bin/bd"' in script
@@ -146,8 +146,8 @@ def test_fleet_deploy_does_not_print_worker_token_in_systemd_status():
         "install_darwin_service() {", 1
     )[0]
 
-    assert "systemctl show mac-agent.service" in agent_service
-    assert "systemctl --no-pager -l status mac-agent.service" not in agent_service
+    assert 'systemctl show "$MAC_AGENT_SERVICE_NAME"' in agent_service
+    assert 'systemctl --no-pager -l status "$MAC_AGENT_SERVICE_NAME"' not in agent_service
     assert "-p ActiveState" in agent_service
     assert "-p MainPID" in agent_service
 
@@ -185,8 +185,10 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert 'updates["QDRANT_URL"] = None' in script
     assert 'values.setdefault("MAC_REVIEW_TICK_HUB_AGENT", shared_services_manager)' in script
     assert "mac-qdrant.service" in qdrant_installer
-    assert "com.mac.qdrant" in qdrant_installer
-    assert "[program:mac-qdrant]" in qdrant_installer
+    assert 'ENV_DEST="/etc/${FLEET_NAME}/qdrant.env"' in qdrant_installer
+    assert 's|/etc/mac/qdrant.env|${env_dest_sed}|g' in qdrant_installer
+    assert 'com.${FLEET_NAME}.qdrant' in qdrant_installer
+    assert '[program:${FLEET_NAME}-qdrant]' in qdrant_installer
     assert cfg["defaults"]["supervisor"] == "auto"
     assert cfg["shared_services_manager_agent"] == "hub"
     assert cfg["defaults"]["qdrant"]["install"] == "auto"
@@ -233,6 +235,7 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
             "",
             "",
             "",
+            "",
             "ops",
             "provider/family/hub-model",
             "",
@@ -242,10 +245,11 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
             "",
             "",
             "",
-            "n",
-            "n",
-            "n",
             "",
+            "",
+            "n",
+            "n",
+            "n",
             "",
         ]
     )
@@ -303,8 +307,11 @@ def test_setup_fleet_wizard_can_write_explicit_headscale_provider(tmp_path):
             "",
             "",
             "",
+            "",
             "n",
             "y",
+            "",
+            "",
             "",
             "",
             "headscale",
@@ -316,10 +323,11 @@ def test_setup_fleet_wizard_can_write_explicit_headscale_provider(tmp_path):
             "hs-preauth-key",
             "",
             "",
-            "n",
-            "n",
-            "n",
             "",
+            "n",
+            "n",
+            "n",
+            "n",
             "",
         ]
     )

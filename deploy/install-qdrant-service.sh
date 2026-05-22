@@ -254,7 +254,11 @@ EOF
 case "$SUPERVISOR_KIND" in
   systemd)
     echo "[qdrant] Installing systemd unit"
-    sudo install -m 0644 "$UNIT_TEMPLATE" "$UNIT_DEST"
+    unit_tmp="$(mktemp)"
+    env_dest_sed="$(printf '%s' "$ENV_DEST" | sed 's/[&|]/\\&/g')"
+    sed "s|/etc/mac/qdrant.env|${env_dest_sed}|g" "$UNIT_TEMPLATE" > "$unit_tmp"
+    sudo install -m 0644 "$unit_tmp" "$UNIT_DEST"
+    rm -f "$unit_tmp"
     sudo systemctl daemon-reload
     sudo systemctl enable "${FLEET_NAME}-qdrant.service" >/dev/null
     echo "[qdrant] Starting ${FLEET_NAME}-qdrant.service"
