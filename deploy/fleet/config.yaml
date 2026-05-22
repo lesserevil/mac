@@ -26,6 +26,10 @@ defaults:
       - python
       - hermes
       - review
+      - web_search
+      - web_extract
+      - web_crawl
+      - firecrawl
     allowed_projects: ""
     required_metadata: ""
     require_canary: true
@@ -38,6 +42,12 @@ defaults:
     data_dir: ""
     image: docker.io/qdrant/qdrant:latest
     memory_limit: 2g
+  firecrawl:
+    install: auto
+    required: true
+    url: ""
+    bind_addr: ""
+    port: 3002
   network:
     provider: tailscale
     install: auto

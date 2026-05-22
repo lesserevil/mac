@@ -321,6 +321,7 @@ for name in selected:
     hermes = merge_dicts(defaults.get("hermes", {}) if isinstance(defaults.get("hermes"), dict) else {}, agent.get("hermes", {}) if isinstance(agent.get("hermes"), dict) else {})
     worker = merge_dicts(defaults.get("worker", {}) if isinstance(defaults.get("worker"), dict) else {}, agent.get("worker", {}) if isinstance(agent.get("worker"), dict) else {})
     qdrant = merge_dicts(defaults.get("qdrant", {}) if isinstance(defaults.get("qdrant"), dict) else {}, agent.get("qdrant", {}) if isinstance(agent.get("qdrant"), dict) else {})
+    firecrawl = merge_dicts(defaults.get("firecrawl", {}) if isinstance(defaults.get("firecrawl"), dict) else {}, agent.get("firecrawl", {}) if isinstance(agent.get("firecrawl"), dict) else {})
     legacy_tailscale = merge_dicts(
         defaults.get("tailscale", {}) if isinstance(defaults.get("tailscale"), dict) else {},
         agent.get("tailscale", {}) if isinstance(agent.get("tailscale"), dict) else {},
@@ -394,7 +395,7 @@ for name in selected:
         hub_url,
         control_bind_host,
         text_field(worker.get("mode") or "heartbeat"),
-        text_field(worker.get("capabilities") or "ops,python,hermes,review"),
+        text_field(worker.get("capabilities") or "ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl"),
         text_field(worker.get("allowed_projects")),
         text_field(worker.get("required_metadata")),
         bool_field(worker.get("require_canary"), True),
@@ -423,6 +424,11 @@ for name in selected:
         control_port,
         headscale_ip_prefix,
         qdrant_data_dir,
+        text_field(firecrawl.get("url")),
+        text_field(firecrawl.get("install") or "auto"),
+        bool_field(firecrawl.get("required"), True),
+        text_field(firecrawl.get("bind_addr")),
+        text_field(firecrawl.get("port") or "3002"),
     ]
     require_no_pipe(fields)
     print("|".join(fields))
@@ -464,8 +470,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir tailscale_auth_key configured_headscale_preauthkey remote_archive
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir <<<"$spec"
+  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port tailscale_auth_key configured_headscale_preauthkey remote_archive
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_preauth_key_env headscale_preauth_key_source headscale_port headscale_public_addr headscale_dns fleet_name control_port headscale_ip_prefix qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port <<<"$spec"
   tailscale_auth_key="$(env_value_or_empty "$tailscale_auth_key_env")"
   configured_headscale_preauthkey="${headscale_preauthkey:-$(env_value_or_empty "$headscale_preauth_key_env")}"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
@@ -475,7 +481,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -A -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "$tailscale_auth_key") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$configured_headscale_preauthkey") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "$tailscale_auth_key") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$configured_headscale_preauthkey") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_FIRECRAWL_URL=$(shell_quote "$firecrawl_url") MAC_DEPLOY_FIRECRAWL_INSTALL=$(shell_quote "$firecrawl_install") MAC_DEPLOY_REQUIRE_FIRECRAWL=$(shell_quote "$firecrawl_required") MAC_DEPLOY_FIRECRAWL_BIND_ADDR=$(shell_quote "$firecrawl_bind_addr") MAC_DEPLOY_FIRECRAWL_PORT=$(shell_quote "$firecrawl_port") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -494,7 +500,7 @@ HUB_URL="${MAC_DEPLOY_HUB_URL:-http://127.0.0.1:8789}"
 HUB_TOKEN="${MAC_DEPLOY_HUB_TOKEN:-}"
 CONTROL_BIND_HOST="${MAC_DEPLOY_CONTROL_BIND_HOST:-127.0.0.1}"
 WORKER_MODE="${MAC_DEPLOY_WORKER_MODE:-heartbeat}"
-WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}"
+WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl}"
 WORKER_ALLOWED_PROJECTS="${MAC_DEPLOY_WORKER_ALLOWED_PROJECTS:-}"
 WORKER_REQUIRED_METADATA="${MAC_DEPLOY_WORKER_REQUIRED_METADATA:-}"
 WORKER_REQUIRE_CANARY="${MAC_DEPLOY_WORKER_REQUIRE_CANARY:-1}"
@@ -507,6 +513,11 @@ QDRANT_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_QDRANT_BIND_ADDR:-}"
 QDRANT_PORT_CONFIGURED="${MAC_DEPLOY_QDRANT_PORT:-6333}"
 QDRANT_IMAGE_CONFIGURED="${MAC_DEPLOY_QDRANT_IMAGE:-docker.io/qdrant/qdrant:latest}"
 QDRANT_MEMORY_LIMIT_CONFIGURED="${MAC_DEPLOY_QDRANT_MEMORY_LIMIT:-2g}"
+FIRECRAWL_URL_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_URL:-}"
+FIRECRAWL_INSTALL="${MAC_DEPLOY_FIRECRAWL_INSTALL:-auto}"
+FIRECRAWL_REQUIRE="${MAC_DEPLOY_REQUIRE_FIRECRAWL:-1}"
+FIRECRAWL_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_BIND_ADDR:-}"
+FIRECRAWL_PORT_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_PORT:-3002}"
 NETWORK_PROVIDER="${MAC_DEPLOY_NETWORK_PROVIDER:-tailscale}"
 NETWORK_INSTALL="${MAC_DEPLOY_NETWORK_INSTALL:-${MAC_DEPLOY_TAILSCALE_INSTALL:-auto}}"
 NETWORK_HOSTNAME_PREFIX="${MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX:-${MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX:-}}"
@@ -732,6 +743,18 @@ qdrant_install_enabled() {
   esac
 }
 
+firecrawl_install_enabled() {
+  case "${FIRECRAWL_INSTALL:-auto}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    0|false|FALSE|no|NO|off|OFF|none|disabled) return 1 ;;
+    auto|"") [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]; return ;;
+    *)
+      log "ERROR: unsupported MAC_DEPLOY_FIRECRAWL_INSTALL value: $FIRECRAWL_INSTALL"
+      exit 1
+      ;;
+  esac
+}
+
 network_provider() {
   case "${NETWORK_PROVIDER:-tailscale}" in
     tailscale|headscale|none) printf '%s\n' "$NETWORK_PROVIDER" ;;
@@ -888,6 +911,43 @@ validate_qdrant_endpoint() {
   exit 1
 }
 
+validate_firecrawl_endpoint() {
+  local firecrawl_url required allow_degraded
+  firecrawl_url="${FIRECRAWL_API_URL:-${FIRECRAWL_GATEWAY_URL:-${FIRECRAWL_URL_CONFIGURED:-}}}"
+  required="${MAC_REQUIRE_FIRECRAWL:-${FIRECRAWL_REQUIRE:-1}}"
+  allow_degraded="${MAC_FIRECRAWL_ALLOW_DEGRADED:-0}"
+  if ! truthy "$required"; then
+    if [ -z "$firecrawl_url" ]; then
+      log "Firecrawl web search is optional and no endpoint is configured"
+      return
+    fi
+    if curl -fsS --connect-timeout 2 --max-time 5 "${firecrawl_url%/}/health" >/dev/null; then
+      log "Optional Firecrawl web search reachable at configured health endpoint"
+    else
+      log "WARNING: optional Firecrawl web search is unreachable at ${firecrawl_url%/}/health"
+    fi
+    return
+  fi
+  if [ -z "$firecrawl_url" ]; then
+    if truthy "$allow_degraded"; then
+      log "WARNING: Firecrawl web search is required but no endpoint is configured; degraded override is active"
+      return
+    fi
+    log "ERROR: Firecrawl web search is required but no endpoint is configured"
+    exit 1
+  fi
+  if curl -fsS --connect-timeout 2 --max-time 5 "${firecrawl_url%/}/health" >/dev/null; then
+    log "Firecrawl web search reachable at configured health endpoint"
+    return
+  fi
+  if truthy "$allow_degraded"; then
+    log "WARNING: Firecrawl web search is unreachable; degraded override is active"
+    return
+  fi
+  log "ERROR: Firecrawl web search is unreachable at ${firecrawl_url%/}/health"
+  exit 1
+}
+
 install_or_validate_shared_services() {
   if qdrant_install_enabled; then
     log "installing hub-managed Qdrant shared memory service"
@@ -914,6 +974,28 @@ install_or_validate_shared_services() {
     log "using hub-managed shared services from $SHARED_SERVICES_MANAGER_AGENT"
   fi
   validate_qdrant_endpoint
+}
+
+install_or_validate_web_search_service() {
+  if firecrawl_install_enabled; then
+    log "installing hub-managed Firecrawl-compatible web search service"
+    if [ -n "$FIRECRAWL_BIND_ADDR_CONFIGURED" ]; then
+      export FIRECRAWL_BIND_ADDR="$FIRECRAWL_BIND_ADDR_CONFIGURED"
+    else
+      unset FIRECRAWL_BIND_ADDR
+    fi
+    export FIRECRAWL_PORT="$FIRECRAWL_PORT_CONFIGURED"
+    export FLEET_NAME="$FLEET_NAME"
+    export FIRECRAWL_SUPERVISOR="$SUPERVISOR_KIND"
+    MAC_HOME="$MAC_HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" WORKSPACE="$SRC_DIR" \
+      bash "$SRC_DIR/deploy/install-firecrawl-gateway.sh"
+    set -a
+    . "$ENV_FILE"
+    set +a
+  else
+    log "using hub-managed Firecrawl web search from $SHARED_SERVICES_MANAGER_AGENT"
+  fi
+  validate_firecrawl_endpoint
 }
 
 write_hermes_memory_topology() {
@@ -985,11 +1067,19 @@ qdrant_url = (
     or ""
 )
 safe_qdrant_url = connection_url(qdrant_url) if qdrant_url else ""
+firecrawl_url = (
+    os.environ.get("FIRECRAWL_API_URL")
+    or os.environ.get("FIRECRAWL_GATEWAY_URL")
+    or ""
+)
+safe_firecrawl_url = connection_url(firecrawl_url) if firecrawl_url else ""
 required = truthy(os.environ.get("MAC_REQUIRE_QDRANT_MEMORY") or os.environ.get("QDRANT_REQUIRE") or "1")
 degraded_allowed = truthy(
     os.environ.get("MAC_QDRANT_MEMORY_ALLOW_DEGRADED")
     or os.environ.get("ACC_QDRANT_MEMORY_ALLOW_DEGRADED")
 )
+firecrawl_required = truthy(os.environ.get("MAC_REQUIRE_FIRECRAWL") or os.environ.get("FIRECRAWL_REQUIRE") or "1")
+firecrawl_degraded_allowed = truthy(os.environ.get("MAC_FIRECRAWL_ALLOW_DEGRADED"))
 
 topology = {
     "schema": "mac.hermes.memory_topology.v1",
@@ -1022,6 +1112,15 @@ topology = {
             "required": required,
             "degraded_allowed": degraded_allowed,
             "api_key_env": "QDRANT_API_KEY" if os.environ.get("QDRANT_API_KEY") else "",
+        },
+        "firecrawl": {
+            "owner": "hub",
+            "manager_agent": hub_agent,
+            "role": "shared_web_search",
+            "url": safe_firecrawl_url,
+            "required": firecrawl_required,
+            "degraded_allowed": firecrawl_degraded_allowed,
+            "api_key_env": "FIRECRAWL_API_KEY" if os.environ.get("FIRECRAWL_API_KEY") else "",
         }
     },
 }
@@ -1033,6 +1132,8 @@ updates = {
     "MAC_SHARED_SERVICES_MANAGER_AGENT": hub_agent,
     "MAC_REQUIRE_QDRANT_MEMORY": "1" if required else "0",
     "MAC_QDRANT_MEMORY_ROLE": "shared_level2",
+    "MAC_REQUIRE_FIRECRAWL": "1" if firecrawl_required else "0",
+    "MAC_WEB_SEARCH_PROVIDER": "firecrawl" if safe_firecrawl_url else "",
 }
 if safe_qdrant_url:
     updates["QDRANT_URL"] = safe_qdrant_url
@@ -1042,10 +1143,19 @@ elif not required:
     updates["QDRANT_URL"] = None
     updates["QDRANT_ADDRESS"] = None
     updates["QDRANT_FLEET_URL"] = None
+if safe_firecrawl_url:
+    updates["FIRECRAWL_API_URL"] = safe_firecrawl_url
+    updates["FIRECRAWL_GATEWAY_URL"] = safe_firecrawl_url
+    updates["FIRECRAWL_API_KEY"] = os.environ.get("FIRECRAWL_API_KEY") or "none"
+    updates["HERMES_WEB_SEARCH_BACKEND"] = "firecrawl"
+    updates["HERMES_WEB_EXTRACT_BACKEND"] = "firecrawl"
+elif not firecrawl_required:
+    updates["FIRECRAWL_API_URL"] = None
+    updates["FIRECRAWL_GATEWAY_URL"] = None
 set_env(hermes_env_path, updates)
 print(
-    "memory topology: agent=%s hub=%s qdrant=%s required=%s"
-    % (agent, hub_agent, safe_qdrant_url or "disabled", required)
+    "memory topology: agent=%s hub=%s qdrant=%s required=%s firecrawl=%s firecrawl_required=%s"
+    % (agent, hub_agent, safe_qdrant_url or "disabled", required, safe_firecrawl_url or "disabled", firecrawl_required)
 )
 PY
 }
@@ -1246,6 +1356,12 @@ manifest = {
             "image": os.environ.get("QDRANT_IMAGE_CONFIGURED") or None,
             "memory_limit": os.environ.get("QDRANT_MEMORY_LIMIT_CONFIGURED") or None,
         },
+        "firecrawl": {
+            "install": os.environ.get("FIRECRAWL_INSTALL") or None,
+            "required": os.environ.get("FIRECRAWL_REQUIRE") or None,
+            "url_configured": bool(os.environ.get("FIRECRAWL_URL_CONFIGURED")),
+            "port": os.environ.get("FIRECRAWL_PORT_CONFIGURED") or None,
+        },
         "network": {
             "provider": os.environ.get("NETWORK_PROVIDER") or None,
             "install": os.environ.get("NETWORK_INSTALL") or None,
@@ -1318,6 +1434,7 @@ manifest = {
             and "resolve_runtime_provider" in hermes_run_text
         ),
         "messaging_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-messaging-deps.json"),
+        "web_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-web-deps.json"),
         "log_summary": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-log-summary.json"),
     },
     "services": service_summary(),
@@ -2030,6 +2147,139 @@ raise SystemExit(1 if failed else 0)
 PY
 }
 
+write_hermes_web_search_config() {
+  log "writing Hermes web search configuration"
+  "$VENV/bin/python" - "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" <<'PY'
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+env_path = Path(sys.argv[2])
+firecrawl_url = (
+    os.environ.get("FIRECRAWL_API_URL")
+    or os.environ.get("FIRECRAWL_GATEWAY_URL")
+    or ""
+).strip().rstrip("/")
+required = (os.environ.get("MAC_REQUIRE_FIRECRAWL") or os.environ.get("FIRECRAWL_REQUIRE") or "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def set_env(path: Path, updates: dict[str, str | None]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            output.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            if updates[key] is not None:
+                output.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            output.append(line)
+    for key in sorted(updates):
+        if key not in seen and updates[key] is not None:
+            output.append(f"{key}={updates[key]}")
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+updates: dict[str, str | None] = {
+    "MAC_REQUIRE_FIRECRAWL": "1" if required else "0",
+}
+if firecrawl_url:
+    updates.update(
+        {
+            "FIRECRAWL_API_URL": firecrawl_url,
+            "FIRECRAWL_GATEWAY_URL": firecrawl_url,
+            "FIRECRAWL_API_KEY": os.environ.get("FIRECRAWL_API_KEY") or "none",
+            "HERMES_WEB_SEARCH_BACKEND": "firecrawl",
+            "HERMES_WEB_EXTRACT_BACKEND": "firecrawl",
+            "MAC_WEB_SEARCH_PROVIDER": "firecrawl",
+            "MAC_WEB_SEARCH_URL": firecrawl_url,
+        }
+    )
+else:
+    updates.update({"FIRECRAWL_API_URL": None, "FIRECRAWL_GATEWAY_URL": None})
+set_env(env_path, updates)
+
+config_path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+except yaml.YAMLError:
+    config = {}
+if not isinstance(config, dict):
+    config = {}
+if firecrawl_url:
+    web = config.setdefault("web", {})
+    if not isinstance(web, dict):
+        web = {}
+        config["web"] = web
+    web["backend"] = "firecrawl"
+    web["search_backend"] = "firecrawl"
+    web["extract_backend"] = "firecrawl"
+config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+config_path.chmod(0o600)
+print("web search config: firecrawl=%s required=%s" % (firecrawl_url or "disabled", required))
+PY
+}
+
+install_hermes_web_deps() {
+  log "preinstalling configured Hermes web dependencies"
+  "$HERMES_DIR/.venv/bin/python" - "$HOME/.hermes" "$LOG_DIR/hermes-web-deps.json" <<'PY'
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+hermes_home = Path(sys.argv[1])
+report_path = Path(sys.argv[2])
+env_text = ""
+try:
+    env_text = (hermes_home / ".env").read_text(encoding="utf-8", errors="ignore")
+except OSError:
+    pass
+configured = bool(os.environ.get("FIRECRAWL_API_URL") or "FIRECRAWL_API_URL=" in env_text)
+report = {
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "configured": configured,
+    "specs": ["firecrawl-py==4.17.0"] if configured else [],
+    "installed": False,
+    "imports_ok": False,
+    "error": "",
+}
+if configured:
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "firecrawl-py==4.17.0"],
+        text=True,
+        capture_output=True,
+    )
+    report["installed"] = result.returncode == 0
+    if result.returncode != 0:
+        report["error"] = (result.stderr or result.stdout)[-4000:]
+    report["imports_ok"] = importlib.util.find_spec("firecrawl") is not None
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print("web deps: configured=%s installed=%s imports_ok=%s" % (configured, report["installed"], report["imports_ok"]))
+raise SystemExit(1 if configured and (not report["installed"] or not report["imports_ok"]) else 0)
+PY
+}
+
 sync_hermes_home_channels() {
   log "syncing Hermes Slack home-channel data"
   HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" \
@@ -2288,7 +2538,7 @@ install_beads_cli || true
 install_github_cli || true
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" "$FIRECRAWL_URL_CONFIGURED" "$FIRECRAWL_REQUIRE" "$FIRECRAWL_PORT_CONFIGURED" <<'PY'
 from pathlib import Path
 import secrets
 import sys
@@ -2306,7 +2556,7 @@ configured_hub_url = sys.argv[9].strip()
 configured_hub_token = sys.argv[10].strip()
 configured_bind_host = sys.argv[11].strip() or "127.0.0.1"
 configured_worker_mode = sys.argv[12].strip() or "heartbeat"
-configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes,review"
+configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl"
 configured_worker_allowed_projects = sys.argv[14].strip()
 configured_worker_required_metadata = sys.argv[15].strip()
 configured_worker_require_canary = sys.argv[16].strip() or "1"
@@ -2316,6 +2566,9 @@ shared_services_manager = sys.argv[19].strip() or agent_name
 configured_qdrant_url = sys.argv[20].strip()
 configured_qdrant_required = sys.argv[21].strip() or "1"
 configured_qdrant_port = sys.argv[22].strip() or "6333"
+configured_firecrawl_url = sys.argv[23].strip()
+configured_firecrawl_required = sys.argv[24].strip() or "1"
+configured_firecrawl_port = sys.argv[25].strip() or "3002"
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -2380,6 +2633,7 @@ values["MAC_SHARED_SERVICES_MANAGER_AGENT"] = shared_services_manager
 values["MAC_REQUIRE_QDRANT_MEMORY"] = configured_qdrant_required
 values["MAC_QDRANT_MEMORY_ROLE"] = "shared_level2"
 values["MAC_MEMORY_TOPOLOGY_FILE"] = str(home / ".hermes" / "mac-memory-topology.json")
+values["MAC_REQUIRE_FIRECRAWL"] = configured_firecrawl_required
 
 def truthy(raw):
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -2405,6 +2659,40 @@ if derived_qdrant_url:
     values["QDRANT_FLEET_URL"] = derived_qdrant_url
 elif not truthy(configured_qdrant_required):
     for key in ("QDRANT_URL", "QDRANT_ADDRESS", "QDRANT_FLEET_URL"):
+        values.pop(key, None)
+
+def firecrawl_url():
+    if configured_firecrawl_url:
+        return configured_firecrawl_url.rstrip("/")
+    if not truthy(configured_firecrawl_required):
+        return ""
+    raw_hub = configured_hub_url or values.get("MAC_HUB_URL") or "http://127.0.0.1:8789"
+    parsed = urllib.parse.urlsplit(raw_hub)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
+    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, configured_firecrawl_port), "", "", ""))
+
+derived_firecrawl_url = firecrawl_url()
+if derived_firecrawl_url:
+    values["FIRECRAWL_API_URL"] = derived_firecrawl_url
+    values["FIRECRAWL_GATEWAY_URL"] = derived_firecrawl_url
+    values.setdefault("FIRECRAWL_API_KEY", "none")
+    values["MAC_WEB_SEARCH_PROVIDER"] = "firecrawl"
+    values["MAC_WEB_SEARCH_URL"] = derived_firecrawl_url
+    values["HERMES_WEB_SEARCH_BACKEND"] = "firecrawl"
+    values["HERMES_WEB_EXTRACT_BACKEND"] = "firecrawl"
+elif not truthy(configured_firecrawl_required):
+    for key in (
+        "FIRECRAWL_API_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "MAC_WEB_SEARCH_PROVIDER",
+        "MAC_WEB_SEARCH_URL",
+        "HERMES_WEB_SEARCH_BACKEND",
+        "HERMES_WEB_EXTRACT_BACKEND",
+    ):
         values.pop(key, None)
 values.setdefault("MAC_WORKER_WORKSPACE", str(mac_home / "agent-workspaces"))
 values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
@@ -2465,6 +2753,8 @@ log "installing mac Python package"
 "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$VENV/bin/python" -m pip install -e "$SRC_DIR" >/dev/null
+install_or_validate_web_search_service
+write_hermes_web_search_config
 
 log "redeploying upstream Hermes agent"
 git clone --quiet https://github.com/NousResearch/hermes-agent.git "$HERMES_DIR"
@@ -2486,6 +2776,7 @@ done
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$HERMES_DIR/.venv/bin/python" -m pip install --ignore-requires-python -e "$HERMES_DIR" >/dev/null
 apply_hermes_gateway_runtime_shim
+install_hermes_web_deps
 install_hermes_messaging_deps
 repair_hermes_kanban_schema
 log "installed Hermes agent from upstream plus mac-managed patches"
@@ -2697,7 +2988,7 @@ agent_name="${MAC_WORKER_AGENT_NAME:-$(hostname -s 2>/dev/null || hostname)}"
 host_name="${MAC_WORKER_HOSTNAME:-$agent_name}"
 workspace="${MAC_WORKER_WORKSPACE:-$HOME/.mac/agent-workspaces}"
 mode="${MAC_WORKER_MODE:-heartbeat}"
-capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review}"
+capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl}"
 mkdir -p "$workspace"
 
 common=(

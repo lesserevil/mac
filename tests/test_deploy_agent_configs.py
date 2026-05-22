@@ -70,12 +70,22 @@ def test_sample_fleet_config_supports_home_channel_and_model_diversity():
 def test_fleet_agent_configs_enable_review_capability_by_default():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
     cfg = load_sample_fleet_config()
+    expected = "ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl"
 
-    assert 'text_field(worker.get("capabilities") or "ops,python,hermes,review")' in script
-    assert 'WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}"' in script
-    assert 'configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes,review"' in script
-    assert 'capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review}"' in script
-    assert cfg["defaults"]["worker"]["capabilities"] == ["ops", "python", "hermes", "review"]
+    assert f'text_field(worker.get("capabilities") or "{expected}")' in script
+    assert f'WORKER_CAPABILITIES="${{MAC_DEPLOY_WORKER_CAPABILITIES:-{expected}}}"' in script
+    assert f'configured_worker_capabilities = sys.argv[13].strip() or "{expected}"' in script
+    assert f'capabilities="${{MAC_WORKER_CAPABILITIES:-{expected}}}"' in script
+    assert cfg["defaults"]["worker"]["capabilities"] == [
+        "ops",
+        "python",
+        "hermes",
+        "review",
+        "web_search",
+        "web_extract",
+        "web_crawl",
+        "firecrawl",
+    ]
 
 
 def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
@@ -169,6 +179,9 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     qdrant_installer = (ROOT / "deploy" / "install-qdrant-service.sh").read_text(
         encoding="utf-8"
     )
+    firecrawl_installer = (ROOT / "deploy" / "install-firecrawl-gateway.sh").read_text(
+        encoding="utf-8"
+    )
     env_example = parse_env(ROOT / "deploy" / "systemd" / "mac.env.example")
     cfg = load_sample_fleet_config()
 
@@ -195,6 +208,27 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert cfg["defaults"]["qdrant"]["required"] is True
     assert env_example["MAC_REQUIRE_QDRANT_MEMORY"] == "1"
     assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
+    assert cfg["defaults"]["firecrawl"]["install"] == "auto"
+    assert cfg["defaults"]["firecrawl"]["required"] is True
+    assert cfg["defaults"]["firecrawl"]["port"] == 3002
+    assert "mac.firecrawl_gateway" in firecrawl_installer
+    assert 'ENV_DEST="/etc/${FLEET_NAME}/firecrawl-gateway.env"' in firecrawl_installer
+    assert "Firecrawl-compatible web search gateway" in firecrawl_installer
+    assert env_example["MAC_REQUIRE_FIRECRAWL"] == "1"
+    assert env_example["FIRECRAWL_API_URL"] == "http://hub.example.internal:3002"
+
+
+def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+
+    assert "firecrawl = merge_dicts" in script
+    assert "install_or_validate_web_search_service()" in script
+    assert "write_hermes_web_search_config()" in script
+    assert "install_hermes_web_deps()" in script
+    assert "firecrawl-py==4.17.0" in script
+    assert "FIRECRAWL_API_URL" in script
+    assert 'web["search_backend"] = "firecrawl"' in script
+    assert '"role": "shared_web_search"' in script
 
 
 def test_fleet_deploy_uses_home_scoped_registry_not_legacy_site_config():
@@ -282,6 +316,8 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
     assert cfg["defaults"]["hermes"]["slack_home_channel_name"] == "ops"
     assert cfg["defaults"]["qdrant"]["required"] is True
     assert cfg["defaults"]["qdrant"]["url"] == "http://hub.example.internal:6333"
+    assert cfg["defaults"]["firecrawl"]["required"] is True
+    assert cfg["defaults"]["firecrawl"]["url"] == "http://hub.example.internal:3002"
     assert cfg["defaults"]["network"]["provider"] == "tailscale"
     assert cfg["defaults"]["network"]["install"] == "auto"
     assert cfg["defaults"]["network"]["headscale"]["manage"] is False

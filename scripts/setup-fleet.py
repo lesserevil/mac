@@ -229,6 +229,8 @@ def main(argv: List[str]) -> int:
     )
     qdrant_bind_addr = prompt("Hub Qdrant bind address override (blank for Tailscale/loopback auto)", default="")
     qdrant_data_dir = prompt("Qdrant data directory override (blank for default /var/lib/<fleet>/qdrant)", default="")
+    firecrawl_port = 3002
+    firecrawl_url = qdrant_url_from_hub(hub_url, firecrawl_port)
 
     print("")
     print("Fleet mesh networking connects agents across networks without manual VPN config.")
@@ -261,6 +263,7 @@ def main(argv: List[str]) -> int:
                 default=True,
             ):
                 hub_url = "http://%s:%d" % (ts_hub_name, control_port)
+                firecrawl_url = "http://%s:%d" % (ts_hub_name, firecrawl_port)
                 if prompt_bool(
                     "Set Qdrant URL to http://%s:%d?" % (ts_hub_name, qdrant_port),
                     default=True,
@@ -311,6 +314,7 @@ def main(argv: List[str]) -> int:
             default=False,
         ):
             hub_url = "http://%s.mac.internal:%d" % (hs_host, control_port)
+            firecrawl_url = "http://%s.mac.internal:%d" % (hs_host, firecrawl_port)
             if prompt_bool(
                 "Set Qdrant URL to http://%s.mac.internal:%d?" % (hs_host, qdrant_port),
                 default=False,
@@ -365,7 +369,16 @@ def main(argv: List[str]) -> int:
             },
             "worker": {
                 "mode": "heartbeat",
-                "capabilities": ["ops", "python", "hermes", "review"],
+                "capabilities": [
+                    "ops",
+                    "python",
+                    "hermes",
+                    "review",
+                    "web_search",
+                    "web_extract",
+                    "web_crawl",
+                    "firecrawl",
+                ],
                 "allowed_projects": "",
                 "required_metadata": "",
                 "require_canary": True,
@@ -379,6 +392,13 @@ def main(argv: List[str]) -> int:
                 "data_dir": qdrant_data_dir,
                 "image": "docker.io/qdrant/qdrant:latest",
                 "memory_limit": "2g",
+            },
+            "firecrawl": {
+                "install": "auto",
+                "required": True,
+                "url": firecrawl_url,
+                "bind_addr": "",
+                "port": firecrawl_port,
             },
             "network": {
                 "provider": network_provider,
