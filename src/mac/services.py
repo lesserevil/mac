@@ -1789,7 +1789,14 @@ class ControlPlane:
             self._sync_beads_reopen(transitioned, actor, target, detail or {})
         return transitioned
 
-    def claim_task(self, task_id: str, agent_id: str, lease_seconds: int = 900) -> Tuple[Task, Lease]:
+    def claim_task(
+        self,
+        task_id: str,
+        agent_id: str,
+        lease_seconds: int = 900,
+        *,
+        sync_beads: bool = True,
+    ) -> Tuple[Task, Lease]:
         task = self.get_task(task_id)
         agent = self.get_agent(agent_id)
         if task.state == TaskState.BLOCKED.value and self._dependencies_satisfied(task):
@@ -1850,6 +1857,29 @@ class ControlPlane:
             {"lease_id": lease_id, "expires_at": expires_at},
         )
         claimed_task = self.get_task(task_id)
+        if sync_beads:
+            self.sync_claim_side_effects(claimed_task.id, agent_id, lease_id, expires_at)
+        return claimed_task, self.get_lease(lease_id)
+
+    def sync_claim_side_effects(
+        self,
+        task_id: str,
+        agent_id: str,
+        lease_id: str,
+        expires_at: str,
+    ) -> None:
+        """Best-effort external writeback for a completed claim transaction.
+
+        The durable mac lease is the authoritative coordination state. Beads
+        claim/comment writeback is human-facing mirror state and must not sit
+        on the hot worker claim response path; a slow Dolt push previously let
+        workers time out after the lease was created, then mark themselves
+        offline and cause the hub to fail the task before execution began.
+        """
+        try:
+            claimed_task = self.get_task(task_id)
+        except NotFoundError:
+            return
         self._sync_beads_claim(claimed_task, agent_id)
         acc_metadata = claimed_task.metadata.get("acc_metadata") if isinstance(claimed_task.metadata, dict) else {}
         if not (
@@ -1867,7 +1897,6 @@ class ControlPlane:
                     "leased_until": expires_at,
                 },
             )
-        return claimed_task, self.get_lease(lease_id)
 
     def start_task(self, task_id: str, agent_id: str) -> Task:
         task = self.get_task(task_id)
@@ -2620,6 +2649,7 @@ class ControlPlane:
         required_metadata: Optional[Dict[str, Any]] = None,
         require_canary: bool = False,
         dry_run: bool = False,
+        sync_beads: bool = True,
     ) -> Optional[JsonDict]:
         """Claim the next dispatch-eligible task for one worker.
 
@@ -2678,7 +2708,12 @@ class ControlPlane:
                     "policy": policy,
                 }
             try:
-                claimed, lease = self.claim_task(task.id, agent.id, lease_seconds=lease_seconds)
+                claimed, lease = self.claim_task(
+                    task.id,
+                    agent.id,
+                    lease_seconds=lease_seconds,
+                    sync_beads=sync_beads,
+                )
             except (TransitionError, ValidationError):
                 continue
             self.record_log(

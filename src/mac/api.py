@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -1353,8 +1353,20 @@ def create_app(
         return cp.transition_task(task_id, body.target_state, body.actor, body.detail).to_dict()
 
     @app.post("/tasks/{task_id}/claim")
-    def claim_task(task_id: str, agent_id: str, lease_seconds: int = 900) -> Dict[str, Any]:
-        task, lease = cp.claim_task(task_id, agent_id, lease_seconds)
+    def claim_task(
+        task_id: str,
+        agent_id: str,
+        background_tasks: BackgroundTasks,
+        lease_seconds: int = 900,
+    ) -> Dict[str, Any]:
+        task, lease = cp.claim_task(task_id, agent_id, lease_seconds, sync_beads=False)
+        background_tasks.add_task(
+            cp.sync_claim_side_effects,
+            task.id,
+            agent_id,
+            lease.id,
+            lease.expires_at,
+        )
         return {"task": task.to_dict(), "lease": lease.to_dict()}
 
     @app.post("/leases/{lease_id}/renew")
@@ -1736,15 +1748,31 @@ def create_app(
         return cp.heartbeat_agent(agent_id, **_data(body)).to_dict()
 
     @app.post("/agents/{agent_id}/claim-next")
-    def claim_next_for_agent(agent_id: str, body: AgentClaimNextRequest) -> Optional[Dict[str, Any]]:
-        return cp.claim_next_for_agent(
+    def claim_next_for_agent(
+        agent_id: str,
+        body: AgentClaimNextRequest,
+        background_tasks: BackgroundTasks,
+    ) -> Optional[Dict[str, Any]]:
+        assignment = cp.claim_next_for_agent(
             agent_id,
             lease_seconds=body.lease_seconds,
             allowed_projects=body.allowed_projects,
             required_metadata=body.required_metadata,
             require_canary=body.require_canary,
             dry_run=body.dry_run,
+            sync_beads=False,
         )
+        if assignment and not body.dry_run:
+            task = assignment["task"]
+            lease = assignment["lease"]
+            background_tasks.add_task(
+                cp.sync_claim_side_effects,
+                task["id"],
+                agent_id,
+                lease["id"],
+                lease["expires_at"],
+            )
+        return assignment
 
     @app.post("/agents/{agent_id}/command-audit")
     def record_agent_command_audit(

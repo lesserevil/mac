@@ -1498,6 +1498,61 @@ def test_claim_next_dry_run_and_canary_policy_are_observed(cp):
     )
 
 
+def test_claim_next_can_defer_beads_claim_side_effects(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-defer-claim",
+                "title": "Defer claim writeback",
+                "description": "claim response should not wait on beads",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        calls.append({"command": command, "cwd": cwd})
+        return Completed()
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    claimed = cp.claim_next_for_agent(worker.id, sync_beads=False)
+
+    assert claimed is not None
+    assert claimed["task"]["id"] == task.id
+    assert calls == []
+
+    cp.sync_claim_side_effects(
+        task.id,
+        worker.id,
+        claimed["lease"]["id"],
+        claimed["lease"]["expires_at"],
+    )
+
+    commands = [call["command"] for call in calls]
+    assert [bd_cli, "--actor", worker.id, "update", "mac-defer-claim", "--claim"] in commands
+    assert any(command[:5] == [bd_cli, "--actor", worker.id, "comment", "mac-defer-claim"] for command in commands)
+
+
 def test_dependencies_block_until_parent_completes(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
