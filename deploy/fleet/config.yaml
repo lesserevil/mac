@@ -38,8 +38,15 @@ defaults:
     memory_limit: 2g
   tailscale:
     install: auto
+    # headscale: auto (default) — use self-hosted headscale on the hub; no external account needed.
+    # Set to "no" to use Tailscale cloud instead (requires MAC_DEPLOY_TAILSCALE_AUTH_KEY in env).
+    headscale: auto
+    headscale_port: 8080
+    # headscale_public_addr: hub's externally routable address for the headscale API.
+    # Workers must be able to reach hub:headscale_port for initial mesh registration.
+    # Defaults to the hub's SSH target hostname if blank.
+    headscale_public_addr: ""
     # hostname_prefix: optional string prepended to each agent name as the Tailscale hostname.
-    # e.g. "mac-fleet-" makes agents appear as "mac-fleet-hub", "mac-fleet-worker-1" in Tailscale.
     hostname_prefix: ""
 
 agents:

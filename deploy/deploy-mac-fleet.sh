@@ -354,6 +354,9 @@ for name in selected:
         text_field(qdrant.get("memory_limit") or "2g"),
         text_field(tailscale.get("install") or "auto"),
         text_field(tailscale.get("hostname_prefix")),
+        text_field(tailscale.get("headscale") or "auto"),
+        text_field(tailscale.get("headscale_port") or "8080"),
+        text_field(tailscale.get("headscale_public_addr")),
     ]
     require_no_pipe(fields)
     print("|".join(fields))
@@ -387,8 +390,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit tailscale_install tailscale_hostname_prefix remote_archive
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit tailscale_install tailscale_hostname_prefix <<<"$spec"
+  local spec="$1" hub_token="${2:-}" headscale_fleet_url="${3:-}" headscale_preauthkey="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit tailscale_install tailscale_hostname_prefix tailscale_headscale tailscale_headscale_port tailscale_headscale_public_addr remote_archive
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit tailscale_install tailscale_hostname_prefix tailscale_headscale tailscale_headscale_port tailscale_headscale_public_addr <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
@@ -396,7 +399,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -A -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_TAILSCALE_INSTALL=$(shell_quote "$tailscale_install") MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX=$(shell_quote "$tailscale_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "${MAC_DEPLOY_TAILSCALE_AUTH_KEY:-}") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_TAILSCALE_INSTALL=$(shell_quote "$tailscale_install") MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX=$(shell_quote "$tailscale_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "${MAC_DEPLOY_TAILSCALE_AUTH_KEY:-}") MAC_DEPLOY_TAILSCALE_HEADSCALE=$(shell_quote "$tailscale_headscale") MAC_DEPLOY_TAILSCALE_HEADSCALE_PORT=$(shell_quote "$tailscale_headscale_port") MAC_DEPLOY_TAILSCALE_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$tailscale_headscale_public_addr") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_HEADSCALE_PREAUTHKEY=$(shell_quote "$headscale_preauthkey") MAC_DEPLOY_TARGET=$(shell_quote "$target") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -430,6 +433,13 @@ QDRANT_MEMORY_LIMIT_CONFIGURED="${MAC_DEPLOY_QDRANT_MEMORY_LIMIT:-2g}"
 TAILSCALE_INSTALL="${MAC_DEPLOY_TAILSCALE_INSTALL:-auto}"
 TAILSCALE_AUTH_KEY="${MAC_DEPLOY_TAILSCALE_AUTH_KEY:-}"
 TAILSCALE_HOSTNAME_PREFIX="${MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX:-}"
+TAILSCALE_HEADSCALE="${MAC_DEPLOY_TAILSCALE_HEADSCALE:-auto}"
+TAILSCALE_HEADSCALE_PORT="${MAC_DEPLOY_TAILSCALE_HEADSCALE_PORT:-8080}"
+TAILSCALE_HEADSCALE_PUBLIC_ADDR="${MAC_DEPLOY_TAILSCALE_HEADSCALE_PUBLIC_ADDR:-}"
+# Headscale credentials: pre-populated for workers from hub's mac.env
+HEADSCALE_FLEET_URL="${MAC_DEPLOY_HEADSCALE_FLEET_URL:-}"
+HEADSCALE_PREAUTHKEY="${MAC_DEPLOY_HEADSCALE_PREAUTHKEY:-}"
+MAC_DEPLOY_TARGET="${MAC_DEPLOY_TARGET:-}"
 DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
 DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${MAC_DEPLOY_DRAIN_POLL_SECONDS:-10}"
@@ -495,7 +505,7 @@ PY
 
 PY="$(python_bin)"
 SUPERVISOR_KIND=""
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED TAILSCALE_INSTALL TAILSCALE_AUTH_KEY TAILSCALE_HOSTNAME_PREFIX DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED TAILSCALE_INSTALL TAILSCALE_AUTH_KEY TAILSCALE_HOSTNAME_PREFIX TAILSCALE_HEADSCALE TAILSCALE_HEADSCALE_PORT TAILSCALE_HEADSCALE_PUBLIC_ADDR HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -614,7 +624,10 @@ tailscale_install_enabled() {
   case "${TAILSCALE_INSTALL:-auto}" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     0|false|FALSE|no|NO|off|OFF|none|disabled) return 1 ;;
-    auto|"") [ -n "$TAILSCALE_AUTH_KEY" ]; return ;;
+    auto|"")
+      # auto = enabled if headscale is requested OR cloud auth key is present
+      [ -n "$TAILSCALE_AUTH_KEY" ] || headscale_enabled; return
+      ;;
     *)
       log "ERROR: unsupported MAC_DEPLOY_TAILSCALE_INSTALL value: $TAILSCALE_INSTALL"
       exit 1
@@ -622,19 +635,72 @@ tailscale_install_enabled() {
   esac
 }
 
+headscale_enabled() {
+  case "${TAILSCALE_HEADSCALE:-auto}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    0|false|FALSE|no|NO|off|OFF|none|disabled|no) return 1 ;;
+    auto|"")
+      # auto = use headscale unless a cloud auth key is explicitly set
+      [ -z "$TAILSCALE_AUTH_KEY" ]; return
+      ;;
+    *)
+      log "ERROR: unsupported TAILSCALE_HEADSCALE value: $TAILSCALE_HEADSCALE"
+      exit 1
+      ;;
+  esac
+}
+
 install_tailscale_networking() {
   if ! tailscale_install_enabled; then
-    log "Tailscale networking: skipped (install=${TAILSCALE_INSTALL:-auto}, auth_key_set=$([ -n "$TAILSCALE_AUTH_KEY" ] && echo yes || echo no))"
+    log "Tailscale/headscale networking: skipped (install=${TAILSCALE_INSTALL:-auto})"
     return
   fi
-  if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-    log "ERROR: Tailscale install is enabled but MAC_DEPLOY_TAILSCALE_AUTH_KEY is not set"
-    exit 1
+
+  if headscale_enabled; then
+    # Hub installs headscale first; workers receive credentials via deploy args
+    if [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]; then
+      log "installing headscale control plane (hub)"
+      # Derive public address for headscale server_url: prefer explicit config, else SSH target host
+      local hs_public_addr
+      hs_public_addr="${TAILSCALE_HEADSCALE_PUBLIC_ADDR:-}"
+      if [ -z "$hs_public_addr" ]; then
+        # Strip user@ from target to get host
+        hs_public_addr="$(echo "${MAC_DEPLOY_TARGET:-$AGENT}" | sed 's/.*@//')"
+      fi
+      AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
+        ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
+        HEADSCALE_PUBLIC_ADDR="$hs_public_addr" \
+        HEADSCALE_PORT="$TAILSCALE_HEADSCALE_PORT" \
+        MAC_SUPERVISOR_KIND="$SUPERVISOR_KIND" \
+        bash "$SRC_DIR/deploy/install-headscale.sh"
+      # Reload mac.env to get HEADSCALE_URL and HEADSCALE_PREAUTHKEY
+      set -a
+      . "$ENV_FILE"
+      set +a
+      # Hub uses local headscale URL for its own tailscale up
+      export HEADSCALE_URL="${HEADSCALE_URL:-http://127.0.0.1:${TAILSCALE_HEADSCALE_PORT}}"
+    else
+      # Worker: credentials were passed from hub by the deploy orchestrator
+      export HEADSCALE_URL="${HEADSCALE_FLEET_URL:-}"
+    fi
+    export HEADSCALE_PREAUTHKEY="${HEADSCALE_PREAUTHKEY:-}"
+    if [ -z "$HEADSCALE_URL" ] || [ -z "$HEADSCALE_PREAUTHKEY" ]; then
+      log "ERROR: headscale is enabled for agent $AGENT but HEADSCALE_URL or HEADSCALE_PREAUTHKEY is empty"
+      exit 1
+    fi
+  else
+    if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+      log "ERROR: Tailscale cloud mode requires MAC_DEPLOY_TAILSCALE_AUTH_KEY"
+      exit 1
+    fi
   fi
-  log "installing Tailscale fleet networking"
+
+  log "installing Tailscale fleet mesh networking"
   AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
     ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
-    MAC_DEPLOY_TAILSCALE_AUTH_KEY="$TAILSCALE_AUTH_KEY" \
+    HEADSCALE_URL="${HEADSCALE_URL:-}" \
+    HEADSCALE_PREAUTHKEY="${HEADSCALE_PREAUTHKEY:-}" \
+    MAC_DEPLOY_TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}" \
     TAILSCALE_HOSTNAME_PREFIX="$TAILSCALE_HOSTNAME_PREFIX" \
     MAC_SUPERVISOR_KIND="$SUPERVISOR_KIND" \
     bash "$SRC_DIR/deploy/install-tailscale.sh"
@@ -1022,6 +1088,9 @@ manifest = {
         "tailscale": {
             "install": os.environ.get("TAILSCALE_INSTALL") or None,
             "hostname_prefix": os.environ.get("TAILSCALE_HOSTNAME_PREFIX") or None,
+            "headscale": os.environ.get("TAILSCALE_HEADSCALE") or None,
+            "headscale_port": os.environ.get("TAILSCALE_HEADSCALE_PORT") or None,
+            "headscale_fleet_url": os.environ.get("HEADSCALE_FLEET_URL") or None,
             "auth_key_configured": bool(os.environ.get("TAILSCALE_AUTH_KEY")),
             "ip": os.environ.get("MAC_TAILSCALE_IP") or None,
             "hostname": os.environ.get("MAC_TAILSCALE_HOSTNAME") or None,
@@ -3200,19 +3269,43 @@ read_hub_token() {
     'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${MAC_API_TOKEN:?}"'
 }
 
+read_headscale_fleet_url() {
+  local target
+  target="$(hub_target)"
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+    'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${HEADSCALE_FLEET_URL:-}"'
+}
+
+read_headscale_preauthkey() {
+  local target
+  target="$(hub_target)"
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+    'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${HEADSCALE_PREAUTHKEY:-}"'
+}
+
 main() {
   make_archive
-  local spec agent hub_agent hub_token
+  local spec agent hub_agent hub_token headscale_fleet_url headscale_preauthkey
   hub_agent="$(fleet_hub_agent)"
   hub_token="${MAC_DEPLOY_HUB_TOKEN:-}"
+  headscale_fleet_url="${MAC_DEPLOY_HEADSCALE_FLEET_URL:-}"
+  headscale_preauthkey="${MAC_DEPLOY_HEADSCALE_PREAUTHKEY:-}"
   while IFS= read -r spec; do
     IFS='|' read -r agent _ <<<"$spec"
     if [ "$agent" != "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
     fi
-    deploy_host "$spec" "$hub_token"
+    if [ "$agent" != "$hub_agent" ] && [ -z "$headscale_fleet_url" ]; then
+      headscale_fleet_url="$(read_headscale_fleet_url)"
+      headscale_preauthkey="$(read_headscale_preauthkey)"
+    fi
+    deploy_host "$spec" "$hub_token" "$headscale_fleet_url" "$headscale_preauthkey"
     if [ "$agent" = "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
+    fi
+    if [ "$agent" = "$hub_agent" ] && [ -z "$headscale_fleet_url" ]; then
+      headscale_fleet_url="$(read_headscale_fleet_url)"
+      headscale_preauthkey="$(read_headscale_preauthkey)"
     fi
   done < <(selected_hosts "${REQUESTED_AGENTS[@]}")
   rm -rf "$TMPDIR_LOCAL"

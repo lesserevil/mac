@@ -226,32 +226,57 @@ def main(argv: List[str]) -> int:
     qdrant_bind_addr = prompt("Hub Qdrant bind address override (blank for Tailscale/loopback auto)", default="")
 
     print("")
-    print("Tailscale networking lets agents on different networks form a private mesh.")
-    print("Store your auth key at https://login.tailscale.com/admin/settings/keys")
-    tailscale_auth_key = prompt("Tailscale auth key (blank to skip Tailscale setup)", default="")
-    tailscale_hostname_prefix = ""
+    print("Fleet mesh networking connects agents across networks without manual VPN config.")
+    print("headscale is self-hosted — no Tailscale account or external auth key needed.")
+    use_headscale = prompt_bool("Enable headscale fleet mesh networking?", default=True)
     tailscale_install = "auto"
-    if tailscale_auth_key:
+    tailscale_headscale = "auto"
+    tailscale_headscale_port = "8080"
+    tailscale_headscale_public_addr = ""
+    tailscale_hostname_prefix = ""
+    tailscale_auth_key = ""
+    if use_headscale:
+        tailscale_headscale = "yes"
+        tailscale_headscale_port = prompt("Headscale port (workers must reach hub on this port)", default="8080")
+        # Derive hub public addr for headscale server_url from SSH target
+        hub_host = hub_target.rsplit("@", 1)[-1].strip() or hub_target
+        tailscale_headscale_public_addr = prompt(
+            "Hub's publicly routable address for headscale",
+            default=hub_host,
+            required=True,
+        )
+        # Hub gets first IP in headscale's default prefix (100.64.0.1)
+        ts_hub_ip = "100.64.0.1"
+        ts_hub_url = "http://%s:8789" % ts_hub_ip
+        if prompt_bool("Set hub URL to headscale IP %s?" % ts_hub_url, default=True):
+            hub_url = ts_hub_url
+            ts_qdrant_url = "http://%s:6333" % ts_hub_ip
+            if prompt_bool("Set Qdrant URL to headscale IP %s?" % ts_qdrant_url, default=True):
+                qdrant_url = ts_qdrant_url
         tailscale_hostname_prefix = prompt(
             "Tailscale hostname prefix for fleet agents (blank for none)",
             default="",
         )
-        # If Tailscale is configured, offer to use MagicDNS name for hub_url
-        ts_hub_name = "%s%s" % (tailscale_hostname_prefix, hub_name)
-        ts_hub_url = "http://%s:8789" % ts_hub_name
-        use_ts_hub_url = prompt_bool(
-            "Set hub URL to Tailscale MagicDNS name %s?" % ts_hub_url,
-            default=True,
-        )
-        if use_ts_hub_url:
-            hub_url = ts_hub_url
-            # Also offer to update qdrant_url to use the MagicDNS name
-            ts_qdrant_url = "http://%s:6333" % ts_hub_name
+    else:
+        # Cloud Tailscale fallback — requires an auth key
+        tailscale_headscale = "no"
+        tailscale_auth_key = prompt("Tailscale cloud auth key (blank to skip mesh networking)", default="")
+        if tailscale_auth_key:
+            tailscale_hostname_prefix = prompt(
+                "Tailscale hostname prefix for fleet agents (blank for none)",
+                default="",
+            )
+            ts_hub_name = "%s%s" % (tailscale_hostname_prefix, hub_name)
             if prompt_bool(
-                "Set Qdrant URL to Tailscale MagicDNS name %s?" % ts_qdrant_url,
+                "Set hub URL to Tailscale MagicDNS name http://%s:8789?" % ts_hub_name,
                 default=True,
             ):
-                qdrant_url = ts_qdrant_url
+                hub_url = "http://%s:8789" % ts_hub_name
+                if prompt_bool(
+                    "Set Qdrant URL to http://%s:6333?" % ts_hub_name,
+                    default=True,
+                ):
+                    qdrant_url = "http://%s:6333" % ts_hub_name
 
     agents = [
         build_agent(
@@ -316,6 +341,9 @@ def main(argv: List[str]) -> int:
             },
             "tailscale": {
                 "install": tailscale_install,
+                "headscale": tailscale_headscale,
+                "headscale_port": int(tailscale_headscale_port) if tailscale_headscale_port.isdigit() else 8080,
+                "headscale_public_addr": tailscale_headscale_public_addr,
                 "hostname_prefix": tailscale_hostname_prefix,
             },
         },
