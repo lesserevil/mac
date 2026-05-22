@@ -2360,7 +2360,10 @@ if configured_gateway_base_url:
     values["ACC_HERMES_GATEWAY_BASE_URL"] = configured_gateway_base_url
     values["CUSTOM_BASE_URL"] = configured_gateway_base_url
     values["OPENAI_BASE_URL"] = configured_gateway_base_url
-if configured_hub_token:
+if configured_worker_mode == "loop":
+    # Hub node: agent must always use the local API token.
+    values["MAC_WORKER_TOKEN"] = values["MAC_API_TOKEN"]
+elif configured_hub_token:
     values["MAC_WORKER_TOKEN"] = configured_hub_token
 else:
     values.setdefault("MAC_WORKER_TOKEN", values["MAC_API_TOKEN"])
