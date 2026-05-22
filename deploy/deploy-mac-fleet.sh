@@ -4128,10 +4128,8 @@ main() {
         hub_token="$(read_hub_token)"
       fi
       upsert_local_env "MAC_DEPLOY_HUB_TOKEN" "$hub_token"
-      local hub_ssh_target
-      hub_ssh_target="$(fleet_hub_target)"
       echo "==> ${agent}: hub UI access:"
-      echo "    ssh -L 8789:127.0.0.1:8789 ${hub_ssh_target}  # then open http://localhost:8789/ui"
+      echo "    ssh -L 8789:127.0.0.1:8789 ${hub_target_str}  # then open http://localhost:8789/ui"
       echo "    token stored in \${MAC_DEPLOY_ENV_FILE:-\$HOME/.mac/.env} as MAC_DEPLOY_HUB_TOKEN"
       hub_tunnel_pubkey="$(read_hub_tunnel_pubkey)"
     else
