@@ -3368,11 +3368,19 @@ PY
 }
 
 verify_hub_registration() {
-  log "verifying mac-agent registration with hub ${MAC_HUB_URL:-$HUB_URL}"
+  local check_url="${MAC_HUB_URL:-$HUB_URL}"
+  # When this node IS the hub, the external service DNS may not expose the API
+  # port. Check localhost first; fall back to the configured hub_url.
+  if [ "$WORKER_MODE" = "loop" ] && curl -fsS --max-time 3 \
+      -H "Authorization: Bearer $MAC_WORKER_TOKEN" \
+      "http://127.0.0.1:${MAC_PORT}/agents" >/dev/null 2>&1; then
+    check_url="http://127.0.0.1:${MAC_PORT}"
+  fi
+  log "verifying mac-agent registration with hub ${check_url}"
   local attempt
   for attempt in $(seq 1 10); do
     if curl -fsS -H "Authorization: Bearer $MAC_WORKER_TOKEN" \
-      "${MAC_HUB_URL:-$HUB_URL}/agents" > "$LOG_DIR/hub-agents.json"; then
+      "${check_url}/agents" > "$LOG_DIR/hub-agents.json"; then
       if "$PY" - "$LOG_DIR/hub-agents.json" "${MAC_WORKER_AGENT_NAME:-$AGENT}" <<'PY'; then
 import json
 import sys
@@ -3401,7 +3409,7 @@ PY
     fi
     sleep 2
   done
-  log "ERROR: mac-agent did not register with hub ${MAC_HUB_URL:-$HUB_URL}"
+  log "ERROR: mac-agent did not register with hub ${check_url}"
   return 1
 }
 
