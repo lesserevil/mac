@@ -107,6 +107,9 @@ if [ "${1:-}" = "--print-bind-addr" ]; then
 fi
 
 CONTAINER_CMD=""
+QDRANT_BINARY="${QDRANT_BINARY:-$MAC_HOME/bin/qdrant}"
+USE_NATIVE_BINARY=0
+
 for _candidate in podman docker; do
   if command -v "$_candidate" >/dev/null 2>&1; then
     CONTAINER_CMD="$_candidate"
@@ -114,12 +117,42 @@ for _candidate in podman docker; do
   fi
 done
 if [ -z "$CONTAINER_CMD" ] && command -v apt-get >/dev/null 2>&1; then
-  echo "[qdrant] podman not found; installing via apt"
+  echo "[qdrant] no container runtime found; trying apt-get install podman"
   sudo apt-get install -y podman >/dev/null 2>&1 && CONTAINER_CMD="podman" || true
 fi
 if [ -z "$CONTAINER_CMD" ]; then
-  echo "[qdrant] ERROR: podman or docker is required for mac-qdrant.service" >&2
-  exit 1
+  if [ -x "$QDRANT_BINARY" ]; then
+    USE_NATIVE_BINARY=1
+    echo "[qdrant] using existing native qdrant binary at $QDRANT_BINARY"
+  elif command -v curl >/dev/null 2>&1; then
+    _qdrant_ver="$(curl -fsSL "https://api.github.com/repos/qdrant/qdrant/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | tr -d '\r\n')"
+    if [ -n "$_qdrant_ver" ]; then
+      case "$(uname -m)" in
+        x86_64)  _qdrant_asset="qdrant-x86_64-unknown-linux-gnu.tar.gz" ;;
+        aarch64) _qdrant_asset="qdrant-aarch64-unknown-linux-gnu.tar.gz" ;;
+        *)       _qdrant_asset="" ;;
+      esac
+      if [ -n "$_qdrant_asset" ]; then
+        echo "[qdrant] downloading native binary v${_qdrant_ver}"
+        _tmp="$(mktemp -d)"
+        if curl -fsSL "https://github.com/qdrant/qdrant/releases/download/v${_qdrant_ver}/${_qdrant_asset}" \
+             | tar -xz -C "$_tmp" 2>/dev/null && [ -x "$_tmp/qdrant" ]; then
+          mkdir -p "$MAC_HOME/bin"
+          install -m 0755 "$_tmp/qdrant" "$QDRANT_BINARY"
+          rm -rf "$_tmp"
+          USE_NATIVE_BINARY=1
+          echo "[qdrant] native binary v${_qdrant_ver} installed at $QDRANT_BINARY"
+        else
+          rm -rf "$_tmp"
+        fi
+      fi
+    fi
+  fi
+  if [ "$USE_NATIVE_BINARY" = 0 ]; then
+    echo "[qdrant] ERROR: no container runtime (podman/docker) or native binary available" >&2
+    exit 1
+  fi
 fi
 
 SUPERVISOR_KIND="$(detect_supervisor)"
@@ -167,7 +200,25 @@ set_env_key "${MAC_HOME}/mac.env" MAC_QDRANT_MEMORY_ROLE "shared_level2"
 
 write_qdrant_wrapper() {
   local wrapper="$MAC_HOME/bin/mac-qdrant-run"
-  cat > "$wrapper" <<EOF
+  if [ "$USE_NATIVE_BINARY" = 1 ]; then
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+[ -f ${ENV_DEST} ] && . ${ENV_DEST}
+[ -f "\$HOME/.mac/qdrant.env" ] && . "\$HOME/.mac/qdrant.env"
+set +a
+: "\${QDRANT_BIND_ADDR:=127.0.0.1}"
+: "\${QDRANT_PORT:=6333}"
+: "\${QDRANT_DATA_DIR:=/var/lib/${FLEET_NAME}/qdrant}"
+mkdir -p "\$QDRANT_DATA_DIR"
+export QDRANT__SERVICE__HOST="\${QDRANT_BIND_ADDR}"
+export QDRANT__SERVICE__HTTP_PORT="\${QDRANT_PORT}"
+export QDRANT__STORAGE__STORAGE_PATH="\${QDRANT_DATA_DIR}"
+exec ${QDRANT_BINARY}
+EOF
+  else
+    cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 set -a
@@ -186,6 +237,7 @@ exec ${CONTAINER_CMD} run --rm --name "\$QDRANT_CONTAINER_NAME" --pull=missing \
   -p "\$QDRANT_BIND_ADDR:\$QDRANT_PORT:6333" \
   -v "\$QDRANT_DATA_DIR:/qdrant/storage" "\$QDRANT_IMAGE"
 EOF
+  fi
   chmod 700 "$wrapper"
 }
 
