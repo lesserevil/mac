@@ -12,6 +12,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+try:
+    import yaml
+except Exception:  # noqa: BLE001 - deploy will surface PyYAML requirement too.
+    yaml = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -113,6 +118,36 @@ def backup_existing(path: Path) -> Path | None:
     return backup
 
 
+def load_fleet_registry(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "fleets": {}}
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to update an existing fleet registry")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if data is None:
+        return {"version": 1, "fleets": {}}
+    if not isinstance(data, dict):
+        raise RuntimeError("%s must contain a YAML mapping" % path)
+    if isinstance(data.get("fleets"), dict):
+        data.setdefault("version", 1)
+        return data
+    if isinstance(data.get("fleets"), list):
+        fleets: Dict[str, Any] = {}
+        for item in data["fleets"]:
+            if not isinstance(item, dict) or not str(item.get("hub_agent") or "").strip():
+                raise RuntimeError("each fleet in %s must have hub_agent" % path)
+            fleets[str(item["hub_agent"]).strip()] = item
+        data["fleets"] = fleets
+        data.setdefault("version", 1)
+        return data
+    if data.get("hub_agent") and data.get("agents"):
+        hub = str(data["hub_agent"]).strip()
+        return {"version": 1, "fleets": {hub: data}}
+    data.setdefault("version", 1)
+    data["fleets"] = {}
+    return data
+
+
 def build_agent(
     *,
     name: str,
@@ -145,9 +180,14 @@ def env_line(key: str, value: str) -> str:
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Interactive first-run mac fleet setup wizard.")
     parser.add_argument(
+        "--fleets-config",
+        default=str(Path.home() / ".mac" / "fleets.yaml"),
+        help="Path to the home-scoped multi-fleet registry.",
+    )
+    parser.add_argument(
         "--site-config",
-        default=str(ROOT / "deploy" / "fleet" / "config-site.yaml"),
-        help="Path to write site-local fleet config.",
+        dest="fleets_config",
+        help="Deprecated alias for --fleets-config.",
     )
     parser.add_argument(
         "--env-file",
@@ -158,11 +198,11 @@ def main(argv: List[str]) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print generated files without writing them.")
     args = parser.parse_args(argv)
 
-    site_config = Path(args.site_config).expanduser()
+    fleets_config = Path(args.fleets_config).expanduser()
     env_file = Path(args.env_file).expanduser()
 
     if not args.force:
-        for path in (site_config, env_file):
+        for path in (fleets_config, env_file):
             if path.exists() and not prompt_bool("Overwrite %s after making a backup?" % path, default=False):
                 print("Aborted before writing %s" % path)
                 return 2
@@ -170,7 +210,7 @@ def main(argv: List[str]) -> int:
     print("mac fleet setup wizard")
     print("Do not paste provider API keys here. Put upstream model/provider keys in TokenHub.")
     fleet_name = prompt("Fleet name", default="my-fleet")
-    hub_name = prompt("Hub agent name", default="hub", required=True)
+    hub_name = prompt("Hub node name", required=True)
     hub_target = prompt("Hub SSH target (user@host or host)", required=True)
     hub_os = prompt("Hub OS", default="linux", choices=["linux", "darwin"])
     hub_url = prompt(
@@ -189,6 +229,34 @@ def main(argv: List[str]) -> int:
         default=qdrant_url_from_hub(hub_url) if qdrant_required else "",
     )
     qdrant_bind_addr = prompt("Hub Qdrant bind address override (blank for Tailscale/loopback auto)", default="")
+
+    print("")
+    print("Tailscale networking lets agents on different networks form a private mesh.")
+    print("Store your auth key at https://login.tailscale.com/admin/settings/keys")
+    tailscale_auth_key = prompt("Tailscale auth key (blank to skip Tailscale setup)", default="")
+    tailscale_hostname_prefix = ""
+    tailscale_install = "auto"
+    if tailscale_auth_key:
+        tailscale_hostname_prefix = prompt(
+            "Tailscale hostname prefix for fleet agents (blank for none)",
+            default="",
+        )
+        # If Tailscale is configured, offer to use MagicDNS name for hub_url
+        ts_hub_name = "%s%s" % (tailscale_hostname_prefix, hub_name)
+        ts_hub_url = "http://%s:8789" % ts_hub_name
+        use_ts_hub_url = prompt_bool(
+            "Set hub URL to Tailscale MagicDNS name %s?" % ts_hub_url,
+            default=True,
+        )
+        if use_ts_hub_url:
+            hub_url = ts_hub_url
+            # Also offer to update qdrant_url to use the MagicDNS name
+            ts_qdrant_url = "http://%s:6333" % ts_hub_name
+            if prompt_bool(
+                "Set Qdrant URL to Tailscale MagicDNS name %s?" % ts_qdrant_url,
+                default=True,
+            ):
+                qdrant_url = ts_qdrant_url
 
     agents = [
         build_agent(
@@ -222,7 +290,7 @@ def main(argv: List[str]) -> int:
             )
         )
 
-    config: Dict[str, Any] = {
+    fleet_config: Dict[str, Any] = {
         "sample": False,
         "fleet_name": fleet_name,
         "hub_agent": hub_name,
@@ -251,15 +319,18 @@ def main(argv: List[str]) -> int:
                 "image": "docker.io/qdrant/qdrant:latest",
                 "memory_limit": "2g",
             },
+            "tailscale": {
+                "install": tailscale_install,
+                "hostname_prefix": tailscale_hostname_prefix,
+            },
         },
         "agents": agents,
     }
 
     env_values = {
         "MAC_DEPLOY_FLEET_CONFIG": str(ROOT / "deploy" / "fleet" / "config.yaml"),
-        "MAC_DEPLOY_FLEET_SITE_CONFIG": str(site_config),
+        "MAC_DEPLOY_FLEETS_CONFIG": str(fleets_config),
         "MAC_DEPLOY_HUB_AGENT": hub_name,
-        "MAC_DEPLOY_HUB_URL": hub_url,
         "MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT": hub_name,
     }
     if prompt_bool("Generate MAC_SECRET_KEY in %s?" % env_file, default=True):
@@ -269,8 +340,17 @@ def main(argv: List[str]) -> int:
     hub_token = prompt("Existing hub token for spoke deploys (blank to read it from hub during deploy)", default="")
     if hub_token:
         env_values["MAC_DEPLOY_HUB_TOKEN"] = hub_token
+    if tailscale_auth_key:
+        env_values["MAC_DEPLOY_TAILSCALE_AUTH_KEY"] = tailscale_auth_key
 
-    config_content = "\n".join(write_yaml_lines(config)) + "\n"
+    registry = load_fleet_registry(fleets_config)
+    fleets = registry.get("fleets")
+    if not isinstance(fleets, dict):
+        fleets = {}
+        registry["fleets"] = fleets
+    fleets[hub_name] = fleet_config
+    registry["version"] = registry.get("version") or 1
+    config_content = "\n".join(write_yaml_lines(registry)) + "\n"
     env_content = "\n".join(
         [
             "# Generated by scripts/setup-fleet.py.",
@@ -281,27 +361,27 @@ def main(argv: List[str]) -> int:
     )
 
     if args.dry_run:
-        print("--- %s" % site_config)
+        print("--- %s" % fleets_config)
         print(config_content, end="")
         print("--- %s" % env_file)
         print(env_content, end="")
         return 0
 
-    site_backup = backup_existing(site_config)
+    site_backup = backup_existing(fleets_config)
     env_backup = backup_existing(env_file)
-    atomic_write(site_config, config_content, 0o600)
+    atomic_write(fleets_config, config_content, 0o600)
     atomic_write(env_file, env_content, 0o600)
 
     if site_backup:
-        print("Backed up previous site config to %s" % site_backup)
+        print("Backed up previous fleet registry to %s" % site_backup)
     if env_backup:
         print("Backed up previous env file to %s" % env_backup)
-    print("Wrote %s" % site_config)
+    print("Wrote %s" % fleets_config)
     print("Wrote %s" % env_file)
     print("")
     print("Next:")
     print("  set -a; . %s; set +a" % env_file)
-    print("  bash deploy/deploy-mac-fleet.sh")
+    print("  bash deploy/deploy-mac-fleet.sh --hub %s" % hub_name)
     return 0
 
 

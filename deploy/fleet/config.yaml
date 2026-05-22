@@ -36,6 +36,11 @@ defaults:
     port: 6333
     image: docker.io/qdrant/qdrant:latest
     memory_limit: 2g
+  tailscale:
+    install: auto
+    # hostname_prefix: optional string prepended to each agent name as the Tailscale hostname.
+    # e.g. "mac-fleet-" makes agents appear as "mac-fleet-hub", "mac-fleet-worker-1" in Tailscale.
+    hostname_prefix: ""
 
 agents:
   - name: hub

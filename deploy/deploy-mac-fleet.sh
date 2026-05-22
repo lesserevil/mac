@@ -17,15 +17,19 @@ case "$GIT_URL" in
 esac
 GIT_BRANCH="${MAC_DEPLOY_GIT_BRANCH:-main}"
 FLEET_CONFIG="${MAC_DEPLOY_FLEET_CONFIG:-$ROOT/deploy/fleet/config.yaml}"
-FLEET_SITE_CONFIG="${MAC_DEPLOY_FLEET_SITE_CONFIG:-$ROOT/deploy/fleet/config-site.yaml}"
+FLEET_REGISTRY_CONFIG="${MAC_DEPLOY_FLEETS_CONFIG:-${MAC_FLEETS_CONFIG:-$HOME/.mac/fleets.yaml}}"
+FLEET_SITE_CONFIG="${MAC_DEPLOY_FLEET_SITE_CONFIG:-}"
+HUB_SELECTOR="${MAC_DEPLOY_HUB_AGENT:-}"
+REQUESTED_AGENTS=()
 
 usage() {
   cat <<'USAGE'
-Usage: deploy/deploy-mac-fleet.sh [agent ...]
+Usage: deploy/deploy-mac-fleet.sh --hub <hub-agent> [agent ...]
 
-Deploy mac as the local ACC replacement to the agents declared in
-deploy/fleet/config-site.yaml, or in MAC_DEPLOY_FLEET_SITE_CONFIG. Copy
-deploy/fleet/config.yaml to config-site.yaml and edit it for your own fleet.
+Deploy mac as the local ACC replacement to a fleet declared in
+~/.mac/fleets.yaml, or in MAC_DEPLOY_FLEETS_CONFIG. Real fleet topology must
+live outside this Git repository. The checked-in deploy/fleet/config.yaml is a
+generic schema/defaults sample only.
 
 Each host gets:
   - ~/.mac/src/mac from this repository
@@ -39,15 +43,76 @@ Each host gets:
   - rollback script and structured deploy manifests under ~/.mac/logs
   - one-time ACC SQLite dry-run and import reports under ~/.mac/logs
 
-Arguments may be agent names from the effective fleet config. With no
-arguments, all enabled agents in the effective config are deployed.
+The hub name selects the fleet. Agent arguments may be agent names from that
+fleet. With no agent arguments, all enabled agents in the selected fleet are
+deployed. MAC_DEPLOY_FLEET_SITE_CONFIG remains as an explicit legacy
+single-fleet compatibility path.
 USAGE
 }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --hub)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --hub requires a hub agent name" >&2
+        exit 2
+      fi
+      HUB_SELECTOR="$2"
+      shift 2
+      ;;
+    --hub=*)
+      HUB_SELECTOR="${1#--hub=}"
+      shift
+      ;;
+    --fleets-config)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --fleets-config requires a path" >&2
+        exit 2
+      fi
+      FLEET_REGISTRY_CONFIG="$2"
+      shift 2
+      ;;
+    --fleets-config=*)
+      FLEET_REGISTRY_CONFIG="${1#--fleets-config=}"
+      shift
+      ;;
+    --site-config)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --site-config requires a path" >&2
+        exit 2
+      fi
+      FLEET_SITE_CONFIG="$2"
+      shift 2
+      ;;
+    --site-config=*)
+      FLEET_SITE_CONFIG="${1#--site-config=}"
+      shift
+      ;;
+    --)
+      shift
+      REQUESTED_AGENTS+=("$@")
+      break
+      ;;
+    -*)
+      echo "ERROR: unknown option $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      REQUESTED_AGENTS+=("$1")
+      shift
+      ;;
+  esac
+done
 
 fleet_config_query() {
   local mode="$1"
   shift || true
-  python3 - "$mode" "$FLEET_CONFIG" "$FLEET_SITE_CONFIG" "$@" <<'PY'
+  python3 - "$mode" "$FLEET_CONFIG" "$FLEET_REGISTRY_CONFIG" "$FLEET_SITE_CONFIG" "$HUB_SELECTOR" "$@" <<'PY'
 from __future__ import annotations
 
 import os
@@ -143,22 +208,90 @@ def agent_map(items: Any) -> Dict[str, Dict[str, Any]]:
 
 mode = sys.argv[1]
 base_path = Path(sys.argv[2])
-site_path = Path(sys.argv[3])
-requested = sys.argv[4:]
+registry_path = Path(sys.argv[3]).expanduser()
+site_path_arg = sys.argv[4]
+site_path = Path(site_path_arg).expanduser() if site_path_arg else None
+hub_selector = sys.argv[5].strip()
+requested = sys.argv[6:]
 
 base = load_yaml(base_path)
-site = load_yaml(site_path)
-site_present = site_path.exists()
-cfg = merge_dicts(base, {k: v for k, v in site.items() if k != "agents"})
-cfg["agents"] = list(agent_map(site.get("agents") if site_present and "agents" in site else base.get("agents")).values())
 
-if cfg.get("sample") and not site_present and os.environ.get("MAC_DEPLOY_ALLOW_SAMPLE_CONFIG") != "1":
-    print(
-        "ERROR: %s is a sample fleet config. Copy it to %s and edit it for this site, "
-        "or set MAC_DEPLOY_FLEET_SITE_CONFIG to a site config." % (base_path, site_path),
-        file=sys.stderr,
-    )
+
+def normalize_fleets(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    fleets = data.get("fleets")
+    result: Dict[str, Dict[str, Any]] = {}
+    if isinstance(fleets, dict):
+        for key, value in fleets.items():
+            if not isinstance(value, dict):
+                print("ERROR: fleet %s in %s must be a mapping" % (key, registry_path), file=sys.stderr)
+                raise SystemExit(2)
+            hub = text_field(value.get("hub_agent") or key)
+            if not hub:
+                print("ERROR: every fleet entry in %s needs a hub_agent" % registry_path, file=sys.stderr)
+                raise SystemExit(2)
+            fleet = deepcopy(value)
+            fleet["hub_agent"] = hub
+            result[hub] = fleet
+        return result
+    if isinstance(fleets, list):
+        for value in fleets:
+            if not isinstance(value, dict):
+                print("ERROR: every fleet entry in %s must be a mapping" % registry_path, file=sys.stderr)
+                raise SystemExit(2)
+            hub = text_field(value.get("hub_agent"))
+            if not hub:
+                print("ERROR: every fleet entry in %s needs a hub_agent" % registry_path, file=sys.stderr)
+                raise SystemExit(2)
+            result[hub] = deepcopy(value)
+        return result
+    if fleets is None:
+        return {}
+    print("ERROR: %s fleets must be a mapping or list" % registry_path, file=sys.stderr)
     raise SystemExit(2)
+
+
+registry_present = registry_path.exists()
+site_present = site_path is not None and site_path.exists()
+if registry_present:
+    registry = load_yaml(registry_path)
+    fleets = normalize_fleets(registry)
+    if not fleets:
+        print("ERROR: %s does not contain any fleets" % registry_path, file=sys.stderr)
+        raise SystemExit(2)
+    if hub_selector:
+        if hub_selector not in fleets:
+            print(
+                "ERROR: hub %s not found in %s. Known hubs: %s"
+                % (hub_selector, registry_path, ", ".join(sorted(fleets))),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        fleet = fleets[hub_selector]
+    elif len(fleets) == 1:
+        fleet = next(iter(fleets.values()))
+    else:
+        print(
+            "ERROR: multiple fleets are configured in %s; pass --hub <hub-agent>. Known hubs: %s"
+            % (registry_path, ", ".join(sorted(fleets))),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    cfg = merge_dicts(base, {k: v for k, v in fleet.items() if k != "agents"})
+    cfg["agents"] = list(agent_map(fleet.get("agents") if "agents" in fleet else base.get("agents")).values())
+elif site_present:
+    site = load_yaml(site_path) if site_path is not None else {}
+    cfg = merge_dicts(base, {k: v for k, v in site.items() if k != "agents"})
+    cfg["agents"] = list(agent_map(site.get("agents") if "agents" in site else base.get("agents")).values())
+else:
+    if base.get("sample") and os.environ.get("MAC_DEPLOY_ALLOW_SAMPLE_CONFIG") != "1":
+        print(
+            "ERROR: no fleet registry found at %s. Run bash setup.sh to create one, "
+            "or pass --fleets-config /path/to/fleets.yaml. The checked-in %s is "
+            "a sample only." % (registry_path, base_path),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    cfg = base
 
 agents = [agent for agent in cfg.get("agents") or [] if agent.get("enabled", True)]
 if not agents:
@@ -166,7 +299,8 @@ if not agents:
     raise SystemExit(2)
 
 hub_agent = (
-    os.environ.get("MAC_DEPLOY_HUB_AGENT")
+    hub_selector
+    or os.environ.get("MAC_DEPLOY_HUB_AGENT")
     or text_field(cfg.get("hub_agent"))
     or text_field(agents[0].get("name"))
 )
@@ -206,6 +340,7 @@ for name in selected:
     hermes = merge_dicts(defaults.get("hermes", {}) if isinstance(defaults.get("hermes"), dict) else {}, agent.get("hermes", {}) if isinstance(agent.get("hermes"), dict) else {})
     worker = merge_dicts(defaults.get("worker", {}) if isinstance(defaults.get("worker"), dict) else {}, agent.get("worker", {}) if isinstance(agent.get("worker"), dict) else {})
     qdrant = merge_dicts(defaults.get("qdrant", {}) if isinstance(defaults.get("qdrant"), dict) else {}, agent.get("qdrant", {}) if isinstance(agent.get("qdrant"), dict) else {})
+    tailscale = merge_dicts(defaults.get("tailscale", {}) if isinstance(defaults.get("tailscale"), dict) else {}, agent.get("tailscale", {}) if isinstance(agent.get("tailscale"), dict) else {})
     target = text_field(agent.get("target"))
     os_kind = text_field(agent.get("os"))
     if not target or not os_kind:
@@ -238,6 +373,8 @@ for name in selected:
         text_field(qdrant.get("port") or "6333"),
         text_field(qdrant.get("image") or "docker.io/qdrant/qdrant:latest"),
         text_field(qdrant.get("memory_limit") or "2g"),
+        text_field(tailscale.get("install") or "auto"),
+        text_field(tailscale.get("hostname_prefix")),
     ]
     require_no_pipe(fields)
     print("|".join(fields))
@@ -271,8 +408,8 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit remote_archive
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit <<<"$spec"
+  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit tailscale_install tailscale_hostname_prefix remote_archive
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit tailscale_install tailscale_hostname_prefix <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
@@ -280,7 +417,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   ssh -A -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_TAILSCALE_INSTALL=$(shell_quote "$tailscale_install") MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX=$(shell_quote "$tailscale_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY=$(shell_quote "${MAC_DEPLOY_TAILSCALE_AUTH_KEY:-}") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -311,6 +448,9 @@ QDRANT_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_QDRANT_BIND_ADDR:-}"
 QDRANT_PORT_CONFIGURED="${MAC_DEPLOY_QDRANT_PORT:-6333}"
 QDRANT_IMAGE_CONFIGURED="${MAC_DEPLOY_QDRANT_IMAGE:-docker.io/qdrant/qdrant:latest}"
 QDRANT_MEMORY_LIMIT_CONFIGURED="${MAC_DEPLOY_QDRANT_MEMORY_LIMIT:-2g}"
+TAILSCALE_INSTALL="${MAC_DEPLOY_TAILSCALE_INSTALL:-auto}"
+TAILSCALE_AUTH_KEY="${MAC_DEPLOY_TAILSCALE_AUTH_KEY:-}"
+TAILSCALE_HOSTNAME_PREFIX="${MAC_DEPLOY_TAILSCALE_HOSTNAME_PREFIX:-}"
 DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
 DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${MAC_DEPLOY_DRAIN_POLL_SECONDS:-10}"
@@ -376,7 +516,7 @@ PY
 
 PY="$(python_bin)"
 SUPERVISOR_KIND=""
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED TAILSCALE_INSTALL TAILSCALE_AUTH_KEY TAILSCALE_HOSTNAME_PREFIX DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -489,6 +629,40 @@ qdrant_install_enabled() {
       exit 1
       ;;
   esac
+}
+
+tailscale_install_enabled() {
+  case "${TAILSCALE_INSTALL:-auto}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    0|false|FALSE|no|NO|off|OFF|none|disabled) return 1 ;;
+    auto|"") [ -n "$TAILSCALE_AUTH_KEY" ]; return ;;
+    *)
+      log "ERROR: unsupported MAC_DEPLOY_TAILSCALE_INSTALL value: $TAILSCALE_INSTALL"
+      exit 1
+      ;;
+  esac
+}
+
+install_tailscale_networking() {
+  if ! tailscale_install_enabled; then
+    log "Tailscale networking: skipped (install=${TAILSCALE_INSTALL:-auto}, auth_key_set=$([ -n "$TAILSCALE_AUTH_KEY" ] && echo yes || echo no))"
+    return
+  fi
+  if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+    log "ERROR: Tailscale install is enabled but MAC_DEPLOY_TAILSCALE_AUTH_KEY is not set"
+    exit 1
+  fi
+  log "installing Tailscale fleet networking"
+  AGENT="$AGENT" MAC_HOME="$MAC_HOME" WORKSPACE="$SRC_DIR" \
+    ENV_FILE="$ENV_FILE" LOG_DIR="$LOG_DIR" \
+    MAC_DEPLOY_TAILSCALE_AUTH_KEY="$TAILSCALE_AUTH_KEY" \
+    TAILSCALE_HOSTNAME_PREFIX="$TAILSCALE_HOSTNAME_PREFIX" \
+    MAC_SUPERVISOR_KIND="$SUPERVISOR_KIND" \
+    bash "$SRC_DIR/deploy/install-tailscale.sh"
+  # Reload mac.env so QDRANT bind-addr detection picks up MAC_TAILSCALE_IP
+  set -a
+  . "$ENV_FILE"
+  set +a
 }
 
 validate_qdrant_endpoint() {
@@ -865,6 +1039,13 @@ manifest = {
             "port": os.environ.get("QDRANT_PORT_CONFIGURED") or None,
             "image": os.environ.get("QDRANT_IMAGE_CONFIGURED") or None,
             "memory_limit": os.environ.get("QDRANT_MEMORY_LIMIT_CONFIGURED") or None,
+        },
+        "tailscale": {
+            "install": os.environ.get("TAILSCALE_INSTALL") or None,
+            "hostname_prefix": os.environ.get("TAILSCALE_HOSTNAME_PREFIX") or None,
+            "auth_key_configured": bool(os.environ.get("TAILSCALE_AUTH_KEY")),
+            "ip": os.environ.get("MAC_TAILSCALE_IP") or None,
+            "hostname": os.environ.get("MAC_TAILSCALE_HOSTNAME") or None,
         },
         "drain": {
             "mode": os.environ.get("DRAIN_MODE") or None,
@@ -2007,6 +2188,7 @@ set -a
 set +a
 bootstrap_beads_repositories
 restore_beads_tracked_exports
+install_tailscale_networking
 install_or_validate_shared_services
 write_hermes_memory_topology
 sync_hermes_home_channels
@@ -3040,10 +3222,6 @@ read_hub_token() {
 }
 
 main() {
-  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    usage
-    exit 0
-  fi
   make_archive
   local spec agent hub_agent hub_token
   hub_agent="$(fleet_hub_agent)"
@@ -3057,8 +3235,8 @@ main() {
     if [ "$agent" = "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
     fi
-  done < <(selected_hosts "$@")
+  done < <(selected_hosts "${REQUESTED_AGENTS[@]}")
   rm -rf "$TMPDIR_LOCAL"
 }
 
-main "$@"
+main
