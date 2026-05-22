@@ -3368,18 +3368,20 @@ PY
 }
 
 verify_hub_registration() {
-  local check_url="${MAC_HUB_URL:-$HUB_URL}"
-  # When this node IS the hub, the external service DNS may not expose the API
-  # port. Check localhost first; fall back to the configured hub_url.
-  if [ "$WORKER_MODE" = "loop" ] && curl -fsS --max-time 3 \
-      -H "Authorization: Bearer $MAC_WORKER_TOKEN" \
-      "http://127.0.0.1:${MAC_PORT}/agents" >/dev/null 2>&1; then
+  # Hub nodes register with their own local API; the external service DNS may
+  # not expose the control-plane port (e.g. K8s Service without port 8789).
+  local check_url token
+  if [ "$WORKER_MODE" = "loop" ]; then
     check_url="http://127.0.0.1:${MAC_PORT}"
+    token="${MAC_API_TOKEN}"
+  else
+    check_url="${MAC_HUB_URL:-$HUB_URL}"
+    token="${MAC_WORKER_TOKEN}"
   fi
   log "verifying mac-agent registration with hub ${check_url}"
   local attempt
   for attempt in $(seq 1 10); do
-    if curl -fsS -H "Authorization: Bearer $MAC_WORKER_TOKEN" \
+    if curl -fsS --max-time 10 -H "Authorization: Bearer $token" \
       "${check_url}/agents" > "$LOG_DIR/hub-agents.json"; then
       if "$PY" - "$LOG_DIR/hub-agents.json" "${MAC_WORKER_AGENT_NAME:-$AGENT}" <<'PY'; then
 import json
