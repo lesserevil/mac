@@ -2,8 +2,8 @@
 # install-tailscale.sh — install Tailscale and join the fleet mesh network.
 #
 # Supports two control plane modes:
-#   headscale (default) — self-hosted, no external account needed
-#   tailscale cloud     — Tailscale SaaS (requires TAILSCALE_AUTH_KEY)
+#   tailscale cloud — Tailscale SaaS (requires TAILSCALE_AUTH_KEY)
+#   headscale       — self-hosted control plane (requires explicit HEADSCALE_URL)
 #
 # In headscale mode HEADSCALE_URL and HEADSCALE_PREAUTHKEY must be set.
 # For the hub, these are written by install-headscale.sh. For workers they

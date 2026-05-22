@@ -36,18 +36,25 @@ defaults:
     port: 6333
     image: docker.io/qdrant/qdrant:latest
     memory_limit: 2g
-  tailscale:
+  network:
+    provider: tailscale
     install: auto
-    # headscale: auto (default) — use self-hosted headscale on the hub; no external account needed.
-    # Set to "no" to use Tailscale cloud instead (requires MAC_DEPLOY_TAILSCALE_AUTH_KEY in env).
-    headscale: auto
-    headscale_port: 8080
-    # headscale_public_addr: hub's externally routable address for the headscale API.
-    # Workers must be able to reach hub:headscale_port for initial mesh registration.
-    # Defaults to the hub's SSH target hostname if blank.
-    headscale_public_addr: ""
     # hostname_prefix: optional string prepended to each agent name as the Tailscale hostname.
     hostname_prefix: ""
+    tailscale:
+      auth_key_env: MAC_DEPLOY_TAILSCALE_AUTH_KEY
+    # Headscale is an advanced provider. To use it, set provider: headscale
+    # and explicitly configure the login server, enrollment-key source, DNS
+    # assumption, and health check.
+    headscale:
+      manage: false
+      login_server: ""
+      health_url: ""
+      preauth_key_source: env
+      preauth_key_env: MAC_DEPLOY_HEADSCALE_PREAUTHKEY
+      port: 8080
+      public_addr: ""
+      dns: magicdns
 
 agents:
   - name: hub

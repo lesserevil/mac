@@ -35,7 +35,9 @@ Use this skill when the user asks to set up or deploy a new mac fleet and
 
 3. The wizard asks for fleet topology, hub, supervisor, Slack home channel,
    per-agent Hermes models, worker mode, canary policy, shared Qdrant readiness,
-   and optional deploy hub token.
+   fleet network provider, and optional deploy hub token. Keep Tailscale as the
+   default; use Headscale only when the user supplies an explicit login server,
+   enrollment-key source, DNS assumption, and health check.
 
 4. Source the generated caller-machine env, then deploy:
 
@@ -54,5 +56,7 @@ Before deploy, run:
 ```bash
 bash -n deploy/deploy-mac-fleet.sh
 bash -n deploy/install-qdrant-service.sh
+bash -n deploy/install-tailscale.sh
+bash -n deploy/install-headscale.sh
 uv run pytest tests/test_deploy_agent_configs.py tests/test_hermes_startup.py
 ```

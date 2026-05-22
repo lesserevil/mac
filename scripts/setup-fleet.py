@@ -227,46 +227,29 @@ def main(argv: List[str]) -> int:
 
     print("")
     print("Fleet mesh networking connects agents across networks without manual VPN config.")
-    print("headscale is self-hosted — no Tailscale account or external auth key needed.")
-    use_headscale = prompt_bool("Enable headscale fleet mesh networking?", default=True)
-    tailscale_install = "auto"
-    tailscale_headscale = "auto"
-    tailscale_headscale_port = "8080"
-    tailscale_headscale_public_addr = ""
-    tailscale_hostname_prefix = ""
+    print("Tailscale is the default. Headscale is advanced and must be configured explicitly.")
+    network_provider = prompt("Fleet network provider", default="tailscale", choices=["tailscale", "headscale", "none"])
+    network_install = "auto"
+    network_hostname_prefix = ""
     tailscale_auth_key = ""
-    if use_headscale:
-        tailscale_headscale = "yes"
-        tailscale_headscale_port = prompt("Headscale port (workers must reach hub on this port)", default="8080")
-        # Derive hub public addr for headscale server_url from SSH target
-        hub_host = hub_target.rsplit("@", 1)[-1].strip() or hub_target
-        tailscale_headscale_public_addr = prompt(
-            "Hub's publicly routable address for headscale",
-            default=hub_host,
-            required=True,
-        )
-        # Hub gets first IP in headscale's default prefix (100.64.0.1)
-        ts_hub_ip = "100.64.0.1"
-        ts_hub_url = "http://%s:8789" % ts_hub_ip
-        if prompt_bool("Set hub URL to headscale IP %s?" % ts_hub_url, default=True):
-            hub_url = ts_hub_url
-            ts_qdrant_url = "http://%s:6333" % ts_hub_ip
-            if prompt_bool("Set Qdrant URL to headscale IP %s?" % ts_qdrant_url, default=True):
-                qdrant_url = ts_qdrant_url
-        tailscale_hostname_prefix = prompt(
-            "Tailscale hostname prefix for fleet agents (blank for none)",
-            default="",
-        )
-    else:
-        # Cloud Tailscale fallback — requires an auth key
-        tailscale_headscale = "no"
-        tailscale_auth_key = prompt("Tailscale cloud auth key (blank to skip mesh networking)", default="")
+    headscale_manage = False
+    headscale_login_server = ""
+    headscale_health_url = ""
+    headscale_preauth_key_source = "env"
+    headscale_preauth_key_env = "MAC_DEPLOY_HEADSCALE_PREAUTHKEY"
+    headscale_preauth_key = ""
+    headscale_port = "8080"
+    headscale_public_addr = ""
+    headscale_dns = "magicdns"
+
+    if network_provider == "tailscale":
+        tailscale_auth_key = prompt("Tailscale auth key (blank to skip automatic mesh join)", default="")
         if tailscale_auth_key:
-            tailscale_hostname_prefix = prompt(
+            network_hostname_prefix = prompt(
                 "Tailscale hostname prefix for fleet agents (blank for none)",
                 default="",
             )
-            ts_hub_name = "%s%s" % (tailscale_hostname_prefix, hub_name)
+            ts_hub_name = "%s%s" % (network_hostname_prefix, hub_name)
             if prompt_bool(
                 "Set hub URL to Tailscale MagicDNS name http://%s:8789?" % ts_hub_name,
                 default=True,
@@ -277,6 +260,55 @@ def main(argv: List[str]) -> int:
                     default=True,
                 ):
                     qdrant_url = "http://%s:6333" % ts_hub_name
+    elif network_provider == "headscale":
+        print("Headscale requires a reachable login server and an enrollment key source.")
+        headscale_mode = prompt("Headscale mode", default="external", choices=["external", "managed-hub"])
+        headscale_manage = headscale_mode == "managed-hub"
+        headscale_login_server = prompt("Headscale login server URL", required=True)
+        headscale_health_url = prompt(
+            "Headscale health check URL",
+            default="%s/health" % headscale_login_server.rstrip("/"),
+            required=True,
+        )
+        if headscale_manage:
+            headscale_preauth_key_source = "hub-managed"
+            headscale_port = prompt("Managed Headscale listen port", default="8080")
+            headscale_public_addr = prompt(
+                "Managed Headscale public address override (blank to use login server URL)",
+                default="",
+            )
+        else:
+            headscale_preauth_key_source = prompt(
+                "Headscale preauth key source",
+                default="env",
+                choices=["env", "hub-managed"],
+            )
+            headscale_preauth_key_env = prompt(
+                "Headscale preauth key env var",
+                default="MAC_DEPLOY_HEADSCALE_PREAUTHKEY",
+                required=True,
+            )
+            if headscale_preauth_key_source == "env":
+                headscale_preauth_key = prompt(
+                    "Headscale preauth key value for ~/.mac/.env (blank to provide at deploy time)",
+                    default="",
+                )
+        headscale_dns = prompt("Headscale DNS assumption", default="magicdns", choices=["magicdns", "none"])
+        network_hostname_prefix = prompt(
+            "Tailscale hostname prefix for fleet agents (blank for none)",
+            default="",
+        )
+        hs_host = "%s%s" % (network_hostname_prefix, hub_name)
+        if headscale_dns == "magicdns" and prompt_bool(
+            "Set hub URL to Headscale MagicDNS name http://%s.mac.internal:8789?" % hs_host,
+            default=False,
+        ):
+            hub_url = "http://%s.mac.internal:8789" % hs_host
+            if prompt_bool(
+                "Set Qdrant URL to http://%s.mac.internal:6333?" % hs_host,
+                default=False,
+            ):
+                qdrant_url = "http://%s.mac.internal:6333" % hs_host
 
     agents = [
         build_agent(
@@ -339,12 +371,23 @@ def main(argv: List[str]) -> int:
                 "image": "docker.io/qdrant/qdrant:latest",
                 "memory_limit": "2g",
             },
-            "tailscale": {
-                "install": tailscale_install,
-                "headscale": tailscale_headscale,
-                "headscale_port": int(tailscale_headscale_port) if tailscale_headscale_port.isdigit() else 8080,
-                "headscale_public_addr": tailscale_headscale_public_addr,
-                "hostname_prefix": tailscale_hostname_prefix,
+            "network": {
+                "provider": network_provider,
+                "install": network_install,
+                "hostname_prefix": network_hostname_prefix,
+                "tailscale": {
+                    "auth_key_env": "MAC_DEPLOY_TAILSCALE_AUTH_KEY",
+                },
+                "headscale": {
+                    "manage": headscale_manage,
+                    "login_server": headscale_login_server,
+                    "health_url": headscale_health_url,
+                    "preauth_key_source": headscale_preauth_key_source,
+                    "preauth_key_env": headscale_preauth_key_env,
+                    "port": int(headscale_port) if str(headscale_port).isdigit() else 8080,
+                    "public_addr": headscale_public_addr,
+                    "dns": headscale_dns,
+                },
             },
         },
         "agents": agents,
@@ -365,6 +408,8 @@ def main(argv: List[str]) -> int:
         env_values["MAC_DEPLOY_HUB_TOKEN"] = hub_token
     if tailscale_auth_key:
         env_values["MAC_DEPLOY_TAILSCALE_AUTH_KEY"] = tailscale_auth_key
+    if headscale_preauth_key:
+        env_values[headscale_preauth_key_env] = headscale_preauth_key
 
     registry = load_fleet_registry(fleets_config)
     fleets = registry.get("fleets")

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # install-headscale.sh — install headscale control plane on the hub.
 #
-# Headscale is the self-hosted Tailscale control plane. Running it on the
-# hub means the fleet needs no external Tailscale account or auth keys.
+# Headscale is the self-hosted Tailscale control plane. This script is used
+# only when a fleet explicitly selects network.provider=headscale.
 # After this script runs, mac.env contains:
 #   HEADSCALE_URL=http://localhost:<port>      (used by hub's own tailscale up)
-#   HEADSCALE_FLEET_URL=http://<public>:<port> (used by worker tailscale up)
+#   HEADSCALE_FLEET_URL=<login-server-url>     (used by worker tailscale up)
 #   HEADSCALE_PREAUTHKEY=<reusable-key>        (used by all agents)
 set -euo pipefail
 
@@ -20,8 +20,10 @@ HEADSCALE_VERSION="${HEADSCALE_VERSION:-0.25.1}"
 HEADSCALE_PORT="${HEADSCALE_PORT:-8080}"
 # The address workers use to reach headscale (hub's publicly routable addr)
 HEADSCALE_PUBLIC_ADDR="${HEADSCALE_PUBLIC_ADDR:-}"
+HEADSCALE_FLEET_URL="${HEADSCALE_FLEET_URL:-}"
 HEADSCALE_USER="${HEADSCALE_USER:-mac-fleet}"
 HEADSCALE_IP_PREFIX="${HEADSCALE_IP_PREFIX:-100.64.0.0/10}"
+HEADSCALE_DNS="${HEADSCALE_DNS:-magicdns}"
 HEADSCALE_DATA_DIR="${HEADSCALE_DATA_DIR:-/var/lib/headscale}"
 HEADSCALE_CONFIG_DIR="${HEADSCALE_CONFIG_DIR:-/etc/headscale}"
 HEADSCALE_BIN="${HEADSCALE_BIN:-/usr/local/bin/headscale}"
@@ -110,14 +112,21 @@ sudo install -d -m 0755 "$HEADSCALE_CONFIG_DIR"
 sudo install -d -m 0750 "$HEADSCALE_DATA_DIR"
 sudo chown "$USER" "$HEADSCALE_DATA_DIR" 2>/dev/null || true
 
-# Derive public address from HEADSCALE_PUBLIC_ADDR or the SSH_CLIENT origin
-if [ -z "$HEADSCALE_PUBLIC_ADDR" ]; then
+# Derive login server from explicit HEADSCALE_FLEET_URL first. If only a
+# public address is supplied, build the URL from HEADSCALE_PORT.
+if [ -z "$HEADSCALE_FLEET_URL" ] && [ -z "$HEADSCALE_PUBLIC_ADDR" ]; then
   # Try to get the public IP via a metadata service or hostname
   HEADSCALE_PUBLIC_ADDR="$(curl -fsS --connect-timeout 3 http://checkip.amazonaws.com 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")"
 fi
 
-HEADSCALE_FLEET_URL="http://${HEADSCALE_PUBLIC_ADDR}:${HEADSCALE_PORT}"
+if [ -z "$HEADSCALE_FLEET_URL" ]; then
+  HEADSCALE_FLEET_URL="http://${HEADSCALE_PUBLIC_ADDR}:${HEADSCALE_PORT}"
+fi
 HEADSCALE_LOCAL_URL="http://127.0.0.1:${HEADSCALE_PORT}"
+HEADSCALE_MAGIC_DNS="true"
+case "$HEADSCALE_DNS" in
+  none|disabled|off|false|FALSE|0) HEADSCALE_MAGIC_DNS="false" ;;
+esac
 
 echo "[headscale] Configuring server_url=${HEADSCALE_FLEET_URL}"
 
@@ -157,7 +166,7 @@ log:
   level: warn
 
 dns:
-  magic_dns: true
+  magic_dns: ${HEADSCALE_MAGIC_DNS}
   base_domain: mac.internal
 EOF
 

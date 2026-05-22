@@ -54,6 +54,9 @@ def test_sample_fleet_config_supports_home_channel_and_model_diversity():
     cfg = load_sample_fleet_config()
     assert cfg["defaults"]["hermes"]["slack_home_channel_name"] == ""
     assert cfg["defaults"]["hermes"]["gateway_provider"] == "custom"
+    assert cfg["defaults"]["network"]["provider"] == "tailscale"
+    assert cfg["defaults"]["network"]["headscale"]["manage"] is False
+    assert cfg["defaults"]["network"]["headscale"]["preauth_key_env"] == "MAC_DEPLOY_HEADSCALE_PREAUTHKEY"
 
     models = [
         agent.get("hermes", {}).get("gateway_model")
@@ -205,6 +208,20 @@ def test_fleet_deploy_uses_home_scoped_registry_not_legacy_site_config():
     assert "FLEET_SITE_CONFIG" not in script
 
 
+def test_fleet_deploy_network_provider_contract_is_explicit():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    sample = (ROOT / "deploy" / "fleet" / "config.yaml").read_text(encoding="utf-8")
+
+    assert "network_provider = text_field(network.get(\"provider\"))" in script
+    assert "network.provider must be tailscale, headscale, or none" in script
+    assert "Headscale provider requires network.headscale.login_server" in script
+    assert "HEADSCALE_HEALTH_URL" in script
+    assert "MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE" in script
+    assert "network:" in sample
+    assert "provider: tailscale" in sample
+    assert "provider: headscale" in sample
+
+
 def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
     fleets_config = tmp_path / ".mac" / "fleets.yaml"
     env_file = tmp_path / ".mac" / ".env"
@@ -224,9 +241,11 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
             "",
             "",
             "",
+            "",
             "n",
             "n",
             "n",
+            "",
             "",
         ]
     )
@@ -259,12 +278,81 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
     assert cfg["defaults"]["hermes"]["slack_home_channel_name"] == "ops"
     assert cfg["defaults"]["qdrant"]["required"] is True
     assert cfg["defaults"]["qdrant"]["url"] == "http://hub.example.internal:6333"
+    assert cfg["defaults"]["network"]["provider"] == "tailscale"
+    assert cfg["defaults"]["network"]["install"] == "auto"
+    assert cfg["defaults"]["network"]["headscale"]["manage"] is False
     assert "MAC_DEPLOY_FLEETS_CONFIG=" in env
     assert "MAC_DEPLOY_HUB_AGENT=hub" in env
     assert "MAC_DEPLOY_FLEET_SITE_CONFIG=" not in env
     assert "MAC_DEPLOY_HUB_URL=" not in env
     assert "MAC_SECRET_KEY" not in env
     assert "MAC_API_TOKEN" not in env
+
+
+def test_setup_fleet_wizard_can_write_explicit_headscale_provider(tmp_path):
+    fleets_config = tmp_path / ".mac" / "fleets.yaml"
+    env_file = tmp_path / ".mac" / ".env"
+    answers = "\n".join(
+        [
+            "headscale-fleet",
+            "hub",
+            "operator@hub.example.internal",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "n",
+            "y",
+            "",
+            "",
+            "headscale",
+            "external",
+            "https://headscale.example.internal",
+            "",
+            "",
+            "",
+            "hs-preauth-key",
+            "",
+            "",
+            "n",
+            "n",
+            "n",
+            "",
+            "",
+        ]
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "setup-fleet.py"),
+            "--force",
+            "--fleets-config",
+            str(fleets_config),
+            "--env-file",
+            str(env_file),
+        ],
+        input=answers + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    registry = yaml.safe_load(fleets_config.read_text(encoding="utf-8"))
+    network = registry["fleets"]["hub"]["defaults"]["network"]
+    env = env_file.read_text(encoding="utf-8")
+
+    assert network["provider"] == "headscale"
+    assert network["headscale"]["manage"] is False
+    assert network["headscale"]["login_server"] == "https://headscale.example.internal"
+    assert network["headscale"]["health_url"] == "https://headscale.example.internal/health"
+    assert network["headscale"]["preauth_key_source"] == "env"
+    assert network["headscale"]["preauth_key_env"] == "MAC_DEPLOY_HEADSCALE_PREAUTHKEY"
+    assert network["headscale"]["dns"] == "magicdns"
+    assert "MAC_DEPLOY_HEADSCALE_PREAUTHKEY=hs-preauth-key" in env
 
 
 def test_executor_prompt_includes_repository_runtime_contract():

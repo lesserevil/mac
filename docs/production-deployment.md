@@ -98,7 +98,8 @@ bash setup.sh
 
 The wizard asks for the hub, agents, SSH targets, OS families, supervisors,
 Slack home channel, per-agent Hermes model selectors, worker mode, canary
-policy, Qdrant shared-memory endpoint, and optional hub token. It writes:
+policy, Qdrant shared-memory endpoint, fleet network provider, and optional
+hub token. It writes:
 
 - `~/.mac/fleets.yaml`: home-scoped multi-fleet topology, keyed by hub node.
 - `~/.mac/.env`: caller-machine deploy settings and local secrets, mode 0600.
@@ -126,6 +127,17 @@ Fleet deploy reads `~/.mac/fleets.yaml` by default. Override
 `MAC_DEPLOY_FLEETS_CONFIG` when a different registry path is required. The hub
 node name selects the fleet. Host-local secret env files still own tokens and
 provider credentials.
+
+Fleet mesh networking is configured under `defaults.network` or per-agent
+`network` overrides in `~/.mac/fleets.yaml`. `provider: tailscale` is the
+default and uses `MAC_DEPLOY_TAILSCALE_AUTH_KEY` from `~/.mac/.env` when
+automatic join is desired. `provider: headscale` is an explicit advanced mode:
+the fleet registry must declare `headscale.login_server`,
+`headscale.health_url`, `headscale.preauth_key_source`,
+`headscale.preauth_key_env`, and the DNS assumption. Managed-hub Headscale is
+available with `headscale.manage: true`, but it should be treated as a shared
+service with backup, monitoring, and recovery expectations rather than an
+implicit default.
 
 Fleet deploy is supervisor-driven, not Linux-systemd-only. Set
 `MAC_DEPLOY_SUPERVISOR=auto` unless a host needs an explicit override. Auto
