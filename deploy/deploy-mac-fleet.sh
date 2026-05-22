@@ -3695,7 +3695,7 @@ EOF
   # Remove stale worker-side hub tunnel conf from previous deploy approach
   sudo rm -f "$conf_dir/${FLEET_NAME}-hub-tunnel.conf" 2>/dev/null || true
   # Truncate gateway log so classify_gateway_logs only sees output from this deploy
-  : > "$LOG_DIR/hermes-gateway.log" 2>/dev/null || true
+  sudo truncate -s 0 "$LOG_DIR/hermes-gateway.log" 2>/dev/null || : > "$LOG_DIR/hermes-gateway.log" 2>/dev/null || true
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   run_supervisorctl reread >/dev/null
   run_supervisorctl update >/dev/null
