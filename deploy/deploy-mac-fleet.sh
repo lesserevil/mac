@@ -402,7 +402,7 @@ for name in selected:
     network = merge_dicts(defaults.get("network", {}) if isinstance(defaults.get("network"), dict) else {}, agent.get("network", {}) if isinstance(agent.get("network"), dict) else {})
     network_provider = text_field(network.get("provider"))
     if not network_provider:
-        network_provider = "tailscale"
+        network_provider = "none"
     if network_provider not in {"tailscale", "headscale", "none"}:
         print("ERROR: network.provider must be tailscale, headscale, or none", file=sys.stderr)
         raise SystemExit(2)
@@ -2775,7 +2775,7 @@ configured_qdrant_port = sys.argv[22].strip() or "6333"
 configured_firecrawl_url = sys.argv[23].strip()
 configured_firecrawl_required = sys.argv[24].strip() or "1"
 configured_firecrawl_port = sys.argv[25].strip() or "3002"
-network_provider = os.environ.get("NETWORK_PROVIDER", "tailscale").strip().lower()
+network_provider = os.environ.get("NETWORK_PROVIDER", "none").strip().lower()
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -4157,7 +4157,7 @@ main() {
     local_target="${spec_fields[1]}"
     hub_url_field="${spec_fields[7]:-}"
     fleet_name_field="${spec_fields[23]:-mac}"
-    network_provider_field="${spec_fields[31]:-tailscale}"
+    network_provider_field="${spec_fields[31]:-none}"
     if [ "$agent" != "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
       upsert_local_env "MAC_DEPLOY_HUB_TOKEN" "$hub_token"
