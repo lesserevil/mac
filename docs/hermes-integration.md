@@ -30,10 +30,10 @@ from mac.hermes_adapter import HermesMacAdapter, MacApiClient, PlatformBindingSp
 adapter = HermesMacAdapter(MacApiClient("http://127.0.0.1:8000"))
 registration = adapter.register_identity(
     tenant_name="personal",
-    persona_name="Rocky",
-    instance_name="rocky",
-    soul_ref="hermes://personal/rocky/SOUL.md",
-    memory_scope="hermes://personal/rocky/memory",
+    persona_name="AssistantOne",
+    instance_name="assistant-one",
+    soul_ref="hermes://personal/assistant-one/SOUL.md",
+    memory_scope="hermes://personal/assistant-one/memory",
     platform_bindings=[
         PlatformBindingSpec("slack", "T123/C456", "#ops"),
     ],
@@ -85,8 +85,8 @@ Relevant environment:
   mirrors it to `HERMES_INFERENCE_MODEL` so gateway conversations and worker
   oneshot execution use the same model on that host.
 - `MAC_HERMES_GATEWAY_PROVIDER`: provider selector for the per-agent model.
-  The Rocky/Natasha/Bullwinkle fleet uses `custom` with TokenHub as the shared
-  OpenAI-compatible endpoint.
+  Fleets normally use `custom` with TokenHub as the shared OpenAI-compatible
+  endpoint.
 - `MAC_HERMES_GATEWAY_BASE_URL`: optional explicit base URL. Usually omitted
   when `TOKENHUB_URL` is available because mac derives `${TOKENHUB_URL}/v1`.
 - `MAC_HERMES_STARTUP_CHECK=0`: disable the check.
@@ -108,8 +108,8 @@ The same explicit-checkout rule applies to the gateway runtime shim. When a
 per-agent model/provider/base URL is configured, `mac` patches upstream Hermes
 `gateway/run.py` so the gateway resolves runtime credentials from TokenHub or
 host-local secrets while preserving the agent-specific model. This is how mac
-keeps Rocky, Natasha, and Bullwinkle on different model families for review
-diversity without forking Hermes or storing provider secrets in Git.
+keeps configured agents on different model families for review diversity
+without forking Hermes or storing provider secrets in Git.
 
 ## Creating Tasks
 

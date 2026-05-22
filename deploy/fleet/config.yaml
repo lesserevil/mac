@@ -1,0 +1,64 @@
+# Sample mac fleet configuration.
+#
+# Copy this file to deploy/fleet/config-site.yaml and edit it for your own
+# machines before running deploy/deploy-mac-fleet.sh. The site file is ignored
+# by Git. Do not put bearer tokens or provider keys in this YAML; use
+# ~/.mac/.env and host-local secret stores for secrets.
+
+sample: true
+fleet_name: example
+
+hub_agent: hub
+hub_url: http://hub.example.internal:8789
+shared_services_manager_agent: hub
+
+defaults:
+  supervisor: auto
+  hermes:
+    slack_home_channel_name: ""
+    gateway_provider: custom
+    gateway_base_url: ""
+  worker:
+    mode: heartbeat
+    capabilities:
+      - ops
+      - python
+      - hermes
+      - review
+    allowed_projects: ""
+    required_metadata: ""
+    require_canary: true
+  qdrant:
+    install: auto
+    required: true
+    url: ""
+    bind_addr: ""
+    port: 6333
+    image: docker.io/qdrant/qdrant:latest
+    memory_limit: 2g
+
+agents:
+  - name: hub
+    enabled: true
+    target: user@hub.example.internal
+    os: linux
+    control_bind_host: 0.0.0.0
+    hermes:
+      gateway_model: provider/family/hub-model
+    worker:
+      mode: loop
+      require_canary: false
+
+  - name: worker-linux
+    enabled: false
+    target: user@worker-linux.example.internal
+    os: linux
+    hermes:
+      gateway_model: provider/family/linux-worker-model
+
+  - name: worker-macos
+    enabled: false
+    target: user@worker-macos.example.internal
+    os: darwin
+    hermes:
+      gateway_model: provider/family/macos-worker-model

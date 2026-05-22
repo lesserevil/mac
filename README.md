@@ -62,6 +62,12 @@ Hermes is the primary interaction agent:
 decisions, rollout events, and durable facts needed to audit work. User memory
 and personality memory stay in Hermes.
 
+Shared long-term recall is hub-managed infrastructure. The hub runs Qdrant for
+shared level-2 memory, while each agent keeps its local Hermes soul,
+conversation state, and private memory under `HERMES_HOME`. Fleet deploy writes
+a Hermes-visible memory topology file that tells every agent where those
+boundaries are and which hub endpoint owns shared services.
+
 The identity framework reflects that split:
 
 - `tenant`: an organization or isolated user deployment.
@@ -200,8 +206,8 @@ authoring UI for humans to edit plans and answer all agent questions up front.
 mac --db mac.db machine register workstation-1
 mac --db mac.db agent register machine_... worker --capabilities python,review
 mac --db mac.db tenant register personal
-mac --db mac.db persona register tenant_... Rocky --soul-ref hermes://personal/rocky/SOUL.md --memory-scope hermes://personal/rocky/memory
-mac --db mac.db hermes register tenant_... rocky --persona-id persona_... --home-ref hermes://personal/rocky
+mac --db mac.db persona register tenant_... AssistantOne --soul-ref hermes://personal/assistant-one/SOUL.md --memory-scope hermes://personal/assistant-one/memory
+mac --db mac.db hermes register tenant_... assistant-one --persona-id persona_... --home-ref hermes://personal/assistant-one
 mac --db mac.db binding register tenant_... hermes_... slack T123/C456 --display-name "#ops"
 mac --db mac.db interaction task hermes_... "Investigate deployment failure" --platform-binding-id binding_...
 mac --db mac.db task create "Implement feature" --required-capabilities python
@@ -262,16 +268,16 @@ mac --db mac.db migrate acc ~/.acc/data/acc.db --mode import \
 
 # Minimal worker harness: register/heartbeat first without claiming, then run
 # an executor-backed claim/start/evidence/submit loop.
-mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
-    --hostname rocky.local --capabilities python,ops,review \
+mac-agent --url http://hub.example.internal:8789 --register --agent-name worker-1 \
+    --hostname worker-1.local --capabilities python,ops,review \
     --resources '{"capacity":2}' --heartbeat-only
-mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
+mac-agent --url http://hub.example.internal:8789 --register --agent-name worker-1 \
     --capabilities python,ops,review --allowed-projects mac-canary --require-canary \
     --dry-run-claim
-mac-agent --url http://100.125.137.89:8789 --agent-id agent_... \
+mac-agent --url http://hub.example.internal:8789 --agent-id agent_... \
     --workspace ~/.mac-agent/workspaces --allowed-projects mac-canary \
     --require-canary --executor ~/.mac/bin/mac-hermes-task-executor
-mac-agent --url http://100.125.137.89:8789 --register --agent-name rocky \
+mac-agent --url http://hub.example.internal:8789 --register --agent-name worker-1 \
     --capabilities python,ops,review --loop --workspace ~/.mac-agent/workspaces \
     --allowed-projects mac-canary --require-canary \
     --executor ~/.mac/bin/mac-hermes-task-executor
@@ -288,10 +294,10 @@ Hermes-facing API adapter:
 ```bash
 mac-hermes --url http://127.0.0.1:8000 register \
   --tenant personal \
-  --persona Rocky \
-  --instance rocky \
-  --soul-ref hermes://personal/rocky/SOUL.md \
-  --memory-scope hermes://personal/rocky/memory \
+  --persona AssistantOne \
+  --instance assistant-one \
+  --soul-ref hermes://personal/assistant-one/SOUL.md \
+  --memory-scope hermes://personal/assistant-one/memory \
   --binding slack:T123/C456:#ops
 
 mac-hermes --url http://127.0.0.1:8000 task hermes_... \
@@ -305,10 +311,11 @@ mac-hermes --url http://127.0.0.1:8000 reply task_...
 mac-hermes --url http://127.0.0.1:8000 writeback hermes_... task_...
 ```
 
-Fleet deployment reads per-agent config from `deploy/agents/<agent>/config.env`.
-Those files set the SSH target, OS kind, and
-`MAC_HERMES_SLACK_HOME_CHANNEL_NAME`, which mac uses to keep Hermes'
-`slack_home_channels.json` aligned with the deployed agent.
+Fleet deployment reads generic defaults from `deploy/fleet/config.yaml` and
+site-specific topology from the ignored `deploy/fleet/config-site.yaml`.
+Run `bash setup.sh` to create the site file and `~/.mac/.env`; those files set
+the SSH targets, OS kinds, supervisors, Slack home channel, shared Qdrant
+endpoint, and per-agent Hermes model selectors.
 
 ## Design Docs
 

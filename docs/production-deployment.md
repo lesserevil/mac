@@ -37,8 +37,14 @@ deploying more than one writer.
 | `MAC_HERMES_GATEWAY_BASE_URL` | no | Optional explicit OpenAI-compatible base URL. Usually omitted because deployed hosts derive TokenHub's `/v1` endpoint from `TOKENHUB_URL`. |
 | `MAC_HERMES_STARTUP_CHECK` | no | Set `0` to disable Hermes state and Slack startup checks. Enabled by default. |
 | `MAC_REQUIRE_HERMES_STARTUP_READY` | no | Set `1` to fail `mac` startup when Hermes soul/memory/state references or Slack activation are not ready. |
-| `MAC_HERMES_SLACK_HOME_CHANNEL_NAME` | no | Slack home-channel name, without `#`, used to write `~/.hermes/slack_home_channels.json` from `slack_accounts.json`. Default `rockyandfriends`. |
+| `MAC_HERMES_SLACK_HOME_CHANNEL_NAME` | no | Slack home-channel name, without `#`, used to write `~/.hermes/slack_home_channels.json` from `slack_accounts.json`. Empty skips discovery. |
 | `MAC_HERMES_SYNC_SLACK_HOME_CHANNELS` | no | Set `0` to preserve existing Slack home-channel files without discovery. Default enabled. |
+| `MAC_SUPERVISOR_KIND` | no | Runtime supervisor selected by fleet deploy: `systemd`, `launchd`, or `supervisord`. |
+| `MAC_MEMORY_TOPOLOGY_FILE` | no | Hermes-visible memory topology JSON. Default `~/.hermes/mac-memory-topology.json`. |
+| `MAC_SHARED_SERVICES_MANAGER_AGENT` | no | Agent that owns hub-managed shared services. Defaults to the configured fleet hub. |
+| `QDRANT_URL` / `QDRANT_ADDRESS` / `QDRANT_FLEET_URL` | no | Shared Qdrant level-2 memory endpoint. When set, Hermes startup readiness validates `/collections`. |
+| `MAC_REQUIRE_QDRANT_MEMORY` | no | Set `1` to require shared Qdrant memory readiness. Fleet deploy enables this by default. |
+| `MAC_QDRANT_MEMORY_ALLOW_DEGRADED` | no | Temporary operator override that allows startup when required Qdrant is missing or unreachable. |
 
 Generate a secret key once:
 
@@ -81,30 +87,52 @@ curl -fsS http://127.0.0.1:8000/health
 The unit binds to `127.0.0.1:8000`. Put a TLS-terminating reverse proxy
 (nginx, Caddy) in front for external access — do not expose the bare port.
 
-## One-Time ACC Replacement Deploy
+## Fleet Setup Wizard
 
-For the current Rocky/Natasha/Bullwinkle cutover, use the fleet deploy script:
+First-time deployments should use the setup wizard instead of hand-editing
+deployment YAML:
 
 ```bash
-deploy/deploy-mac-fleet.sh
+bash setup.sh
 ```
 
-Per-agent deploy settings live in `deploy/agents/<agent>/config.env`. The
-committed fleet configs set `MAC_DEPLOY_TARGET`, `MAC_DEPLOY_OS`,
-`MAC_HERMES_SLACK_HOME_CHANNEL_NAME`, and a distinct
-`MAC_HERMES_GATEWAY_MODEL` for each agent. Host-local secret env files still
-own tokens. Override `MAC_DEPLOY_AGENT_CONFIG_DIR` to test an alternate config
-set.
+The wizard asks for the hub, agents, SSH targets, OS families, supervisors,
+Slack home channel, per-agent Hermes model selectors, worker mode, canary
+policy, Qdrant shared-memory endpoint, and optional hub token. It writes:
 
-The default fleet intentionally avoids model monoculture:
+- `deploy/fleet/config-site.yaml`: site-local fleet topology, ignored by Git.
+- `~/.mac/.env`: caller-machine deploy settings and local secrets, mode 0600.
 
-| Agent | Hermes model |
-|---|---|
-| Rocky | `azure/openai/gpt-5.5` |
-| Natasha | `azure/anthropic/claude-opus-4-7` |
-| Bullwinkle | `gcp/google/gemini-2.5-pro` |
+To deploy after the wizard:
 
-Fleet deploy mirrors each configured model into `ACC_HERMES_GATEWAY_MODEL`,
+```bash
+set -a; . ~/.mac/.env; set +a
+bash deploy/deploy-mac-fleet.sh
+```
+
+The checked-in `deploy/fleet/config.yaml` is a generic sample only. It is
+marked `sample: true`, and `deploy/deploy-mac-fleet.sh` refuses to deploy from
+it unless `MAC_DEPLOY_ALLOW_SAMPLE_CONFIG=1` is set explicitly for tests.
+
+## One-Time ACC Replacement Deploy
+
+For a configured fleet, use the fleet deploy script:
+
+```bash
+bash deploy/deploy-mac-fleet.sh
+```
+
+Fleet deploy reads `deploy/fleet/config-site.yaml` by default. Override
+`MAC_DEPLOY_FLEET_SITE_CONFIG` to test another site file. Host-local secret env
+files still own tokens and provider credentials.
+
+Fleet deploy is supervisor-driven, not Linux-systemd-only. Set
+`MAC_DEPLOY_SUPERVISOR=auto` unless a host needs an explicit override. Auto
+selects `launchd` on macOS, `systemd` on systemd Linux, and `supervisord` when
+that is the available process supervisor. The selected value is written to
+`MAC_SUPERVISOR_KIND` and recorded in deploy manifests.
+
+Fleet deploy mirrors each configured per-agent model into `ACC_HERMES_GATEWAY_MODEL`,
 `HERMES_INFERENCE_MODEL`, and `ACC_LLM_MODEL` so upstream Hermes gateway turns
 and `mac-hermes-task-executor` oneshot work use the same per-agent identity.
 Credentials remain in TokenHub or inherited host-local env files; mac only
@@ -128,14 +156,22 @@ as a branch-tracking Git worktree and sets `MAC_SELF_UPDATE_REPO` to that path.
 That lets the AgentBus repo-update control message pull future changes and
 restart the listening `mac-agent` process without another manual deploy pass.
 
-The fleet topology is hub-and-spoke, matching ACC. Rocky is the default hub at
-`http://100.125.137.89:8789`; Natasha, Bullwinkle, and other spokes keep a
-host-local control plane for local state and Hermes startup checks, but their
-`mac-agent` service registers and heartbeats against Rocky. By default the hub
-binds `0.0.0.0` and spokes bind `127.0.0.1`.
+The fleet topology is hub-and-spoke, matching ACC. The configured hub exposes
+the shared control plane URL from `hub_url`; spokes keep a host-local control
+plane for local state and Hermes startup checks, but their `mac-agent` service
+registers and heartbeats against the configured hub. By default the hub binds
+`0.0.0.0` and spokes bind `127.0.0.1`.
 Runtime lazy dependency installs are disabled after the preinstall step, and
 `HERMES_REDACT_SECRETS=false` in inherited Hermes env files is corrected to
 `true` because disabled redaction is treated as state drift.
+
+The hub also owns the shared-services layer. Fleet deploy installs Qdrant on
+the shared-services manager agent by default and configures every agent with
+the same `QDRANT_URL` / `QDRANT_FLEET_URL`. Each agent receives a
+Hermes-visible `~/.hermes/mac-memory-topology.json` plus `.env` pointers that
+describe local Hermes soul/conversation state, mac operational provenance, and
+hub-managed shared level-2 memory. `/startup/hermes` reports
+`qdrant_level2` readiness using redacted endpoints only.
 
 Deployment logs and migration reports are written under `~/.mac/logs/` on each
 host:
@@ -177,16 +213,17 @@ The control-plane service does not execute tasks by itself. Each execution host
 must run a worker process that registers or refreshes its machine/agent row,
 heartbeats, then claims eligible open work with a real executor. Fleet deploy
 installs that process as a service in `heartbeat` mode by default so hosts are
-visible in Rocky's registry without claiming imported ACC work prematurely:
+visible in the configured hub registry without claiming imported ACC work
+prematurely:
 
 ```bash
-mac-agent --url http://100.125.137.89:8789 --register \
-  --agent-name rocky --hostname rocky.local \
+mac-agent --url http://hub.example.internal:8789 --register \
+  --agent-name worker-1 --hostname worker-1.local \
   --capabilities python,ops,review --resources '{"capacity":2}' \
   --heartbeat-only
 
-mac-agent --url http://100.125.137.89:8789 --register \
-  --agent-name rocky --capabilities python,ops,review \
+mac-agent --url http://hub.example.internal:8789 --register \
+  --agent-name worker-1 --capabilities python,ops,review \
   --workspace ~/.mac-agent/workspaces --loop \
   --executor ~/.mac/bin/mac-hermes-task-executor
 ```
@@ -230,10 +267,10 @@ also refreshes the owning agent's `last_seen_at`, keeps it `busy`, and preserves
 an invalid `idle` heartbeat while the lease is active.
 
 For already-migrated or pre-upgrade rows that are stuck in `needs_review`, run
-the backlog tick against Rocky:
+the backlog tick against the hub:
 
 ```bash
-curl -X POST 'http://100.125.137.89:8789/reviews/default/tick?limit=100&actor=operator'
+curl -X POST 'http://hub.example.internal:8789/reviews/default/tick?limit=100&actor=operator'
 ```
 
 Before enabling executor-backed claiming, use `dry-run` mode to record routing
@@ -283,7 +320,7 @@ the blast radius with project or metadata filters first.
 
 ## Beads Bridge
 
-Rocky's hub can turn ready Beads into durable mac tasks automatically. Register
+The hub can turn ready Beads into durable mac tasks automatically. Register
 each repository once:
 
 ```bash
@@ -297,12 +334,12 @@ each poll, and rejects repositories that do not declare their supported host
 families, bootstrap command, canonical test command, and required evidence.
 See [Repository Runtime Contract](repository-runtime-contract.md).
 
-The deploy script enables heartbeat polling on the hub agent (`rocky`) and
+The deploy script enables heartbeat polling on the configured hub agent and
 registers the deployed mac checkout by default through:
 
 ```bash
 MAC_BEADS_BRIDGE_ON_HEARTBEAT=1
-MAC_BEADS_BRIDGE_HUB_AGENT=rocky
+MAC_BEADS_BRIDGE_HUB_AGENT=<hub-agent-name>
 MAC_BEADS_AUTO_PULL=1
 MAC_BEADS_CLI=$HOME/.mac/bin/bd
 MAC_BEADS_BRIDGE_ROOT=$HOME/.mac/beads-checkouts
@@ -328,7 +365,7 @@ there. The registered path remains the canonical project path that workers use
 to create task-owned worktrees, but bridge polling is isolated from local
 self-update, deploy, and repair activity in `~/.mac/src/mac`.
 
-On each Rocky heartbeat or lease renewal, the control plane
+On each hub heartbeat or lease renewal, the control plane
 polls every enabled registered repository whose poll interval has elapsed. The
 poller first refreshes the managed bridge checkout. With `MAC_BEADS_AUTO_PULL=1`
 (default), the bridge checkout is cloned if missing, fetches its upstream, and
@@ -360,8 +397,10 @@ configured remote, mac moves that disposable DB aside, re-runs
 `bd bootstrap --yes`, and retries `bd dolt pull` before declaring drift.
 See [Integration Authority Contract](integration-authority-contract.md).
 
-The hub also advances the default review/publication workflow from heartbeat by
-default (`MAC_REVIEW_TICK_ON_HEARTBEAT=1`, `MAC_REVIEW_TICK_HUB_AGENT=rocky`).
+The hub also advances the default review/publication workflow from heartbeat
+when `MAC_REVIEW_TICK_ON_HEARTBEAT=1` and `MAC_REVIEW_TICK_HUB_AGENT` is set
+to the configured hub agent. Fleet deploy sets it from the same configured hub
+agent used by `MAC_BEADS_BRIDGE_HUB_AGENT` unless explicitly overridden.
 The tick only moves tasks when required evidence, reviewer verdicts, and
 publication targets are present; otherwise it records explicit waiting reasons
 in observability.
@@ -444,7 +483,7 @@ as result streams instead of being forced. Result streams use topic
 To broadcast a source update from the hub:
 
 ```bash
-mac --db ~/.mac/mac.db agentbus repo-update agent_rocky --all-agents
+mac --db ~/.mac/mac.db agentbus repo-update agent_<hub> --all-agents
 ```
 
 ## Roles, Workflows, and Provisioning

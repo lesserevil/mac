@@ -6,6 +6,10 @@ dist/
 *.db
 *.sqlite
 
+# Site-local fleet configuration and secrets.
+deploy/fleet/config-site.yaml
+~/.mac/.env
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 .beads-credential-key

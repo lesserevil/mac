@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 
 import yaml
 
@@ -17,52 +19,55 @@ def parse_env(path: Path):
     return values
 
 
-def test_fleet_agent_configs_include_hermes_home_channel():
-    expected = {
-        "rocky": ("jkh@100.125.137.89", "linux"),
-        "natasha": ("jkh@100.87.229.125", "linux"),
-        "bullwinkle": ("jkh@100.72.16.110", "darwin"),
-    }
-
-    for agent, (target, os_kind) in expected.items():
-        values = parse_env(ROOT / "deploy" / "agents" / agent / "config.env")
-        assert values["MAC_DEPLOY_AGENT"] == agent
-        assert values["MAC_DEPLOY_TARGET"] == target
-        assert values["MAC_DEPLOY_OS"] == os_kind
-        assert values["MAC_HERMES_SLACK_HOME_CHANNEL_NAME"] == "rockyandfriends"
+def load_sample_fleet_config():
+    return yaml.safe_load((ROOT / "deploy" / "fleet" / "config.yaml").read_text(encoding="utf-8"))
 
 
-def test_fleet_agent_configs_use_distinct_hermes_models():
-    expected_models = {
-        "rocky": "azure/openai/gpt-5.5",
-        "natasha": "azure/anthropic/claude-opus-4-7",
-        "bullwinkle": "gcp/google/gemini-2.5-pro",
-    }
-    models = []
+def test_sample_fleet_config_is_generic_and_site_local():
+    cfg = load_sample_fleet_config()
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    rendered = "\n".join(
+        [
+            (ROOT / "deploy" / "fleet" / "config.yaml").read_text(encoding="utf-8"),
+            (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8"),
+            (ROOT / "deploy" / "systemd" / "mac.env.example").read_text(encoding="utf-8"),
+        ]
+    )
 
-    for agent, expected_model in expected_models.items():
-        values = parse_env(ROOT / "deploy" / "agents" / agent / "config.env")
-        model = values["MAC_HERMES_GATEWAY_MODEL"]
-        models.append(model)
-        assert model == expected_model
-        assert values["MAC_HERMES_GATEWAY_PROVIDER"] == "custom"
+    assert cfg["sample"] is True
+    assert cfg["hub_agent"] == "hub"
+    assert cfg["shared_services_manager_agent"] == "hub"
+    assert "deploy/fleet/config-site.yaml" in gitignore
+    assert "deploy/agents/" not in rendered
+    assert "rocky" not in rendered.lower()
+    assert "natasha" not in rendered.lower()
+    assert "bullwinkle" not in rendered.lower()
+    assert "100.125.137.89" not in rendered
 
+
+def test_sample_fleet_config_supports_home_channel_and_model_diversity():
+    cfg = load_sample_fleet_config()
+    assert cfg["defaults"]["hermes"]["slack_home_channel_name"] == ""
+    assert cfg["defaults"]["hermes"]["gateway_provider"] == "custom"
+
+    models = [
+        agent.get("hermes", {}).get("gateway_model")
+        for agent in cfg["agents"]
+        if agent.get("hermes", {}).get("gateway_model")
+    ]
+    assert len(models) >= 3
     assert len(set(models)) == len(models)
 
 
 def test_fleet_agent_configs_enable_review_capability_by_default():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
-    template = parse_env(ROOT / "deploy" / "agents" / "TEMPLATE" / "config.env")
+    cfg = load_sample_fleet_config()
 
-    assert 'MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes,review"' in script
+    assert 'text_field(worker.get("capabilities") or "ops,python,hermes,review")' in script
     assert 'WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}"' in script
     assert 'configured_worker_capabilities = sys.argv[13].strip() or "ops,python,hermes,review"' in script
     assert 'capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review}"' in script
-    assert template["MAC_DEPLOY_WORKER_CAPABILITIES"] == "ops,python,hermes,review"
-
-    for agent in ("rocky", "natasha", "bullwinkle"):
-        values = parse_env(ROOT / "deploy" / "agents" / agent / "config.env")
-        assert values["MAC_DEPLOY_WORKER_CAPABILITIES"] == "ops,python,hermes,review"
+    assert cfg["defaults"]["worker"]["capabilities"] == ["ops", "python", "hermes", "review"]
 
 
 def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
@@ -149,6 +154,94 @@ def test_fleet_deploy_applies_hermes_patch_set():
     assert "Shutdown chat notifications disabled by MAC deployment policy." in quench_patch.read_text(
         encoding="utf-8"
     )
+
+
+def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    qdrant_installer = (ROOT / "deploy" / "install-qdrant-service.sh").read_text(
+        encoding="utf-8"
+    )
+    env_example = parse_env(ROOT / "deploy" / "systemd" / "mac.env.example")
+    cfg = load_sample_fleet_config()
+
+    assert 'SUPERVISOR_REQUESTED="${MAC_DEPLOY_SUPERVISOR:-auto}"' in script
+    assert "detect_supervisor()" in script
+    assert "systemd|launchd|supervisord" in script
+    assert "install_supervisord_service()" in script
+    assert "write_hermes_memory_topology()" in script
+    assert "install_or_validate_shared_services" in script
+    assert "mac.hermes.memory_topology.v1" in script
+    assert "QDRANT_FLEET_URL" in script
+    assert 'if ! truthy "$required"; then' in script
+    assert 'values.pop(key, None)' in script
+    assert 'updates["QDRANT_URL"] = None' in script
+    assert 'values.setdefault("MAC_REVIEW_TICK_HUB_AGENT", shared_services_manager)' in script
+    assert "mac-qdrant.service" in qdrant_installer
+    assert "com.mac.qdrant" in qdrant_installer
+    assert "[program:mac-qdrant]" in qdrant_installer
+    assert cfg["defaults"]["supervisor"] == "auto"
+    assert cfg["shared_services_manager_agent"] == "hub"
+    assert cfg["defaults"]["qdrant"]["install"] == "auto"
+    assert cfg["defaults"]["qdrant"]["required"] is True
+    assert env_example["MAC_REQUIRE_QDRANT_MEMORY"] == "1"
+    assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
+
+
+def test_setup_fleet_wizard_writes_site_config_and_env(tmp_path):
+    site_config = tmp_path / "config-site.yaml"
+    env_file = tmp_path / ".mac" / ".env"
+    answers = "\n".join(
+        [
+            "test-fleet",
+            "hub",
+            "operator@hub.example.internal",
+            "",
+            "",
+            "",
+            "ops",
+            "provider/family/hub-model",
+            "",
+            "n",
+            "y",
+            "",
+            "",
+            "n",
+            "n",
+            "n",
+            "",
+        ]
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "setup-fleet.py"),
+            "--force",
+            "--site-config",
+            str(site_config),
+            "--env-file",
+            str(env_file),
+        ],
+        input=answers + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    cfg = yaml.safe_load(site_config.read_text(encoding="utf-8"))
+    env = env_file.read_text(encoding="utf-8")
+    assert cfg["sample"] is False
+    assert cfg["fleet_name"] == "test-fleet"
+    assert cfg["hub_agent"] == "hub"
+    assert cfg["agents"][0]["target"] == "operator@hub.example.internal"
+    assert cfg["defaults"]["hermes"]["slack_home_channel_name"] == "ops"
+    assert cfg["defaults"]["qdrant"]["required"] is True
+    assert cfg["defaults"]["qdrant"]["url"] == "http://hub.example.internal:6333"
+    assert "MAC_DEPLOY_FLEET_SITE_CONFIG=" in env
+    assert "MAC_DEPLOY_HUB_AGENT=hub" in env
+    assert "MAC_SECRET_KEY" not in env
+    assert "MAC_API_TOKEN" not in env
 
 
 def test_executor_prompt_includes_repository_runtime_contract():

@@ -51,7 +51,7 @@ operator killed the daemon). `mac` is still up.
    ```json
    {
      "tenant": {...},
-     "hermes_instance": {"name": "rocky", "persona_id": "persona_...", ...},
+     "hermes_instance": {"name": "assistant-one", "persona_id": "persona_...", ...},
      "persona": {"soul_ref": "hermes://...", "memory_scope": "hermes://...", ...},
      "platform_bindings": [...],
      "memory_contract": {

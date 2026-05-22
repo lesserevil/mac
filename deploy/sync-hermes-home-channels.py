@@ -33,7 +33,7 @@ def _home_channel_name() -> str:
         os.environ.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME")
         or os.environ.get("ACC_SLACK_HOME_CHANNEL_NAME")
         or os.environ.get("SLACK_HOME_CHANNEL_NAME")
-        or "rockyandfriends"
+        or ""
     ).strip().lstrip("#")
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -29,16 +31,31 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
         "MAC_HERMES_SLACK_HOME_CHANNEL_NAME",
+        "MAC_MEMORY_TOPOLOGY_FILE",
+        "MAC_QDRANT_CHECK_TIMEOUT_SECONDS",
+        "MAC_QDRANT_MEMORY",
+        "MAC_QDRANT_MEMORY_ALLOW_DEGRADED",
+        "MAC_QDRANT_MEMORY_ROLE",
         "MAC_REQUIRE_HERMES_STARTUP_READY",
+        "MAC_REQUIRE_QDRANT_MEMORY",
+        "MAC_SHARED_SERVICES_MANAGER_AGENT",
         "ACC_HERMES_GATEWAY_BASE_URL",
         "ACC_HERMES_GATEWAY_MODEL",
         "ACC_HERMES_GATEWAY_PROVIDER",
+        "ACC_QDRANT_MEMORY",
+        "ACC_QDRANT_MEMORY_ALLOW_DEGRADED",
+        "ACC_REQUIRE_QDRANT_MEMORY",
         "ACC_LLM_MODEL",
         "ACC_SLACK_HOME_CHANNEL_NAME",
         "CUSTOM_BASE_URL",
         "HERMES_INFERENCE_MODEL",
         "HERMES_INFERENCE_PROVIDER",
         "OPENAI_BASE_URL",
+        "QDRANT_ADDRESS",
+        "QDRANT_API_KEY",
+        "QDRANT_FLEET_KEY",
+        "QDRANT_FLEET_URL",
+        "QDRANT_URL",
         "SLACK_BOT_TOKEN",
         "SLACK_HOME_CHANNEL_NAME",
         "TOKENHUB_API_KEY",
@@ -409,6 +426,111 @@ def test_startup_detects_inherited_env_file_redaction_drift(monkeypatch, tmp_pat
     assert report["security"]["secret_redaction"]["drift_detected"] is True
     assert report["security"]["secret_redaction"]["env_files"][0]["redact_secrets"] == "false"
     assert "not-returned" not in str(report)
+
+
+def test_qdrant_shared_memory_disabled_without_endpoint(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["qdrant_level2"]["status"] == "disabled"
+    assert report["checks"]["shared_qdrant_memory_ready"] is True
+
+
+def test_required_qdrant_without_endpoint_blocks_readiness(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_REQUIRE_QDRANT_MEMORY", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["qdrant_level2"]["status"] == "missing_endpoint"
+    assert report["checks"]["shared_qdrant_memory_ready"] is False
+    assert "required Qdrant shared memory endpoint is not configured" in " ".join(
+        report["warnings"]
+    )
+
+
+def test_required_qdrant_endpoint_uses_redacted_topology(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    topology = hermes_home / "mac-memory-topology.json"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        topology,
+        json.dumps(
+            {
+                "schema": "mac.hermes.memory_topology.v1",
+                "agent": "hub",
+                "hub": {"agent": "hub", "url": "http://secret@hub.example.internal:8789"},
+                "shared_services": {
+                    "qdrant": {
+                        "url": "http://secret@hub.example.internal:6333?token=hidden",
+                        "role": "shared_level2_memory",
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("QDRANT_URL", "http://secret@hub.example.internal:6333?token=hidden")
+    monkeypatch.setenv("QDRANT_API_KEY", "secret-qdrant-key")
+
+    def fake_fetch(endpoint, api_key, timeout_seconds):
+        assert endpoint == "http://secret@hub.example.internal:6333?token=hidden"
+        assert api_key == "secret-qdrant-key"
+        assert timeout_seconds == 2
+        return {"result": {"collections": [{"name": "hermes-memory"}]}}
+
+    monkeypatch.setattr("mac.hermes_startup._fetch_qdrant_collections", fake_fetch)
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["qdrant_level2"]["status"] == "ready"
+    assert report["qdrant_level2"]["collection_count"] == 1
+    assert report["qdrant_level2"]["api_key_present"] is True
+    assert report["qdrant_level2"]["endpoint"] == "http://redacted@hub.example.internal:6333"
+    assert report["qdrant_level2"]["topology"]["hub_url"] == "http://redacted@hub.example.internal:8789"
+    assert report["qdrant_level2"]["topology"]["qdrant_url"] == "http://redacted@hub.example.internal:6333"
+    rendered = str(report)
+    assert "secret-qdrant-key" not in rendered
+    assert "token=hidden" not in rendered
+
+
+def test_qdrant_degraded_override_allows_startup(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_REQUIRE_QDRANT_MEMORY", "1")
+    monkeypatch.setenv("MAC_QDRANT_MEMORY_ALLOW_DEGRADED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["qdrant_level2"]["status"] == "degraded_allowed"
+    assert report["qdrant_level2"]["degradation_reason"]
+    assert report["warnings"] == []
 
 
 def test_startup_includes_gateway_log_classification(monkeypatch, tmp_path):

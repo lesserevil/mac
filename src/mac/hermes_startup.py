@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 STATE_REF_CANDIDATES = (
@@ -41,6 +46,13 @@ def _env_enabled(name: str, default: bool) -> bool:
         return True
     if value in FALSY:
         return False
+    return default
+
+
+def _any_env_enabled(names: Iterable[str], default: bool) -> bool:
+    for name in names:
+        if os.environ.get(name) is not None:
+            return _env_enabled(name, default)
     return default
 
 
@@ -89,6 +101,170 @@ def _read_small_text(path: Path, limit: int = 262_144) -> str:
     except OSError:
         return ""
     return data.decode("utf-8", errors="ignore")
+
+
+def _qdrant_endpoint_from_env() -> Tuple[Optional[str], Optional[str]]:
+    for name in ("QDRANT_URL", "QDRANT_ADDRESS", "QDRANT_FLEET_URL"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip().rstrip("/"), name
+    return None, None
+
+
+def _redact_url(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return raw
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return "<invalid-url>"
+    if not parsed.scheme or not parsed.netloc:
+        return "<invalid-url>"
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
+    netloc = host
+    if parsed.port is not None:
+        netloc = "%s:%s" % (netloc, parsed.port)
+    if parsed.username or parsed.password:
+        netloc = "redacted@%s" % netloc
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _memory_topology_path(hermes_home: Path) -> Path:
+    configured = os.environ.get("MAC_MEMORY_TOPOLOGY_FILE")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return hermes_home / "mac-memory-topology.json"
+
+
+def _topology_summary(path: Path) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "file": _file_ref(path, "memory_topology", False),
+        "schema": None,
+        "agent": None,
+        "hub_agent": None,
+        "hub_url": None,
+        "qdrant_url": None,
+        "error": "",
+    }
+    if not path.exists() or not path.is_file():
+        return summary
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        summary["error"] = str(exc)
+        return summary
+    if not isinstance(data, dict):
+        summary["error"] = "memory topology root is not an object"
+        return summary
+    hub = data.get("hub") if isinstance(data.get("hub"), dict) else {}
+    services = data.get("shared_services") if isinstance(data.get("shared_services"), dict) else {}
+    qdrant = services.get("qdrant") if isinstance(services.get("qdrant"), dict) else {}
+    summary.update(
+        {
+            "schema": data.get("schema"),
+            "agent": data.get("agent"),
+            "hub_agent": hub.get("agent"),
+            "hub_url": _redact_url(hub.get("url")) if isinstance(hub.get("url"), str) else None,
+            "qdrant_url": _redact_url(qdrant.get("url")) if isinstance(qdrant.get("url"), str) else None,
+        }
+    )
+    return summary
+
+
+def _fetch_qdrant_collections(endpoint: str, api_key: Optional[str], timeout_seconds: float) -> Dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["api-key"] = api_key
+    request = urllib.request.Request(endpoint.rstrip("/") + "/collections", headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = response.read(262_144)
+    if not payload:
+        return {}
+    return json.loads(payload.decode("utf-8"))
+
+
+def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
+    endpoint, endpoint_source = _qdrant_endpoint_from_env()
+    memory_disabled = not _any_env_enabled(("MAC_QDRANT_MEMORY", "ACC_QDRANT_MEMORY"), True)
+    explicitly_required = _any_env_enabled(
+        ("MAC_REQUIRE_QDRANT_MEMORY", "ACC_REQUIRE_QDRANT_MEMORY"),
+        False,
+    )
+    required = not memory_disabled and (explicitly_required or bool(endpoint))
+    degraded_allowed = _any_env_enabled(
+        ("MAC_QDRANT_MEMORY_ALLOW_DEGRADED", "ACC_QDRANT_MEMORY_ALLOW_DEGRADED"),
+        False,
+    )
+    topology = _topology_summary(_memory_topology_path(hermes_home))
+    api_key = os.environ.get("QDRANT_API_KEY") or os.environ.get("QDRANT_FLEET_KEY")
+    report: Dict[str, Any] = {
+        "status": "disabled",
+        "ready": True,
+        "required": required,
+        "degraded_allowed": degraded_allowed,
+        "endpoint": _redact_url(endpoint),
+        "endpoint_source": endpoint_source,
+        "api_key_present": bool(api_key),
+        "role": os.environ.get("MAC_QDRANT_MEMORY_ROLE", "shared_level2"),
+        "manager_agent": os.environ.get("MAC_SHARED_SERVICES_MANAGER_AGENT")
+        or os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT")
+        or "",
+        "topology": topology,
+        "collection_count": None,
+        "warning": "",
+        "degradation_reason": "",
+    }
+    if memory_disabled:
+        report["status"] = "disabled_by_env"
+        return report
+    if not endpoint:
+        if not required:
+            return report
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "missing_endpoint"
+        report["degradation_reason"] = "required Qdrant shared memory endpoint is not configured"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    parsed = urllib.parse.urlsplit(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "invalid_endpoint"
+        report["degradation_reason"] = "Qdrant shared memory endpoint is invalid"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    if required and not topology["file"]["exists"]:
+        report["ready"] = False
+        report["status"] = "missing_topology"
+        report["warning"] = "Hermes memory topology file is missing: %s" % topology["file"]["path"]
+        return report
+    if required and topology["error"]:
+        report["ready"] = False
+        report["status"] = "invalid_topology"
+        report["warning"] = "Hermes memory topology file is invalid: %s" % topology["error"]
+        return report
+
+    timeout_seconds = float(os.environ.get("MAC_QDRANT_CHECK_TIMEOUT_SECONDS", "2"))
+    try:
+        collections = _fetch_qdrant_collections(endpoint, api_key, timeout_seconds)
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "unreachable"
+        report["degradation_reason"] = "Qdrant collections endpoint is unreachable: %s" % exc
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+    result = collections.get("result") if isinstance(collections, dict) else {}
+    collection_rows = result.get("collections") if isinstance(result, dict) else None
+    report["collection_count"] = len(collection_rows) if isinstance(collection_rows, list) else None
+    report["status"] = "ready"
+    report["ready"] = True
+    return report
 
 
 def _config_explicitly_enables_slack(config_path: Path) -> bool:
@@ -252,7 +428,7 @@ def _slack_home_channel_name() -> str:
         os.environ.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME")
         or os.environ.get("ACC_SLACK_HOME_CHANNEL_NAME")
         or os.environ.get("SLACK_HOME_CHANNEL_NAME")
-        or "rockyandfriends"
+        or ""
     ).strip().lstrip("#")
 
 
@@ -846,6 +1022,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "secret_redaction": {"effective": True, "source": "startup_check_disabled"}
             },
             "logs": {"classes": [], "actionable_count": 0, "benign_count": 0},
+            "qdrant_level2": {
+                "status": "startup_check_disabled",
+                "ready": True,
+                "required": False,
+            },
             "operator_health": {"status": "healthy"},
         }
 
@@ -858,6 +1039,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     runtime = apply_hermes_gateway_runtime_shim_report()
     secret_redaction = _secret_redaction_report(hermes_home, acc_dir)
     logs = _log_classification_report()
+    qdrant = _qdrant_memory_report(hermes_home)
 
     warnings: List[str] = []
     if not hermes_home.exists():
@@ -875,6 +1057,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     warnings.extend(runtime["warnings"])
     warnings.extend(secret_redaction["warnings"])
     warnings.extend(logs["warnings"])
+    if qdrant["warning"]:
+        warnings.append(qdrant["warning"])
 
     checks = {
         "hermes_home_exists": hermes_home.exists(),
@@ -889,6 +1073,10 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "secret_redaction_enabled": bool(secret_redaction["effective"])
         and not secret_redaction["drift_detected"],
         "logs_have_no_actionable_classes": not bool(logs["actionable_count"]),
+        "shared_qdrant_memory_ready": bool(qdrant["ready"]),
+        "memory_topology_available": (
+            not qdrant["required"] or bool(qdrant["topology"]["file"]["exists"])
+        ),
         "gateway_runtime_override_active": (
             not (
                 runtime["configured_model"]
@@ -913,6 +1101,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "runtime": runtime,
         "security": {"secret_redaction": secret_redaction},
         "logs": logs,
+        "qdrant_level2": qdrant,
         "operator_health": {
             "status": operator_status,
             "state_refs_existing": state_refs_existing,
@@ -921,5 +1110,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "gateway_runtime_shim_present": runtime["gateway_runtime_shim_present"],
             "secret_redaction_effective": secret_redaction["effective"],
             "log_actionable_count": logs["actionable_count"],
+            "qdrant_level2_status": qdrant["status"],
+            "qdrant_level2_ready": qdrant["ready"],
+            "memory_topology_present": qdrant["topology"]["file"]["exists"],
         },
     }

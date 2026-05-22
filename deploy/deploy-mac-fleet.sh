@@ -16,121 +16,248 @@ case "$GIT_URL" in
     ;;
 esac
 GIT_BRANCH="${MAC_DEPLOY_GIT_BRANCH:-main}"
-AGENT_CONFIG_DIR="${MAC_DEPLOY_AGENT_CONFIG_DIR:-$ROOT/deploy/agents}"
-MAC_DEPLOY_HUB_AGENT="${MAC_DEPLOY_HUB_AGENT:-rocky}"
-MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
-
-DEFAULT_HOSTS=(
-  "rocky|jkh@100.125.137.89|linux"
-  "natasha|jkh@100.87.229.125|linux"
-  "bullwinkle|jkh@100.72.16.110|darwin"
-)
+FLEET_CONFIG="${MAC_DEPLOY_FLEET_CONFIG:-$ROOT/deploy/fleet/config.yaml}"
+FLEET_SITE_CONFIG="${MAC_DEPLOY_FLEET_SITE_CONFIG:-$ROOT/deploy/fleet/config-site.yaml}"
 
 usage() {
   cat <<'USAGE'
 Usage: deploy/deploy-mac-fleet.sh [agent ...]
 
-Deploy mac as the local ACC replacement on rocky, natasha, and bullwinkle by
-default. Each host gets:
+Deploy mac as the local ACC replacement to the agents declared in
+deploy/fleet/config-site.yaml, or in MAC_DEPLOY_FLEET_SITE_CONFIG. Copy
+deploy/fleet/config.yaml to config-site.yaml and edit it for your own fleet.
+
+Each host gets:
   - ~/.mac/src/mac from this repository
   - ~/.mac/venv with mac installed
   - upstream NousResearch/hermes-agent in ~/.mac/hermes-agent
   - the minimal Hermes multi-Slack patch set
   - preinstalled configured Hermes messaging dependencies
   - enforced Hermes secret redaction
-  - a host-local mac service, with Rocky exposed as the hub
-  - a mac-agent service that registers against the Rocky hub
+  - a host-local mac service, with the configured hub exposed
+  - a mac-agent service that registers against the configured hub
   - rollback script and structured deploy manifests under ~/.mac/logs
   - one-time ACC SQLite dry-run and import reports under ~/.mac/logs
 
-Arguments may be agent names: rocky, natasha, bullwinkle.
-Per-agent defaults are read from deploy/agents/<agent>/config.env when present.
-Rocky is the default hub at http://100.125.137.89:8789. Spokes keep their
-local control plane for host-local state and register their mac-agent service
-against the hub.
+Arguments may be agent names from the effective fleet config. With no
+arguments, all enabled agents in the effective config are deployed.
 USAGE
 }
 
-legacy_host_spec() {
-  local requested="$1" spec name
-  for spec in "${DEFAULT_HOSTS[@]}"; do
-    name="${spec%%|*}"
-    if [ "$name" = "$requested" ]; then
-      printf '%s\n' "$spec"
-      return 0
-    fi
-  done
-  return 1
+fleet_config_query() {
+  local mode="$1"
+  shift || true
+  python3 - "$mode" "$FLEET_CONFIG" "$FLEET_SITE_CONFIG" "$@" <<'PY'
+from __future__ import annotations
+
+import os
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+try:
+    import yaml
+except Exception as exc:
+    print(
+        "ERROR: PyYAML is required to read fleet config; run via the project "
+        "environment or install PyYAML: %s" % exc,
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        print("ERROR: fleet config %s must be a YAML mapping" % path, file=sys.stderr)
+        raise SystemExit(2)
+    return data
+
+
+def merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result = deepcopy(base)
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(result.get(key), dict)
+        ):
+            result[key] = merge_dicts(result[key], value)
+        else:
+            result[key] = deepcopy(value)
+    return result
+
+
+def bool_field(value: Any, default: bool) -> str:
+    if value is None:
+        return "1" if default else "0"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return "1"
+    if text in {"0", "false", "no", "off"}:
+        return "0"
+    return str(value)
+
+
+def text_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, list):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def require_no_pipe(fields: Iterable[str]) -> None:
+    for field in fields:
+        if "|" in field:
+            print("ERROR: fleet config values may not contain '|'", file=sys.stderr)
+            raise SystemExit(2)
+
+
+def agent_map(items: Any) -> Dict[str, Dict[str, Any]]:
+    if not items:
+        return {}
+    if not isinstance(items, list):
+        print("ERROR: fleet config agents must be a list", file=sys.stderr)
+        raise SystemExit(2)
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            print("ERROR: each fleet agent must be a mapping", file=sys.stderr)
+            raise SystemExit(2)
+        name = text_field(item.get("name"))
+        if not name:
+            print("ERROR: each fleet agent needs a name", file=sys.stderr)
+            raise SystemExit(2)
+        result[name] = deepcopy(item)
+    return result
+
+
+mode = sys.argv[1]
+base_path = Path(sys.argv[2])
+site_path = Path(sys.argv[3])
+requested = sys.argv[4:]
+
+base = load_yaml(base_path)
+site = load_yaml(site_path)
+site_present = site_path.exists()
+cfg = merge_dicts(base, {k: v for k, v in site.items() if k != "agents"})
+cfg["agents"] = list(agent_map(site.get("agents") if site_present and "agents" in site else base.get("agents")).values())
+
+if cfg.get("sample") and not site_present and os.environ.get("MAC_DEPLOY_ALLOW_SAMPLE_CONFIG") != "1":
+    print(
+        "ERROR: %s is a sample fleet config. Copy it to %s and edit it for this site, "
+        "or set MAC_DEPLOY_FLEET_SITE_CONFIG to a site config." % (base_path, site_path),
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+agents = [agent for agent in cfg.get("agents") or [] if agent.get("enabled", True)]
+if not agents:
+    print("ERROR: no enabled agents in fleet config", file=sys.stderr)
+    raise SystemExit(2)
+
+hub_agent = (
+    os.environ.get("MAC_DEPLOY_HUB_AGENT")
+    or text_field(cfg.get("hub_agent"))
+    or text_field(agents[0].get("name"))
+)
+hub_url = os.environ.get("MAC_DEPLOY_HUB_URL") or text_field(cfg.get("hub_url"))
+shared_services_manager = (
+    os.environ.get("MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT")
+    or text_field(cfg.get("shared_services_manager_agent"))
+    or hub_agent
+)
+defaults = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+
+if mode == "hub-agent":
+    print(hub_agent)
+    raise SystemExit(0)
+
+if mode == "hub-target":
+    for agent in agents:
+        if text_field(agent.get("name")) == hub_agent:
+            print(text_field(agent.get("target")))
+            raise SystemExit(0)
+    print("ERROR: hub_agent %s is not an enabled agent" % hub_agent, file=sys.stderr)
+    raise SystemExit(2)
+
+by_name = {text_field(agent.get("name")): agent for agent in agents}
+selected = requested or list(by_name)
+unknown = [name for name in selected if name not in by_name]
+if unknown:
+    print("unknown agent(s): %s" % ", ".join(unknown), file=sys.stderr)
+    raise SystemExit(2)
+
+if mode != "specs":
+    print("ERROR: unknown fleet config query mode %s" % mode, file=sys.stderr)
+    raise SystemExit(2)
+
+for name in selected:
+    agent = by_name[name]
+    hermes = merge_dicts(defaults.get("hermes", {}) if isinstance(defaults.get("hermes"), dict) else {}, agent.get("hermes", {}) if isinstance(agent.get("hermes"), dict) else {})
+    worker = merge_dicts(defaults.get("worker", {}) if isinstance(defaults.get("worker"), dict) else {}, agent.get("worker", {}) if isinstance(agent.get("worker"), dict) else {})
+    qdrant = merge_dicts(defaults.get("qdrant", {}) if isinstance(defaults.get("qdrant"), dict) else {}, agent.get("qdrant", {}) if isinstance(agent.get("qdrant"), dict) else {})
+    target = text_field(agent.get("target"))
+    os_kind = text_field(agent.get("os"))
+    if not target or not os_kind:
+        print("ERROR: agent %s must set target and os" % name, file=sys.stderr)
+        raise SystemExit(2)
+    control_bind_host = text_field(agent.get("control_bind_host"))
+    if not control_bind_host:
+        control_bind_host = "0.0.0.0" if name == hub_agent else "127.0.0.1"
+    fields = [
+        name,
+        target,
+        os_kind,
+        text_field(hermes.get("slack_home_channel_name")),
+        text_field(hermes.get("gateway_model")),
+        text_field(hermes.get("gateway_provider") or "custom"),
+        text_field(hermes.get("gateway_base_url")),
+        hub_url,
+        control_bind_host,
+        text_field(worker.get("mode") or "heartbeat"),
+        text_field(worker.get("capabilities") or "ops,python,hermes,review"),
+        text_field(worker.get("allowed_projects")),
+        text_field(worker.get("required_metadata")),
+        bool_field(worker.get("require_canary"), True),
+        text_field(agent.get("supervisor") or defaults.get("supervisor") or "auto"),
+        shared_services_manager,
+        text_field(qdrant.get("url")),
+        text_field(qdrant.get("install") or "auto"),
+        bool_field(qdrant.get("required"), True),
+        text_field(qdrant.get("bind_addr")),
+        text_field(qdrant.get("port") or "6333"),
+        text_field(qdrant.get("image") or "docker.io/qdrant/qdrant:latest"),
+        text_field(qdrant.get("memory_limit") or "2g"),
+    ]
+    require_no_pipe(fields)
+    print("|".join(fields))
+PY
 }
 
 agent_spec() {
-  local requested="$1" legacy config
-  legacy="$(legacy_host_spec "$requested")" || return 1
-  config="$AGENT_CONFIG_DIR/$requested/config.env"
-  (
-    IFS='|' read -r MAC_DEPLOY_AGENT MAC_DEPLOY_TARGET MAC_DEPLOY_OS <<EOF
-$legacy
-EOF
-    MAC_HERMES_SLACK_HOME_CHANNEL_NAME=""
-    MAC_HERMES_GATEWAY_MODEL=""
-    MAC_HERMES_GATEWAY_PROVIDER="custom"
-    MAC_HERMES_GATEWAY_BASE_URL=""
-    MAC_DEPLOY_HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
-    MAC_DEPLOY_CONTROL_BIND_HOST=""
-    MAC_DEPLOY_WORKER_MODE="heartbeat"
-    MAC_DEPLOY_WORKER_CAPABILITIES="ops,python,hermes,review"
-    MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=""
-    MAC_DEPLOY_WORKER_REQUIRED_METADATA=""
-    MAC_DEPLOY_WORKER_REQUIRE_CANARY="1"
-    if [ -f "$config" ]; then
-      # shellcheck source=/dev/null
-      . "$config"
-    fi
-    : "${MAC_DEPLOY_AGENT:=$requested}"
-    : "${MAC_DEPLOY_TARGET:?agent config must set MAC_DEPLOY_TARGET}"
-    : "${MAC_DEPLOY_OS:?agent config must set MAC_DEPLOY_OS}"
-    if [ -z "$MAC_DEPLOY_CONTROL_BIND_HOST" ]; then
-      if [ "$MAC_DEPLOY_AGENT" = "${MAC_DEPLOY_HUB_AGENT:-rocky}" ]; then
-        MAC_DEPLOY_CONTROL_BIND_HOST="0.0.0.0"
-      else
-        MAC_DEPLOY_CONTROL_BIND_HOST="127.0.0.1"
-      fi
-    fi
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-      "$MAC_DEPLOY_AGENT" \
-      "$MAC_DEPLOY_TARGET" \
-      "$MAC_DEPLOY_OS" \
-      "${MAC_HERMES_SLACK_HOME_CHANNEL_NAME:-}" \
-      "${MAC_HERMES_GATEWAY_MODEL:-}" \
-      "${MAC_HERMES_GATEWAY_PROVIDER:-}" \
-      "${MAC_HERMES_GATEWAY_BASE_URL:-}" \
-      "$MAC_DEPLOY_HUB_URL" \
-      "$MAC_DEPLOY_CONTROL_BIND_HOST" \
-      "$MAC_DEPLOY_WORKER_MODE" \
-      "$MAC_DEPLOY_WORKER_CAPABILITIES" \
-      "$MAC_DEPLOY_WORKER_ALLOWED_PROJECTS" \
-      "$MAC_DEPLOY_WORKER_REQUIRED_METADATA" \
-      "$MAC_DEPLOY_WORKER_REQUIRE_CANARY"
-  )
+  fleet_config_query specs "$1"
 }
 
 selected_hosts() {
-  if [ "$#" -eq 0 ]; then
-    local spec name
-    for spec in "${DEFAULT_HOSTS[@]}"; do
-      name="${spec%%|*}"
-      agent_spec "$name"
-    done
-    return
-  fi
-  local requested
-  for requested in "$@"; do
-    if ! agent_spec "$requested"; then
-      echo "unknown agent: $requested" >&2
-      usage >&2
-      return 2
-    fi
-  done
+  fleet_config_query specs "$@"
+}
+
+fleet_hub_agent() {
+  fleet_config_query hub-agent
+}
+
+fleet_hub_target() {
+  fleet_config_query hub-target
 }
 
 shell_quote() {
@@ -144,16 +271,16 @@ make_archive() {
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary remote_archive
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary <<<"$spec"
+  local spec="$1" hub_token="${2:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit remote_archive
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
 
   echo "==> ${agent}: copying mac release archive"
   scp -q -o BatchMode=yes -o ConnectTimeout=10 "$ARCHIVE" "${target}:${remote_archive}"
 
   echo "==> ${agent}: running one-time deploy"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") bash -s" <<'REMOTE'
+  ssh -A -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -167,7 +294,7 @@ HERMES_SLACK_HOME_CHANNEL_NAME="${MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME:-}"
 HERMES_GATEWAY_MODEL="${MAC_DEPLOY_HERMES_GATEWAY_MODEL:-}"
 HERMES_GATEWAY_PROVIDER="${MAC_DEPLOY_HERMES_GATEWAY_PROVIDER:-custom}"
 HERMES_GATEWAY_BASE_URL="${MAC_DEPLOY_HERMES_GATEWAY_BASE_URL:-}"
-HUB_URL="${MAC_DEPLOY_HUB_URL:-http://100.125.137.89:8789}"
+HUB_URL="${MAC_DEPLOY_HUB_URL:-http://127.0.0.1:8789}"
 HUB_TOKEN="${MAC_DEPLOY_HUB_TOKEN:-}"
 CONTROL_BIND_HOST="${MAC_DEPLOY_CONTROL_BIND_HOST:-127.0.0.1}"
 WORKER_MODE="${MAC_DEPLOY_WORKER_MODE:-heartbeat}"
@@ -175,6 +302,15 @@ WORKER_CAPABILITIES="${MAC_DEPLOY_WORKER_CAPABILITIES:-ops,python,hermes,review}
 WORKER_ALLOWED_PROJECTS="${MAC_DEPLOY_WORKER_ALLOWED_PROJECTS:-}"
 WORKER_REQUIRED_METADATA="${MAC_DEPLOY_WORKER_REQUIRED_METADATA:-}"
 WORKER_REQUIRE_CANARY="${MAC_DEPLOY_WORKER_REQUIRE_CANARY:-1}"
+SUPERVISOR_REQUESTED="${MAC_DEPLOY_SUPERVISOR:-auto}"
+SHARED_SERVICES_MANAGER_AGENT="${MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT:-$AGENT}"
+QDRANT_URL_CONFIGURED="${MAC_DEPLOY_QDRANT_URL:-}"
+QDRANT_INSTALL="${MAC_DEPLOY_QDRANT_INSTALL:-auto}"
+QDRANT_REQUIRE="${MAC_DEPLOY_REQUIRE_QDRANT_MEMORY:-1}"
+QDRANT_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_QDRANT_BIND_ADDR:-}"
+QDRANT_PORT_CONFIGURED="${MAC_DEPLOY_QDRANT_PORT:-6333}"
+QDRANT_IMAGE_CONFIGURED="${MAC_DEPLOY_QDRANT_IMAGE:-docker.io/qdrant/qdrant:latest}"
+QDRANT_MEMORY_LIMIT_CONFIGURED="${MAC_DEPLOY_QDRANT_MEMORY_LIMIT:-2g}"
 DRAIN_MODE="${MAC_DEPLOY_DRAIN_MODE:-wait}"
 DRAIN_TIMEOUT_SECONDS="${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${MAC_DEPLOY_DRAIN_POLL_SECONDS:-10}"
@@ -219,7 +355,7 @@ log() {
 
 python_bin() {
   local candidate
-  for candidate in "${MAC_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 python3 python; do
+  for candidate in "${MAC_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 python3.13 python3.12 python3.11 python3 python; do
     [ -n "$candidate" ] || continue
     if ! command -v "$candidate" >/dev/null 2>&1; then
       continue
@@ -239,7 +375,8 @@ PY
 }
 
 PY="$(python_bin)"
-export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
+SUPERVISOR_KIND=""
+export AGENT OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -284,6 +421,269 @@ ensure_venv_support() {
   fi
   log "ERROR: python venv support is unavailable and could not be installed automatically"
   exit 1
+}
+
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_supervisor() {
+  case "${SUPERVISOR_REQUESTED:-auto}" in
+    systemd|launchd|supervisord)
+      printf '%s\n' "$SUPERVISOR_REQUESTED"
+      return
+      ;;
+    auto|"")
+      ;;
+    *)
+      log "ERROR: unsupported MAC_DEPLOY_SUPERVISOR value: $SUPERVISOR_REQUESTED"
+      exit 1
+      ;;
+  esac
+  if [ "$OS_KIND" = "darwin" ] && command -v launchctl >/dev/null 2>&1; then
+    printf '%s\n' "launchd"
+    return
+  fi
+  if [ "$OS_KIND" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    printf '%s\n' "systemd"
+    return
+  fi
+  if command -v supervisorctl >/dev/null 2>&1; then
+    printf '%s\n' "supervisord"
+    return
+  fi
+  log "ERROR: could not detect a supported supervisor; set MAC_DEPLOY_SUPERVISOR=systemd, launchd, or supervisord"
+  exit 1
+}
+
+run_supervisorctl() {
+  if command -v sudo >/dev/null 2>&1; then
+    sudo supervisorctl "$@" || supervisorctl "$@"
+  else
+    supervisorctl "$@"
+  fi
+}
+
+supervisord_conf_dir() {
+  if [ -n "${MAC_DEPLOY_SUPERVISOR_CONF_DIR:-}" ]; then
+    printf '%s\n' "$MAC_DEPLOY_SUPERVISOR_CONF_DIR"
+  elif [ -d /etc/supervisor/conf.d ]; then
+    printf '%s\n' "/etc/supervisor/conf.d"
+  elif [ -d /etc/supervisord.d ]; then
+    printf '%s\n' "/etc/supervisord.d"
+  else
+    printf '%s\n' "/etc/supervisor/conf.d"
+  fi
+}
+
+qdrant_install_enabled() {
+  case "${QDRANT_INSTALL:-auto}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    0|false|FALSE|no|NO|off|OFF|none|disabled) return 1 ;;
+    auto|"") [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]; return ;;
+    *)
+      log "ERROR: unsupported MAC_DEPLOY_QDRANT_INSTALL value: $QDRANT_INSTALL"
+      exit 1
+      ;;
+  esac
+}
+
+validate_qdrant_endpoint() {
+  local qdrant_url required allow_degraded
+  qdrant_url="${QDRANT_URL:-${QDRANT_ADDRESS:-${QDRANT_FLEET_URL:-}}}"
+  required="${MAC_REQUIRE_QDRANT_MEMORY:-${QDRANT_REQUIRE:-1}}"
+  allow_degraded="${MAC_QDRANT_MEMORY_ALLOW_DEGRADED:-${ACC_QDRANT_MEMORY_ALLOW_DEGRADED:-0}}"
+  if ! truthy "$required"; then
+    if [ -z "$qdrant_url" ]; then
+      log "Qdrant shared memory is optional and no endpoint is configured"
+      return
+    fi
+    if curl -fsS --connect-timeout 2 --max-time 5 "${qdrant_url%/}/collections" >/dev/null; then
+      log "Optional Qdrant shared memory reachable at configured collections endpoint"
+    else
+      log "WARNING: optional Qdrant shared memory is unreachable at ${qdrant_url%/}/collections"
+    fi
+    return
+  fi
+  if [ -z "$qdrant_url" ]; then
+    if truthy "$allow_degraded"; then
+      log "WARNING: Qdrant shared memory is required but no endpoint is configured; degraded override is active"
+      return
+    fi
+    log "ERROR: Qdrant shared memory is required but no endpoint is configured"
+    exit 1
+  fi
+  if curl -fsS --connect-timeout 2 --max-time 5 "${qdrant_url%/}/collections" >/dev/null; then
+    log "Qdrant shared memory reachable at configured collections endpoint"
+    return
+  fi
+  if truthy "$allow_degraded"; then
+    log "WARNING: Qdrant shared memory is unreachable; degraded override is active"
+    return
+  fi
+  log "ERROR: Qdrant shared memory is unreachable at ${qdrant_url%/}/collections"
+  exit 1
+}
+
+install_or_validate_shared_services() {
+  if qdrant_install_enabled; then
+    log "installing hub-managed Qdrant shared memory service"
+    if [ -n "$QDRANT_BIND_ADDR_CONFIGURED" ]; then
+      export QDRANT_BIND_ADDR="$QDRANT_BIND_ADDR_CONFIGURED"
+    else
+      unset QDRANT_BIND_ADDR
+    fi
+    export QDRANT_PORT="$QDRANT_PORT_CONFIGURED"
+    export QDRANT_IMAGE="$QDRANT_IMAGE_CONFIGURED"
+    export QDRANT_MEMORY_LIMIT="$QDRANT_MEMORY_LIMIT_CONFIGURED"
+    export QDRANT_CONTAINER_NAME="mac-qdrant"
+    export QDRANT_SUPERVISOR="$SUPERVISOR_KIND"
+    MAC_HOME="$MAC_HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" WORKSPACE="$SRC_DIR" \
+      bash "$SRC_DIR/deploy/install-qdrant-service.sh"
+    set -a
+    . "$ENV_FILE"
+    set +a
+  else
+    log "using hub-managed shared services from $SHARED_SERVICES_MANAGER_AGENT"
+  fi
+  validate_qdrant_endpoint
+}
+
+write_hermes_memory_topology() {
+  log "writing Hermes memory topology"
+  "$PY" - "$HOME/.hermes/mac-memory-topology.json" "$HOME/.hermes/.env" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+topology_path = Path(sys.argv[1])
+hermes_env_path = Path(sys.argv[2])
+topology_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def connection_url(raw: str) -> str:
+    parsed = urllib.parse.urlsplit(raw.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return raw.strip()
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def set_env(path: Path, updates: dict[str, str | None]) -> None:
+    lines: list[str] = []
+    seen: set[str] = set()
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    output: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            output.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            if updates[key] is not None:
+                output.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            output.append(line)
+    for key in sorted(updates):
+        if key not in seen and updates[key] is not None:
+            output.append(f"{key}={updates[key]}")
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+agent = os.environ["AGENT"]
+hub_url = os.environ.get("MAC_HUB_URL") or os.environ.get("HUB_URL") or ""
+hub_agent = os.environ.get("MAC_SHARED_SERVICES_MANAGER_AGENT") or os.environ.get("SHARED_SERVICES_MANAGER_AGENT") or agent
+qdrant_url = (
+    os.environ.get("QDRANT_URL")
+    or os.environ.get("QDRANT_ADDRESS")
+    or os.environ.get("QDRANT_FLEET_URL")
+    or ""
+)
+safe_qdrant_url = connection_url(qdrant_url) if qdrant_url else ""
+required = truthy(os.environ.get("MAC_REQUIRE_QDRANT_MEMORY") or os.environ.get("QDRANT_REQUIRE") or "1")
+degraded_allowed = truthy(
+    os.environ.get("MAC_QDRANT_MEMORY_ALLOW_DEGRADED")
+    or os.environ.get("ACC_QDRANT_MEMORY_ALLOW_DEGRADED")
+)
+
+topology = {
+    "schema": "mac.hermes.memory_topology.v1",
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "agent": agent,
+    "hub": {
+        "agent": hub_agent,
+        "url": connection_url(hub_url) if hub_url else "",
+        "manages_shared_services": True,
+    },
+    "local_memory": {
+        "owner": "hermes",
+        "home": os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"),
+        "soul": "SOUL.md",
+        "user_profile": "USER.md",
+        "long_term_memory": "MEMORY.md",
+        "conversation_state": "state.db",
+    },
+    "mac_memory": {
+        "owner": "mac",
+        "purpose": "operational provenance, task ledger, vector_refs pointers",
+        "database": os.environ.get("MAC_DB", ""),
+    },
+    "shared_services": {
+        "qdrant": {
+            "owner": "hub",
+            "manager_agent": hub_agent,
+            "role": "shared_level2_memory",
+            "url": safe_qdrant_url,
+            "required": required,
+            "degraded_allowed": degraded_allowed,
+            "api_key_env": "QDRANT_API_KEY" if os.environ.get("QDRANT_API_KEY") else "",
+        }
+    },
+}
+topology_path.write_text(json.dumps(topology, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+topology_path.chmod(0o600)
+
+updates = {
+    "MAC_MEMORY_TOPOLOGY_FILE": str(topology_path),
+    "MAC_SHARED_SERVICES_MANAGER_AGENT": hub_agent,
+    "MAC_REQUIRE_QDRANT_MEMORY": "1" if required else "0",
+    "MAC_QDRANT_MEMORY_ROLE": "shared_level2",
+}
+if safe_qdrant_url:
+    updates["QDRANT_URL"] = safe_qdrant_url
+    updates["QDRANT_ADDRESS"] = safe_qdrant_url
+    updates["QDRANT_FLEET_URL"] = safe_qdrant_url
+elif not required:
+    updates["QDRANT_URL"] = None
+    updates["QDRANT_ADDRESS"] = None
+    updates["QDRANT_FLEET_URL"] = None
+set_env(hermes_env_path, updates)
+print(
+    "memory topology: agent=%s hub=%s qdrant=%s required=%s"
+    % (agent, hub_agent, safe_qdrant_url or "disabled", required)
+)
+PY
 }
 
 write_deploy_manifest() {
@@ -347,7 +747,10 @@ def file_ref(path):
 
 
 def service_summary():
-    if os.environ["OS_KIND"] == "linux":
+    supervisor = os.environ.get("SUPERVISOR_KIND") or (
+        "launchd" if os.environ["OS_KIND"] == "darwin" else "systemd"
+    )
+    if supervisor == "systemd":
         result = run(
             [
                 "systemctl",
@@ -355,6 +758,7 @@ def service_summary():
                 "mac.service",
                 "mac-hermes-gateway.service",
                 "mac-agent.service",
+                "mac-qdrant.service",
                 "-p",
                 "Id",
                 "-p",
@@ -372,11 +776,31 @@ def service_summary():
             ]
         )
         return {"manager": "systemd", "raw": result}
+    if supervisor == "launchd":
+        return {
+            "manager": "launchd",
+            "control_plane": run(["launchctl", "list", "com.mac.control-plane"]),
+            "hermes_gateway": run(["launchctl", "list", "com.mac.hermes-gateway"]),
+            "mac_agent": run(["launchctl", "list", "com.mac.agent"]),
+            "qdrant": run(["launchctl", "list", "com.mac.qdrant"]),
+        }
+    if supervisor == "supervisord":
+        return {
+            "manager": "supervisord",
+            "status": run(
+                [
+                    "supervisorctl",
+                    "status",
+                    "mac-control-plane",
+                    "mac-hermes-gateway",
+                    "mac-agent",
+                    "mac-qdrant",
+                ]
+            ),
+        }
     return {
-        "manager": "launchd",
-        "control_plane": run(["launchctl", "list", "com.mac.control-plane"]),
-        "hermes_gateway": run(["launchctl", "list", "com.mac.hermes-gateway"]),
-        "mac_agent": run(["launchctl", "list", "com.mac.agent"]),
+        "manager": supervisor,
+        "error": "unsupported supervisor in manifest",
     }
 
 
@@ -431,6 +855,17 @@ manifest = {
         ],
         "worker_required_metadata_configured": bool(os.environ.get("WORKER_REQUIRED_METADATA")),
         "worker_require_canary": os.environ.get("WORKER_REQUIRE_CANARY") or None,
+        "supervisor_requested": os.environ.get("SUPERVISOR_REQUESTED") or None,
+        "supervisor_selected": os.environ.get("SUPERVISOR_KIND") or None,
+        "shared_services_manager_agent": os.environ.get("SHARED_SERVICES_MANAGER_AGENT") or None,
+        "qdrant": {
+            "install": os.environ.get("QDRANT_INSTALL") or None,
+            "required": os.environ.get("QDRANT_REQUIRE") or None,
+            "url_configured": bool(os.environ.get("QDRANT_URL_CONFIGURED")),
+            "port": os.environ.get("QDRANT_PORT_CONFIGURED") or None,
+            "image": os.environ.get("QDRANT_IMAGE_CONFIGURED") or None,
+            "memory_limit": os.environ.get("QDRANT_MEMORY_LIMIT_CONFIGURED") or None,
+        },
         "drain": {
             "mode": os.environ.get("DRAIN_MODE") or None,
             "timeout_seconds": int(os.environ.get("DRAIN_TIMEOUT_SECONDS") or 0),
@@ -511,6 +946,7 @@ SRC_DIR='$SRC_DIR'
 VENV='$VENV'
 HERMES_DIR='$HERMES_DIR'
 OS_KIND='$OS_KIND'
+SUPERVISOR_KIND='${SUPERVISOR_KIND:-}'
 SRC_BACKUP='$SRC_BACKUP'
 VENV_BACKUP='$VENV_BACKUP'
 HERMES_BACKUP='$HERMES_BACKUP'
@@ -533,11 +969,15 @@ restore_dir() {
   command cp -a "\$backup" "\$dest"
 }
 
-case "\$OS_KIND" in
-  linux)
+case "\${SUPERVISOR_KIND:-\$OS_KIND}" in
+  systemd|linux)
     sudo systemctl stop mac-agent.service mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
     ;;
-  darwin)
+  supervisord)
+    supervisorctl stop mac-agent mac-hermes-gateway mac-control-plane >/dev/null 2>&1 || true
+    sudo supervisorctl stop mac-agent mac-hermes-gateway mac-control-plane >/dev/null 2>&1 || true
+    ;;
+  launchd|darwin)
     uid="\$(id -u)"
     launchctl bootout "gui/\$uid/com.mac.agent" >/dev/null 2>&1 || true
     launchctl bootout "gui/\$uid/com.mac.hermes-gateway" >/dev/null 2>&1 || true
@@ -549,15 +989,21 @@ restore_dir "\$SRC_BACKUP" "\$SRC_DIR"
 restore_dir "\$VENV_BACKUP" "\$VENV"
 restore_dir "\$HERMES_BACKUP" "\$HERMES_DIR"
 
-case "\$OS_KIND" in
-  linux)
+case "\${SUPERVISOR_KIND:-\$OS_KIND}" in
+  systemd|linux)
     [ -n "\$MAC_UNIT_BACKUP" ] && [ -f "\$MAC_UNIT_BACKUP" ] && sudo cp -f "\$MAC_UNIT_BACKUP" /etc/systemd/system/mac.service
     [ -n "\$HERMES_UNIT_BACKUP" ] && [ -f "\$HERMES_UNIT_BACKUP" ] && sudo cp -f "\$HERMES_UNIT_BACKUP" /etc/systemd/system/mac-hermes-gateway.service
     [ -n "\$MAC_AGENT_UNIT_BACKUP" ] && [ -f "\$MAC_AGENT_UNIT_BACKUP" ] && sudo cp -f "\$MAC_AGENT_UNIT_BACKUP" /etc/systemd/system/mac-agent.service
     sudo systemctl daemon-reload
     sudo systemctl restart mac.service mac-hermes-gateway.service mac-agent.service
     ;;
-  darwin)
+  supervisord)
+    supervisorctl reread >/dev/null 2>&1 || sudo supervisorctl reread >/dev/null 2>&1 || true
+    supervisorctl update >/dev/null 2>&1 || sudo supervisorctl update >/dev/null 2>&1 || true
+    supervisorctl restart mac-control-plane mac-hermes-gateway mac-agent >/dev/null 2>&1 || \
+      sudo supervisorctl restart mac-control-plane mac-hermes-gateway mac-agent >/dev/null 2>&1 || true
+    ;;
+  launchd|darwin)
     mkdir -p "\$HOME/Library/LaunchAgents"
     [ -n "\$MAC_PLIST_BACKUP" ] && [ -f "\$MAC_PLIST_BACKUP" ] && cp -f "\$MAC_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.control-plane.plist"
     [ -n "\$HERMES_PLIST_BACKUP" ] && [ -f "\$HERMES_PLIST_BACKUP" ] && cp -f "\$HERMES_PLIST_BACKUP" "\$HOME/Library/LaunchAgents/com.mac.hermes-gateway.plist"
@@ -596,11 +1042,14 @@ backup_existing_artifacts() {
 
 stop_existing_services_for_deploy() {
   log "stopping existing mac services for artifact replacement"
-  case "$OS_KIND" in
-    linux)
+  case "$SUPERVISOR_KIND" in
+    systemd)
       sudo systemctl stop mac-agent.service mac-hermes-gateway.service mac.service >/dev/null 2>&1 || true
       ;;
-    darwin)
+    supervisord)
+      run_supervisorctl stop mac-agent mac-hermes-gateway mac-control-plane >/dev/null 2>&1 || true
+      ;;
+    launchd)
       local uid
       uid="$(id -u)"
       launchctl bootout "gui/$uid/com.mac.agent" >/dev/null 2>&1 || true
@@ -1371,6 +1820,9 @@ PY
 log "deploy log: $DEPLOY_LOG"
 ensure_dns_resolution
 ensure_venv_support
+SUPERVISOR_KIND="$(detect_supervisor)"
+export SUPERVISOR_KIND
+log "selected supervisor: $SUPERVISOR_KIND (requested: ${SUPERVISOR_REQUESTED:-auto})"
 write_deploy_manifest "pre" "$MANIFEST_PRE"
 drain_mac_agent_before_deploy
 stop_existing_services_for_deploy
@@ -1395,10 +1847,11 @@ install_beads_cli
 install_github_cli
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" <<'PY'
 from pathlib import Path
 import secrets
 import sys
+import urllib.parse
 
 env_path = Path(sys.argv[1])
 mac_home = Path(sys.argv[2])
@@ -1417,6 +1870,11 @@ configured_worker_allowed_projects = sys.argv[14].strip()
 configured_worker_required_metadata = sys.argv[15].strip()
 configured_worker_require_canary = sys.argv[16].strip() or "1"
 agent_name = sys.argv[17].strip()
+supervisor_kind = sys.argv[18].strip()
+shared_services_manager = sys.argv[19].strip() or agent_name
+configured_qdrant_url = sys.argv[20].strip()
+configured_qdrant_required = sys.argv[21].strip() or "1"
+configured_qdrant_port = sys.argv[22].strip() or "6333"
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -1431,6 +1889,7 @@ values["MAC_DB"] = str(mac_home / "mac.db")
 values["MAC_PORT"] = port
 values["MAC_BIND_HOST"] = configured_bind_host
 values["MAC_HUB_URL"] = configured_hub_url or values.get("MAC_HUB_URL", "http://127.0.0.1:8789")
+values["MAC_SUPERVISOR_KIND"] = supervisor_kind
 values["HERMES_HOME"] = str(home / ".hermes")
 values["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 values["HERMES_REDACT_SECRETS"] = "true"
@@ -1468,14 +1927,45 @@ values["MAC_WORKER_CAPABILITIES"] = configured_worker_capabilities
 values["MAC_WORKER_REQUIRE_CANARY"] = configured_worker_require_canary
 values["MAC_WORKER_ALLOWED_PROJECTS"] = configured_worker_allowed_projects
 values["MAC_WORKER_REQUIRED_METADATA"] = configured_worker_required_metadata
+values["MAC_SHARED_SERVICES_MANAGER_AGENT"] = shared_services_manager
+values["MAC_REQUIRE_QDRANT_MEMORY"] = configured_qdrant_required
+values["MAC_QDRANT_MEMORY_ROLE"] = "shared_level2"
+values["MAC_MEMORY_TOPOLOGY_FILE"] = str(home / ".hermes" / "mac-memory-topology.json")
+
+def truthy(raw):
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+def qdrant_url():
+    if configured_qdrant_url:
+        return configured_qdrant_url.rstrip("/")
+    if not truthy(configured_qdrant_required):
+        return ""
+    raw_hub = configured_hub_url or values.get("MAC_HUB_URL") or "http://127.0.0.1:8789"
+    parsed = urllib.parse.urlsplit(raw_hub)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
+    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, configured_qdrant_port), "", "", ""))
+
+derived_qdrant_url = qdrant_url()
+if derived_qdrant_url:
+    values["QDRANT_URL"] = derived_qdrant_url
+    values["QDRANT_ADDRESS"] = derived_qdrant_url
+    values["QDRANT_FLEET_URL"] = derived_qdrant_url
+elif not truthy(configured_qdrant_required):
+    for key in ("QDRANT_URL", "QDRANT_ADDRESS", "QDRANT_FLEET_URL"):
+        values.pop(key, None)
 values.setdefault("MAC_WORKER_WORKSPACE", str(mac_home / "agent-workspaces"))
 values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
 values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
 values.setdefault("MAC_WORKER_LEASE_SECONDS", "900")
 values.setdefault("MAC_WORKER_EXECUTOR", str(mac_home / "bin" / "mac-hermes-task-executor"))
-values.setdefault("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+values.setdefault("MAC_BEADS_BRIDGE_HUB_AGENT", shared_services_manager)
+values.setdefault("MAC_REVIEW_TICK_HUB_AGENT", shared_services_manager)
 values.setdefault("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")
-if agent_name == values.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky"):
+if agent_name == values.get("MAC_BEADS_BRIDGE_HUB_AGENT", ""):
     values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
     values.setdefault(
         "MAC_BEADS_REPOSITORIES",
@@ -1493,7 +1983,7 @@ home_channel = (
     or values.get("MAC_HERMES_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
     or values.get("ACC_SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
     or values.get("SLACK_HOME_CHANNEL_NAME", "").strip().lstrip("#")
-    or "rockyandfriends"
+    or ""
 )
 values["MAC_HERMES_SLACK_HOME_CHANNEL_NAME"] = home_channel
 values["ACC_SLACK_HOME_CHANNEL_NAME"] = home_channel
@@ -1517,6 +2007,8 @@ set -a
 set +a
 bootstrap_beads_repositories
 restore_beads_tracked_exports
+install_or_validate_shared_services
+write_hermes_memory_topology
 sync_hermes_home_channels
 
 log "installing mac Python package"
@@ -1642,6 +2134,22 @@ else
   log "no ACC SQLite database found under ~/.acc/data; classifying host"
   write_migration_status "no_acc_sqlite_db" ""
 fi
+
+install_mac_control_wrapper() {
+  local wrapper="$MAC_HOME/bin/mac-service"
+  mkdir -p "$MAC_HOME/bin"
+  cat > "$wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+. "$HOME/.mac/mac.env"
+set +a
+export PATH="$HOME/.mac/bin:$PATH"
+export HERMES_REDACT_SECRETS=true
+exec "$HOME/.mac/venv/bin/uvicorn" mac.api:create_app --factory --host "${MAC_BIND_HOST:-127.0.0.1}" --port "${MAC_PORT:-8789}" --workers 1 --log-level info
+EOF
+  chmod 700 "$wrapper"
+}
 
 install_linux_service() {
   local unit="/etc/systemd/system/mac.service" restart_since
@@ -2159,6 +2667,71 @@ EOF
   sudo journalctl -u mac-agent.service --since "$restart_since" --no-pager > "$LOG_DIR/mac-agent-journal.txt" || true
 }
 
+install_supervisord_service() {
+  local conf_dir conf restart_since
+  conf_dir="$(supervisord_conf_dir)"
+  conf="$conf_dir/mac-fleet.conf"
+  log "installing supervisord programs in $conf"
+  install_mac_control_wrapper
+  install_hermes_gateway_wrapper
+  install_mac_agent_wrapper
+  if sudo test -f "$conf"; then
+    MAC_UNIT_BACKUP="$MAC_HOME/backups/supervisord-mac-fleet.${AGENT}.${DEPLOY_TS}.conf"
+    sudo cp -f "$conf" "$MAC_UNIT_BACKUP"
+    sudo chown "$USER" "$MAC_UNIT_BACKUP" || true
+    write_rollback_script
+  fi
+  sudo install -d -m 0755 "$conf_dir"
+  sudo tee "$conf" >/dev/null <<EOF
+[program:mac-control-plane]
+command=$MAC_HOME/bin/mac-service
+directory=$MAC_HOME
+user=$USER
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=20
+stdout_logfile=$LOG_DIR/mac-service.log
+stderr_logfile=$LOG_DIR/mac-service.log
+environment=HOME="$HOME"
+
+[program:mac-hermes-gateway]
+command=$MAC_HOME/bin/hermes-gateway
+directory=$HERMES_DIR
+user=$USER
+autostart=true
+autorestart=true
+startsecs=5
+stopwaitsecs=120
+stdout_logfile=$LOG_DIR/hermes-gateway.log
+stderr_logfile=$LOG_DIR/hermes-gateway.log
+environment=HOME="$HOME"
+
+[program:mac-agent]
+command=$MAC_HOME/bin/mac-agent-service
+directory=$MAC_HOME
+user=$USER
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=$LOG_DIR/mac-agent.log
+stderr_logfile=$LOG_DIR/mac-agent.log
+environment=HOME="$HOME"
+EOF
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  run_supervisorctl reread >/dev/null
+  run_supervisorctl update >/dev/null
+  run_supervisorctl restart mac-control-plane >/dev/null 2>&1 || run_supervisorctl start mac-control-plane >/dev/null
+  sleep 3
+  run_supervisorctl restart mac-hermes-gateway >/dev/null 2>&1 || run_supervisorctl start mac-hermes-gateway >/dev/null
+  sleep 5
+  run_supervisorctl restart mac-agent >/dev/null 2>&1 || run_supervisorctl start mac-agent >/dev/null
+  sleep 3
+  run_supervisorctl status mac-control-plane mac-hermes-gateway mac-agent > "$LOG_DIR/supervisord-services.txt" || true
+  printf 'supervisord restarted at %s\n' "$restart_since" >> "$LOG_DIR/supervisord-services.txt"
+}
+
 install_darwin_service() {
   local uid plist wrapper
   uid="$(id -u)"
@@ -2392,13 +2965,14 @@ PY
   return 1
 }
 
-case "$OS_KIND" in
-  linux) install_linux_service ;;
-  darwin) install_darwin_service ;;
-  *) log "ERROR: unsupported OS kind $OS_KIND"; exit 1 ;;
+case "$SUPERVISOR_KIND" in
+  systemd) install_linux_service ;;
+  launchd) install_darwin_service ;;
+  supervisord) install_supervisord_service ;;
+  *) log "ERROR: unsupported supervisor $SUPERVISOR_KIND"; exit 1 ;;
 esac
 
-if [ "$OS_KIND" = "linux" ]; then
+if [ "$SUPERVISOR_KIND" = "systemd" ]; then
   classify_gateway_logs "$LOG_DIR/hermes-gateway-journal.txt"
 else
   classify_gateway_logs "$LOG_DIR/hermes-gateway.log"
@@ -2415,12 +2989,14 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     data = json.load(handle)
 slack = data.get("slack") or {}
+qdrant = data.get("qdrant_level2") or {}
 refs = data.get("state_refs") or []
 existing = sum(1 for ref in refs if ref.get("exists"))
 patch = slack.get("account_file_activation_shim_patch") or {}
 print(
     "startup: ready=%s warnings=%d state_refs_existing=%d "
     "slack_activation=%s shim_present=%s redaction=%s operator_status=%s "
+    "qdrant_status=%s qdrant_ready=%s topology=%s "
     "patch_attempted=%s patch_applied=%s patch_error=%s"
     % (
         data.get("ready"),
@@ -2430,6 +3006,9 @@ print(
         slack.get("account_file_activation_shim_present"),
         (data.get("security") or {}).get("secret_redaction", {}).get("effective"),
         (data.get("operator_health") or {}).get("status"),
+        qdrant.get("status"),
+        qdrant.get("ready"),
+        ((qdrant.get("topology") or {}).get("file") or {}).get("exists"),
         patch.get("attempted"),
         patch.get("applied"),
         bool(patch.get("error")),
@@ -2450,10 +3029,7 @@ REMOTE
 }
 
 hub_target() {
-  local spec agent target
-  spec="$(agent_spec "$MAC_DEPLOY_HUB_AGENT")"
-  IFS='|' read -r agent target _ <<<"$spec"
-  printf '%s\n' "$target"
+  fleet_hub_target
 }
 
 read_hub_token() {
@@ -2469,15 +3045,16 @@ main() {
     exit 0
   fi
   make_archive
-  local spec agent hub_token
+  local spec agent hub_agent hub_token
+  hub_agent="$(fleet_hub_agent)"
   hub_token="${MAC_DEPLOY_HUB_TOKEN:-}"
   while IFS= read -r spec; do
     IFS='|' read -r agent _ <<<"$spec"
-    if [ "$agent" != "$MAC_DEPLOY_HUB_AGENT" ] && [ -z "$hub_token" ]; then
+    if [ "$agent" != "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
     fi
     deploy_host "$spec" "$hub_token"
-    if [ "$agent" = "$MAC_DEPLOY_HUB_AGENT" ] && [ -z "$hub_token" ]; then
+    if [ "$agent" = "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
     fi
   done < <(selected_hosts "$@")

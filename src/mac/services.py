@@ -2364,8 +2364,10 @@ class ControlPlane:
     def _maybe_poll_beads_bridge_on_heartbeat(self, agent: Agent) -> None:
         if not _truthy_env("MAC_BEADS_BRIDGE_ON_HEARTBEAT"):
             return
-        hub_agent = os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky").strip()
-        if hub_agent and agent.name != hub_agent and agent.id != hub_agent:
+        hub_agent = os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT", "").strip()
+        if not hub_agent:
+            return
+        if agent.name != hub_agent and agent.id != hub_agent:
             return
         try:
             self.poll_beads_repositories(actor=agent.id)
@@ -2386,9 +2388,11 @@ class ControlPlane:
             return
         hub_agent = os.environ.get(
             "MAC_REVIEW_TICK_HUB_AGENT",
-            os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky"),
+            os.environ.get("MAC_BEADS_BRIDGE_HUB_AGENT", ""),
         ).strip()
-        if hub_agent and agent.name != hub_agent and agent.id != hub_agent:
+        if not hub_agent:
+            return
+        if agent.name != hub_agent and agent.id != hub_agent:
             return
         try:
             limit = int(os.environ.get("MAC_REVIEW_TICK_LIMIT", "25"))

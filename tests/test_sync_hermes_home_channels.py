@@ -68,7 +68,7 @@ def test_home_channel_sync_removes_legacy_direct_home_env(monkeypatch, tmp_path)
             [
                 "KEEP_ME=1",
                 "SLACK_HOME_CHANNEL=C123",
-                "SLACK_HOME_CHANNEL_NAME=rockyandfriends",
+                "SLACK_HOME_CHANNEL_NAME=team-home",
             ]
         )
         + "\n",
