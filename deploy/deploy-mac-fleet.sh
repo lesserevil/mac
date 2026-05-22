@@ -3255,14 +3255,14 @@ case "$mode" in
   heartbeat)
     interval="${MAC_WORKER_HEARTBEAT_INTERVAL:-30}"
     while :; do
-      "${common[@]}" --heartbeat-only
+      "${common[@]}" --heartbeat-only || true
       sleep "$interval"
     done
     ;;
   dry-run)
     interval="${MAC_WORKER_HEARTBEAT_INTERVAL:-30}"
     while :; do
-      "${common[@]}" --dry-run-claim
+      "${common[@]}" --dry-run-claim || true
       sleep "$interval"
     done
     ;;
