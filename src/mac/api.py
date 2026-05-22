@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -253,6 +254,14 @@ class AgentUpdate(BaseModel):
     resources: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
     health_status: Optional[str] = None
+    hermes_instance_id: Optional[str] = None
+
+
+class AgentBulkUpdate(BaseModel):
+    agent_ids: List[str] = Field(default_factory=list)
+    status: Optional[str] = None
+    health_status: Optional[str] = None
+    capabilities: Optional[List[str]] = None
     hermes_instance_id: Optional[str] = None
 
 
@@ -891,6 +900,186 @@ def _state_counts(items: List[Dict[str, Any]], key: str) -> Dict[str, int]:
     return counts
 
 
+def _task_project_key(task: Any) -> str:
+    project = str(getattr(task, "project", "") or "").strip()
+    if project:
+        return project
+    metadata = getattr(task, "metadata", {}) or {}
+    if isinstance(metadata, dict):
+        for key in ("project", "repository", "repo"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+        origin = metadata.get("origin")
+        if isinstance(origin, dict):
+            for key in ("project", "repository", "repo", "source"):
+                value = str(origin.get(key) or "").strip()
+                if value:
+                    return value
+    return "unassigned"
+
+
+def _project_summary_task(task: Any) -> Dict[str, Any]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "state": task.state,
+        "priority": task.priority,
+        "owner_agent_id": task.owner_agent_id,
+        "required_capabilities": list(task.required_capabilities),
+        "dependencies": list(task.dependencies),
+        "updated_at": task.updated_at,
+    }
+
+
+def _dashboard_project_summaries(
+    tasks: List[Any],
+    agents: List[Any],
+    bridge_items: List[Dict[str, Any]],
+    beads_repositories: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    task_by_id = {task.id: task for task in tasks}
+    agents_by_id = {agent.id: agent for agent in agents}
+    projects: Dict[str, Dict[str, Any]] = {}
+
+    def bucket(project: str) -> Dict[str, Any]:
+        if project not in projects:
+            projects[project] = {
+                "project": project,
+                "task_count": 0,
+                "active_count": 0,
+                "ready_count": 0,
+                "blocked_count": 0,
+                "review_count": 0,
+                "completed_count": 0,
+                "state_counts": {},
+                "dependency_edge_count": 0,
+                "cross_project_dependency_count": 0,
+                "active_agent_ids": set(),
+                "active_agent_names": set(),
+                "required_capabilities": set(),
+                "frontier_tasks": [],
+                "waiting_tasks": [],
+                "active_tasks": [],
+                "cross_project_edges": [],
+                "bridge_item_count": 0,
+                "repository_count": 0,
+            }
+        return projects[project]
+
+    for task in tasks:
+        project = _task_project_key(task)
+        item = bucket(project)
+        item["task_count"] += 1
+        item["state_counts"][task.state] = item["state_counts"].get(task.state, 0) + 1
+        item["dependency_edge_count"] += len(task.dependencies)
+        for capability in task.required_capabilities:
+            item["required_capabilities"].add(str(capability))
+        if task.owner_agent_id:
+            item["active_agent_ids"].add(task.owner_agent_id)
+            agent = agents_by_id.get(task.owner_agent_id)
+            if agent is not None:
+                item["active_agent_names"].add(agent.name)
+        if task.state not in TERMINAL_DASHBOARD_STATES:
+            item["active_count"] += 1
+        if task.state in {"needs_review", "reviewing"}:
+            item["review_count"] += 1
+        if task.state == "completed":
+            item["completed_count"] += 1
+        missing_or_incomplete = []
+        for dependency_id in task.dependencies:
+            dependency = task_by_id.get(dependency_id)
+            if dependency is None or dependency.state != "completed":
+                missing_or_incomplete.append(dependency_id)
+            if dependency is not None and _task_project_key(dependency) != project:
+                item["cross_project_dependency_count"] += 1
+                if len(item["cross_project_edges"]) < 8:
+                    item["cross_project_edges"].append(
+                        {
+                            "from_project": _task_project_key(dependency),
+                            "from_task_id": dependency.id,
+                            "from_task_title": dependency.title,
+                            "to_task_id": task.id,
+                            "to_task_title": task.title,
+                        }
+                    )
+        if task.state == "open" and not missing_or_incomplete:
+            item["ready_count"] += 1
+            if len(item["frontier_tasks"]) < 10:
+                item["frontier_tasks"].append(_project_summary_task(task))
+        elif task.state in {"open", "blocked"} and missing_or_incomplete:
+            item["blocked_count"] += 1
+            if len(item["waiting_tasks"]) < 10:
+                blocked = _project_summary_task(task)
+                blocked["waiting_on"] = missing_or_incomplete[:8]
+                item["waiting_tasks"].append(blocked)
+        elif task.state in {"claimed", "running", "needs_review", "reviewing"}:
+            if len(item["active_tasks"]) < 10:
+                item["active_tasks"].append(_project_summary_task(task))
+
+    for bridge_item in bridge_items:
+        project = str(bridge_item.get("project") or bridge_item.get("source") or "unassigned")
+        bucket(project)["bridge_item_count"] += 1
+    for repo in beads_repositories:
+        project = str(repo.get("project") or repo.get("name") or repo.get("source") or "unassigned")
+        bucket(project)["repository_count"] += 1
+
+    summaries = []
+    for item in projects.values():
+        normalized = dict(item)
+        normalized["active_agent_ids"] = sorted(item["active_agent_ids"])
+        normalized["active_agent_names"] = sorted(item["active_agent_names"])
+        normalized["required_capabilities"] = sorted(item["required_capabilities"])
+        summaries.append(normalized)
+    return sorted(
+        summaries,
+        key=lambda item: (
+            -int(item["ready_count"]),
+            -int(item["active_count"]),
+            str(item["project"]),
+        ),
+    )
+
+
+def _dashboard_swarm_summary(
+    agents: List[Any],
+    tasks: List[Any],
+    machines_by_id: Dict[str, Any],
+) -> Dict[str, Any]:
+    active_project_by_agent: Dict[str, str] = {}
+    for task in tasks:
+        if task.owner_agent_id and task.state not in TERMINAL_DASHBOARD_STATES:
+            active_project_by_agent[task.owner_agent_id] = _task_project_key(task)
+
+    status_counts = Counter(agent.status for agent in agents)
+    health_counts = Counter(agent.health_status for agent in agents)
+    role_counts = Counter(str(agent.role_id or "unassigned") for agent in agents)
+    project_counts = Counter(active_project_by_agent.get(agent.id, "idle") for agent in agents)
+    capability_counts: Counter[str] = Counter()
+    machine_counts: Counter[str] = Counter()
+    for agent in agents:
+        for capability in agent.capabilities:
+            capability_counts[str(capability)] += 1
+        machine = machines_by_id.get(agent.machine_id)
+        machine_counts[machine.hostname if machine is not None else "missing-machine"] += 1
+
+    def rows(counter: Counter[str], limit: int = 40) -> List[Dict[str, Any]]:
+        return [
+            {"key": key, "count": count}
+            for key, count in counter.most_common(limit)
+        ]
+
+    return {
+        "agent_total": len(agents),
+        "status": rows(status_counts),
+        "health": rows(health_counts),
+        "role": rows(role_counts),
+        "project": rows(project_counts),
+        "capability": rows(capability_counts),
+        "machine": rows(machine_counts),
+    }
+
+
 def _dashboard_task(cp: ControlPlane, task_id: str) -> Dict[str, Any]:
     detail = cp.task_detail(task_id)
     summary = cp.task_summary(task_id)
@@ -930,6 +1119,7 @@ def _dashboard_agent_base(
         "agent": agent.to_dict(),
         "machine": machine.to_dict() if machine is not None else None,
         "active_tasks": active_tasks,
+        "active_projects": sorted({_task_project_key(task) for task in tasks if task.owner_agent_id == agent.id and task.state not in TERMINAL_DASHBOARD_STATES}),
         "capacity": capacity,
         "active_lease_count": active_lease_count,
         "availability": {
@@ -971,6 +1161,7 @@ def _dashboard_dispatch_explain(
     tasks: Optional[List[Any]] = None,
     agents: Optional[List[Any]] = None,
     machines_by_id: Optional[Dict[str, Any]] = None,
+    candidate_limit: int = 60,
 ) -> Dict[str, Any]:
     tasks = tasks if tasks is not None else cp.list_tasks()
     agents = agents if agents is not None else cp.list_agents()
@@ -981,9 +1172,12 @@ def _dashboard_dispatch_explain(
     explanations = []
     for task in open_tasks:
         candidates = []
+        eligible_count = 0
         for agent in agents:
             machine = machines_by_id.get(agent.machine_id)
             eligible = cp._agent_available_for(agent, task)
+            if eligible:
+                eligible_count += 1
             reasons = [] if eligible else _dashboard_dispatch_reasons(cp, agent, task, machine)
             if not eligible and not reasons:
                 reasons.append("dispatch policy rejected pair")
@@ -995,12 +1189,17 @@ def _dashboard_dispatch_explain(
                     "reasons": reasons,
                 }
             )
+        candidates.sort(key=lambda item: (not item["eligible"], item["agent_name"], item["agent_id"]))
+        limited_candidates = candidates[: max(1, int(candidate_limit))]
         explanations.append(
             {
                 "task": task.to_dict(),
                 "tenant_id": cp._task_tenant_id(task),
-                "candidates": candidates,
-                "eligible_agent_count": sum(1 for candidate in candidates if candidate["eligible"]),
+                "candidates": limited_candidates,
+                "candidate_count": len(candidates),
+                "candidate_limit": max(1, int(candidate_limit)),
+                "candidate_truncated": len(candidates) > len(limited_candidates),
+                "eligible_agent_count": eligible_count,
             }
         )
     return {"open_task_count": len(open_tasks), "tasks": explanations}
@@ -1094,6 +1293,13 @@ def _dashboard_state(
     ]
     task_details = [_dashboard_task(cp, task.id) for task in tasks]
     rollout_statuses = [_dashboard_rollout_status(cp, rollout.id) for rollout in rollouts]
+    project_summaries = _dashboard_project_summaries(
+        tasks,
+        agents,
+        bridge_items,
+        beads_repositories,
+    )
+    swarm_summary = _dashboard_swarm_summary(agents, tasks, machines_by_id)
     return {
         "overview": {
             "counts": {
@@ -1125,6 +1331,7 @@ def _dashboard_state(
                 "agentbus_streams": len(agentbus_streams),
                 "artifacts": len(artifacts),
                 "beads_repositories": len(beads_repositories),
+                "projects": len(project_summaries),
                 "memory_records": len(memory_records),
                 "integration_findings": len(integration_findings),
                 "open_integration_findings": sum(
@@ -1134,6 +1341,8 @@ def _dashboard_state(
             "task_states": _state_counts(task_dicts, "state"),
             "agent_statuses": _state_counts([agent.to_dict() for agent in agents], "status"),
         },
+        "project_summaries": project_summaries,
+        "swarm_summary": swarm_summary,
         "tenants": tenants,
         "users": users,
         "personas": personas,
@@ -1540,6 +1749,34 @@ def create_app(
     @app.get("/agents")
     def list_agents() -> List[Dict[str, Any]]:
         return [agent.to_dict() for agent in cp.list_agents()]
+
+    @app.post("/agents/bulk")
+    def bulk_update_agents(
+        body: AgentBulkUpdate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        if not body.agent_ids:
+            raise ValidationError("agent_ids is required")
+        data = _data(body)
+        agent_ids = [str(agent_id).strip() for agent_id in data.pop("agent_ids", [])]
+        if not data:
+            raise ValidationError("bulk update requires at least one update field")
+        updated = []
+        failed = []
+        for agent_id in agent_ids:
+            if not agent_id:
+                continue
+            try:
+                updated.append(cp.update_agent(agent_id, **data).to_dict())
+            except MACError as exc:
+                failed.append({"agent_id": agent_id, "error": str(exc)})
+        return {
+            "updated": updated,
+            "updated_count": len(updated),
+            "failed": failed,
+            "failed_count": len(failed),
+        }
 
     @app.get("/agents/{agent_id}")
     def get_agent(agent_id: str) -> Dict[str, Any]:

@@ -15,8 +15,10 @@ const TASK_STATES = [
     "cancelled",
 ];
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled"]);
+const AGENT_PAGE_SIZE = 50;
 const VIEW_TITLES = {
     overview: "Overview",
+    work: "Work",
     map: "Map",
     agents: "Agents",
     tasks: "Tasks",
@@ -40,6 +42,9 @@ const state = {
     actionMessage: null,
     agentQuery: DEFAULT_URL_STATE.agentQuery,
     agentFilter: DEFAULT_URL_STATE.agentFilter,
+    agentSort: DEFAULT_URL_STATE.agentSort,
+    agentPage: DEFAULT_URL_STATE.agentPage,
+    projectFilter: DEFAULT_URL_STATE.projectFilter,
     taskFilter: DEFAULT_URL_STATE.taskFilter,
     selectedId: DEFAULT_URL_STATE.selectedId,
     observabilityLive: [],
@@ -125,7 +130,9 @@ function render() {
         return;
     }
     const action = state.actionMessage ? `<div class="action-status">${escapeHtml(state.actionMessage)}</div>` : "";
-    const body = state.activeView === "map"
+    const body = state.activeView === "work"
+        ? renderWork()
+        : state.activeView === "map"
         ? renderMap()
         : state.activeView === "agents"
             ? renderAgents()
@@ -171,10 +178,14 @@ function renderBanner() {
 function readUrlState() {
     const params = new URLSearchParams(window.location.search);
     const rawView = params.get("view") || "overview";
+    const page = Number(params.get("agent_page") || "1");
     return {
         activeView: VIEW_KEYS.has(rawView) ? rawView : "overview",
         agentQuery: params.get("agent_q") || "",
         agentFilter: params.get("agent_filter") || "all",
+        agentSort: params.get("agent_sort") || "name",
+        agentPage: Number.isFinite(page) && page > 0 ? Math.floor(page) : 1,
+        projectFilter: params.get("project") || "all",
         taskFilter: params.get("task_state") || "all",
         selectedId: params.get("selected") || "",
     };
@@ -184,6 +195,9 @@ function applyUrlState() {
     state.activeView = next.activeView;
     state.agentQuery = next.agentQuery;
     state.agentFilter = next.agentFilter;
+    state.agentSort = next.agentSort;
+    state.agentPage = next.agentPage;
+    state.projectFilter = next.projectFilter;
     state.taskFilter = next.taskFilter;
     state.selectedId = next.selectedId;
 }
@@ -195,6 +209,12 @@ function updateUrlState(replace = false) {
         params.set("agent_q", state.agentQuery.trim());
     if (state.agentFilter !== "all")
         params.set("agent_filter", state.agentFilter);
+    if (state.agentSort !== "name")
+        params.set("agent_sort", state.agentSort);
+    if (state.agentPage > 1)
+        params.set("agent_page", String(state.agentPage));
+    if (state.projectFilter !== "all")
+        params.set("project", state.projectFilter);
     if (state.taskFilter !== "all")
         params.set("task_state", state.taskFilter);
     if (state.selectedId)
@@ -214,11 +234,12 @@ function renderOverview() {
     const counts = data.overview.counts;
     const startup = data.hermes_startup;
     const startupStatus = startup?.operator_health?.status || (startup?.ready ? "healthy" : "degraded");
+    const readyStories = data.project_summaries.reduce((sum, project) => sum + project.ready_count, 0);
     return `
     <section class="metric-grid">
       ${metric("Agents", counts.agents || 0, `${counts.healthy_agents || 0} healthy, ${counts.busy_agents || 0} busy`)}
-      ${metric("Machines", counts.machines || 0, `${counts.trusted_machines || 0} trusted`)}
-      ${metric("Active Tasks", counts.active_tasks || 0, `${counts.dead_letters || 0} dead letters`)}
+      ${metric("Projects", counts.projects || 0, `${readyStories} ready stories`)}
+      ${metric("Active Work", counts.active_tasks || 0, `${counts.dead_letters || 0} dead letters`)}
       ${metric("Hermes", counts.hermes_instances || 0, `${startupStatus}, ${counts.platform_bindings || 0} bindings`)}
     </section>
     <section class="surface">
@@ -238,6 +259,63 @@ function renderOverview() {
       <div class="surface">
         <h2>Attention</h2>
         ${attentionList(data)}
+      </div>
+    </section>
+  `;
+}
+function renderWork() {
+    const data = mustData();
+    const projects = data.project_summaries;
+    const selectedProject = selectedProjectSummary(data);
+    const scopedProjects = state.projectFilter === "all" ? projects : projects.filter((project) => project.project === state.projectFilter);
+    const selectedTask = selectedTaskDetail(data) || selectedProject?.frontier_tasks
+        .map((task) => taskDetailById(data, task.id))
+        .find(Boolean) || null;
+    const readyStories = scopedProjects.reduce((sum, project) => sum + project.ready_count, 0);
+    const blockedStories = scopedProjects.reduce((sum, project) => sum + project.blocked_count, 0);
+    const activeAgents = new Set(scopedProjects.flatMap((project) => project.active_agent_ids)).size;
+    return `
+    <section class="toolbar">
+      <select id="projectFilter">
+        ${option("all", "All projects", state.projectFilter)}
+        ${projects.map((project) => option(project.project, project.project, state.projectFilter)).join("")}
+      </select>
+      <button type="button" id="clearWorkScope">Clear Scope</button>
+    </section>
+    <section class="metric-grid">
+      ${metric("Projects", projects.length, `${readyStories} ready stories`)}
+      ${metric("Active Agents", activeAgents, "working in selected scope")}
+      ${metric("Blocked Stories", blockedStories, "waiting on dependencies")}
+      ${metric("Cross-Project Edges", projects.reduce((sum, project) => sum + project.cross_project_dependency_count, 0), "dependency order links")}
+    </section>
+    <section class="work-layout">
+      <div class="surface">
+        <div class="surface-heading">
+          <h2>Epic / Project Frontier</h2>
+          ${chip(selectedProject?.project || "all projects", "info")}
+        </div>
+        <div class="project-frontier-list">
+          ${scopedProjects
+        .map(projectFrontierRecord)
+        .join("") || `<div class="empty-state">No projects</div>`}
+        </div>
+      </div>
+      <div class="surface">
+        <div class="surface-heading">
+          <h2>Story Scope</h2>
+          ${selectedTask ? chip(selectedTask.task.state, statusTone(selectedTask.task.state)) : chip("none selected", "warn")}
+        </div>
+        ${selectedTask ? storyScopePanel(data, selectedTask) : `<div class="empty-state">Select a story to inspect related agents</div>`}
+      </div>
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Project Agents</h2>
+        ${projectAgentsPanel(data, selectedProject)}
+      </div>
+      <div class="surface">
+        <h2>Dependency Order</h2>
+        ${dependencyOrderPanel(data, selectedProject)}
       </div>
     </section>
   `;
@@ -278,27 +356,26 @@ function renderMap() {
 }
 function renderAgents() {
     const data = mustData();
-    const query = state.agentQuery.trim().toLowerCase();
-    const agents = data.agents.filter((item) => {
-        const haystack = [
-            item.agent.name,
-            item.agent.id,
-            item.machine?.hostname || "",
-            item.agent.status,
-            item.agent.health_status,
-            ...(item.agent.capabilities || []),
-        ].join(" ").toLowerCase();
-        const matchesQuery = !query || haystack.includes(query);
-        const matchesFilter = state.agentFilter === "all" ||
-            (state.agentFilter === "eligible" && item.availability.eligible) ||
-            (state.agentFilter === "blocked" && !item.availability.eligible) ||
-            item.agent.status === state.agentFilter ||
-            item.agent.health_status === state.agentFilter;
-        return matchesQuery && matchesFilter;
-    });
+    const agents = filteredAgents(data);
+    const pageCount = Math.max(1, Math.ceil(agents.length / AGENT_PAGE_SIZE));
+    if (state.agentPage > pageCount)
+        state.agentPage = pageCount;
+    const start = (state.agentPage - 1) * AGENT_PAGE_SIZE;
+    const visible = agents.slice(start, start + AGENT_PAGE_SIZE);
+    const visibleIds = visible.map((item) => item.agent.id);
     return `
+    <section class="metric-grid">
+      ${metric("Visible Agents", agents.length, `${data.agents.length} total`)}
+      ${metric("Busy", agents.filter((item) => item.agent.status === "busy").length, "in current result")}
+      ${metric("Blocked", agents.filter((item) => !item.availability.eligible).length, "not dispatch eligible")}
+      ${metric("Page", `${state.agentPage}/${pageCount}`, `${visible.length} rows shown`)}
+    </section>
     <section class="toolbar">
       <input id="agentSearch" type="search" placeholder="Search agents, hosts, capabilities" value="${escapeHtml(state.agentQuery)}">
+      <select id="agentProjectFilter">
+        ${option("all", "All projects", state.projectFilter)}
+        ${data.project_summaries.map((project) => option(project.project, project.project, state.projectFilter)).join("")}
+      </select>
       <select id="agentFilter">
         ${option("all", "All agents", state.agentFilter)}
         ${option("eligible", "Eligible", state.agentFilter)}
@@ -310,10 +387,42 @@ function renderAgents() {
         ${option("degraded", "Degraded", state.agentFilter)}
         ${option("unhealthy", "Unhealthy", state.agentFilter)}
       </select>
+      <select id="agentSort">
+        ${option("name", "Sort by name", state.agentSort)}
+        ${option("status", "Sort by status", state.agentSort)}
+        ${option("project", "Sort by project", state.agentSort)}
+        ${option("capacity", "Sort by capacity", state.agentSort)}
+        ${option("last_seen", "Sort by last seen", state.agentSort)}
+      </select>
       <button type="button" id="clearAgentFilters">Clear</button>
     </section>
-    <section class="agent-list">
-      ${agents.length ? agents.map(agentCard).join("") : `<div class="empty-state">No matching agents</div>`}
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Agent Resource Table</h2>
+        ${chip(`${agents.length} matching`, "info")}
+      </div>
+      <form class="action-form compact" data-action="agentBulkUpdate">
+        <input type="hidden" name="agent_ids" value="${escapeHtml(visibleIds.join(","))}">
+        <label>Status <select name="status">${option("", "No status change", "")}${["idle", "draining", "offline"].map((value) => option(value, labelize(value), "")).join("")}</select></label>
+        <label>Health <select name="health_status">${option("", "No health change", "")}${["healthy", "degraded", "unhealthy"].map((value) => option(value, labelize(value), "")).join("")}</select></label>
+        <button type="submit">Apply To Visible</button>
+      </form>
+      ${agentTable(visible, data)}
+      <div class="pager">
+        <button type="button" id="agentPrevPage" ${state.agentPage <= 1 ? "disabled" : ""}>Previous</button>
+        <span class="muted small">Rows ${agents.length ? start + 1 : 0}-${start + visible.length} of ${agents.length}</span>
+        <button type="button" id="agentNextPage" ${state.agentPage >= pageCount ? "disabled" : ""}>Next</button>
+      </div>
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Project Cohorts</h2>
+        ${swarmBuckets(data.swarm_summary.project)}
+      </div>
+      <div class="surface">
+        <h2>Capability Footprint</h2>
+        ${swarmBuckets(data.swarm_summary.capability)}
+      </div>
     </section>
   `;
 }
@@ -957,6 +1066,261 @@ function memoryRecord(memory) {
     </article>
   `;
 }
+function selectedProjectSummary(data) {
+    if (state.projectFilter !== "all") {
+        return data.project_summaries.find((project) => project.project === state.projectFilter) || null;
+    }
+    if (state.selectedId) {
+        const selectedTask = taskDetailById(data, state.selectedId);
+        if (selectedTask) {
+            const project = taskProject(selectedTask.task);
+            return data.project_summaries.find((item) => item.project === project) || null;
+        }
+    }
+    return data.project_summaries[0] || null;
+}
+function selectedTaskDetail(data) {
+    if (!state.selectedId)
+        return null;
+    return taskDetailById(data, state.selectedId);
+}
+function taskDetailById(data, taskId) {
+    return data.tasks.find((detail) => detail.task.id === taskId) || null;
+}
+function taskProject(task) {
+    if (task.project)
+        return String(task.project);
+    const metadata = task.metadata || {};
+    for (const key of ["project", "repository", "repo"]) {
+        const value = metadata[key];
+        if (value)
+            return String(value);
+    }
+    const origin = metadata.origin;
+    if (origin) {
+        for (const key of ["project", "repository", "repo", "source"]) {
+            const value = origin[key];
+            if (value)
+                return String(value);
+        }
+    }
+    return "unassigned";
+}
+function projectFrontierRecord(project) {
+    const ready = project.frontier_tasks.slice(0, 4);
+    return `
+    <article class="project-row ${state.projectFilter === project.project ? "is-selected" : ""}">
+      <div>
+        <div class="record-header">
+          <div><h3>${escapeHtml(project.project)}</h3><p class="muted small">${project.task_count} stories, ${project.active_agent_ids.length} active agents</p></div>
+          <button class="link-button" type="button" data-project="${escapeHtml(project.project)}">Focus</button>
+        </div>
+        <div class="chip-row">
+          ${chip(`${project.ready_count} ready`, project.ready_count ? "good" : "info")}
+          ${chip(`${project.blocked_count} blocked`, project.blocked_count ? "warn" : "good")}
+          ${chip(`${project.review_count} review`, project.review_count ? "warn" : "info")}
+          ${project.cross_project_dependency_count ? chip(`${project.cross_project_dependency_count} cross-project`, "warn") : ""}
+        </div>
+      </div>
+      <div class="story-stack">
+        ${ready.length ? ready.map((task) => storyButton(task)).join("") : `<span class="muted small">No ready stories</span>`}
+      </div>
+    </article>
+  `;
+}
+function storyButton(task) {
+    return `<button class="story-button ${selectedClass(task.id)}" type="button" data-select-id="${escapeHtml(task.id)}"><span>${escapeHtml(task.title)}</span><span class="mono small">${escapeHtml(task.id)}</span></button>`;
+}
+function storyScopePanel(data, detail) {
+    const task = detail.task;
+    const related = relatedAgentsForTask(data, detail);
+    const dependencyDetails = (task.dependencies || []).map((id) => taskDetailById(data, id)).filter(Boolean);
+    const dependents = data.tasks.filter((candidate) => (candidate.task.dependencies || []).includes(task.id));
+    return `
+    <div class="story-scope">
+      <div>
+        <h3>${escapeHtml(task.title)}</h3>
+        <p class="muted small mono">${escapeHtml(task.id)} / ${escapeHtml(taskProject(task))}</p>
+        <div class="chip-row">
+          ${chip(task.state, statusTone(task.state))}
+          ${chip(`P${task.priority || 0}`, "info")}
+          ${(task.required_capabilities || []).map((capability) => chip(capability, "info")).join("")}
+        </div>
+      </div>
+      <div class="relationship-strip">
+        ${related.length ? related.map(({ item, relation }) => scopedAgentPill(item, relation)).join("") : `<div class="empty-state">No agents attached to this story yet</div>`}
+      </div>
+      <div class="split compact-split">
+        <div>
+          <h3>Blocks This Story</h3>
+          <div class="story-stack">${dependencyDetails.length ? dependencyDetails.map((item) => storyButton(item.task)).join("") : `<span class="muted small">No dependencies</span>`}</div>
+        </div>
+        <div>
+          <h3>Unblocks Next</h3>
+          <div class="story-stack">${dependents.length ? dependents.slice(0, 8).map((item) => storyButton(item.task)).join("") : `<span class="muted small">No dependents</span>`}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+function relatedAgentsForTask(data, detail) {
+    const relations = new Map();
+    const add = (agentId, relation) => {
+        const id = String(agentId || "").trim();
+        if (!id)
+            return;
+        if (!relations.has(id))
+            relations.set(id, new Set());
+        relations.get(id)?.add(relation);
+    };
+    add(detail.task.owner_agent_id, "writing");
+    for (const review of detail.reviews || [])
+        add(review.reviewer_agent_id, "reviewing");
+    for (const evidence of detail.evidence || []) {
+        const kind = String(evidence.kind || "");
+        add(evidence.created_by, kind === "test" ? "testing" : kind === "publication" ? "deploying" : "evidence");
+    }
+    for (const event of detail.history || [])
+        add(event.actor, "history");
+    for (const dependencyId of detail.task.dependencies || []) {
+        const dependency = taskDetailById(data, dependencyId);
+        add(dependency?.task.owner_agent_id, "dependency");
+    }
+    const byId = new Map(data.agents.map((item) => [item.agent.id, item]));
+    return Array.from(relations.entries())
+        .map(([agentId, relationSet]) => {
+        const item = byId.get(agentId);
+        return item ? { item, relation: Array.from(relationSet).join(", ") } : null;
+    })
+        .filter(Boolean);
+}
+function scopedAgentPill(item, relation) {
+    return `
+    <button class="agent-pill ${selectedClass(item.agent.id)}" type="button" data-select-id="${escapeHtml(item.agent.id)}">
+      <span class="mono">${escapeHtml(item.agent.name)}</span>
+      <span>${escapeHtml(relation)}</span>
+      <span>${escapeHtml(item.agent.status)} / ${escapeHtml(item.agent.health_status)}</span>
+    </button>
+  `;
+}
+function projectAgentsPanel(data, project) {
+    const projectName = project?.project || "all";
+    const agents = data.agents.filter((item) => projectName === "all" ? item.active_tasks.length : (item.active_projects || []).includes(projectName));
+    if (!agents.length)
+        return `<div class="empty-state">No active agents in this scope</div>`;
+    return agentTable(agents.slice(0, 40), data, true);
+}
+function dependencyOrderPanel(data, project) {
+    const projects = project ? [project] : data.project_summaries;
+    const waiting = projects.flatMap((item) => item.waiting_tasks.map((task) => ({ project: item.project, task }))).slice(0, 12);
+    const edges = projects.flatMap((item) => item.cross_project_edges.map((edge) => ({ project: item.project, edge }))).slice(0, 12);
+    return `
+    <div class="record-list">
+      ${waiting.map(({ project: projectName, task }) => `
+        <article class="record compact">
+          <div class="record-header"><div><h3>${escapeHtml(task.title)}</h3><p class="muted small">${escapeHtml(projectName)}</p></div>${chip("waiting", "warn")}</div>
+          <p class="muted small mono">${escapeHtml((task.waiting_on || []).join(" -> "))}</p>
+        </article>
+      `).join("")}
+      ${edges.map(({ project: projectName, edge }) => `
+        <article class="record compact">
+          <div class="record-header"><div><h3>${escapeHtml(String(edge.from_project || "project"))} -> ${escapeHtml(projectName)}</h3><p class="muted small">${escapeHtml(String(edge.from_task_title || edge.from_task_id || ""))}</p></div>${chip("cross-project", "warn")}</div>
+          <p class="muted small">${escapeHtml(String(edge.to_task_title || edge.to_task_id || ""))}</p>
+        </article>
+      `).join("")}
+      ${!waiting.length && !edges.length ? `<div class="empty-state">No dependency waits in scope</div>` : ""}
+    </div>
+  `;
+}
+function filteredAgents(data) {
+    const query = state.agentQuery.trim().toLowerCase();
+    const agents = data.agents.filter((item) => {
+        const projects = item.active_projects || [];
+        const haystack = [
+            item.agent.name,
+            item.agent.id,
+            item.machine?.hostname || "",
+            item.agent.status,
+            item.agent.health_status,
+            ...projects,
+            ...(item.agent.capabilities || []),
+        ].join(" ").toLowerCase();
+        const matchesQuery = !query || haystack.includes(query);
+        const matchesProject = state.projectFilter === "all" || projects.includes(state.projectFilter);
+        const matchesFilter = state.agentFilter === "all" ||
+            (state.agentFilter === "eligible" && item.availability.eligible) ||
+            (state.agentFilter === "blocked" && !item.availability.eligible) ||
+            item.agent.status === state.agentFilter ||
+            item.agent.health_status === state.agentFilter;
+        return matchesQuery && matchesProject && matchesFilter;
+    });
+    return agents.sort(agentSort);
+}
+function agentSort(left, right) {
+    if (state.agentSort === "status")
+        return compareText(`${left.agent.status} ${left.agent.name}`, `${right.agent.status} ${right.agent.name}`);
+    if (state.agentSort === "project")
+        return compareText((left.active_projects || []).join(",") || "idle", (right.active_projects || []).join(",") || "idle") || compareText(left.agent.name, right.agent.name);
+    if (state.agentSort === "capacity")
+        return (right.capacity - right.active_lease_count) - (left.capacity - left.active_lease_count) || compareText(left.agent.name, right.agent.name);
+    if (state.agentSort === "last_seen")
+        return compareText(String(right.agent.last_seen_at || ""), String(left.agent.last_seen_at || ""));
+    return compareText(left.agent.name, right.agent.name);
+}
+function compareText(left, right) {
+    return left.localeCompare(right, undefined, { sensitivity: "base", numeric: true });
+}
+function agentTable(agents, data, compact = false) {
+    if (!agents.length)
+        return `<div class="empty-state">No matching agents</div>`;
+    return `
+    <div class="table-wrap">
+      <table class="data-table ${compact ? "compact-table" : ""}">
+        <thead><tr><th>Agent</th><th>Project</th><th>Status</th><th>Capacity</th><th>Machine</th><th>Capabilities</th><th>Task</th><th></th></tr></thead>
+        <tbody>
+          ${agents.map((item) => agentRow(item, data)).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+function agentRow(item, data) {
+    const task = item.active_tasks[0];
+    return `
+    <tr class="${selectedClass(item.agent.id)}">
+      <td><button class="link-button mono" type="button" data-select-id="${escapeHtml(item.agent.id)}">${escapeHtml(item.agent.name)}</button><br><span class="muted small">${escapeHtml(item.agent.id)}</span></td>
+      <td>${escapeHtml((item.active_projects || []).join(", ") || "idle")}</td>
+      <td>${chip(item.agent.status, statusTone(item.agent.status))} ${chip(item.agent.health_status, healthTone(item.agent.health_status))}</td>
+      <td class="mono">${item.active_lease_count} / ${item.capacity}</td>
+      <td>${escapeHtml(item.machine?.hostname || "missing")}</td>
+      <td>${escapeHtml((item.agent.capabilities || []).slice(0, 8).join(", ") || "none")}</td>
+      <td>${task ? storyButton(task) : `<span class="muted small">none</span>`}</td>
+      <td>
+        <form class="inline-form" data-action="agentBulkUpdate">
+          <input type="hidden" name="agent_ids" value="${escapeHtml(item.agent.id)}">
+          <input type="hidden" name="status" value="draining">
+          <button type="submit">Drain</button>
+        </form>
+      </td>
+    </tr>
+  `;
+}
+function swarmBuckets(items) {
+    if (!items.length)
+        return `<div class="empty-state">No data</div>`;
+    const total = items.reduce((sum, item) => sum + item.count, 0) || 1;
+    return `
+    <div class="bucket-list">
+      ${items.slice(0, 16).map((item) => `
+        <button class="bucket-row" type="button" data-agent-filter-value="${escapeHtml(item.key)}">
+          <span>${escapeHtml(item.key)}</span>
+          <span class="bar-track"><span class="bar-fill" style="width:${Math.max(2, (item.count / total) * 100)}%"></span></span>
+          <span class="mono small">${item.count}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
 function agentCard(item) {
     const agent = item.agent;
     const machine = item.machine;
@@ -1183,13 +1547,38 @@ function bindViewControls() {
     if (search)
         search.addEventListener("input", (event) => {
             state.agentQuery = event.target.value;
+            state.agentPage = 1;
             updateUrlState(true);
+            render();
+        });
+    const projectFilter = document.querySelector("#projectFilter");
+    if (projectFilter)
+        projectFilter.addEventListener("change", (event) => {
+            state.projectFilter = event.target.value;
+            state.agentPage = 1;
+            updateUrlState();
+            render();
+        });
+    const agentProjectFilter = document.querySelector("#agentProjectFilter");
+    if (agentProjectFilter)
+        agentProjectFilter.addEventListener("change", (event) => {
+            state.projectFilter = event.target.value;
+            state.agentPage = 1;
+            updateUrlState();
             render();
         });
     const agentFilter = document.querySelector("#agentFilter");
     if (agentFilter)
         agentFilter.addEventListener("change", (event) => {
             state.agentFilter = event.target.value;
+            state.agentPage = 1;
+            updateUrlState();
+            render();
+        });
+    const agentSort = document.querySelector("#agentSort");
+    if (agentSort)
+        agentSort.addEventListener("change", (event) => {
+            state.agentSort = event.target.value;
             updateUrlState();
             render();
         });
@@ -1198,6 +1587,31 @@ function bindViewControls() {
         clearAgents.addEventListener("click", () => {
             state.agentQuery = "";
             state.agentFilter = "all";
+            state.agentSort = "name";
+            state.agentPage = 1;
+            state.projectFilter = "all";
+            updateUrlState();
+            render();
+        });
+    const clearWorkScope = document.querySelector("#clearWorkScope");
+    if (clearWorkScope)
+        clearWorkScope.addEventListener("click", () => {
+            state.projectFilter = "all";
+            state.selectedId = "";
+            updateUrlState();
+            render();
+        });
+    const prevAgentPage = document.querySelector("#agentPrevPage");
+    if (prevAgentPage)
+        prevAgentPage.addEventListener("click", () => {
+            state.agentPage = Math.max(1, state.agentPage - 1);
+            updateUrlState();
+            render();
+        });
+    const nextAgentPage = document.querySelector("#agentNextPage");
+    if (nextAgentPage)
+        nextAgentPage.addEventListener("click", () => {
+            state.agentPage += 1;
             updateUrlState();
             render();
         });
@@ -1217,6 +1631,26 @@ function bindViewControls() {
         });
 }
 function handleContentClick(event) {
+    const projectTarget = event.target?.closest("[data-project]");
+    if (projectTarget) {
+        state.projectFilter = projectTarget.dataset.project || "all";
+        state.agentPage = 1;
+        updateUrlState();
+        render();
+        return;
+    }
+    const bucketTarget = event.target?.closest("[data-agent-filter-value]");
+    if (bucketTarget) {
+        const value = bucketTarget.dataset.agentFilterValue || "";
+        if (value && value !== "idle") {
+            state.projectFilter = value;
+            state.activeView = "agents";
+            state.agentPage = 1;
+            updateUrlState();
+            render();
+        }
+        return;
+    }
     const target = event.target?.closest("[data-select-id]");
     if (!target)
         return;
@@ -1382,6 +1816,19 @@ async function runAction(action, form, values) {
             created_by: requiredString(values.created_by),
             evidence_id: emptyToNull(values.evidence_id),
         });
+    }
+    if (action === "agentBulkUpdate") {
+        const body = {
+            agent_ids: String(values.agent_ids || "").split(",").map((item) => item.trim()).filter(Boolean),
+        };
+        if (String(values.status || "").trim())
+            body.status = String(values.status).trim();
+        if (String(values.health_status || "").trim())
+            body.health_status = String(values.health_status).trim();
+        if (String(values.capabilities || "").trim()) {
+            body.capabilities = String(values.capabilities).split(",").map((item) => item.trim()).filter(Boolean);
+        }
+        return postJSON("/agents/bulk", body);
     }
     if (action === "rolloutAdvance") {
         return postJSON(`/rollouts/${encodeURIComponent(requiredDataset(form, "rolloutId"))}/advance`, {

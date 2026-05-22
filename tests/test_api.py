@@ -429,6 +429,11 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert "artifacts" in state
     assert "bridge_items" in state
     assert "beads_repositories" in state
+    assert "project_summaries" in state
+    assert "swarm_summary" in state
+    assert state["project_summaries"][0]["project"] == "unassigned"
+    assert state["project_summaries"][0]["ready_count"] == 1
+    assert state["swarm_summary"]["agent_total"] == 1
     assert "memory_records" in state
     assert "nap_schedules" in state
     assert "nap_runs" in state
@@ -439,6 +444,52 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
 
     agent_detail = client.get("/dashboard/agents/%s" % agent["id"]).json()
     assert agent_detail["availability"]["eligible"] is True
+
+
+def test_dashboard_models_large_swarm_by_project_and_limits_dispatch_candidates():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "swarm-host"}).json()
+    for index in range(75):
+        client.post(
+            "/agents",
+            json={
+                "machine_id": machine["id"],
+                "name": "agent-%03d" % index,
+                "capabilities": ["python"],
+            },
+        )
+    story = client.post(
+        "/tasks",
+        json={
+            "title": "Story ready for writing",
+            "project": "nanolang",
+            "required_capabilities": ["python"],
+        },
+    ).json()
+    blocker = client.post(
+        "/tasks",
+        json={"title": "Dependency library", "project": "libcore"},
+    ).json()
+    client.post(
+        "/tasks",
+        json={
+            "title": "Story waiting on libcore",
+            "project": "nanolang",
+            "dependencies": [blocker["id"]],
+        },
+    )
+
+    state = client.get("/dashboard/state").json()
+
+    nanolang = next(project for project in state["project_summaries"] if project["project"] == "nanolang")
+    assert nanolang["ready_count"] == 1
+    assert nanolang["blocked_count"] == 1
+    assert nanolang["cross_project_dependency_count"] == 1
+    assert nanolang["frontier_tasks"][0]["id"] == story["id"]
+    assert state["swarm_summary"]["agent_total"] == 75
+    assert state["dispatch"]["tasks"][0]["candidate_count"] == 75
+    assert len(state["dispatch"]["tasks"][0]["candidates"]) == 60
+    assert state["dispatch"]["tasks"][0]["candidate_truncated"] is True
 
 
 def test_fastapi_exposes_operator_notifications():
@@ -489,6 +540,14 @@ def test_fastapi_exposes_agent_crud_operations():
     assert updated.status_code == 200
     assert updated.json()["name"] == "worker-renamed"
     assert updated.json()["capabilities"] == ["ops", "python"]
+
+    bulk = client.post(
+        "/agents/bulk",
+        json={"agent_ids": [agent["id"]], "status": "draining"},
+    )
+    assert bulk.status_code == 200
+    assert bulk.json()["updated_count"] == 1
+    assert bulk.json()["updated"][0]["status"] == "draining"
 
     disabled = client.post("/agents/%s/disable" % agent["id"])
     assert disabled.status_code == 200
@@ -860,8 +919,12 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     index_html = (root / "src/mac/ui/index.html").read_text(encoding="utf-8")
     assert "URLSearchParams" in app_js
     assert "createDashboardApi" in app_js
+    assert "renderWork" in app_js
+    assert "Epic / Project Frontier" in app_js
+    assert "Agent Resource Table" in app_js
     assert "renderWorkflows" in app_js
     assert "workflowGraph" in app_js
+    assert 'data-view="work"' in index_html
     assert 'data-view="map"' in index_html
     assert 'data-view="workflows"' in index_html
     assert not (root / "package.json").exists()

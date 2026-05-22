@@ -250,6 +250,12 @@ h3 {
   gap: 14px;
 }
 
+.work-layout {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.9fr) minmax(420px, 1.1fr);
+  gap: 18px;
+}
+
 .metric {
   min-height: 104px;
   border: 1px solid var(--line);
@@ -301,7 +307,7 @@ h3 {
 
 .toolbar {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) 180px 132px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 10px;
 }
 
@@ -397,6 +403,114 @@ details.action-box summary {
 .observability-feed {
   display: grid;
   gap: 12px;
+}
+
+.project-frontier-list,
+.story-stack,
+.bucket-list {
+  display: grid;
+  gap: 8px;
+}
+
+.project-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.8fr);
+  gap: 12px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px;
+}
+
+.story-button,
+.agent-pill,
+.bucket-row {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--ink);
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.story-button {
+  display: grid;
+  gap: 2px;
+}
+
+.agent-pill {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(80px, auto) minmax(120px, auto);
+  gap: 10px;
+  align-items: center;
+}
+
+.relationship-strip {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.compact-split {
+  gap: 12px;
+}
+
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+}
+
+.data-table th,
+.data-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.data-table th {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.compact-table {
+  min-width: 760px;
+}
+
+.inline-form {
+  display: inline-grid;
+}
+
+.inline-form button {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--blue);
+  padding: 0 10px;
+  font-weight: 700;
+}
+
+.pager,
+.bucket-row {
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.pager {
+  margin-top: 12px;
 }
 
 .agent-card,
