@@ -111,7 +111,10 @@ QDRANT_BINARY="${QDRANT_BINARY:-$MAC_HOME/bin/qdrant}"
 USE_NATIVE_BINARY=0
 
 _container_works() {
-  "$1" info >/dev/null 2>&1
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" info >/dev/null 2>&1 || return 1
+  # Empty cgroupControllers means no cgroup delegation — containers can't start
+  "$1" info 2>/dev/null | grep -qE 'cgroupControllers:.*\S'
 }
 
 for _candidate in podman docker; do
