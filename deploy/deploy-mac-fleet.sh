@@ -574,7 +574,28 @@ log() {
 
 python_bin() {
   local candidate
-  for candidate in "${MAC_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 python3.13 python3.12 python3.11 python3 python; do
+  for candidate in "${MAC_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 python3.13 python3.12 python3.11 python3.10 python3 python; do
+    [ -n "$candidate" ] || continue
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    candidate="$(command -v "$candidate")"
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+    then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  log "ERROR: no Python >= 3.10 found"
+  exit 1
+}
+
+hermes_python_bin() {
+  local candidate
+  for candidate in "${MAC_HERMES_PYTHON:-}" python3.13 python3.12 python3.11 /opt/homebrew/bin/python3 /usr/local/bin/python3 python3 python; do
     [ -n "$candidate" ] || continue
     if ! command -v "$candidate" >/dev/null 2>&1; then
       continue
@@ -589,13 +610,25 @@ PY
       return
     fi
   done
-  log "ERROR: no Python >= 3.11 found"
-  exit 1
+  if [ "$OS_KIND" = "linux" ] && command -v apt-get >/dev/null 2>&1; then
+    log "Python >= 3.11 not found; installing python3.11 via deadsnakes PPA"
+    sudo apt-get install -y software-properties-common >/dev/null 2>&1 || true
+    sudo add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1
+    sudo apt-get update >/dev/null 2>&1
+    sudo apt-get install -y python3.11 python3.11-venv >/dev/null 2>&1
+    if command -v python3.11 >/dev/null 2>&1; then
+      printf '%s\n' "$(command -v python3.11)"
+      return
+    fi
+  fi
+  log "WARNING: Python >= 3.11 not available; Hermes agent venv will use $1 (may fail package install)"
+  printf '%s\n' "$1"
 }
 
 PY="$(python_bin)"
+HERMES_PY="$(hermes_python_bin "$PY")"
 SUPERVISOR_KIND=""
-export AGENT FLEET_NAME OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED QDRANT_DATA_DIR_CONFIGURED NETWORK_PROVIDER NETWORK_INSTALL NETWORK_HOSTNAME_PREFIX TAILSCALE_AUTH_KEY TAILSCALE_AUTH_KEY_ENV HEADSCALE_MANAGE HEADSCALE_LOGIN_SERVER HEADSCALE_HEALTH_URL HEADSCALE_PREAUTH_KEY_ENV HEADSCALE_PREAUTH_KEY_SOURCE HEADSCALE_PORT HEADSCALE_PUBLIC_ADDR HEADSCALE_DNS HEADSCALE_IP_PREFIX HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT MAC_SERVICE_NAME HERMES_SERVICE_NAME MAC_AGENT_SERVICE_NAME MAC_LAUNCHD_LABEL HERMES_LAUNCHD_LABEL MAC_AGENT_LAUNCHD_LABEL MAC_SUPERVISORD_PROG HERMES_SUPERVISORD_PROG AGENT_SUPERVISORD_PROG MAC_SUPERVISORD_CONF_NAME SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY
+export AGENT FLEET_NAME OS_KIND DEPLOY_TS DEPLOY_REV DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_STARTED_ISO HERMES_SLACK_HOME_CHANNEL_NAME HERMES_GATEWAY_MODEL HERMES_GATEWAY_PROVIDER HERMES_GATEWAY_BASE_URL HUB_URL CONTROL_BIND_HOST WORKER_MODE WORKER_CAPABILITIES WORKER_ALLOWED_PROJECTS WORKER_REQUIRED_METADATA WORKER_REQUIRE_CANARY SUPERVISOR_REQUESTED SUPERVISOR_KIND SHARED_SERVICES_MANAGER_AGENT QDRANT_URL_CONFIGURED QDRANT_INSTALL QDRANT_REQUIRE QDRANT_BIND_ADDR_CONFIGURED QDRANT_PORT_CONFIGURED QDRANT_IMAGE_CONFIGURED QDRANT_MEMORY_LIMIT_CONFIGURED QDRANT_DATA_DIR_CONFIGURED NETWORK_PROVIDER NETWORK_INSTALL NETWORK_HOSTNAME_PREFIX TAILSCALE_AUTH_KEY TAILSCALE_AUTH_KEY_ENV HEADSCALE_MANAGE HEADSCALE_LOGIN_SERVER HEADSCALE_HEALTH_URL HEADSCALE_PREAUTH_KEY_ENV HEADSCALE_PREAUTH_KEY_SOURCE HEADSCALE_PORT HEADSCALE_PUBLIC_ADDR HEADSCALE_DNS HEADSCALE_IP_PREFIX HEADSCALE_FLEET_URL HEADSCALE_PREAUTHKEY DRAIN_MODE DRAIN_TIMEOUT_SECONDS DRAIN_POLL_SECONDS MAC_HOME MAC_PORT MAC_SERVICE_NAME HERMES_SERVICE_NAME MAC_AGENT_SERVICE_NAME MAC_LAUNCHD_LABEL HERMES_LAUNCHD_LABEL MAC_AGENT_LAUNCHD_LABEL MAC_SUPERVISORD_PROG HERMES_SUPERVISORD_PROG AGENT_SUPERVISORD_PROG MAC_SUPERVISORD_CONF_NAME SRC_DIR VENV HERMES_DIR BEADS_DIR BEADS_REPO_URL BEADS_REF ENV_FILE LOG_DIR DEPLOY_LOG PY HERMES_PY
 
 dns_lookup() {
   if command -v getent >/dev/null 2>&1; then
@@ -1637,8 +1670,8 @@ install_beads_cli() {
   fi
   for required in git make go; do
     if ! command -v "$required" >/dev/null 2>&1; then
-      log "ERROR: bd CLI is required for Beads lifecycle sync, but $required is unavailable"
-      exit 1
+      log "WARNING: bd CLI could not be installed (build prereq missing: $required); Beads lifecycle sync disabled"
+      return 1
     fi
   done
   log "building bd CLI from $BEADS_REPO_URL@$BEADS_REF"
@@ -2232,8 +2265,8 @@ fi
 mv "$SRC_DIR.new" "$SRC_DIR"
 rm -f "$ARCHIVE"
 
-install_beads_cli
-install_github_cli
+install_beads_cli || true
+install_github_cli || true
 
 log "creating/updating mac environment file"
 "$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" <<'PY'
@@ -2394,8 +2427,8 @@ normalize_hermes_redaction_env
 set -a
 . "$ENV_FILE"
 set +a
-bootstrap_beads_repositories
-restore_beads_tracked_exports
+[ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories || true
+[ -x "$MAC_HOME/bin/bd" ] && restore_beads_tracked_exports || true
 install_fleet_networking
 install_or_validate_shared_services
 write_hermes_memory_topology
@@ -2422,7 +2455,7 @@ do
     exit 1
   fi
 done
-"$PY" -m venv "$HERMES_DIR/.venv"
+"$HERMES_PY" -m venv "$HERMES_DIR/.venv"
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$HERMES_DIR/.venv/bin/python" -m pip install -e "$HERMES_DIR" >/dev/null
 apply_hermes_gateway_runtime_shim
