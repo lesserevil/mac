@@ -143,7 +143,8 @@ button {
 
 .token-actions button,
 .primary-button,
-.toolbar button {
+.toolbar button,
+.link-button {
   min-height: 38px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -151,6 +152,13 @@ button {
   color: var(--ink);
   padding: 0 12px;
   font-weight: 700;
+}
+
+.link-button {
+  min-height: 30px;
+  background: #ffffff;
+  color: var(--blue);
+  padding: 0 10px;
 }
 
 .primary-button {
@@ -463,6 +471,11 @@ details.action-box summary {
   border-color: #e7c4bd;
 }
 
+.is-selected {
+  outline: 2px solid #245c8f;
+  outline-offset: 2px;
+}
+
 .record.compact {
   box-shadow: none;
 }
@@ -505,6 +518,10 @@ details.action-box summary {
   grid-template-columns: repeat(4, minmax(130px, 1fr));
   gap: 10px;
   margin-top: 14px;
+}
+
+.compact-grid {
+  grid-template-columns: repeat(4, minmax(90px, 1fr));
 }
 
 .field {
@@ -638,6 +655,88 @@ details.action-box summary {
   background: var(--accent);
 }
 
+.score-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.graph-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin-top: 12px;
+  border: 1px solid #e5e9ef;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #ffffff 0%, #f9fbfa 100%);
+}
+
+.relationship-graph {
+  display: block;
+  min-width: 760px;
+  width: 100%;
+}
+
+.graph-column-label {
+  fill: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.graph-edge {
+  fill: none;
+  stroke: #b8c5d2;
+  stroke-width: 2;
+  opacity: 0.72;
+}
+
+.graph-edge-agent-task {
+  stroke: #2f6f63;
+}
+
+.graph-edge-dependency {
+  stroke: #9a5b13;
+  stroke-dasharray: 5 4;
+}
+
+.graph-node {
+  cursor: pointer;
+}
+
+.graph-node rect {
+  fill: #ffffff;
+  stroke: var(--line);
+  stroke-width: 1.2;
+}
+
+.graph-node-machine rect {
+  fill: var(--blue-soft);
+  stroke: #bdd4e9;
+}
+
+.graph-node-agent rect {
+  fill: var(--accent-soft);
+  stroke: #b8d8d0;
+}
+
+.graph-node-task rect {
+  fill: var(--warning-soft);
+  stroke: #ead09f;
+}
+
+.graph-node.is-selected rect {
+  stroke: var(--blue);
+  stroke-width: 2.4;
+}
+
+.graph-node text {
+  fill: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .empty-state {
   border: 1px dashed #c7d0dc;
   border-radius: 8px;
@@ -672,7 +771,7 @@ details.action-box summary {
   }
 
   .nav {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .nav-item {

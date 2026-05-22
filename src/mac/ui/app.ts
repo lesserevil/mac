@@ -1,6 +1,16 @@
 // Maintained dashboard source. The browser module is checked in as app.js so
 // mac does not require Node.js/npm to serve or install the UI.
-type ViewKey = "overview" | "agents" | "tasks" | "hermes" | "runtime" | "observability" | "secrets";
+type ViewKey =
+  | "overview"
+  | "map"
+  | "agents"
+  | "tasks"
+  | "hermes"
+  | "ops"
+  | "integrations"
+  | "runtime"
+  | "observability"
+  | "secrets";
 type Tone = "good" | "warn" | "bad" | "info";
 type JsonObject = Record<string, unknown>;
 
@@ -30,8 +40,10 @@ interface MachineRecord extends ApiRecord {
 interface TaskRecord extends ApiRecord {
   title: string;
   state: string;
+  project?: string | null;
   priority?: number;
   required_capabilities?: string[];
+  dependencies?: string[];
   metadata?: JsonObject;
   owner_agent_id?: string | null;
   leased_until?: string | null;
@@ -186,6 +198,8 @@ interface DashboardData {
   personas: ApiRecord[];
   hermes_instances: ApiRecord[];
   platform_bindings: ApiRecord[];
+  roles: ApiRecord[];
+  provisioning_requests: ApiRecord[];
   machines: MachineRecord[];
   agents: AgentItem[];
   tasks: TaskDetail[];
@@ -193,6 +207,15 @@ interface DashboardData {
   dispatch: { open_task_count: number; tasks: DispatchTask[] };
   messages: ApiRecord[];
   notifications: OperatorNotification[];
+  workflows: ApiRecord[];
+  workflow_runs: { counts?: Record<string, number>; total?: number; latest?: ApiRecord[] };
+  agentbus_streams: ApiRecord[];
+  artifacts: ApiRecord[];
+  bridge_items: ApiRecord[];
+  beads_repositories: ApiRecord[];
+  memory_records: ApiRecord[];
+  nap_schedules: ApiRecord[];
+  nap_runs: ApiRecord[];
   integration_findings: IntegrationFinding[];
   integration_observations: IntegrationObservation[];
   command_audit: CommandAuditRecord[];
@@ -218,6 +241,7 @@ interface DashboardState {
   agentQuery: string;
   agentFilter: string;
   taskFilter: string;
+  selectedId: string;
   observabilityLive: ObservabilityEvent[];
   observabilityStream: AbortController | null;
   observabilityStreamStatus: string;
@@ -250,25 +274,31 @@ const TASK_STATES = [
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled"]);
 const VIEW_TITLES: Record<ViewKey, string> = {
   overview: "Overview",
+  map: "Map",
   agents: "Agents",
   tasks: "Tasks",
   hermes: "Hermes",
+  ops: "Operations",
+  integrations: "Integrations",
   runtime: "Runtime",
   observability: "Observability",
   secrets: "Secrets",
 };
+const VIEW_KEYS = new Set(Object.keys(VIEW_TITLES));
+const DEFAULT_URL_STATE = readUrlState();
 
 const state: DashboardState = {
-  activeView: "overview",
+  activeView: DEFAULT_URL_STATE.activeView,
   token: sessionStorage.getItem(TOKEN_KEY) || "",
   loading: false,
   loadedAt: null,
   data: null,
   error: null,
   actionMessage: null,
-  agentQuery: "",
-  agentFilter: "all",
-  taskFilter: "all",
+  agentQuery: DEFAULT_URL_STATE.agentQuery,
+  agentFilter: DEFAULT_URL_STATE.agentFilter,
+  taskFilter: DEFAULT_URL_STATE.taskFilter,
+  selectedId: DEFAULT_URL_STATE.selectedId,
   observabilityLive: [],
   observabilityStream: null,
   observabilityStreamStatus: "idle",
@@ -296,9 +326,11 @@ function bindEvents(): void {
     if (!button) return;
     state.activeView = (button.dataset.view || "overview") as ViewKey;
     state.actionMessage = null;
+    updateUrlState();
     render();
   });
   nodes.refresh.addEventListener("click", () => loadDashboard());
+  nodes.content.addEventListener("click", handleContentClick);
   nodes.content.addEventListener("submit", handleActionSubmit);
   nodes.tokenForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -365,19 +397,25 @@ function render(): void {
   }
   const action = state.actionMessage ? `<div class="action-status">${escapeHtml(state.actionMessage)}</div>` : "";
   const body =
-    state.activeView === "agents"
+    state.activeView === "map"
+      ? renderMap()
+      : state.activeView === "agents"
       ? renderAgents()
       : state.activeView === "tasks"
         ? renderTasks()
         : state.activeView === "hermes"
           ? renderHermes()
-          : state.activeView === "runtime"
-            ? renderRuntime()
-            : state.activeView === "observability"
-              ? renderObservability()
-              : state.activeView === "secrets"
-                ? renderSecrets()
-                : renderOverview();
+          : state.activeView === "ops"
+            ? renderOperations()
+            : state.activeView === "integrations"
+              ? renderIntegrations()
+              : state.activeView === "runtime"
+                ? renderRuntime()
+                : state.activeView === "observability"
+                  ? renderObservability()
+                  : state.activeView === "secrets"
+                    ? renderSecrets()
+                    : renderOverview();
   nodes.content.innerHTML = `${action}${body}`;
   bindViewControls();
   syncObservabilitySubscription();
@@ -402,6 +440,46 @@ function renderBanner(): void {
     ? "Dashboard data needs a token with read scope."
     : state.error;
 }
+
+function readUrlState(): Pick<DashboardState, "activeView" | "agentQuery" | "agentFilter" | "taskFilter" | "selectedId"> {
+  const params = new URLSearchParams(window.location.search);
+  const rawView = params.get("view") || "overview";
+  return {
+    activeView: VIEW_KEYS.has(rawView) ? rawView as ViewKey : "overview",
+    agentQuery: params.get("agent_q") || "",
+    agentFilter: params.get("agent_filter") || "all",
+    taskFilter: params.get("task_state") || "all",
+    selectedId: params.get("selected") || "",
+  };
+}
+
+function applyUrlState(): void {
+  const next = readUrlState();
+  state.activeView = next.activeView;
+  state.agentQuery = next.agentQuery;
+  state.agentFilter = next.agentFilter;
+  state.taskFilter = next.taskFilter;
+  state.selectedId = next.selectedId;
+}
+
+function updateUrlState(replace = false): void {
+  const params = new URLSearchParams();
+  if (state.activeView !== "overview") params.set("view", state.activeView);
+  if (state.agentQuery.trim()) params.set("agent_q", state.agentQuery.trim());
+  if (state.agentFilter !== "all") params.set("agent_filter", state.agentFilter);
+  if (state.taskFilter !== "all") params.set("task_state", state.taskFilter);
+  if (state.selectedId) params.set("selected", state.selectedId);
+  const query = params.toString();
+  const nextUrl = `${window.location.pathname}${query ? `?${query}` : ""}`;
+  const method = replace ? "replaceState" : "pushState";
+  window.history[method]({}, "", nextUrl);
+}
+
+window.addEventListener("popstate", () => {
+  applyUrlState();
+  state.actionMessage = null;
+  render();
+});
 
 function renderOverview(): string {
   const data = mustData();
@@ -432,6 +510,41 @@ function renderOverview(): string {
       <div class="surface">
         <h2>Attention</h2>
         ${attentionList(data)}
+      </div>
+    </section>
+  `;
+}
+
+function renderMap(): string {
+  const data = mustData();
+  const activeTasks = data.tasks.filter((detail) => !TERMINAL_TASK_STATES.has(detail.task.state));
+  const dependencyCount = data.tasks.reduce((sum, detail) => sum + (detail.task.dependencies || []).length, 0);
+  return `
+    <section class="metric-grid">
+      ${metric("Topology Nodes", data.machines.length + data.agents.length + activeTasks.length, "machines, agents, active tasks")}
+      ${metric("Dispatch Queue", data.dispatch.open_task_count || 0, "open tasks awaiting agents")}
+      ${metric("Dependencies", dependencyCount, "task dependency edges")}
+      ${metric("AgentBus", data.agentbus_streams.length, "recent streams")}
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Fleet Relationship Map</h2>
+        ${chip(state.selectedId || "nothing selected", state.selectedId ? "info" : "warn")}
+      </div>
+      ${relationshipGraph(data)}
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Dispatch Eligibility</h2>
+        <div class="record-list">
+          ${data.dispatch.tasks.length ? data.dispatch.tasks.slice(0, 20).map(dispatchRecord).join("") : `<div class="empty-state">No dispatch candidates</div>`}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>Dependency Edges</h2>
+        <div class="record-list">
+          ${taskDependencyRecords(data)}
+        </div>
       </div>
     </section>
   `;
@@ -541,6 +654,102 @@ function hermesStartupPanel(startup?: HermesStartup | null): string {
         ${field("Log classes", (logs.classes as unknown[] | undefined)?.length ?? 0)}
       </div>
       ${warnings.length ? `<div class="timeline">${warnings.map((warning) => timelineItem("warning", warning, "")).join("")}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderOperations(): string {
+  const data = mustData();
+  const workflowCounts = data.workflow_runs.counts || {};
+  const pendingProvisioning = data.provisioning_requests.filter((item) => item.status === "pending");
+  const openStreams = data.agentbus_streams.filter((item) => item.status === "open");
+  return `
+    <section class="metric-grid">
+      ${metric("Roles", data.roles.length, "agent personas and constraints")}
+      ${metric("Provisioning", pendingProvisioning.length, "pending agent requests")}
+      ${metric("Workflows", data.workflows.length, `${data.workflow_runs.total || 0} runs`)}
+      ${metric("AgentBus", openStreams.length, `${data.agentbus_streams.length} recent streams`)}
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Workflow Runs</h2>
+        ${stateBars(Object.keys(workflowCounts).sort(), workflowCounts, Number(data.workflow_runs.total || 0), "No workflow runs")}
+        <div class="record-list">
+          ${(data.workflow_runs.latest || []).length ? (data.workflow_runs.latest || []).map(workflowRunRecord).join("") : `<div class="empty-state">No workflow run records</div>`}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>Provisioning Requests</h2>
+        <div class="record-list">
+          ${data.provisioning_requests.length ? data.provisioning_requests.map(provisioningRecord).join("") : `<div class="empty-state">No provisioning requests</div>`}
+        </div>
+      </div>
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Roles</h2>
+        <div class="record-list">
+          ${data.roles.length ? data.roles.map(roleRecord).join("") : `<div class="empty-state">No roles</div>`}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>AgentBus And Messages</h2>
+        <div class="record-list">
+          ${data.agentbus_streams.length ? data.agentbus_streams.slice(0, 40).map(agentBusRecord).join("") : `<div class="empty-state">No AgentBus streams</div>`}
+          ${data.messages.length ? data.messages.slice(0, 20).map(messageRecord).join("") : ""}
+        </div>
+      </div>
+    </section>
+    <section class="surface">
+      <h2>Nap Schedules</h2>
+      <div class="record-list">
+        ${data.nap_schedules.length || data.nap_runs.length
+          ? [...data.nap_schedules.map(napScheduleRecord), ...data.nap_runs.slice(0, 20).map(napRunRecord)].join("")
+          : `<div class="empty-state">No nap activity</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderIntegrations(): string {
+  const data = mustData();
+  const failingEvalRuns = data.eval_runs.filter((run) => run.passed === false);
+  return `
+    <section class="metric-grid">
+      ${metric("Beads Repos", data.beads_repositories.length, "registered issue sources")}
+      ${metric("Bridge Items", data.bridge_items.length, "imported project items")}
+      ${metric("Artifacts", data.artifacts.length, "registered outputs")}
+      ${metric("Eval Runs", data.eval_runs.length, `${failingEvalRuns.length} failing`)}
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Beads Bridge</h2>
+        <div class="record-list">
+          ${data.beads_repositories.length ? data.beads_repositories.map(beadsRepositoryRecord).join("") : `<div class="empty-state">No Beads repositories</div>`}
+          ${data.bridge_items.length ? data.bridge_items.slice(0, 30).map(bridgeItemRecord).join("") : ""}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>Artifacts</h2>
+        <div class="record-list">
+          ${data.artifacts.length ? data.artifacts.slice(0, 40).map(artifactRecord).join("") : `<div class="empty-state">No artifacts</div>`}
+        </div>
+      </div>
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Evaluations</h2>
+        <div class="record-list">
+          ${data.eval_sets.length ? data.eval_sets.map(evalSetRecord).join("") : `<div class="empty-state">No eval sets</div>`}
+          ${data.eval_runs.length ? data.eval_runs.slice(0, 40).map(evalRunRecord).join("") : ""}
+        </div>
+      </div>
+      <div class="surface">
+        <h2>Memory</h2>
+        <div class="record-list">
+          ${data.memory_records.length ? data.memory_records.slice().reverse().slice(0, 40).map(memoryRecord).join("") : `<div class="empty-state">No memory records</div>`}
+        </div>
+      </div>
     </section>
   `;
 }
@@ -702,6 +911,197 @@ function notificationRecord(item: OperatorNotification): string {
   `;
 }
 
+function dispatchRecord(item: DispatchTask): string {
+  return `
+    <article class="record compact ${selectedClass(item.task.id)}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(item.task.title)}</h3><p class="muted small mono">${escapeHtml(item.task.id)}</p></div>
+        <button class="link-button" type="button" data-select-id="${escapeHtml(item.task.id)}">Select</button>
+      </div>
+      <div class="chip-row">
+        ${chip(`${item.eligible_agent_count} eligible`, item.eligible_agent_count ? "good" : "bad")}
+        ${item.candidates.slice(0, 8).map((candidate) => chip(candidate.agent_name, candidate.eligible ? "good" : "warn")).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function taskDependencyRecords(data: DashboardData): string {
+  const tasksById = new Map(data.tasks.map((detail) => [detail.task.id, detail.task]));
+  const edges = data.tasks.flatMap((detail) =>
+    (detail.task.dependencies || []).map((dependencyId) => ({ task: detail.task, dependency: tasksById.get(dependencyId), dependencyId }))
+  );
+  if (!edges.length) return `<div class="empty-state">No task dependencies</div>`;
+  return edges.slice(0, 40).map((edge) => `
+    <article class="record compact">
+      <div class="record-header">
+        <div><h3>${escapeHtml(edge.dependency?.title || edge.dependencyId)}</h3><p class="muted small">blocks</p></div>
+        <button class="link-button" type="button" data-select-id="${escapeHtml(edge.task.id)}">Select child</button>
+      </div>
+      <p>${escapeHtml(edge.task.title)}</p>
+      <p class="muted small mono">${escapeHtml(edge.dependencyId)} -> ${escapeHtml(edge.task.id)}</p>
+    </article>
+  `).join("");
+}
+
+function roleRecord(role: ApiRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(role.id))}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(role.display_name || role.name || role.slug || role.id)}</h3><p class="muted small mono">${escapeHtml(role.id)}</p></div>
+        <button class="link-button" type="button" data-select-id="${escapeHtml(role.id)}">Select</button>
+      </div>
+      <div class="chip-row">
+        ${chip(role.level || "role", "info")}
+        ${(role.required_capabilities as string[] | undefined || []).slice(0, 6).map((cap) => chip(cap, "good")).join("")}
+      </div>
+      <p class="muted small">${escapeHtml(role.description || "")}</p>
+    </article>
+  `;
+}
+
+function provisioningRecord(item: ApiRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(item.id))}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(item.reason || item.id)}</h3><p class="muted small mono">${escapeHtml(item.id)}</p></div>
+        ${chip(item.status, item.status === "pending" ? "warn" : item.status === "fulfilled" ? "good" : "bad")}
+      </div>
+      <div class="chip-row">
+        ${(item.capabilities as string[] | undefined || []).map((cap) => chip(cap, "info")).join("")}
+        ${item.role_slug ? chip(item.role_slug, "good") : ""}
+        ${item.task_id ? chip(`task ${shortHash(String(item.task_id))}`, "info") : ""}
+      </div>
+    </article>
+  `;
+}
+
+function workflowRunRecord(run: ApiRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(run.id))}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(run.workflow_id || run.id)}</h3><p class="muted small mono">${escapeHtml(run.id)}</p></div>
+        ${chip(run.state, run.state === "completed" ? "good" : run.state === "failed" ? "bad" : "info")}
+      </div>
+      <div class="row-grid compact-grid">
+        ${field("Tenant", run.tenant_id || "global")}
+        ${field("Started", formatAge(String(run.started_at || run.created_at || "")))}
+        ${field("Current node", run.current_node_key || "none")}
+        ${field("Task", run.task_id || "none")}
+      </div>
+    </article>
+  `;
+}
+
+function agentBusRecord(stream: ApiRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(stream.id))}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(stream.topic || stream.content_type || stream.id)}</h3><p class="muted small mono">${escapeHtml(stream.id)}</p></div>
+        ${chip(stream.status, stream.status === "open" ? "good" : "info")}
+      </div>
+      <p class="muted small">${escapeHtml(stream.sender_agent_id || "unknown")} -> ${escapeHtml(stream.recipient_agent_id || "broadcast")}</p>
+    </article>
+  `;
+}
+
+function messageRecord(message: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(message.message_type || message.id)}</h3><p class="muted small mono">${escapeHtml(message.id)}</p></div>${chip(message.status, message.status === "pending" ? "warn" : "good")}</div>
+      <p class="muted small">${escapeHtml(message.sender_agent_id || "unknown")} -> ${escapeHtml(message.recipient_agent_id || "broadcast")}</p>
+    </article>
+  `;
+}
+
+function napScheduleRecord(schedule: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(schedule.agent_id)}</h3><p class="muted small mono">${escapeHtml(schedule.id)}</p></div>${chip(schedule.enabled ? "enabled" : "disabled", schedule.enabled ? "good" : "warn")}</div>
+      <div class="row-grid compact-grid">
+        ${field("Offset", schedule.offset_minutes)}
+        ${field("Window", schedule.window_minutes)}
+        ${field("Updated", formatAge(String(schedule.updated_at || "")))}
+        ${field("Actor", schedule.actor || "agent")}
+      </div>
+    </article>
+  `;
+}
+
+function napRunRecord(run: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(run.agent_id)}</h3><p class="muted small mono">${escapeHtml(run.id)}</p></div>${chip(run.status, run.status === "completed" ? "good" : run.status === "failed" ? "bad" : "info")}</div>
+      <p class="muted small">${escapeHtml(formatAge(String(run.started_at || run.created_at || "")))}</p>
+    </article>
+  `;
+}
+
+function beadsRepositoryRecord(repo: ApiRecord): string {
+  return `
+    <article class="record compact ${selectedClass(String(repo.id))}">
+      <div class="record-header"><div><h3>${escapeHtml(repo.name)}</h3><p class="muted small mono">${escapeHtml(repo.id)}</p></div>${chip(repo.enabled ? "enabled" : "disabled", repo.enabled ? "good" : "warn")}</div>
+      <div class="row-grid compact-grid">
+        ${field("Project", repo.project || "none")}
+        ${field("Source", repo.source || "none")}
+        ${field("Poll", `${repo.poll_interval_seconds || 0}s`)}
+        ${field("Path", repo.path || "none")}
+      </div>
+    </article>
+  `;
+}
+
+function bridgeItemRecord(item: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(item.title || item.external_id)}</h3><p class="muted small mono">${escapeHtml(item.id)}</p></div>${chip(item.status || "imported", "info")}</div>
+      <p class="muted small">${escapeHtml(item.source || "source")} / ${escapeHtml(item.project || "")}</p>
+    </article>
+  `;
+}
+
+function artifactRecord(artifact: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(artifact.kind || "artifact")}</h3><p class="muted small mono">${escapeHtml(artifact.id)}</p></div>${chip(shortHash(String(artifact.digest || "")), "good")}</div>
+      <p class="muted small">${escapeHtml(artifact.uri || "")}</p>
+    </article>
+  `;
+}
+
+function evalSetRecord(evalSet: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(evalSet.name)}</h3><p class="muted small mono">${escapeHtml(evalSet.id)}</p></div>${chip(evalSet.scoring || "eval", "info")}</div>
+      <div class="row-grid compact-grid">
+        ${field("Baseline", evalSet.baseline_score ?? "none")}
+        ${field("Regression", evalSet.regression_threshold ?? "none")}
+        ${field("Created", formatAge(String(evalSet.created_at || "")))}
+        ${field("Updated", formatAge(String(evalSet.updated_at || "")))}
+      </div>
+    </article>
+  `;
+}
+
+function evalRunRecord(run: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(run.target_kind || "target")} ${escapeHtml(run.target_id || "")}</h3><p class="muted small mono">${escapeHtml(run.id)}</p></div>${chip(run.passed ? "passed" : "failed", run.passed ? "good" : "bad")}</div>
+      <div class="score-line"><span class="bar-track"><span class="bar-fill" style="width:${Math.max(2, Math.min(100, Number(run.score || 0) * 100))}%"></span></span><span class="mono small">${escapeHtml(run.score ?? "n/a")}</span></div>
+    </article>
+  `;
+}
+
+function memoryRecord(memory: ApiRecord): string {
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(memory.record_type || "memory")}</h3><p class="muted small mono">${escapeHtml(memory.id)}</p></div>${chip(memory.subject_type || "memory", "info")}</div>
+      <p>${escapeHtml(memory.content || "")}</p>
+      <p class="muted small">${escapeHtml(memory.task_id || "")} ${escapeHtml(formatAge(String(memory.created_at || "")))}</p>
+    </article>
+  `;
+}
+
 function agentCard(item: AgentItem): string {
   const agent = item.agent;
   const machine = item.machine;
@@ -709,10 +1109,10 @@ function agentCard(item: AgentItem): string {
     ? chip("dispatch eligible", "good")
     : item.availability.reasons.map((reason) => chip(reason, "bad")).join("");
   return `
-    <article class="agent-card ${item.availability.eligible ? "" : "is-blocked"}">
+    <article class="agent-card ${item.availability.eligible ? "" : "is-blocked"} ${selectedClass(agent.id)}">
       <div class="agent-header">
         <div><h2 class="mono">${escapeHtml(agent.name)}</h2><p class="muted small">${escapeHtml(agent.id)}</p></div>
-        <div class="chip-row">${chip(agent.status, statusTone(agent.status))}${chip(agent.health_status, healthTone(agent.health_status))}</div>
+        <div class="chip-row">${chip(agent.status, statusTone(agent.status))}${chip(agent.health_status, healthTone(agent.health_status))}<button class="link-button" type="button" data-select-id="${escapeHtml(agent.id)}">Select</button></div>
       </div>
       <div class="row-grid">
         ${field("Machine", machine?.hostname || "missing")}
@@ -746,9 +1146,11 @@ function taskCard(detail: TaskDetail, agents: AgentItem[]): string {
   const evidenceOptions = detail.evidence.map((item) => option(String(item.id), String(item.id), "")).join("");
   const pendingReviews = detail.reviews.filter((review) => review.status === "pending");
   return `
-    <article class="task-card">
-      <h3>${escapeHtml(task.title)}</h3>
-      <p class="muted small mono">${escapeHtml(task.id)}</p>
+    <article class="task-card ${selectedClass(task.id)}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(task.title)}</h3><p class="muted small mono">${escapeHtml(task.id)}</p></div>
+        <button class="link-button" type="button" data-select-id="${escapeHtml(task.id)}">Select</button>
+      </div>
       <div class="chip-row">
         ${chip(`P${task.priority || 0}`, "info")}
         ${chip(`${task.attempt_count || 0}/${task.max_attempts || 0} attempts`, (task.attempt_count || 0) >= (task.max_attempts || 1) ? "bad" : "good")}
@@ -933,29 +1335,44 @@ function bindViewControls(): void {
   const search = document.querySelector<HTMLInputElement>("#agentSearch");
   if (search) search.addEventListener("input", (event) => {
     state.agentQuery = (event.target as HTMLInputElement).value;
+    updateUrlState(true);
     render();
   });
   const agentFilter = document.querySelector<HTMLSelectElement>("#agentFilter");
   if (agentFilter) agentFilter.addEventListener("change", (event) => {
     state.agentFilter = (event.target as HTMLSelectElement).value;
+    updateUrlState();
     render();
   });
   const clearAgents = document.querySelector<HTMLButtonElement>("#clearAgentFilters");
   if (clearAgents) clearAgents.addEventListener("click", () => {
     state.agentQuery = "";
     state.agentFilter = "all";
+    updateUrlState();
     render();
   });
   const taskFilter = document.querySelector<HTMLSelectElement>("#taskFilter");
   if (taskFilter) taskFilter.addEventListener("change", (event) => {
     state.taskFilter = (event.target as HTMLSelectElement).value;
+    updateUrlState();
     render();
   });
   const clearTasks = document.querySelector<HTMLButtonElement>("#clearTaskFilter");
   if (clearTasks) clearTasks.addEventListener("click", () => {
     state.taskFilter = "all";
+    updateUrlState();
     render();
   });
+}
+
+function handleContentClick(event: MouseEvent): void {
+  const target = (event.target as Element | null)?.closest<HTMLElement>("[data-select-id]");
+  if (!target) return;
+  const selectedId = target.dataset.selectId || "";
+  if (!selectedId) return;
+  state.selectedId = state.selectedId === selectedId ? "" : selectedId;
+  updateUrlState();
+  render();
 }
 
 function syncObservabilitySubscription(): void {
@@ -1147,6 +1564,59 @@ function formValues(form: HTMLFormElement): JsonObject {
   return values;
 }
 
+function relationshipGraph(data: DashboardData): string {
+  const machines = data.machines.slice(0, 8);
+  const agents = data.agents.slice(0, 12).map((item) => item.agent);
+  const activeTasks = data.tasks
+    .filter((detail) => !TERMINAL_TASK_STATES.has(detail.task.state))
+    .slice(0, 14)
+    .map((detail) => detail.task);
+  const nodes = [
+    ...machines.map((machine, index) => graphNode(machine.id, machine.hostname, "machine", 80, 60 + index * 58)),
+    ...agents.map((agent, index) => graphNode(agent.id, agent.name, "agent", 330, 46 + index * 48)),
+    ...activeTasks.map((task, index) => graphNode(task.id, task.title, "task", 610, 44 + index * 46)),
+  ];
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const edges: Array<{ from: string; to: string; tone: string }> = [];
+  for (const agent of agents) {
+    edges.push({ from: agent.machine_id, to: agent.id, tone: "machine-agent" });
+  }
+  for (const task of activeTasks) {
+    if (task.owner_agent_id) edges.push({ from: task.owner_agent_id, to: task.id, tone: "agent-task" });
+    for (const dependency of task.dependencies || []) {
+      edges.push({ from: dependency, to: task.id, tone: "dependency" });
+    }
+  }
+  const height = Math.max(360, 90 + Math.max(machines.length * 58, agents.length * 48, activeTasks.length * 46));
+  const edgeSvg = edges.map((edge) => {
+    const from = byId.get(edge.from);
+    const to = byId.get(edge.to);
+    if (!from || !to) return "";
+    return `<path class="graph-edge graph-edge-${edge.tone}" d="M${from.x + 90},${from.y} C${from.x + 170},${from.y} ${to.x - 170},${to.y} ${to.x - 90},${to.y}"></path>`;
+  }).join("");
+  const nodeSvg = nodes.map((node) => `
+    <g class="graph-node graph-node-${node.kind} ${selectedClass(node.id)}" data-select-id="${escapeHtml(node.id)}" transform="translate(${node.x},${node.y})">
+      <rect x="-86" y="-18" width="172" height="36" rx="8"></rect>
+      <text text-anchor="middle" y="4">${escapeHtml(truncate(node.label, 22))}</text>
+    </g>
+  `).join("");
+  return `
+    <div class="graph-wrap">
+      <svg class="relationship-graph" viewBox="0 0 760 ${height}" role="img" aria-label="Fleet topology graph">
+        <text class="graph-column-label" x="80" y="24">Machines</text>
+        <text class="graph-column-label" x="330" y="24">Agents</text>
+        <text class="graph-column-label" x="610" y="24">Active Tasks</text>
+        ${edgeSvg}
+        ${nodeSvg}
+      </svg>
+    </div>
+  `;
+}
+
+function graphNode(id: string, label: string, kind: string, x: number, y: number): { id: string; label: string; kind: string; x: number; y: number } {
+  return { id, label, kind, x, y };
+}
+
 function metric(label: string, value: unknown, note: string): string {
   return `<div class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${escapeHtml(value)}</div><p class="metric-note">${escapeHtml(note)}</p></div>`;
 }
@@ -1325,6 +1795,15 @@ function compactValue(value: unknown): string {
 function shortHash(value: unknown): string {
   const text = String(value || "");
   return text.length > 16 ? `${text.slice(0, 12)}...` : text || "no digest";
+}
+
+function selectedClass(id: string): string {
+  return state.selectedId && state.selectedId === id ? "is-selected" : "";
+}
+
+function truncate(value: unknown, limit: number): string {
+  const text = String(value || "");
+  return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
 }
 
 function statusTone(status: string): Tone {

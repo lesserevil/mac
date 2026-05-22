@@ -421,6 +421,17 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert "notifications" in state
     assert "integration_findings" in state
     assert "integration_observations" in state
+    assert "roles" in state
+    assert "provisioning_requests" in state
+    assert "workflows" in state
+    assert "workflow_runs" in state
+    assert "agentbus_streams" in state
+    assert "artifacts" in state
+    assert "bridge_items" in state
+    assert "beads_repositories" in state
+    assert "memory_records" in state
+    assert "nap_schedules" in state
+    assert "nap_runs" in state
 
     timeline = client.get("/dashboard/tasks/%s/timeline" % task["id"]).json()
     assert timeline["task"]["title"] == "Dashboard task"
@@ -747,6 +758,8 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
 
     assert (root / "src/mac/ui/app.ts").exists()
     assert (root / "src/mac/ui/app.js").exists()
+    assert "URLSearchParams" in (root / "src/mac/ui/app.js").read_text(encoding="utf-8")
+    assert 'data-view="map"' in (root / "src/mac/ui/index.html").read_text(encoding="utf-8")
     assert not (root / "package.json").exists()
     assert not (root / "package-lock.json").exists()
 

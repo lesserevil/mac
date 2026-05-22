@@ -1005,8 +1005,28 @@ def _dashboard_state(
     task_dicts = [task.to_dict() for task in tasks]
     dead_letters = [task.to_dict() for task in cp.list_dead_letters()]
     rollouts = cp.list_rollouts()
+    roles = [role.to_dict() for role in cp.list_roles()]
+    provisioning_requests = [
+        request.to_dict()
+        for request in cp.provisioning.list_requests(limit=120)
+    ]
     secrets = [secret.to_dict() for secret in cp.list_secrets()]
     secret_audits = [audit.to_dict() for audit in cp.list_secret_audits()]
+    workflows = [workflow.to_dict() for workflow in cp.list_workflows()]
+    workflow_runs = cp.workflow_runs_summary()
+    agentbus_streams = [
+        stream.to_dict() for stream in cp.list_agentbus_streams(limit=120)
+    ]
+    artifacts = [artifact.to_dict() for artifact in cp.list_artifacts()]
+    bridge_items = [item.to_dict() for item in cp.list_project_items()]
+    beads_repositories = [
+        repo.to_dict() for repo in cp.list_beads_repositories()
+    ]
+    memory_records = [
+        record.to_dict() for record in cp.search_memory()
+    ][-120:]
+    nap_schedules = [schedule.to_dict() for schedule in cp.list_nap_schedules()]
+    nap_runs = [run.to_dict() for run in cp.list_nap_runs()]
     runtime_runs = [run.to_dict() for run in cp.list_runtime_runs()]
     integration_findings = [
         finding.to_dict() for finding in cp.list_integration_findings(limit=120)
@@ -1037,6 +1057,16 @@ def _dashboard_state(
                 "rollouts": len(rollouts),
                 "secrets": len(secrets),
                 "secret_audits": len(secret_audits),
+                "roles": len(roles),
+                "pending_provisioning_requests": sum(
+                    1 for request in provisioning_requests if request["status"] == "pending"
+                ),
+                "workflows": len(workflows),
+                "workflow_runs": workflow_runs.get("total", 0),
+                "agentbus_streams": len(agentbus_streams),
+                "artifacts": len(artifacts),
+                "beads_repositories": len(beads_repositories),
+                "memory_records": len(memory_records),
                 "integration_findings": len(integration_findings),
                 "open_integration_findings": sum(
                     1 for finding in integration_findings if finding["status"] == "open"
@@ -1050,6 +1080,8 @@ def _dashboard_state(
         "personas": personas,
         "hermes_instances": hermes_instances,
         "platform_bindings": bindings,
+        "roles": roles,
+        "provisioning_requests": provisioning_requests,
         "machines": [machine.to_dict() for machine in machines],
         "agents": [
             _dashboard_agent_base(cp, agent, tasks, machines_by_id)
@@ -1062,6 +1094,15 @@ def _dashboard_state(
         "notifications": [
             notification.to_dict() for notification in cp.list_notifications(limit=120)
         ],
+        "workflows": workflows,
+        "workflow_runs": workflow_runs,
+        "agentbus_streams": agentbus_streams,
+        "artifacts": artifacts,
+        "bridge_items": bridge_items,
+        "beads_repositories": beads_repositories,
+        "memory_records": memory_records,
+        "nap_schedules": nap_schedules,
+        "nap_runs": nap_runs,
         "integration_findings": integration_findings,
         "integration_observations": integration_observations,
         "command_audit": [
@@ -1075,7 +1116,6 @@ def _dashboard_state(
         "eval_sets": [eval_set.to_dict() for eval_set in cp.list_eval_sets()],
         "eval_runs": [run.to_dict() for run in cp.list_eval_runs()],
         "observability": cp.observability_summary(),
-        "workflow_runs": cp.workflow_runs_summary(),
         "hermes_startup": hermes_startup,
     }
 
