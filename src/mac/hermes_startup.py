@@ -382,6 +382,7 @@ def _log_classification_report() -> Dict[str, Any]:
         "known_benign_classes": [
             "controlled_restart",
             "slack_file_public_unhandled",
+            "discord_missing_token_unconfigured",
         ],
         "actionable_count": 0,
         "benign_count": 0,

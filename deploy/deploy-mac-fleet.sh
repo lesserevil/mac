@@ -3868,6 +3868,10 @@ patterns = {
         "severity": "info",
         "regex": r"Unhandled request .*'file_public'",
     },
+    "discord_missing_token_unconfigured": {
+        "severity": "info",
+        "regex": r"\[Discord\] No bot token configured|discord failed to connect",
+    },
     "secret_redaction_disabled": {
         "severity": "critical",
         "regex": r"Secret redaction: DISABLED|HERMES_REDACT_SECRETS=false",
@@ -3878,8 +3882,23 @@ patterns = {
     },
 }
 classes = []
+actionable_text = text
 for name, spec in patterns.items():
+    if spec["severity"] != "info":
+        continue
     matches = re.findall(spec["regex"], text, flags=re.IGNORECASE)
+    if matches:
+        classes.append({"name": name, "severity": spec["severity"], "count": len(matches)})
+        actionable_text = "\n".join(
+            line
+            for line in actionable_text.splitlines()
+            if not re.search(spec["regex"], line, flags=re.IGNORECASE)
+        )
+
+for name, spec in patterns.items():
+    if spec["severity"] == "info":
+        continue
+    matches = re.findall(spec["regex"], actionable_text, flags=re.IGNORECASE)
     if matches:
         classes.append({"name": name, "severity": spec["severity"], "count": len(matches)})
 

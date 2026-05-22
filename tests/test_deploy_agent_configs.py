@@ -470,6 +470,19 @@ def test_fleet_deploy_handles_custom_ssh_ports_reconciliation_and_disk_hygiene()
     assert ".acc/hermes-agent" in cleanup_plan
 
 
+def test_fleet_deploy_treats_unconfigured_discord_startup_as_benign():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    classifier = script.split("classify_gateway_logs() {", 1)[1].split(
+        "verify_hub_registration() {", 1
+    )[0]
+
+    assert "discord_missing_token_unconfigured" in classifier
+    assert r"\[Discord\] No bot token configured" in classifier
+    assert "actionable_text" in classifier
+    assert 'if spec["severity"] != "info"' in classifier
+    assert 'if spec["severity"] == "info"' in classifier
+
+
 def test_launchd_worker_wrapper_marks_agent_offline_on_controlled_shutdown():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
     wrapper = script.split("install_mac_agent_wrapper() {", 1)[1].split(

@@ -552,6 +552,7 @@ def test_startup_includes_gateway_log_classification(monkeypatch, tmp_path):
 
     assert report["ready"] is False
     assert report["logs"]["actionable_count"] == 1
+    assert "discord_missing_token_unconfigured" in report["logs"]["known_benign_classes"]
     assert report["operator_health"]["status"] == "degraded"
 
 
