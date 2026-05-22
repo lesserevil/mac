@@ -4024,6 +4024,20 @@ hub_target() {
   fleet_hub_target
 }
 
+upsert_local_env() {
+  local key="$1" value="$2"
+  local env_file="${MAC_DEPLOY_ENV_FILE:-$HOME/.mac/.env}"
+  [ -f "$env_file" ] || return 0
+  local escaped
+  escaped="$(printf '%s' "$value" | sed 's/[&/\]/\\&/g')"
+  if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+    sed -i.bak "s|^${key}=.*|${key}=${escaped}|" "$env_file" && rm -f "${env_file}.bak"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$env_file"
+  fi
+  chmod 600 "$env_file"
+}
+
 read_hub_token() {
   local target ssh_parts=() ssh_args=() ssh_target item last_index
   target="$(hub_target)"
@@ -4106,12 +4120,19 @@ main() {
     fleet_name_field="${spec_fields[23]:-mac}"
     if [ "$agent" != "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
+      upsert_local_env "MAC_DEPLOY_HUB_TOKEN" "$hub_token"
     fi
     deploy_host "$spec" "$hub_token" "$hub_tunnel_pubkey"
     if [ "$agent" = "$hub_agent" ]; then
       if [ -z "$hub_token" ]; then
         hub_token="$(read_hub_token)"
       fi
+      upsert_local_env "MAC_DEPLOY_HUB_TOKEN" "$hub_token"
+      local hub_ssh_target
+      hub_ssh_target="$(fleet_hub_target)"
+      echo "==> ${agent}: hub UI access:"
+      echo "    ssh -L 8789:127.0.0.1:8789 ${hub_ssh_target}  # then open http://localhost:8789/ui"
+      echo "    token stored in \${MAC_DEPLOY_ENV_FILE:-\$HOME/.mac/.env} as MAC_DEPLOY_HUB_TOKEN"
       hub_tunnel_pubkey="$(read_hub_tunnel_pubkey)"
     else
       install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
