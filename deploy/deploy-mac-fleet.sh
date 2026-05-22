@@ -3901,8 +3901,11 @@ PY
     fi
     sleep 2
   done
-  log "ERROR: mac-agent did not register with hub ${check_url}"
-  return 1
+  if [ "$WORKER_MODE" = "loop" ]; then
+    log "ERROR: mac-agent did not register with hub ${check_url}"
+    return 1
+  fi
+  log "WARNING: mac-agent not yet registered with hub ${check_url} (tunnel may not be established yet)"
 }
 
 case "$SUPERVISOR_KIND" in
@@ -4074,6 +4077,16 @@ main() {
       hub_tunnel_pubkey="$(read_hub_tunnel_pubkey)"
     else
       install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
+      echo "==> ${agent}: waiting for hub reverse tunnel to establish"
+      local attempt
+      for attempt in $(seq 1 6); do
+        sleep 5
+        if ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$local_target" \
+          "curl -fsS --max-time 3 http://127.0.0.1:18789/healthz >/dev/null 2>&1" 2>/dev/null; then
+          echo "==> ${agent}: hub tunnel reachable after $((attempt * 5))s"
+          break
+        fi
+      done
     fi
   done < <(selected_hosts "${REQUESTED_AGENTS[@]}")
   rm -rf "$TMPDIR_LOCAL"
