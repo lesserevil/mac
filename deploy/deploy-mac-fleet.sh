@@ -2327,7 +2327,12 @@ values.setdefault("MAC_API_TOKEN", secrets.token_urlsafe(32))
 values["MAC_DB"] = str(mac_home / "mac.db")
 values["MAC_PORT"] = port
 values["MAC_BIND_HOST"] = configured_bind_host
-values["MAC_HUB_URL"] = configured_hub_url or values.get("MAC_HUB_URL", "http://127.0.0.1:8789")
+if configured_worker_mode == "loop":
+    # Hub nodes connect to their own local control plane; the external service
+    # DNS may not expose the API port (e.g. K8s Service without port mapping).
+    values["MAC_HUB_URL"] = f"http://127.0.0.1:{port}"
+else:
+    values["MAC_HUB_URL"] = configured_hub_url or values.get("MAC_HUB_URL", "http://127.0.0.1:8789")
 values["MAC_SUPERVISOR_KIND"] = supervisor_kind
 values["HERMES_HOME"] = str(home / ".hermes")
 values["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
