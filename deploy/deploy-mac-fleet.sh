@@ -4054,7 +4054,10 @@ main() {
   hub_agent="$(fleet_hub_agent)"
   hub_target_str="$(fleet_hub_target)"
   hub_token="${MAC_DEPLOY_HUB_TOKEN:-}"
-  hub_tunnel_pubkey=""
+  hub_tunnel_pubkey="${MAC_DEPLOY_HUB_TUNNEL_PUBKEY:-}"
+  if [ -z "$hub_tunnel_pubkey" ]; then
+    hub_tunnel_pubkey="$(read_hub_tunnel_pubkey 2>/dev/null || true)"
+  fi
   while IFS= read -r spec; do
     IFS='|' read -r -a spec_fields <<<"$spec"
     agent="${spec_fields[0]}"
