@@ -139,8 +139,8 @@ if [ -z "$CONTAINER_CMD" ]; then
       | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | tr -d '\r\n')"
     if [ -n "$_qdrant_ver" ]; then
       case "$(uname -m)" in
-        x86_64)  _qdrant_asset="qdrant-x86_64-unknown-linux-gnu.tar.gz" ;;
-        aarch64) _qdrant_asset="qdrant-aarch64-unknown-linux-gnu.tar.gz" ;;
+        x86_64)  _qdrant_asset="qdrant-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64) _qdrant_asset="qdrant-aarch64-unknown-linux-musl.tar.gz" ;;
         *)       _qdrant_asset="" ;;
       esac
       if [ -n "$_qdrant_asset" ]; then
