@@ -110,15 +110,22 @@ CONTAINER_CMD=""
 QDRANT_BINARY="${QDRANT_BINARY:-$MAC_HOME/bin/qdrant}"
 USE_NATIVE_BINARY=0
 
+_container_works() {
+  "$1" info >/dev/null 2>&1
+}
+
 for _candidate in podman docker; do
-  if command -v "$_candidate" >/dev/null 2>&1; then
+  if command -v "$_candidate" >/dev/null 2>&1 && _container_works "$_candidate"; then
     CONTAINER_CMD="$_candidate"
     break
   fi
 done
 if [ -z "$CONTAINER_CMD" ] && command -v apt-get >/dev/null 2>&1; then
-  echo "[qdrant] no container runtime found; trying apt-get install podman"
-  sudo apt-get install -y podman >/dev/null 2>&1 && CONTAINER_CMD="podman" || true
+  echo "[qdrant] no working container runtime; trying apt-get install podman"
+  sudo apt-get install -y podman >/dev/null 2>&1 || true
+  if command -v podman >/dev/null 2>&1 && _container_works podman; then
+    CONTAINER_CMD="podman"
+  fi
 fi
 if [ -z "$CONTAINER_CMD" ]; then
   if [ -x "$QDRANT_BINARY" ]; then
