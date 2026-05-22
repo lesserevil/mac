@@ -562,7 +562,7 @@ MAC_AGENT_UNIT_BACKUP=""
 MAC_PLIST_BACKUP=""
 HERMES_PLIST_BACKUP=""
 MAC_AGENT_PLIST_BACKUP=""
-BEADS_REPO_URL="${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/steveyegge/beads.git}"
+BEADS_REPO_URL="${MAC_DEPLOY_BEADS_REPO_URL:-https://github.com/gastownhall/beads.git}"
 BEADS_REF="${MAC_DEPLOY_BEADS_REF:-main}"
 
 mkdir -p "$LOG_DIR" "$MAC_HOME/backups"
@@ -610,18 +610,7 @@ PY
       return
     fi
   done
-  if [ "$OS_KIND" = "linux" ] && command -v apt-get >/dev/null 2>&1; then
-    log "Python >= 3.11 not found; installing python3.11 via deadsnakes PPA"
-    sudo apt-get install -y software-properties-common >/dev/null 2>&1 || true
-    sudo add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1
-    sudo apt-get update >/dev/null 2>&1
-    sudo apt-get install -y python3.11 python3.11-venv >/dev/null 2>&1
-    if command -v python3.11 >/dev/null 2>&1; then
-      printf '%s\n' "$(command -v python3.11)"
-      return
-    fi
-  fi
-  log "WARNING: Python >= 3.11 not available; Hermes agent venv will use $1 (may fail package install)"
+  log "WARNING: Python >= 3.11 not found; Hermes agent venv will use $1 with --ignore-requires-python" >&2
   printf '%s\n' "$1"
 }
 
@@ -1668,6 +1657,34 @@ install_beads_cli() {
     "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
     return 0
   fi
+  local os_name arch_name dl_url tmp_dir bd_version
+  case "$OS_KIND" in
+    linux)  os_name="linux" ;;
+    darwin) os_name="darwin" ;;
+    *)      os_name="" ;;
+  esac
+  case "$(uname -m 2>/dev/null || true)" in
+    x86_64)        arch_name="amd64" ;;
+    aarch64|arm64) arch_name="arm64" ;;
+    *)             arch_name="" ;;
+  esac
+  if [ -n "$os_name" ] && [ -n "$arch_name" ] && command -v curl >/dev/null 2>&1; then
+    bd_version="$(curl -fsSL "https://api.github.com/repos/gastownhall/beads/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/' | tr -d '\r\n')"
+    if [ -n "$bd_version" ]; then
+      dl_url="https://github.com/gastownhall/beads/releases/download/v${bd_version}/beads_${bd_version}_${os_name}_${arch_name}.tar.gz"
+      log "downloading bd CLI v${bd_version} from GitHub releases"
+      tmp_dir="$(mktemp -d)"
+      if curl -fsSL "$dl_url" | tar -xz -C "$tmp_dir" 2>/dev/null && [ -x "$tmp_dir/bd" ]; then
+        install -m 0755 "$tmp_dir/bd" "$target"
+        rm -rf "$tmp_dir"
+        "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
+        return 0
+      fi
+      rm -rf "$tmp_dir"
+      log "WARNING: bd CLI release download failed; falling back to source build"
+    fi
+  fi
   for required in git make go; do
     if ! command -v "$required" >/dev/null 2>&1; then
       log "WARNING: bd CLI could not be installed (build prereq missing: $required); Beads lifecycle sync disabled"
@@ -2457,7 +2474,7 @@ do
 done
 "$HERMES_PY" -m venv "$HERMES_DIR/.venv"
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
-"$HERMES_DIR/.venv/bin/python" -m pip install -e "$HERMES_DIR" >/dev/null
+"$HERMES_DIR/.venv/bin/python" -m pip install --ignore-requires-python -e "$HERMES_DIR" >/dev/null
 apply_hermes_gateway_runtime_shim
 install_hermes_messaging_deps
 repair_hermes_kanban_schema
