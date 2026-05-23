@@ -4996,13 +4996,14 @@ class ControlPlane:
         *,
         summary: Optional[str] = None,
     ) -> JsonDict:
+        detail_copy = json_loads(json_dumps(ensure_json_object(detail or {})), {})
         return {
             "schema": "mac.beads_repository_health.v1",
             "status": status,
             "reason": reason,
             "summary": summary or reason,
             "checked_at": utcnow(),
-            "detail": ensure_json_object(detail or {}),
+            "detail": detail_copy,
         }
 
     def _beads_repository_health_from_source_state(self, source_state: Optional[JsonDict]) -> JsonDict:

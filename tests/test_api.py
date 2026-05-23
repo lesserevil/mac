@@ -1135,6 +1135,67 @@ def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path, monkeypa
     assert items[0]["external_id"] == "mac-api"
 
 
+def test_fastapi_serializes_beads_authority_drift_health(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    contract_dir = repo / ".mac"
+    contract_dir.mkdir()
+    (contract_dir / "project.yaml").write_text(
+        "\n".join(
+            [
+                "schema: mac.repository_contract.v1",
+                "project: repo-beads-mac",
+                "platforms:",
+                "  - linux",
+                "toolchain:",
+                "  required_commands:",
+                "    - python3",
+                "bootstrap:",
+                "  command: python3 scripts/bootstrap-project.py",
+                "  creates:",
+                "    - .venv/bin/python",
+                "test:",
+                "  command: pytest",
+                "evidence:",
+                "  required:",
+                "    - tests",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    beads_dir = repo / ".beads"
+    beads_dir.mkdir()
+    (beads_dir / "issues.jsonl").write_text(
+        json.dumps({"_type": "issue", "id": "mac-jsonl-only", "status": "open", "priority": 0})
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_bd = tmp_path / "bd"
+    fake_bd.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--actor\" ]; then shift 2; fi\n"
+        "if [ \"$1 $2\" = \"ready --json\" ]; then echo '[]'; exit 0; fi\n"
+        "if [ \"$1 $2\" = \"bootstrap --yes\" ] || [ \"$1 $2\" = \"dolt pull\" ]; then exit 0; fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    registered = client.post(
+        "/bridge/beads/repositories",
+        json={"name": "mac", "path": str(repo), "source": "repo-beads-mac"},
+    ).json()
+
+    response = client.post("/bridge/beads/poll", json={"repository": registered["id"], "force": True})
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["repositories"][0]["status"] == "authority_drift"
+    assert report["repositories"][0]["health"]["status"] == "unhealthy"
+
+
 def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():
     import time as _time
 
