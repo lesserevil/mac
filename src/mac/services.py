@@ -3183,6 +3183,153 @@ class ControlPlane:
         )
         return review
 
+    def claim_review(
+        self,
+        review_id: str,
+        reviewer_agent_id: str,
+        *,
+        executor_evidence_id: Optional[str] = None,
+        actor: str = "reviewer",
+    ) -> JsonDict:
+        review = self.get_review(review_id)
+        if review.reviewer_agent_id != reviewer_agent_id:
+            raise AuthorizationError("reviewer does not own review")
+        task = self.get_task(review.task_id)
+        existing_claim = ensure_json_object(
+            ensure_json_object(task.metadata).get("review_claims")
+        ).get(review.id)
+        if review.status != ReviewStatus.PENDING.value:
+            return {
+                "schema": "mac.review_claim.v1",
+                "status": "not_claimable",
+                "reason": "review_%s" % review.status,
+                "review": review.to_dict(),
+                "task": task.to_dict(),
+                "claim": existing_claim if isinstance(existing_claim, dict) else None,
+            }
+        if isinstance(existing_claim, dict) and existing_claim.get(
+            "reviewer_agent_id"
+        ) not in {
+            None,
+            "",
+            reviewer_agent_id,
+        }:
+            raise ValidationError(
+                "review is already claimed by %s"
+                % existing_claim.get("reviewer_agent_id")
+            )
+        evidence = None
+        if executor_evidence_id:
+            evidence = self.get_evidence(executor_evidence_id)
+            if evidence.task_id != task.id:
+                raise ValidationError("review claim evidence must belong to reviewed task")
+        claim = self._review_claim_detail(task, review, evidence, actor=actor)
+        now = utcnow()
+        claim["claimed_at"] = now
+        metadata = ensure_json_object(task.metadata)
+        claims = ensure_json_object(metadata.get("review_claims"))
+        claims[review.id] = claim
+        metadata["review_claims"] = claims
+        metadata["latest_review_claim"] = claim
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json_dumps(metadata), now, task.id),
+            )
+            conn.execute(
+                """
+                UPDATE agents
+                SET status = ?, current_task_id = ?, updated_at = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (AgentStatus.BUSY.value, task.id, now, now, reviewer_agent_id),
+            )
+            self._record_history(
+                task.id,
+                "task.review_claimed",
+                reviewer_agent_id,
+                None,
+                None,
+                claim,
+                conn=conn,
+            )
+        refreshed = self.get_task(task.id)
+        self._append_beads_ledger_comment(
+            refreshed,
+            reviewer_agent_id,
+            "review_claimed",
+            "review claimed for %s" % task.title,
+            fields={
+                "review": review.id,
+                "project": claim.get("project"),
+                "worktree": claim.get("repository_worktree"),
+                "head": claim.get("repository_head_sha"),
+                "ref": claim.get("repository_remote_ref"),
+                "work": claim.get("work_summary"),
+            },
+        )
+        return {
+            "schema": "mac.review_claim.v1",
+            "status": "claimed",
+            "review": review.to_dict(),
+            "task": refreshed.to_dict(),
+            "claim": claim,
+        }
+
+    def _review_claim_detail(
+        self,
+        task: Task,
+        review: Review,
+        evidence: Optional[Evidence],
+        *,
+        actor: str,
+    ) -> JsonDict:
+        verification = ensure_json_object(
+            evidence.metadata.get("verification") if evidence is not None else {}
+        )
+        repo = ensure_json_object(verification.get("repo"))
+        tests = (
+            verification.get("tests")
+            if isinstance(verification.get("tests"), list)
+            else []
+        )
+        checks = (
+            verification.get("checks")
+            if isinstance(verification.get("checks"), list)
+            else []
+        )
+        runtime = ensure_json_object(ensure_json_object(task.metadata).get("runtime"))
+        return {
+            "schema": "mac.review_claim.detail.v1",
+            "actor": actor,
+            "task_id": task.id,
+            "task_title": task.title,
+            "project": task.project,
+            "review_id": review.id,
+            "reviewer_agent_id": review.reviewer_agent_id,
+            "executor_evidence_id": evidence.id if evidence is not None else None,
+            "work_summary": evidence.summary if evidence is not None else "",
+            "evidence_type": verification.get("evidence_type"),
+            "repository_worktree": (
+                repo.get("path")
+                or runtime.get("repository_worktree")
+                or repo.get("worktree")
+                or ""
+            ),
+            "repository_branch": repo.get("branch")
+            or runtime.get("repository_branch")
+            or "",
+            "repository_head_sha": repo.get("head_sha") or "",
+            "repository_remote_ref": repo.get("remote_ref") or "",
+            "repository_files_changed": (
+                repo.get("files_changed")
+                if isinstance(repo.get("files_changed"), list)
+                else []
+            ),
+            "checks": checks,
+            "tests": tests,
+        }
+
     def submit_review(self, *args: Any, **kwargs: Any) -> Review:
         review = self.reviews.submit_review(*args, **kwargs)
         reviewer_agent_id = kwargs.get("reviewer_agent_id")
@@ -3202,6 +3349,9 @@ class ControlPlane:
                 "evidence": review.evidence_id,
             },
         )
+        current = self.get_agent(str(reviewer_agent_id))
+        if current.current_task_id == review.task_id:
+            self._set_agent_idle(str(reviewer_agent_id))
         return review
 
     def get_review(self, review_id: str) -> Review:
@@ -6761,6 +6911,14 @@ class ControlPlane:
                 "event_type": event_type,
                 "title": "Review requested",
                 "body": "Review requested for %s" % task_title,
+                "channels": ["dashboard", "hermes"],
+                "metadata": metadata,
+            }
+        if event_type == "task.review_claimed":
+            return {
+                "event_type": event_type,
+                "title": "Review claimed",
+                "body": "%s claimed review for %s" % (actor, task_title),
                 "channels": ["dashboard", "hermes"],
                 "metadata": metadata,
             }

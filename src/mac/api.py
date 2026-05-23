@@ -535,6 +535,12 @@ class ReviewRequest(BaseModel):
     actor: str = "dispatcher"
 
 
+class ReviewClaim(BaseModel):
+    reviewer_agent_id: str
+    executor_evidence_id: Optional[str] = None
+    actor: str = "reviewer"
+
+
 class ReviewDecision(BaseModel):
     status: str
     reviewer_agent_id: str
@@ -2689,6 +2695,15 @@ def create_app(
     @app.post("/tasks/{task_id}/reviews")
     def request_review(task_id: str, body: ReviewRequest) -> Dict[str, Any]:
         return cp.request_review(task_id, body.reviewer_agent_id, body.actor).to_dict()
+
+    @app.post("/reviews/{review_id}/claim")
+    def claim_review(review_id: str, body: ReviewClaim) -> Dict[str, Any]:
+        return cp.claim_review(
+            review_id,
+            body.reviewer_agent_id,
+            executor_evidence_id=body.executor_evidence_id,
+            actor=body.actor,
+        )
 
     @app.post("/reviews/{review_id}/decision")
     def submit_review(review_id: str, body: ReviewDecision) -> Dict[str, Any]:

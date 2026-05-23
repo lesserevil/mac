@@ -681,6 +681,24 @@ class MacWorker:
             return WorkerRunResult(status="review_nudge_invalid", error=error)
 
         try:
+            claim = self.client.post(
+                "/reviews/%s/claim" % quote(review_id, safe=""),
+                {
+                    "reviewer_agent_id": self.agent_id,
+                    "executor_evidence_id": executor_evidence_id,
+                    "actor": self.agent_id,
+                },
+            )
+            if isinstance(claim, dict) and claim.get("status") != "claimed":
+                return WorkerRunResult(
+                    status="review_not_claimable",
+                    task=(
+                        claim.get("task")
+                        if isinstance(claim.get("task"), dict)
+                        else None
+                    ),
+                    error=str(claim.get("reason") or "review is not claimable"),
+                )
             task_detail = self.client.get("/tasks/%s" % quote(task_id, safe=""))
             task_dir = self._prepare_review_workspace(
                 task_id,
@@ -688,6 +706,7 @@ class MacWorker:
                 executor_evidence_id,
                 task_detail if isinstance(task_detail, dict) else {},
                 message,
+                claim if isinstance(claim, dict) else {},
             )
             started = time.monotonic()
             execution = self._call_executor(
@@ -726,6 +745,8 @@ class MacWorker:
             )
             if execution.succeeded:
                 self._advance_review_workflow_after_verdict(task_id)
+            else:
+                self._heartbeat()
             status = "review_verdict_recorded" if execution.succeeded else "review_verdict_failed"
             self._observe_log(
                 "worker.%s" % status,
@@ -1199,9 +1220,11 @@ class MacWorker:
         executor_evidence_id: str,
         task_detail: JsonDict,
         message: JsonDict,
+        claim_result: Optional[JsonDict] = None,
     ) -> Path:
         task_dir = self.workspace / "_reviews" / _safe_path_component(review_id)
         task_dir.mkdir(parents=True, exist_ok=True)
+        claim = ensure_json_object(claim_result)
         task = {
             "id": "review_%s" % review_id,
             "title": "Review task %s" % task_id,
@@ -1217,6 +1240,11 @@ class MacWorker:
                     "executor_evidence_id": executor_evidence_id,
                     "nudge_message_id": message.get("id"),
                     "task_detail": task_detail,
+                    "review_claim": (
+                        claim.get("claim")
+                        if isinstance(claim.get("claim"), dict)
+                        else {}
+                    ),
                 }
             },
         }

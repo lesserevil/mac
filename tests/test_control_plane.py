@@ -3280,6 +3280,172 @@ def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch
     assert "event=published" in comments
 
 
+def test_review_claim_records_bead_metadata_and_slack_notification(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_beads(
+        repo,
+        [
+            {
+                "_type": "issue",
+                "id": "mac-review-claim",
+                "title": "Track review claim",
+                "description": "record reviewer ownership before verdict",
+                "status": "open",
+                "priority": 0,
+                "created_at": "2026-05-20T00:00:00Z",
+                "dependency_count": 0,
+            }
+        ],
+    )
+    cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    cp.poll_beads_repositories(force=True)
+    task = cp.get_task(cp.list_project_items()[0].task_id)
+    worker = register_agent(cp, "worker", ["python"])
+
+    tenant = cp.register_tenant("ops")
+    persona = cp.register_persona(
+        tenant.id,
+        "Reviewer",
+        soul_ref="hermes://ops/reviewer/SOUL.md",
+        memory_scope="hermes://ops/reviewer/memory",
+    )
+    hermes = cp.register_hermes_instance(tenant.id, "reviewer", persona_id=persona.id)
+    binding = cp.register_platform_binding(
+        tenant.id,
+        hermes.id,
+        "slack",
+        "T123/C456",
+        display_name="#mac-home",
+    )
+    reviewer_machine = cp.register_machine("reviewer-host")
+    reviewer = cp.register_agent(
+        reviewer_machine.id,
+        "reviewer",
+        capabilities=["review"],
+        hermes_instance_id=hermes.id,
+    )
+    cp.configure_notifier_channel(
+        "slack-review-claims",
+        "slack",
+        event_types=["task.review_claimed"],
+        target={"platform_binding_id": binding.id},
+    )
+
+    bd_cli = str(tmp_path / "bd")
+    monkeypatch.setenv("MAC_BEADS_CLI", bd_cli)
+    calls = []
+
+    def fake_run(command, cwd, capture_output, text, timeout, check):
+        calls.append({"command": command, "cwd": cwd})
+
+        class Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("mac.services.subprocess.run", fake_run)
+
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    verification = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "repo_change",
+        "repo": {
+            "path": "/tmp/mac-review-claim-worktree",
+            "branch": "mac/worker/review-claim",
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "pushed": True,
+            "remote_ref": "origin/mac/worker/review-claim",
+            "dirty": False,
+            "files_changed": ["src/mac/services.py"],
+        },
+        "checks": [{"name": "make build", "returncode": 0}],
+        "tests": [{"command": "pytest tests/test_control_plane.py", "returncode": 0}],
+    }
+    evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://pytest",
+        "review claim implementation complete",
+        worker.id,
+        metadata={"returncode": 0, "verification": _sign(cp, worker.id, verification)},
+    )
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id, actor="dispatcher")
+
+    claim_result = cp.claim_review(
+        review.id,
+        reviewer.id,
+        executor_evidence_id=evidence.id,
+        actor=reviewer.id,
+    )
+
+    claim = claim_result["claim"]
+    assert claim_result["status"] == "claimed"
+    assert claim["review_id"] == review.id
+    assert claim["reviewer_agent_id"] == reviewer.id
+    assert claim["executor_evidence_id"] == evidence.id
+    assert claim["project"] == task.project
+    assert claim["repository_worktree"] == "/tmp/mac-review-claim-worktree"
+    assert claim["repository_branch"] == "mac/worker/review-claim"
+    assert claim["repository_head_sha"] == "abcdef1234567890abcdef1234567890abcdef12"
+    assert claim["repository_remote_ref"] == "origin/mac/worker/review-claim"
+    assert claim["repository_files_changed"] == ["src/mac/services.py"]
+    assert claim["checks"][0]["name"] == "make build"
+    assert claim["tests"][0]["command"] == "pytest tests/test_control_plane.py"
+
+    task_metadata = cp.get_task(task.id).metadata
+    assert task_metadata["review_claims"][review.id] == claim
+    assert task_metadata["latest_review_claim"] == claim
+    assert cp.get_agent(reviewer.id).status == AgentStatus.BUSY.value
+    assert cp.get_agent(reviewer.id).current_task_id == task.id
+
+    history = cp.task_history(task.id)
+    claim_events = [event for event in history if event.event_type == "task.review_claimed"]
+    assert len(claim_events) == 1
+    assert claim_events[0].actor == reviewer.id
+    assert claim_events[0].detail["repository_worktree"] == "/tmp/mac-review-claim-worktree"
+    assert "task.review_claimed" in {
+        notification.event_type for notification in cp.list_notifications(subject_id=task.id)
+    }
+
+    comments = "\n".join(
+        call["command"][5]
+        for call in calls
+        if len(call["command"]) > 5 and call["command"][3:5] == ["comment", "mac-review-claim"]
+    )
+    assert "event=review_claimed" in comments
+    assert "project=repo-beads-mac" in comments
+    assert "worktree=/tmp/mac-review-claim-worktree" in comments
+    assert "head=abcdef1234567890abcdef1234567890abcdef12" in comments
+    assert "ref=origin/mac/worker/review-claim" in comments
+
+    delivery = cp.deliver_pending_notifications(limit=50)
+    assert delivery["delivered"] >= 1
+    messages = cp.list_messages(reviewer.id)
+    review_claim_messages = [
+        message
+        for message in messages
+        if message.payload.get("notification", {}).get("event_type") == "task.review_claimed"
+    ]
+    assert len(review_claim_messages) == 1
+    assert review_claim_messages[0].payload["target"]["platform_binding_id"] == binding.id
+    safe_test = review_claim_messages[0].payload["notification"]["metadata"]["tests"][0]
+    assert safe_test["command_text"] == "pytest tests/test_control_plane.py"
+    assert "command" not in safe_test
+
+    from tests.conftest import submit_review_verdict
+
+    verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
+    assert cp.get_agent(reviewer.id).status == AgentStatus.IDLE.value
+    assert cp.get_agent(reviewer.id).current_task_id is None
+
+
 def test_acc_migration_dry_run_reports_without_writing(cp, tmp_path):
     acc_db = tmp_path / "acc.db"
     create_acc_migration_fixture(acc_db)

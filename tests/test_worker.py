@@ -287,6 +287,9 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
         assert context["task_id"] == task.id
         assert context["review_id"] == first["review_id"]
         assert context["executor_evidence_id"] == evidence.id
+        assert context["review_claim"]["review_id"] == first["review_id"]
+        assert context["review_claim"]["reviewer_agent_id"] == reviewer.id
+        assert context["review_claim"]["executor_evidence_id"] == evidence.id
         manifest = {
             "schema": "mac.worker_evidence.v1",
             "status": "complete",
@@ -323,6 +326,13 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
     assert manifest["signed_by"] == reviewer.id
     assert manifest["reviewed_evidence_id"] == evidence.id
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+    assert cp.get_agent(reviewer.id).status == "idle"
+    task_metadata = cp.get_task(task.id).metadata
+    assert (
+        task_metadata["review_claims"][first["review_id"]]["reviewer_agent_id"]
+        == reviewer.id
+    )
+    assert "task.review_claimed" in {event.event_type for event in cp.task_history(task.id)}
 
 
 def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):
