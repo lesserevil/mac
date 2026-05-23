@@ -13,6 +13,7 @@ dependencies = [
     "uvicorn[standard]>=0.29,<1.0",
     "cryptography>=42,<46",
     "PyYAML>=6.0,<7.0",
+    "slack-sdk>=3.27,<4.0",
 ]
 
 [project.optional-dependencies]
