@@ -32,6 +32,7 @@ from mac.hermes_adapter import MacApiClient, MacApiError
 JsonDict = Dict[str, Any]
 Executor = Callable[[JsonDict, Path], "WorkerExecution"]
 CommandAuditSink = Callable[[JsonDict], None]
+StatusUpdateSink = Callable[[JsonDict], JsonDict]
 SAFE_GIT_REF_RE = r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$"
 VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -244,6 +245,7 @@ class MacWorker:
         self_update_repo: Optional[Path] = None,
         agentbus_control_state_path: Optional[Path] = None,
         attestation_key: Optional[str] = None,
+        status_update_sink: Optional[StatusUpdateSink] = None,
     ) -> None:
         if not agent_id:
             raise MacApiError("agent_id is required")
@@ -274,6 +276,7 @@ class MacWorker:
             if agentbus_control_state_path is not None
             else self.workspace / ".mac-agentbus-control.json"
         )
+        self.status_update_sink = status_update_sink or self._send_status_update_to_home_channels
         self._stop = False
         self._declared_digest = False
         self._declared_policy = False
@@ -657,6 +660,9 @@ class MacWorker:
         for message in messages:
             if not isinstance(message, dict):
                 continue
+            if str(message.get("message_type") or "") == "status_update":
+                self._handle_status_update_message(message)
+                continue
             if str(message.get("message_type") or "") != "nudge":
                 continue
             payload = message.get("payload")
@@ -666,6 +672,117 @@ class MacWorker:
                 continue
             return self._handle_review_verdict_nudge(message, payload)
         return None
+
+    def _handle_status_update_message(self, message: JsonDict) -> None:
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("schema") or "") != "mac.notifier.task_progress.v1":
+            return
+        try:
+            result = self.status_update_sink(payload)
+            self._observe_log(
+                "worker.notifier.status_forwarded",
+                level="info",
+                detail={
+                    "message_id": message.get("id"),
+                    "status": result.get("status"),
+                    "sent": result.get("sent", 0),
+                    "skipped": result.get("skipped", 0),
+                    "failed": result.get("failed", 0),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - notification forwarding is best effort.
+            self._observe_log(
+                "worker.notifier.status_forward_failed",
+                level="warning",
+                detail={"message_id": message.get("id"), "error": str(exc)},
+            )
+
+    def _send_status_update_to_home_channels(self, payload: JsonDict) -> JsonDict:
+        channel_type = str(payload.get("channel_type") or "").strip().lower()
+        target = ensure_json_object(payload.get("target"))
+        target_type = str(target.get("channel_type") or "").strip().lower()
+        if channel_type not in {"", "hermes", "slack"} and target_type != "slack":
+            return {"status": "skipped", "sent": 0, "skipped": 1, "failed": 0}
+
+        hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        accounts = _load_slack_accounts(hermes_home)
+        home_channels = _load_slack_home_channels(hermes_home)
+        if not accounts or not home_channels:
+            return {"status": "skipped", "sent": 0, "skipped": 1, "failed": 0}
+
+        try:
+            from slack_sdk import WebClient  # type: ignore
+        except Exception as exc:  # noqa: BLE001 - optional Hermes messaging dependency.
+            return {
+                "status": "failed",
+                "sent": 0,
+                "skipped": 0,
+                "failed": 1,
+                "error": "slack_sdk unavailable: %s" % exc,
+            }
+
+        notification = ensure_json_object(payload.get("notification"))
+        text = _status_update_slack_text(notification)
+        account_by_name = {
+            str(account.get("name") or ""): account
+            for account in accounts
+            if str(account.get("name") or "")
+        }
+        target_team, target_channel = _target_slack_route(target)
+        sent = 0
+        failed = 0
+        skipped = 0
+        for channel in home_channels:
+            channel_id = str(channel.get("channel_id") or "").strip()
+            team_id = str(channel.get("team_id") or "").strip()
+            if not channel_id:
+                skipped += 1
+                continue
+            if target_channel and channel_id != target_channel:
+                skipped += 1
+                continue
+            if target_team and team_id and team_id != target_team:
+                skipped += 1
+                continue
+            account_name = str(channel.get("name") or channel.get("account") or "")
+            account = account_by_name.get(account_name)
+            if account is None:
+                skipped += 1
+                continue
+            token = str(
+                account.get("bot_token")
+                or account.get("token")
+                or account.get("slack_bot_token")
+                or ""
+            ).strip()
+            if not token:
+                skipped += 1
+                continue
+            try:
+                response = WebClient(token=token).chat_postMessage(
+                    channel=channel_id,
+                    text=text,
+                )
+                if bool(response.get("ok", True)):
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception as exc:  # noqa: BLE001 - continue across workspaces.
+                failed += 1
+                self._observe_log(
+                    "worker.notifier.slack_send_failed",
+                    level="warning",
+                    detail={
+                        "channel_id": channel_id,
+                        "team_id": team_id,
+                        "account": account_name,
+                        "error": str(exc),
+                    },
+                )
+        status = "sent" if sent else ("failed" if failed else "skipped")
+        return {"status": status, "sent": sent, "skipped": skipped, "failed": failed}
 
     def _handle_review_verdict_nudge(self, message: JsonDict, payload: JsonDict) -> WorkerRunResult:
         task_id = str(payload.get("task_id") or "").strip()
@@ -1568,6 +1685,70 @@ def _sha256_text(value: str) -> str:
 
 def ensure_json_object(value: Any) -> JsonDict:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _load_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _load_slack_accounts(hermes_home: Path) -> List[JsonDict]:
+    data = _load_json_file(hermes_home / "slack_accounts.json")
+    if isinstance(data, dict):
+        raw_accounts = data.get("accounts") or data.get("workspaces") or data
+        if isinstance(raw_accounts, dict):
+            raw_accounts = [
+                {**ensure_json_object(value), "name": key}
+                for key, value in raw_accounts.items()
+            ]
+    else:
+        raw_accounts = data
+    if not isinstance(raw_accounts, list):
+        return []
+    return [ensure_json_object(item) for item in raw_accounts if isinstance(item, dict)]
+
+
+def _load_slack_home_channels(hermes_home: Path) -> List[JsonDict]:
+    data = _load_json_file(hermes_home / "slack_home_channels.json")
+    if isinstance(data, dict):
+        raw_channels = data.get("channels") or data.get("home_channels") or data
+        if isinstance(raw_channels, dict):
+            raw_channels = [
+                {**ensure_json_object(value), "name": key}
+                for key, value in raw_channels.items()
+            ]
+    else:
+        raw_channels = data
+    if not isinstance(raw_channels, list):
+        return []
+    return [ensure_json_object(item) for item in raw_channels if isinstance(item, dict)]
+
+
+def _target_slack_route(target: JsonDict) -> tuple[str, str]:
+    team_id = str(target.get("team_id") or "").strip()
+    channel_id = str(target.get("channel_id") or "").strip()
+    external_id = str(target.get("external_id") or "").strip()
+    if external_id and "/" in external_id:
+        raw_team, raw_channel = external_id.split("/", 1)
+        team_id = team_id or raw_team.strip()
+        channel_id = channel_id or raw_channel.strip()
+    return team_id, channel_id
+
+
+def _status_update_slack_text(notification: JsonDict) -> str:
+    title = str(notification.get("title") or "Task update").strip()
+    body = str(notification.get("body") or "").strip()
+    event_type = str(notification.get("event_type") or "").strip()
+    subject_id = str(notification.get("subject_id") or "").strip()
+    lines = [title]
+    if body and body != title:
+        lines.append(body)
+    context = " ".join(item for item in (event_type, subject_id) if item)
+    if context:
+        lines.append(context)
+    return "\n".join(lines)[:3000]
 
 
 def _coerce_process_output(value: Any) -> str:

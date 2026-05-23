@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import time
+import types
 from typing import Any, Dict, Optional
 
 import pytest
@@ -333,6 +334,96 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
         == reviewer.id
     )
     assert "task.review_claimed" in {event.event_type for event in cp.task_history(task.id)}
+
+
+def test_mac_worker_forwards_notifier_status_updates_to_slack_home_channels(
+    tmp_path: Path,
+    monkeypatch,
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "slack_accounts.json").write_text(
+        json.dumps(
+            [
+                {"name": "omgjkh", "bot_token": "xoxb-one"},
+                {"name": "offtera", "bot_token": "xoxb-two"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (hermes_home / "slack_home_channels.json").write_text(
+        json.dumps(
+            [
+                {"name": "omgjkh", "team_id": "T1", "channel_id": "C1"},
+                {"name": "offtera", "team_id": "T2", "channel_id": "C2"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    sent = []
+
+    class FakeWebClient:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def chat_postMessage(self, channel: str, text: str) -> Dict[str, Any]:
+            sent.append({"token": self.token, "channel": channel, "text": text})
+            return {"ok": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "slack_sdk",
+        types.SimpleNamespace(WebClient=FakeWebClient),
+    )
+
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    cp.send_message(
+        "notifier",
+        agent.id,
+        "status_update",
+        {
+            "schema": "mac.notifier.task_progress.v1",
+            "status": "task.completed",
+            "channel_type": "slack",
+            "notification": {
+                "title": "Task completed",
+                "body": "Rocky completed lifecycle proof",
+                "event_type": "task.completed",
+                "subject_id": "task_live",
+            },
+            "target": {"channel_type": "slack"},
+        },
+    )
+    client = TestClient(create_app(control_plane=cp))
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path,
+        lambda _task, _task_dir: WorkerExecution(0, "unused"),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "no_task"
+    assert sent == [
+        {
+            "token": "xoxb-one",
+            "channel": "C1",
+            "text": "Task completed\nRocky completed lifecycle proof\ntask.completed task_live",
+        },
+        {
+            "token": "xoxb-two",
+            "channel": "C2",
+            "text": "Task completed\nRocky completed lifecycle proof\ntask.completed task_live",
+        },
+    ]
+    assert cp.list_messages(agent.id)[0].status == "delivered"
+    assert any(
+        event.name == "worker.notifier.status_forwarded"
+        for event in cp.list_observability(limit=20)
+    )
 
 
 def test_mac_worker_records_failed_execution_and_fails_task(tmp_path: Path):
