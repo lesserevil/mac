@@ -690,6 +690,11 @@ class BeadsRepositoryPoll(BaseModel):
     actor: str = "beads-bridge"
 
 
+class BeadsRepositoryRepair(BaseModel):
+    actor: str = "beads-bridge"
+    poll_after: bool = True
+
+
 class MemoryCreate(BaseModel):
     task_id: Optional[str] = None
     subject_type: str
@@ -2856,6 +2861,10 @@ def create_app(
     @app.post("/bridge/beads/poll")
     def poll_beads_repositories(body: BeadsRepositoryPoll) -> Dict[str, Any]:
         return cp.poll_beads_repositories(body.repository, force=body.force, actor=body.actor)
+
+    @app.post("/bridge/beads/repositories/{repo_id_or_name}/repair")
+    def repair_beads_repository(repo_id_or_name: str, body: BeadsRepositoryRepair) -> Dict[str, Any]:
+        return cp.repair_beads_repository(repo_id_or_name, actor=body.actor, poll_after=body.poll_after)
 
     @app.post("/memory")
     def add_memory(body: MemoryCreate) -> Dict[str, Any]:

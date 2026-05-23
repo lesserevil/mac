@@ -4026,6 +4026,8 @@ class ControlPlane:
                 "error",
                 "source_dirty",
                 "source_refresh_error",
+                "authority_drift",
+                "authority_export_error",
             }:
                 report["error_count"] += 1
         if report["imported_count"] or report["reopened_count"] or report["error_count"]:
@@ -4037,6 +4039,136 @@ class ControlPlane:
             )
         return report
 
+    def repair_beads_repository(
+        self,
+        repo_id_or_name: str,
+        *,
+        actor: str = "beads-bridge",
+        poll_after: bool = True,
+    ) -> JsonDict:
+        repo = self.get_beads_repository(repo_id_or_name)
+        now = utcnow()
+        source_state = self._refresh_beads_repository_source(repo, actor)
+        poll_path = Path(str(source_state.get("poll_path") or repo.path)).expanduser()
+        repair_action = self._beads_repair_action(repo, poll_path, "operator_repair")
+        steps: List[JsonDict] = []
+
+        def fail(reason: str, summary: str, status: str = "error") -> JsonDict:
+            health = self._beads_repository_health(
+                "unhealthy",
+                reason,
+                {"source_state": source_state, "steps": steps, "repair_action": repair_action},
+                summary=summary,
+            )
+            self._update_beads_repository_poll_state(
+                repo.id,
+                now,
+                last_imported_at=repo.last_imported_at,
+                last_error=summary,
+                health=health,
+            )
+            return {
+                "schema": "mac.beads_bridge.repair.v1",
+                "repository_id": repo.id,
+                "name": repo.name,
+                "status": status,
+                "reason": reason,
+                "error": summary,
+                "health": health,
+                "source_state": source_state,
+                "repair_action": repair_action,
+                "steps": steps,
+            }
+
+        if source_state.get("status") in {"dirty", "error"}:
+            return fail(
+                "source_refresh_error",
+                str(source_state.get("error") or source_state.get("status") or "source refresh failed"),
+                status=str(source_state.get("status") or "error"),
+            )
+
+        def run_step(name: str, args: List[str], timeout: int = 60) -> Any:
+            result = self.beads_bridge.run(args, cwd=poll_path, actor=actor, timeout=timeout)
+            steps.append(
+                {
+                    "name": name,
+                    "argv": result.argv,
+                    "returncode": result.returncode,
+                    "stdout": result.stdout[:1000],
+                    "stderr": result.stderr[:1000],
+                }
+            )
+            return result
+
+        bootstrap = run_step("bootstrap", ["bootstrap", "--yes"], timeout=120)
+        if bootstrap.returncode != 0:
+            return fail("bootstrap_failed", bootstrap.output or "bd bootstrap failed")
+        dolt_pull = run_step("dolt_pull", ["dolt", "pull"], timeout=120)
+        if dolt_pull.returncode != 0:
+            return fail("dolt_pull_failed", dolt_pull.output or "bd dolt pull failed")
+        ready = run_step("ready", ["ready", "--json"], timeout=30)
+        if ready.returncode != 0:
+            return fail("canonical_unavailable", ready.output or "bd ready --json failed")
+        data = json_loads(ready.stdout.strip(), []) if ready.stdout.strip() else []
+        if not isinstance(data, list):
+            return fail("canonical_unavailable", "bd ready --json did not return a list")
+        export_path = poll_path / ".beads" / "issues.jsonl"
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        export = run_step("export", ["export", "-o", str(export_path)], timeout=60)
+        if export.returncode != 0:
+            return fail("authority_export_error", export.output or "bd export failed")
+        poll_report = (
+            self.poll_beads_repositories(repo.id, force=True, actor=actor)
+            if poll_after
+            else None
+        )
+        if poll_report is not None and int(poll_report.get("error_count", 0)) > 0:
+            refreshed = self.get_beads_repository(repo.id)
+            health = ensure_json_object(refreshed.metadata.get("health") or {})
+            if not health:
+                health = self._beads_repository_health(
+                    "unhealthy",
+                    "post_repair_poll_failed",
+                    {"source_state": source_state, "steps": steps, "poll_report": poll_report},
+                    summary="post-repair poll still reports Beads repository errors",
+                )
+            return {
+                "schema": "mac.beads_bridge.repair.v1",
+                "repository_id": repo.id,
+                "name": repo.name,
+                "status": "error",
+                "reason": "post_repair_poll_failed",
+                "error": "post-repair poll still reports Beads repository errors",
+                "health": health,
+                "source_state": source_state,
+                "repair_action": repair_action,
+                "steps": steps,
+                "poll_report": poll_report,
+            }
+        health = self._beads_repository_health(
+            "healthy",
+            "canonical_beads_db_reconciled",
+            {"source_state": source_state, "steps": steps, "poll_report": poll_report},
+        )
+        self._update_beads_repository_poll_state(
+            repo.id,
+            utcnow(),
+            last_imported_at=self.get_beads_repository(repo.id).last_imported_at,
+            last_error=None,
+            health=health,
+        )
+        return {
+            "schema": "mac.beads_bridge.repair.v1",
+            "repository_id": repo.id,
+            "name": repo.name,
+            "status": "ok",
+            "health": health,
+            "source_state": source_state,
+            "repair_action": repair_action,
+            "steps": steps,
+            "poll_report": poll_report,
+        }
+
     def _poll_beads_repository(
         self,
         repo: BeadsRepository,
@@ -4045,6 +4177,7 @@ class ControlPlane:
         actor: str,
     ) -> JsonDict:
         now = utcnow()
+        source_state: Optional[JsonDict] = None
         if not force and repo.last_polled_at:
             elapsed = parse_time(now) - parse_time(repo.last_polled_at)
             if elapsed.total_seconds() < repo.poll_interval_seconds:
@@ -4065,6 +4198,11 @@ class ControlPlane:
                     if source_state["status"] == "dirty"
                     else "source_refresh_error"
                 )
+                health = self._beads_repository_health(
+                    "unhealthy",
+                    status,
+                    source_state,
+                )
                 remediation_task = self._ensure_beads_source_remediation_task(
                     repo,
                     source_state,
@@ -4076,6 +4214,7 @@ class ControlPlane:
                     now,
                     last_imported_at=repo.last_imported_at,
                     last_error=source_state.get("error") or source_state["status"],
+                    health=health,
                 )
                 self.record_notification(
                     "bridge.beads.%s" % status,
@@ -4095,6 +4234,7 @@ class ControlPlane:
                     "repository_id": repo.id,
                     "name": repo.name,
                     "status": status,
+                    "health": health,
                     "source_state": source_state,
                     "remediation_task_id": remediation_task.id if remediation_task else None,
                     "imported_count": 0,
@@ -4150,16 +4290,25 @@ class ControlPlane:
                         reopened += 1
                     elif result == "retry_exhausted":
                         retry_exhausted += 1
+            health = self._beads_repository_health_from_source_state(source_state)
+            report_status = "ok"
+            last_error: Optional[str] = None
+            if health["status"] != "healthy":
+                reason = str(health.get("reason") or "")
+                report_status = reason if reason in {"authority_drift", "authority_export_error"} else "error"
+                last_error = str(health.get("summary") or health.get("reason") or "beads repository unhealthy")
             self._update_beads_repository_poll_state(
                 repo.id,
                 now,
                 last_imported_at=now if imported or reopened else repo.last_imported_at,
-                last_error=None,
+                last_error=last_error,
+                health=health,
             )
             return {
                 "repository_id": repo.id,
                 "name": repo.name,
-                "status": "ok",
+                "status": report_status,
+                "health": health,
                 "ready_count": len(issues),
                 "imported_count": imported,
                 "existing_count": existing,
@@ -4171,17 +4320,32 @@ class ControlPlane:
                 "source_state": source_state,
             }
         except Exception as exc:  # noqa: BLE001 - one broken repo must not break heartbeats.
+            authority = ensure_json_object((source_state or {}).get("authority") if source_state else {})
+            health_reason = (
+                "canonical_unavailable"
+                if authority.get("status") == "unavailable"
+                else "poll_error"
+            )
+            health = self._beads_repository_health(
+                "unhealthy",
+                health_reason,
+                source_state or {"error": str(exc)},
+                summary=str(exc),
+            )
             self._update_beads_repository_poll_state(
                 repo.id,
                 now,
                 last_imported_at=repo.last_imported_at,
                 last_error=str(exc),
+                health=health,
             )
             return {
                 "repository_id": repo.id,
                 "name": repo.name,
                 "status": "error",
                 "error": str(exc),
+                "health": health,
+                "source_state": source_state,
                 "imported_count": 0,
                 "existing_count": 0,
                 "skipped_count": 0,
@@ -4802,6 +4966,65 @@ class ControlPlane:
         )
         return self._agent_from_row(row) if row is not None else None
 
+    def _beads_repair_action(
+        self,
+        repo: BeadsRepository,
+        repo_path: Path,
+        reason: str,
+    ) -> JsonDict:
+        return {
+            "schema": "mac.beads_bridge.repair_action.v1",
+            "type": "beads_canonical_reconcile",
+            "reason": reason,
+            "repository_id": repo.id,
+            "repository_name": repo.name,
+            "path": str(repo_path),
+            "policy": "dispatch imports only canonical `bd ready --json` output; tracked JSONL is diagnostics only",
+            "commands": [
+                "bd doctor",
+                "bd dolt pull",
+                "bd ready --json",
+                "bd export -o .beads/issues.jsonl",
+            ],
+        }
+
+    def _beads_repository_health(
+        self,
+        status: str,
+        reason: str,
+        detail: Optional[JsonDict] = None,
+        *,
+        summary: Optional[str] = None,
+    ) -> JsonDict:
+        return {
+            "schema": "mac.beads_repository_health.v1",
+            "status": status,
+            "reason": reason,
+            "summary": summary or reason,
+            "checked_at": utcnow(),
+            "detail": ensure_json_object(detail or {}),
+        }
+
+    def _beads_repository_health_from_source_state(self, source_state: Optional[JsonDict]) -> JsonDict:
+        state = ensure_json_object(source_state or {})
+        authority = ensure_json_object(state.get("authority") or {})
+        authority_status = str(authority.get("status") or "ok")
+        if authority_status == "drift" or state.get("authority_drift"):
+            return self._beads_repository_health(
+                "unhealthy",
+                "authority_drift",
+                state,
+                summary="canonical Beads DB and tracked JSONL ready sets disagree",
+            )
+        if authority_status == "export_error":
+            return self._beads_repository_health(
+                "unhealthy",
+                "authority_export_error",
+                state,
+                summary="tracked Beads JSONL export is unreadable",
+            )
+        return self._beads_repository_health("healthy", "canonical_beads_db_ok", state)
+
     def _ready_beads_issues(
         self,
         repo: BeadsRepository,
@@ -4814,19 +5037,10 @@ class ControlPlane:
         if not repo_path.exists():
             raise ValidationError("beads repository path does not exist: %s" % repo_path)
         if repo_path.is_file():
-            issues = self._ready_beads_issues_from_jsonl(repo_path)
-            self._record_beads_authority_observation(
-                repo,
-                repo_path,
-                authority="tracked_jsonl",
-                status="ok",
-                mode="direct_jsonl",
-                canonical_ready_issues=[],
-                jsonl_ready_issues=issues,
-                actor=actor,
-                source_state=source_state,
+            raise ValidationError(
+                "beads repository path must be a repository directory with canonical DB state, not a JSONL export: %s"
+                % repo_path
             )
-            return issues
         completed: Any = None
         try:
             completed = self.beads_bridge.run(["ready", "--json"], cwd=repo_path, timeout=15)
@@ -4846,11 +5060,18 @@ class ControlPlane:
                     jsonl_ready = self._ready_beads_issues_from_jsonl(jsonl_path)
                 except Exception as exc:  # noqa: BLE001 - DB authority can still poll.
                     jsonl_error = str(exc)
+            canonical_ids = set(self._beads_issue_ids(canonical))
+            jsonl_ids = set(self._beads_issue_ids(jsonl_ready))
+            authority_status = "ok"
+            if jsonl_error:
+                authority_status = "export_error"
+            elif canonical_ids != jsonl_ids:
+                authority_status = "drift"
             observation = self._record_beads_authority_observation(
                 repo,
                 repo_path,
                 authority="beads_db",
-                status="ok" if not jsonl_error else "export_error",
+                status=authority_status,
                 mode="canonical_bd_ready",
                 canonical_ready_issues=canonical,
                 jsonl_ready_issues=jsonl_ready,
@@ -4870,26 +5091,74 @@ class ControlPlane:
                 jsonl_error=jsonl_error,
             )
             return canonical
+        bd_error = (
+            (completed.stderr or completed.stdout or "").strip()
+            if completed is not None
+            else "bd ready unavailable"
+        )
+        jsonl_ready: List[JsonDict] = []
+        jsonl_error: Optional[str] = None
         fallback_path = repo_path / ".beads" / "issues.jsonl"
-        issues = self._ready_beads_issues_from_jsonl(fallback_path)
+        if fallback_path.exists():
+            try:
+                jsonl_ready = self._ready_beads_issues_from_jsonl(fallback_path)
+            except Exception as exc:  # noqa: BLE001 - diagnostic export may also be broken.
+                jsonl_error = str(exc)
         self._record_beads_authority_observation(
             repo,
             repo_path,
-            authority="tracked_jsonl",
-            status="fallback",
-            mode="bd_ready_unavailable_jsonl_fallback",
+            authority="beads_db",
+            status="unavailable",
+            mode="canonical_bd_ready_failed",
             canonical_ready_issues=[],
-            jsonl_ready_issues=issues,
+            jsonl_ready_issues=jsonl_ready,
             actor=actor,
             source_state=source_state,
             bd_returncode=completed.returncode if completed is not None else None,
-            bd_error=(
-                (completed.stderr or completed.stdout or "").strip()
-                if completed is not None
-                else "bd ready unavailable"
-            ),
+            bd_error=bd_error,
+            jsonl_error=jsonl_error,
         )
-        return issues
+        repair_action = self._beads_repair_action(repo, repo_path, "canonical_unavailable")
+        finding = self.record_integration_finding(
+            "beads_repository",
+            repo.id,
+            "beads.canonical_unavailable",
+            "Canonical Beads DB is unavailable",
+            {
+                "schema": "mac.integration.beads_canonical_unavailable.v1",
+                "repository": repo.to_dict(),
+                "poll_path": str(repo_path),
+                "actor": actor,
+                "bd_error": bd_error[:2000],
+                "jsonl_ready_count": len(jsonl_ready),
+                "jsonl_ready_ids": self._beads_issue_ids(jsonl_ready),
+                "jsonl_error": jsonl_error,
+                "policy": "mac fails closed and never dispatches from JSONL when canonical `bd ready --json` is unavailable",
+                "repair_action": repair_action,
+            },
+            severity="error",
+            fingerprint=self._integration_fingerprint(
+                {
+                    "finding_type": "beads.canonical_unavailable",
+                    "repository_id": repo.id,
+                    "bd_error": bool(bd_error),
+                    "jsonl_error": bool(jsonl_error),
+                }
+            ),
+            notify=True,
+            channels=["dashboard", "hermes"],
+            notification_body=(
+                "%s cannot read canonical Beads ready state. mac will not import JSONL-only work."
+            )
+            % repo.name,
+        )
+        if source_state is not None:
+            source_state["authority_findings"] = [finding.to_dict()]
+            source_state["repair_action"] = repair_action
+        raise ValidationError(
+            "canonical Beads DB unavailable for %s: %s; JSONL exports are diagnostics only"
+            % (repo.name, bd_error or "bd ready failed")
+        )
 
     def _read_beads_jsonl_issues(self, issues_path: Path) -> List[JsonDict]:
         if not issues_path.exists():
@@ -5026,7 +5295,7 @@ class ControlPlane:
         jsonl_error: Optional[str] = None,
     ) -> None:
         findings: List[JsonDict] = []
-        active_jsonl_only: List[str] = []
+        active_ready_mismatch: List[str] = []
         active_parse_error: List[str] = []
         if jsonl_error:
             fingerprint = self._integration_fingerprint(
@@ -5063,9 +5332,16 @@ class ControlPlane:
             "beads.export_parse_error",
             active_fingerprints=active_parse_error,
         )
+        self._resolve_integration_findings_for_source(
+            "beads_repository",
+            repo.id,
+            "beads.canonical_unavailable",
+            active_fingerprints=[],
+        )
 
         canonical_ids = self._beads_issue_ids(canonical_ready_issues)
         jsonl_ids = self._beads_issue_ids(jsonl_ready_issues)
+        canonical_only = sorted(set(canonical_ids) - set(jsonl_ids))
         jsonl_only = sorted(set(jsonl_ids) - set(canonical_ids))
         existing_jsonl_only = self._existing_beads_project_items_by_external_id(
             repo,
@@ -5075,19 +5351,21 @@ class ControlPlane:
         untracked_jsonl_only = sorted(
             issue_id for issue_id in jsonl_only if issue_id not in existing_jsonl_only
         )
-        if untracked_jsonl_only:
+        if canonical_only or jsonl_only:
+            repair_action = self._beads_repair_action(repo, repo_path, "authority_drift")
             fingerprint = self._integration_fingerprint(
                 {
-                    "finding_type": "beads.export_drift.jsonl_only_ready",
-                    "jsonl_only_ready_ids": untracked_jsonl_only,
+                    "finding_type": "beads.export_drift.ready_mismatch",
+                    "canonical_only_ready_ids": canonical_only,
+                    "jsonl_only_ready_ids": jsonl_only,
                 }
             )
-            active_jsonl_only.append(fingerprint)
+            active_ready_mismatch.append(fingerprint)
             finding = self.record_integration_finding(
                 "beads_repository",
                 repo.id,
-                "beads.export_drift.jsonl_only_ready",
-                "Beads tracked export has ready issues missing from canonical DB",
+                "beads.export_drift.ready_mismatch",
+                "Beads tracked export ready set differs from canonical DB",
                 {
                     "schema": "mac.integration.beads_export_drift.v1",
                     "repository": repo.to_dict(),
@@ -5100,34 +5378,8 @@ class ControlPlane:
                     "canonical_ready_ids": canonical_ids,
                     "jsonl_ready_count": len(jsonl_ids),
                     "jsonl_ready_ids": jsonl_ids,
-                    "jsonl_only_ready_count": len(untracked_jsonl_only),
-                    "jsonl_only_ready_ids": untracked_jsonl_only,
-                    "jsonl_only_already_imported_count": len(already_imported_jsonl_only),
-                    "jsonl_only_already_imported_ids": already_imported_jsonl_only,
-                    "jsonl_only_existing_tasks": existing_jsonl_only,
-                },
-                severity="warning",
-                fingerprint=fingerprint,
-                notify=True,
-                channels=["dashboard", "hermes"],
-                notification_body=(
-                    "%s has %d ready issue(s) present only in .beads/issues.jsonl. "
-                    "mac will not import them until Beads DB exposes them through `bd ready --json`."
-                )
-                % (repo.name, len(untracked_jsonl_only)),
-            )
-            findings.append(finding.to_dict())
-        self._resolve_integration_findings_for_source(
-            "beads_repository",
-            repo.id,
-            "beads.export_drift.jsonl_only_ready",
-            active_fingerprints=active_jsonl_only,
-        )
-        if source_state is not None:
-            source_state["authority_findings"] = findings
-            if jsonl_only:
-                source_state["authority_drift"] = {
-                    "schema": "mac.integration.beads_authority_drift_summary.v1",
+                    "canonical_only_ready_count": len(canonical_only),
+                    "canonical_only_ready_ids": canonical_only,
                     "jsonl_only_ready_count": len(jsonl_only),
                     "jsonl_only_ready_ids": jsonl_only,
                     "jsonl_only_untracked_count": len(untracked_jsonl_only),
@@ -5135,6 +5387,46 @@ class ControlPlane:
                     "jsonl_only_already_imported_count": len(already_imported_jsonl_only),
                     "jsonl_only_already_imported_ids": already_imported_jsonl_only,
                     "jsonl_only_existing_tasks": existing_jsonl_only,
+                    "repair_action": repair_action,
+                },
+                severity="warning",
+                fingerprint=fingerprint,
+                notify=True,
+                channels=["dashboard", "hermes"],
+                notification_body=(
+                    "%s has Beads ready-state drift: canonical-only=%d, JSONL-only=%d. "
+                    "mac imports only canonical `bd ready --json` output."
+                )
+                % (repo.name, len(canonical_only), len(jsonl_only)),
+            )
+            findings.append(finding.to_dict())
+        self._resolve_integration_findings_for_source(
+            "beads_repository",
+            repo.id,
+            "beads.export_drift.ready_mismatch",
+            active_fingerprints=active_ready_mismatch,
+        )
+        self._resolve_integration_findings_for_source(
+            "beads_repository",
+            repo.id,
+            "beads.export_drift.jsonl_only_ready",
+            active_fingerprints=[],
+        )
+        if source_state is not None:
+            source_state["authority_findings"] = findings
+            if canonical_only or jsonl_only:
+                source_state["authority_drift"] = {
+                    "schema": "mac.integration.beads_authority_drift_summary.v1",
+                    "canonical_only_ready_count": len(canonical_only),
+                    "canonical_only_ready_ids": canonical_only,
+                    "jsonl_only_ready_count": len(jsonl_only),
+                    "jsonl_only_ready_ids": jsonl_only,
+                    "jsonl_only_untracked_count": len(untracked_jsonl_only),
+                    "jsonl_only_untracked_ids": untracked_jsonl_only,
+                    "jsonl_only_already_imported_count": len(already_imported_jsonl_only),
+                    "jsonl_only_already_imported_ids": already_imported_jsonl_only,
+                    "jsonl_only_existing_tasks": existing_jsonl_only,
+                    "repair_action": self._beads_repair_action(repo, repo_path, "authority_drift"),
                 }
 
     def _existing_beads_project_items_by_external_id(
@@ -5230,14 +5522,33 @@ class ControlPlane:
         *,
         last_imported_at: Optional[str],
         last_error: Optional[str],
+        health: Optional[JsonDict] = None,
     ) -> None:
+        metadata: Optional[JsonDict] = None
+        if health is not None:
+            row = self.store.query_one("SELECT metadata FROM beads_repositories WHERE id = ?", (repo_id,))
+            metadata = ensure_json_object(json_loads(row["metadata"], {}) if row is not None else {})
+            metadata["health"] = health
         self.store.execute(
-            """
-            UPDATE beads_repositories
-            SET last_polled_at = ?, last_imported_at = ?, last_error = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (last_polled_at, last_imported_at, last_error, utcnow(), repo_id),
+            (
+                """
+                UPDATE beads_repositories
+                SET last_polled_at = ?, last_imported_at = ?, last_error = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+                """
+                if metadata is not None
+                else
+                """
+                UPDATE beads_repositories
+                SET last_polled_at = ?, last_imported_at = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """
+            ),
+            (
+                (last_polled_at, last_imported_at, last_error, json_dumps(metadata), utcnow(), repo_id)
+                if metadata is not None
+                else (last_polled_at, last_imported_at, last_error, utcnow(), repo_id)
+            ),
         )
 
     def _beads_binding_for_task(self, task: Task) -> Optional[JsonDict]:

@@ -1360,13 +1360,17 @@ function napRunRecord(run: ApiRecord): string {
 }
 
 function beadsRepositoryRecord(repo: ApiRecord): string {
+  const health = (repo.metadata && typeof repo.metadata === "object" ? repo.metadata.health : {}) as ApiRecord;
+  const healthStatus = String(health.status || (repo.last_error ? "unhealthy" : "healthy"));
+  const healthReason = String(health.reason || repo.last_error || "canonical");
   return `
     <article class="record compact ${selectedClass(String(repo.id))}">
-      <div class="record-header"><div><h3>${escapeHtml(repo.name)}</h3><p class="muted small mono">${escapeHtml(repo.id)}</p></div>${chip(repo.enabled ? "enabled" : "disabled", repo.enabled ? "good" : "warn")}</div>
+      <div class="record-header"><div><h3>${escapeHtml(repo.name)}</h3><p class="muted small mono">${escapeHtml(repo.id)}</p></div><div class="chip-row">${chip(repo.enabled ? "enabled" : "disabled", repo.enabled ? "good" : "warn")}${chip(healthStatus, healthTone(healthStatus))}</div></div>
       <div class="row-grid compact-grid">
         ${field("Project", repo.project || "none")}
         ${field("Source", repo.source || "none")}
         ${field("Poll", `${repo.poll_interval_seconds || 0}s`)}
+        ${field("Health", healthReason)}
         ${field("Path", repo.path || "none")}
       </div>
     </article>

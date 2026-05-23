@@ -1032,7 +1032,7 @@ def test_fastapi_publishes_agentbus_repo_update_to_all_agents():
     assert chunks[0]["payload"]["request_id"] == "req-api"
 
 
-def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path):
+def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     contract_dir = repo / ".mac"
@@ -1081,6 +1081,34 @@ def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path):
         + "\n",
         encoding="utf-8",
     )
+    fake_bd = tmp_path / "bd"
+    fake_bd.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import json",
+                "import pathlib",
+                "import sys",
+                "args = sys.argv[1:]",
+                "if len(args) >= 2 and args[0] == '--actor':",
+                "    args = args[2:]",
+                "if args == ['ready', '--json']:",
+                "    issues = [json.loads(raw) for raw in (pathlib.Path.cwd() / '.beads' / 'issues.jsonl').read_text(encoding='utf-8').splitlines() if raw.strip()]",
+                "    sys.stdout.write(json.dumps(issues))",
+                "    sys.exit(0)",
+                "if args[:1] == ['bootstrap'] or args == ['dolt', 'pull']:",
+                "    sys.exit(0)",
+                "if args[:1] == ['export']:",
+                "    pathlib.Path(args[args.index('-o') + 1]).write_text((pathlib.Path.cwd() / '.beads' / 'issues.jsonl').read_text(encoding='utf-8'), encoding='utf-8')",
+                "    sys.exit(0)",
+                "sys.exit(1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
     client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
 
     registered = client.post(
@@ -1093,11 +1121,16 @@ def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path):
         },
     ).json()
     poll = client.post("/bridge/beads/poll", json={"force": True}).json()
+    repair = client.post(
+        "/bridge/beads/repositories/%s/repair" % registered["id"],
+        json={"actor": "api-test"},
+    ).json()
     repos = client.get("/bridge/beads/repositories").json()
     items = client.get("/bridge/items").json()
 
     assert registered["name"] == "mac"
     assert poll["imported_count"] == 1
+    assert repair["status"] == "ok"
     assert repos[0]["source"] == "repo-beads-mac"
     assert items[0]["external_id"] == "mac-api"
 

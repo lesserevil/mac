@@ -2775,7 +2775,11 @@ configured_qdrant_port = sys.argv[22].strip() or "6333"
 configured_firecrawl_url = sys.argv[23].strip()
 configured_firecrawl_required = sys.argv[24].strip() or "1"
 configured_firecrawl_port = sys.argv[25].strip() or "3002"
-network_provider = os.environ.get("NETWORK_PROVIDER", "none").strip().lower()
+network_provider = (
+    os.environ.get("MAC_DEPLOY_NETWORK_PROVIDER")
+    or os.environ.get("NETWORK_PROVIDER")
+    or "tailscale"
+).strip().lower()
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():

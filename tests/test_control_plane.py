@@ -25,8 +25,81 @@ from mac.migration import migrate_acc_sqlite
 from mac.services import ControlPlane
 
 
+def _write_cwd_fake_bd_cli(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import json",
+                "import pathlib",
+                "import sys",
+                "args = sys.argv[1:]",
+                "if len(args) >= 2 and args[0] == '--actor':",
+                "    args = args[2:]",
+                "cwd = pathlib.Path.cwd()",
+                "issues_path = cwd / '.beads' / 'issues.jsonl'",
+                "def read_issues():",
+                "    issues = []",
+                "    if not issues_path.exists():",
+                "        return issues",
+                "    for raw in issues_path.read_text(encoding='utf-8').splitlines():",
+                "        if raw.strip():",
+                "            issue = json.loads(raw)",
+                "            if isinstance(issue, dict) and issue.get('_type', 'issue') == 'issue':",
+                "                issues.append(issue)",
+                "    return issues",
+                "def ready_issues():",
+                "    issues = read_issues()",
+                "    by_id = {str(item.get('id')): item for item in issues if item.get('id')}",
+                "    ready = []",
+                "    for issue in issues:",
+                "        if str(issue.get('status') or '').lower() != 'open' or not str(issue.get('id') or '').strip():",
+                "            continue",
+                "        deps = issue.get('dependencies') or []",
+                "        if int(issue.get('dependency_count') or 0) > 0 and not deps:",
+                "            continue",
+                "        blocked = False",
+                "        for dep in deps:",
+                "            dep_issue = by_id.get(str(dep.get('depends_on_id') or '')) if isinstance(dep, dict) else None",
+                "            if dep_issue is None or str(dep_issue.get('status') or '') != 'closed':",
+                "                blocked = True",
+                "                break",
+                "        if not blocked:",
+                "            ready.append(issue)",
+                "    ready.sort(key=lambda item: (int(item.get('priority') or 2), str(item.get('created_at') or ''), str(item.get('id') or '')))",
+                "    return ready",
+                "if args == ['ready', '--json']:",
+                "    sys.stdout.write(json.dumps(ready_issues()))",
+                "    sys.exit(0)",
+                "if args[:1] == ['bootstrap']:",
+                "    (cwd / '.beads' / 'embeddeddolt').mkdir(parents=True, exist_ok=True)",
+                "    sys.exit(0)",
+                "if args == ['dolt', 'pull'] or args == ['dolt', 'push']:",
+                "    sys.exit(0)",
+                "if args[:1] == ['export']:",
+                "    output = json.dumps(read_issues())",
+                "    if '-o' in args:",
+                "        pathlib.Path(args[args.index('-o') + 1]).write_text('\\n'.join(json.dumps(item) for item in read_issues()) + '\\n', encoding='utf-8')",
+                "    else:",
+                "        sys.stdout.write(output)",
+                "    sys.exit(0)",
+                "if args[:1] == ['--actor']:",
+                "    sys.exit(0)",
+                "sys.stderr.write('unsupported fake bd command: %s\\n' % ' '.join(args))",
+                "sys.exit(1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 @pytest.fixture()
-def cp():
+def cp(tmp_path, monkeypatch):
+    fake_bd = tmp_path / "bd"
+    _write_cwd_fake_bd_cli(fake_bd)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
     return ControlPlane.in_memory()
 
 
@@ -1705,13 +1778,25 @@ def _write_fake_bd_cli(path, ready_path):
         "\n".join(
             [
                 "#!/usr/bin/env python3",
+                "import json",
                 "import pathlib",
                 "import sys",
                 "args = sys.argv[1:]",
+                "if len(args) >= 2 and args[0] == '--actor':",
+                "    args = args[2:]",
                 "if args == ['ready', '--json']:",
                 "    sys.stdout.write(pathlib.Path(%r).read_text(encoding='utf-8'))" % str(ready_path),
                 "    sys.exit(0)",
                 "if args[:1] == ['bootstrap']:",
+                "    sys.exit(0)",
+                "if args == ['dolt', 'pull'] or args == ['dolt', 'push']:",
+                "    sys.exit(0)",
+                "if args[:1] == ['export']:",
+                "    issues = json.loads(pathlib.Path(%r).read_text(encoding='utf-8') or '[]')" % str(ready_path),
+                "    output = '\\n'.join(json.dumps(item) for item in issues)",
+                "    if output:",
+                "        output += '\\n'",
+                "    pathlib.Path(args[args.index('-o') + 1]).write_text(output, encoding='utf-8')",
                 "    sys.exit(0)",
                 "sys.stderr.write('unsupported fake bd command: %s\\n' % ' '.join(args))",
                 "sys.exit(1)",
@@ -1898,21 +1983,30 @@ def test_beads_bridge_records_authority_drift_when_jsonl_export_disagrees_with_d
     report = cp.poll_beads_repositories(repo_record.id, force=True)
 
     assert report["imported_count"] == 0
+    assert report["error_count"] == 1
     assert cp.list_project_items() == []
     repo_report = report["repositories"][0]
+    assert repo_report["status"] == "authority_drift"
+    assert repo_report["health"]["status"] == "unhealthy"
+    assert repo_report["health"]["reason"] == "authority_drift"
     assert repo_report["ready_count"] == 0
     assert repo_report["source_state"]["authority"]["authority"] == "beads_db"
+    assert repo_report["source_state"]["authority"]["status"] == "drift"
     assert repo_report["source_state"]["authority"]["jsonl_ready_ids"] == ["mac-jsonl-only"]
-    assert repo_report["source_state"]["authority_findings"][0]["finding_type"] == "beads.export_drift.jsonl_only_ready"
+    assert repo_report["source_state"]["authority_findings"][0]["finding_type"] == "beads.export_drift.ready_mismatch"
+    assert repo_report["source_state"]["authority_drift"]["repair_action"]["type"] == "beads_canonical_reconcile"
+    assert cp.get_beads_repository(repo_record.id).metadata["health"]["status"] == "unhealthy"
     findings = cp.list_integration_findings(status="open")
     assert len(findings) == 1
     assert findings[0].detail["jsonl_only_ready_ids"] == ["mac-jsonl-only"]
+    assert findings[0].detail["jsonl_only_untracked_ids"] == ["mac-jsonl-only"]
+    assert findings[0].detail["repair_action"]["commands"][-1] == "bd export -o .beads/issues.jsonl"
     observations = cp.list_integration_observations(source_id=repo_record.id)
     assert observations[0].authority == "beads_db"
-    assert observations[0].status == "ok"
+    assert observations[0].status == "drift"
     assert observations[0].detail["canonical_ready_ids"] == []
     notifications = cp.list_notifications(subject_id=repo_record.id)
-    assert notifications[0].event_type == "integration.beads.export_drift.jsonl_only_ready"
+    assert notifications[0].event_type == "integration.beads.export_drift.ready_mismatch"
     names = {item.name for item in cp.list_observability(layer="control_plane", limit=20)}
     assert "integration.finding.opened" in names
 
@@ -1920,13 +2014,16 @@ def test_beads_bridge_records_authority_drift_when_jsonl_export_disagrees_with_d
     second = cp.poll_beads_repositories(repo_record.id, force=True)
 
     assert second["imported_count"] == 1
+    assert second["error_count"] == 0
+    assert second["repositories"][0]["health"]["status"] == "healthy"
+    assert cp.get_beads_repository(repo_record.id).last_error is None
     assert cp.list_integration_findings(status="open") == []
     resolved = cp.list_integration_findings(status="resolved")
     assert len(resolved) == 1
     assert resolved[0].resolution == "no longer observed"
 
 
-def test_beads_bridge_does_not_alert_for_jsonl_only_issue_already_imported(
+def test_beads_bridge_marks_repo_unhealthy_for_jsonl_only_issue_already_imported(
     cp,
     tmp_path,
     monkeypatch,
@@ -1961,7 +2058,10 @@ def test_beads_bridge_does_not_alert_for_jsonl_only_issue_already_imported(
     report = cp.poll_beads_repositories(repo_record.id, force=True)
 
     assert report["imported_count"] == 0
-    assert report["repositories"][0]["source_state"]["authority_findings"] == []
+    assert report["error_count"] == 1
+    assert report["repositories"][0]["status"] == "authority_drift"
+    assert report["repositories"][0]["health"]["status"] == "unhealthy"
+    assert report["repositories"][0]["source_state"]["authority_findings"][0]["finding_type"] == "beads.export_drift.ready_mismatch"
     drift = report["repositories"][0]["source_state"]["authority_drift"]
     assert drift["jsonl_only_ready_ids"] == ["mac-jsonl-active"]
     assert drift["jsonl_only_untracked_ids"] == []
@@ -1970,8 +2070,95 @@ def test_beads_bridge_does_not_alert_for_jsonl_only_issue_already_imported(
         "task_id": item.task_id,
         "state": "open",
     }
+    findings = cp.list_integration_findings(status="open")
+    assert len(findings) == 1
+    assert findings[0].detail["jsonl_only_already_imported_ids"] == ["mac-jsonl-active"]
+    assert cp.list_notifications(subject_id=repo_record.id)[0].event_type == "integration.beads.export_drift.ready_mismatch"
+
+
+def test_beads_bridge_fails_closed_when_canonical_ready_is_unavailable(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue = {
+        "_type": "issue",
+        "id": "mac-jsonl-only",
+        "title": "Do not import from JSONL fallback",
+        "description": "canonical DB is broken",
+        "status": "open",
+        "priority": 0,
+        "created_at": "2026-05-20T00:00:00Z",
+        "dependency_count": 0,
+    }
+    _write_beads(repo, [issue])
+    fake_bd = tmp_path / "bd-broken"
+    fake_bd.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1 $2\" = \"ready --json\" ]; then echo 'embeddeddolt: missing table' >&2; exit 1; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+
+    report = cp.poll_beads_repositories(repo_record.id, force=True)
+
+    repo_report = report["repositories"][0]
+    assert report["imported_count"] == 0
+    assert report["error_count"] == 1
+    assert repo_report["status"] == "error"
+    assert repo_report["health"]["status"] == "unhealthy"
+    assert repo_report["health"]["reason"] == "canonical_unavailable"
+    assert repo_report["source_state"]["authority"]["authority"] == "beads_db"
+    assert repo_report["source_state"]["authority"]["status"] == "unavailable"
+    assert repo_report["source_state"]["authority"]["jsonl_ready_ids"] == ["mac-jsonl-only"]
+    assert cp.list_project_items() == []
+    refreshed_repo = cp.get_beads_repository(repo_record.id)
+    assert refreshed_repo.last_error.startswith("canonical Beads DB unavailable")
+    assert refreshed_repo.metadata["health"]["status"] == "unhealthy"
+    findings = cp.list_integration_findings(status="open")
+    assert len(findings) == 1
+    assert findings[0].finding_type == "beads.canonical_unavailable"
+    assert findings[0].detail["jsonl_ready_ids"] == ["mac-jsonl-only"]
+    assert findings[0].detail["repair_action"]["type"] == "beads_canonical_reconcile"
+
+
+def test_beads_bridge_repair_reconciles_tracked_export_from_canonical_db(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue = {
+        "_type": "issue",
+        "id": "mac-stale-export",
+        "title": "Stale export",
+        "description": "JSONL says ready but canonical DB does not",
+        "status": "open",
+        "priority": 0,
+        "created_at": "2026-05-20T00:00:00Z",
+        "dependency_count": 0,
+    }
+    _write_beads(repo, [issue])
+    ready_path = tmp_path / "ready.json"
+    ready_path.write_text("[]", encoding="utf-8")
+    fake_bd = tmp_path / "bd"
+    _write_fake_bd_cli(fake_bd, ready_path)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    drift = cp.poll_beads_repositories(repo_record.id, force=True)
+    assert drift["repositories"][0]["status"] == "authority_drift"
+
+    repaired = cp.repair_beads_repository(repo_record.id, actor="operator")
+
+    assert repaired["status"] == "ok"
+    assert [step["name"] for step in repaired["steps"]] == [
+        "bootstrap",
+        "dolt_pull",
+        "ready",
+        "export",
+    ]
+    assert (repo / ".beads" / "issues.jsonl").read_text(encoding="utf-8") == ""
+    assert repaired["poll_report"]["repositories"][0]["status"] == "ok"
+    assert cp.get_beads_repository(repo_record.id).metadata["health"]["status"] == "healthy"
     assert cp.list_integration_findings(status="open") == []
-    assert cp.list_notifications(subject_id=repo_record.id) == []
 
 
 def test_direct_task_for_registered_project_gets_repository_execution_contract(cp, tmp_path):
@@ -2190,7 +2377,6 @@ def test_beads_bridge_reopens_failed_existing_task_while_bead_ready(cp, tmp_path
             }
         ],
     )
-    monkeypatch.setenv("MAC_BEADS_CLI", str(tmp_path / "missing-bd"))
     cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
     cp.poll_beads_repositories(force=True)
     task = cp.get_task(cp.list_project_items()[0].task_id)
@@ -2228,7 +2414,6 @@ def test_beads_bridge_failed_task_reopen_limit_is_bounded(cp, tmp_path, monkeypa
             }
         ],
     )
-    monkeypatch.setenv("MAC_BEADS_CLI", str(tmp_path / "missing-bd"))
     monkeypatch.setenv("MAC_BEADS_FAILED_TASK_REOPEN_LIMIT", "1")
     cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
     cp.poll_beads_repositories(force=True)
@@ -2552,7 +2737,6 @@ def test_beads_bridge_backfills_retry_exhausted_failure_summary_to_beads(
             }
         ],
     )
-    monkeypatch.setenv("MAC_BEADS_CLI", str(tmp_path / "missing-bd"))
     monkeypatch.setenv("MAC_BEADS_FAILED_TASK_REOPEN_LIMIT", "1")
     cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
     cp.poll_beads_repositories(force=True)
@@ -2903,7 +3087,22 @@ def test_beads_bridge_reconciles_existing_active_task_claim(cp, tmp_path, monkey
 
     def fake_run(command, cwd, capture_output, text, timeout, check):
         if command == [bd_cli, "ready", "--json"]:
-            return Completed(returncode=1, stderr="no beads database")
+            return Completed(
+                stdout=json.dumps(
+                    [
+                        {
+                            "_type": "issue",
+                            "id": "mac-reconcile",
+                            "title": "Reconcile missed claim",
+                            "description": "claim sync missed during deploy",
+                            "status": "open",
+                            "priority": 0,
+                            "created_at": "2026-05-20T00:00:00Z",
+                            "dependency_count": 0,
+                        }
+                    ]
+                )
+            )
         calls.append({"command": command, "cwd": cwd})
         return Completed()
 
@@ -2964,7 +3163,22 @@ def test_beads_bridge_tolerates_preclaimed_bead_during_reconcile(cp, tmp_path, m
 
     def fake_run(command, cwd, capture_output, text, timeout, check):
         if command == [bd_cli, "ready", "--json"]:
-            return Completed(returncode=1, stderr="no beads database")
+            return Completed(
+                stdout=json.dumps(
+                    [
+                        {
+                            "_type": "issue",
+                            "id": "mac-preclaimed",
+                            "title": "Preclaimed work",
+                            "description": "already assigned before mac claimed it",
+                            "status": "open",
+                            "priority": 0,
+                            "created_at": "2026-05-20T00:00:00Z",
+                            "dependency_count": 0,
+                        }
+                    ]
+                )
+            )
         return Completed(returncode=1, stderr="Error claiming mac-preclaimed: issue already claimed by Jordan Hubbard")
 
     monkeypatch.setattr("mac.services.subprocess.run", fake_run)
