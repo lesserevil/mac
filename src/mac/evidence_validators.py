@@ -61,6 +61,7 @@ class VerificationManifest:
 @dataclass(frozen=True)
 class EvidenceValidationContext:
     passed_check_count: Callable[[JsonDict], int]
+    allow_empty_repo_change: bool = False
 
 
 class EvidenceValidator:
@@ -103,7 +104,11 @@ class RepoChangeValidator(EvidenceValidator):
         context: EvidenceValidationContext,
     ) -> List[str]:
         problems = self.require_pushed_repo_anchor(manifest)
-        if manifest.repo is not None and not manifest.repo.files_changed:
+        if (
+            manifest.repo is not None
+            and not manifest.repo.files_changed
+            and not context.allow_empty_repo_change
+        ):
             problems.append("repo evidence requires changed files")
         if self.passed_checks(manifest, context) < 1:
             problems.append("repo code evidence requires at least one passing test/check")
@@ -237,12 +242,19 @@ def validate_evidence_type(
     manifest: Any,
     *,
     passed_check_count: Callable[[JsonDict], int],
+    allow_empty_repo_change: bool = False,
 ) -> List[str]:
     typed = VerificationManifest.parse(manifest)
     validator = VALIDATORS.get(str(evidence_type or "").strip().lower())
     if validator is None:
         return ["unsupported verification.evidence_type: %s" % evidence_type]
-    return validator.validate(typed, EvidenceValidationContext(passed_check_count=passed_check_count))
+    return validator.validate(
+        typed,
+        EvidenceValidationContext(
+            passed_check_count=passed_check_count,
+            allow_empty_repo_change=allow_empty_repo_change,
+        ),
+    )
 
 
 def _manifest_list(value: Any) -> List[Any]:

@@ -7416,7 +7416,18 @@ class ControlPlane:
             evidence_type,
             manifest,
             passed_check_count=self._passed_verification_check_count,
+            allow_empty_repo_change=self._allows_empty_repo_change_evidence(task, evidence_type),
         )
+
+    def _allows_empty_repo_change_evidence(self, task: Task, evidence_type: str) -> bool:
+        if str(evidence_type or "").strip().lower() != "repo_change":
+            return False
+        metadata = ensure_json_object(task.metadata)
+        origin = ensure_json_object(metadata.get("origin"))
+        remediation = ensure_json_object(metadata.get("remediation"))
+        return origin.get("type") == "beads_source_remediation" or remediation.get(
+            "type"
+        ) == "beads_source_refresh"
 
     def _repo_verification_problems(self, manifest: JsonDict, require_tests: bool) -> List[str]:
         problems = self._require_pushed_repo_anchor(manifest)

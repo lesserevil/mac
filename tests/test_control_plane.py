@@ -904,6 +904,38 @@ def test_submit_for_review_requires_pushed_repo_anchor_for_all_evidence_types(cp
         cp.submit_for_review(task.id, worker.id)
 
 
+def test_source_remediation_repo_change_allows_empty_files_changed(cp):
+    worker = register_agent(cp, "worker", ["ops"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "Repair checkout",
+        required_capabilities=["ops"],
+        metadata={
+            "origin": {"type": "beads_source_remediation"},
+            "remediation": {"type": "beads_source_refresh"},
+            "publication_target": "environment://beads-repository/example/source",
+        },
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    metadata = verified_repo_metadata(cp, worker.id)
+    metadata["verification"]["repo"]["files_changed"] = []
+    metadata["verification"] = _sign(cp, worker.id, metadata["verification"])
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://source-refresh",
+        "source already clean",
+        worker.id,
+        metadata=metadata,
+    )
+
+    cp.submit_for_review(task.id, worker.id)
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+
+
 def test_default_review_workflow_allows_verified_deployment_evidence(cp):
     worker = register_agent(cp, "worker", ["ops"])
     reviewer = register_agent(cp, "reviewer", ["review"])
