@@ -2475,6 +2475,7 @@ def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeyp
     natasha = register_agent(cp, "natasha", ["python"])
     monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
     monkeypatch.setenv("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT_ASYNC", "0")
 
     cp.heartbeat_agent(natasha.id, status=AgentStatus.IDLE.value)
     assert cp.list_project_items() == []
@@ -2483,6 +2484,33 @@ def test_hub_heartbeat_polls_registered_beads_repositories(cp, tmp_path, monkeyp
 
     assert len(cp.list_project_items()) == 1
     assert cp.list_project_items()[0].external_id == "mac-heartbeat"
+
+
+def test_hub_heartbeat_schedules_beads_poll_async_by_default(cp, monkeypatch):
+    rocky = register_agent(cp, "rocky", ["python"])
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = []
+
+    def fake_poll(**kwargs):
+        calls.append(kwargs["actor"])
+        started.set()
+        release.wait(1)
+        finished.set()
+        return {"repositories": []}
+
+    monkeypatch.setattr(cp, "poll_beads_repositories", fake_poll)
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+
+    cp.heartbeat_agent(rocky.id, status=AgentStatus.IDLE.value)
+    assert started.wait(1)
+
+    cp.heartbeat_agent(rocky.id, status=AgentStatus.IDLE.value)
+    release.set()
+    assert finished.wait(1)
+    assert calls == [rocky.id]
 
 
 def test_hub_lease_renewal_polls_registered_beads_repositories(cp, tmp_path, monkeypatch):
@@ -2509,6 +2537,7 @@ def test_hub_lease_renewal_polls_registered_beads_repositories(cp, tmp_path, mon
     _claimed, lease = cp.claim_task(task.id, rocky.id)
     monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
     monkeypatch.setenv("MAC_BEADS_BRIDGE_HUB_AGENT", "rocky")
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ON_HEARTBEAT_ASYNC", "0")
 
     cp.renew_lease(lease.id, rocky.id)
 

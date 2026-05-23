@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -392,6 +393,9 @@ class ControlPlane:
         self.task_ledger = TaskLedgerService(self.store)
         self.dispatch = DispatchService(self)
         self.beads_bridge = BeadsBridgeService(_beads_cli, runner=_run_beads_command)
+        self._beads_cli_lock = threading.RLock()
+        self._beads_heartbeat_poll_lock = threading.Lock()
+        self._task_outbox_drain_lock = threading.Lock()
         self.identity = IdentityService(self.store)
         self.observability = ObservabilityService(self.store)
         self.agentbus = AgentBusService(self.store, self.observability)
@@ -1781,6 +1785,8 @@ class ControlPlane:
         target_state: str,
         actor: str,
         detail: Optional[Dict[str, Any]] = None,
+        *,
+        drain_outbox: bool = True,
     ) -> Task:
         target = _state_value(target_state)
         task = self.get_task(task_id)
@@ -1882,7 +1888,8 @@ class ControlPlane:
                     detail=detail or {},
                     created_at=now,
                 )
-        self.drain_task_transition_outbox(task_id=task_id, limit=20)
+        if drain_outbox:
+            self.drain_task_transition_outbox(task_id=task_id, limit=20)
         transitioned = self.get_task(task_id)
         return transitioned
 
@@ -2043,6 +2050,33 @@ class ControlPlane:
             processed.append({"id": item.id, "event_type": item.event_type, "status": "delivered"})
         return {"processed": processed, "count": len(processed)}
 
+    def drain_task_transition_outbox_best_effort(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> JsonDict:
+        if not self._task_outbox_drain_lock.acquire(blocking=False):
+            return {"processed": [], "count": 0, "status": "busy"}
+        try:
+            return self.drain_task_transition_outbox(task_id=task_id, limit=limit)
+        except Exception as exc:  # noqa: BLE001 - side effects must not break API responses.
+            try:
+                self.record_log(
+                    "task.transition_outbox.drain_failed",
+                    layer="control_plane",
+                    source="task-ledger",
+                    level="warning",
+                    subject_type="task" if task_id else None,
+                    subject_id=task_id,
+                    detail={"error": str(exc), "limit": limit},
+                )
+            except Exception:
+                pass
+            return {"processed": [], "count": 0, "status": "failed", "error": str(exc)}
+        finally:
+            self._task_outbox_drain_lock.release()
+
     def _process_task_transition_outbox_item(self, item: TaskTransitionOutbox) -> None:
         if item.event_type == "task.lifecycle":
             return
@@ -2076,18 +2110,36 @@ class ControlPlane:
             return
         raise ValidationError("unsupported task transition outbox event: %s" % item.event_type)
 
-    def start_task(self, task_id: str, agent_id: str) -> Task:
+    def start_task(self, task_id: str, agent_id: str, *, drain_outbox: bool = True) -> Task:
         task = self.get_task(task_id)
         if task.owner_agent_id != agent_id:
             raise AuthorizationError("agent does not own task lease")
-        return self.transition_task(task_id, TaskState.RUNNING.value, agent_id, {})
+        return self.transition_task(
+            task_id,
+            TaskState.RUNNING.value,
+            agent_id,
+            {},
+            drain_outbox=drain_outbox,
+        )
 
-    def submit_for_review(self, task_id: str, agent_id: str) -> Task:
+    def submit_for_review(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        drain_outbox: bool = True,
+    ) -> Task:
         task = self.get_task(task_id)
         if task.owner_agent_id != agent_id:
             raise AuthorizationError("agent does not own task lease")
         self._require_review_ready(task)
-        reviewed = self.transition_task(task_id, TaskState.NEEDS_REVIEW.value, agent_id, {})
+        reviewed = self.transition_task(
+            task_id,
+            TaskState.NEEDS_REVIEW.value,
+            agent_id,
+            {},
+            drain_outbox=drain_outbox,
+        )
         return reviewed
 
     def _require_review_ready(self, task: Task) -> None:
@@ -2113,6 +2165,8 @@ class ControlPlane:
         created_by: str,
         checksum: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        sync_beads: bool = True,
     ) -> Evidence:
         self.get_task(task_id)
         if not kind or not uri or not summary:
@@ -2151,18 +2205,38 @@ class ControlPlane:
                 conn=conn,
             )
         evidence = self.get_evidence(evidence_id)
-        self._append_beads_ledger_comment(
-            self.get_task(task_id),
-            created_by,
-            "evidence_added",
-            "%s evidence recorded" % kind,
-            fields={
-                "evidence": evidence_id,
-                "kind": kind,
-                "summary": summary,
-            },
-        )
+        if sync_beads:
+            self.sync_evidence_side_effects(evidence_id)
         return evidence
+
+    def sync_evidence_side_effects(self, evidence_id: str) -> None:
+        try:
+            evidence = self.get_evidence(evidence_id)
+            self._append_beads_ledger_comment(
+                self.get_task(evidence.task_id),
+                evidence.created_by,
+                "evidence_added",
+                "%s evidence recorded" % evidence.kind,
+                fields={
+                    "evidence": evidence.id,
+                    "kind": evidence.kind,
+                    "summary": evidence.summary,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence is already durable.
+            try:
+                evidence = self.get_evidence(evidence_id)
+                self.record_log(
+                    "task.evidence_side_effects_failed",
+                    layer="control_plane",
+                    source=evidence.created_by,
+                    level="warning",
+                    subject_type="task",
+                    subject_id=evidence.task_id,
+                    detail={"evidence_id": evidence_id, "error": str(exc)},
+                )
+            except Exception:
+                pass
 
     def get_evidence(self, evidence_id: str) -> Evidence:
         row = self.store.query_one("SELECT * FROM evidence WHERE id = ?", (evidence_id,))
@@ -2697,6 +2771,17 @@ class ControlPlane:
             return
         if agent.name != hub_agent and agent.id != hub_agent:
             return
+        if _truthy_env("MAC_BEADS_BRIDGE_ON_HEARTBEAT_ASYNC", "1"):
+            if not self._beads_heartbeat_poll_lock.acquire(blocking=False):
+                return
+            thread = threading.Thread(
+                target=self._poll_beads_bridge_from_heartbeat,
+                args=(agent.id,),
+                name="mac-beads-heartbeat-poll",
+                daemon=True,
+            )
+            thread.start()
+            return
         try:
             self.poll_beads_repositories(actor=agent.id)
         except Exception as exc:  # noqa: BLE001 - heartbeat liveness must survive bridge failures.
@@ -2710,6 +2795,23 @@ class ControlPlane:
                 )
             except Exception:
                 pass
+
+    def _poll_beads_bridge_from_heartbeat(self, actor: str) -> None:
+        try:
+            self.poll_beads_repositories(actor=actor)
+        except Exception as exc:  # noqa: BLE001 - heartbeat liveness must survive bridge failures.
+            try:
+                self.record_log(
+                    "bridge.beads.heartbeat_poll_failed",
+                    layer="control_plane",
+                    source=actor,
+                    level="warning",
+                    detail={"error": str(exc)},
+                )
+            except Exception:
+                pass
+        finally:
+            self._beads_heartbeat_poll_lock.release()
 
     def _maybe_advance_reviews_on_heartbeat(self, agent: Agent) -> None:
         if not _truthy_env("MAC_REVIEW_TICK_ON_HEARTBEAT", "1"):
@@ -3190,6 +3292,7 @@ class ControlPlane:
         *,
         executor_evidence_id: Optional[str] = None,
         actor: str = "reviewer",
+        sync_beads: bool = True,
     ) -> JsonDict:
         review = self.get_review(review_id)
         if review.reviewer_agent_id != reviewer_agent_id:
@@ -3254,20 +3357,8 @@ class ControlPlane:
                 conn=conn,
             )
         refreshed = self.get_task(task.id)
-        self._append_beads_ledger_comment(
-            refreshed,
-            reviewer_agent_id,
-            "review_claimed",
-            "review claimed for %s" % task.title,
-            fields={
-                "review": review.id,
-                "project": claim.get("project"),
-                "worktree": claim.get("repository_worktree"),
-                "head": claim.get("repository_head_sha"),
-                "ref": claim.get("repository_remote_ref"),
-                "work": claim.get("work_summary"),
-            },
-        )
+        if sync_beads:
+            self.sync_review_claim_side_effects(refreshed.id, review.id, reviewer_agent_id)
         return {
             "schema": "mac.review_claim.v1",
             "status": "claimed",
@@ -3275,6 +3366,46 @@ class ControlPlane:
             "task": refreshed.to_dict(),
             "claim": claim,
         }
+
+    def sync_review_claim_side_effects(
+        self,
+        task_id: str,
+        review_id: str,
+        reviewer_agent_id: str,
+    ) -> None:
+        try:
+            task = self.get_task(task_id)
+            claim = ensure_json_object(
+                ensure_json_object(task.metadata).get("review_claims")
+            ).get(review_id)
+            claim_detail = claim if isinstance(claim, dict) else {}
+            self._append_beads_ledger_comment(
+                task,
+                reviewer_agent_id,
+                "review_claimed",
+                "review claimed for %s" % task.title,
+                fields={
+                    "review": review_id,
+                    "project": claim_detail.get("project"),
+                    "worktree": claim_detail.get("repository_worktree"),
+                    "head": claim_detail.get("repository_head_sha"),
+                    "ref": claim_detail.get("repository_remote_ref"),
+                    "work": claim_detail.get("work_summary"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - review claim is already durable.
+            try:
+                self.record_log(
+                    "task.review_claim_side_effects_failed",
+                    layer="control_plane",
+                    source=reviewer_agent_id,
+                    level="warning",
+                    subject_type="task",
+                    subject_id=task_id,
+                    detail={"review_id": review_id, "error": str(exc)},
+                )
+            except Exception:
+                pass
 
     def _review_claim_detail(
         self,
@@ -4164,22 +4295,40 @@ class ControlPlane:
             "error_count": 0,
             "repositories": [],
         }
-        for repo in repos:
-            repo_report = self._poll_beads_repository(repo, force=force, actor=actor)
-            report["repositories"].append(repo_report)
-            report["imported_count"] += int(repo_report.get("imported_count", 0))
-            report["existing_count"] += int(repo_report.get("existing_count", 0))
-            report["reopened_count"] += int(repo_report.get("reopened_count", 0))
-            report["retry_exhausted_count"] += int(repo_report.get("retry_exhausted_count", 0))
-            report["skipped_count"] += int(repo_report.get("skipped_count", 0))
-            if repo_report.get("status") in {
-                "error",
-                "source_dirty",
-                "source_refresh_error",
-                "authority_drift",
-                "authority_export_error",
-            }:
-                report["error_count"] += 1
+        if not self._beads_cli_lock.acquire(blocking=False):
+            report["busy_count"] = len(repos)
+            report["skipped_count"] = len(repos)
+            report["repositories"] = [
+                {
+                    "repository_id": repo.id,
+                    "name": repo.name,
+                    "status": "busy",
+                    "imported_count": 0,
+                    "existing_count": 0,
+                    "skipped_count": 1,
+                }
+                for repo in repos
+            ]
+            return report
+        try:
+            for repo in repos:
+                repo_report = self._poll_beads_repository(repo, force=force, actor=actor)
+                report["repositories"].append(repo_report)
+                report["imported_count"] += int(repo_report.get("imported_count", 0))
+                report["existing_count"] += int(repo_report.get("existing_count", 0))
+                report["reopened_count"] += int(repo_report.get("reopened_count", 0))
+                report["retry_exhausted_count"] += int(repo_report.get("retry_exhausted_count", 0))
+                report["skipped_count"] += int(repo_report.get("skipped_count", 0))
+                if repo_report.get("status") in {
+                    "error",
+                    "source_dirty",
+                    "source_refresh_error",
+                    "authority_drift",
+                    "authority_export_error",
+                }:
+                    report["error_count"] += 1
+        finally:
+            self._beads_cli_lock.release()
         if report["imported_count"] or report["reopened_count"] or report["error_count"]:
             self.record_log(
                 "bridge.beads.poll",
@@ -5742,6 +5891,21 @@ class ControlPlane:
         if not repo_path.exists():
             return False
         registered_path = Path(str(binding["repo_path"])).expanduser()
+        if not self._beads_cli_lock.acquire(blocking=False):
+            self.record_log(
+                "bridge.beads.sync_busy",
+                layer="control_plane",
+                source=actor,
+                level="warning",
+                subject_type="task",
+                subject_id=task.id,
+                detail={
+                    "action": action,
+                    "bead_id": binding["bead_id"],
+                    "repo_path": str(repo_path),
+                },
+            )
+            return False
         try:
             completed = self.beads_bridge.run(
                 args,
@@ -5835,6 +5999,8 @@ class ControlPlane:
                 },
             )
             return False
+        finally:
+            self._beads_cli_lock.release()
 
     def _push_beads_writeback(
         self,

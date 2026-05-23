@@ -1670,8 +1670,24 @@ def create_app(
         return cp.task_summary(task_id)
 
     @app.post("/tasks/{task_id}/transition")
-    def transition_task(task_id: str, body: TransitionRequest) -> Dict[str, Any]:
-        return cp.transition_task(task_id, body.target_state, body.actor, body.detail).to_dict()
+    def transition_task(
+        task_id: str,
+        body: TransitionRequest,
+        background_tasks: BackgroundTasks,
+    ) -> Dict[str, Any]:
+        task = cp.transition_task(
+            task_id,
+            body.target_state,
+            body.actor,
+            body.detail,
+            drain_outbox=False,
+        )
+        background_tasks.add_task(
+            cp.drain_task_transition_outbox_best_effort,
+            task_id=task_id,
+            limit=20,
+        )
+        return task.to_dict()
 
     @app.post("/tasks/{task_id}/claim")
     def claim_task(
@@ -1695,24 +1711,49 @@ def create_app(
         return cp.renew_lease(lease_id, body.agent_id, body.lease_seconds).to_dict()
 
     @app.post("/tasks/{task_id}/start")
-    def start_task(task_id: str, agent_id: str) -> Dict[str, Any]:
-        return cp.start_task(task_id, agent_id).to_dict()
+    def start_task(
+        task_id: str,
+        agent_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> Dict[str, Any]:
+        task = cp.start_task(task_id, agent_id, drain_outbox=False)
+        background_tasks.add_task(
+            cp.drain_task_transition_outbox_best_effort,
+            task_id=task_id,
+            limit=20,
+        )
+        return task.to_dict()
 
     @app.post("/tasks/{task_id}/submit-for-review")
     def submit_for_review(
         task_id: str,
         agent_id: str,
+        background_tasks: BackgroundTasks,
         advance_default_workflow: bool = Query(default=False),
     ) -> Dict[str, Any]:
-        task = cp.submit_for_review(task_id, agent_id)
+        task = cp.submit_for_review(task_id, agent_id, drain_outbox=False)
+        background_tasks.add_task(
+            cp.drain_task_transition_outbox_best_effort,
+            task_id=task_id,
+            limit=20,
+        )
         if advance_default_workflow:
-            cp.advance_default_review_workflow(task_id, actor=agent_id)
-            task = cp.get_task(task_id)
+            background_tasks.add_task(
+                cp.advance_default_review_workflow,
+                task_id,
+                actor=agent_id,
+            )
         return task.to_dict()
 
     @app.post("/tasks/{task_id}/evidence")
-    def add_evidence(task_id: str, body: EvidenceCreate) -> Dict[str, Any]:
-        return cp.add_evidence(task_id=task_id, **_data(body)).to_dict()
+    def add_evidence(
+        task_id: str,
+        body: EvidenceCreate,
+        background_tasks: BackgroundTasks,
+    ) -> Dict[str, Any]:
+        evidence = cp.add_evidence(task_id=task_id, sync_beads=False, **_data(body))
+        background_tasks.add_task(cp.sync_evidence_side_effects, evidence.id)
+        return evidence.to_dict()
 
     @app.post("/machines")
     def register_machine(
@@ -2697,13 +2738,27 @@ def create_app(
         return cp.request_review(task_id, body.reviewer_agent_id, body.actor).to_dict()
 
     @app.post("/reviews/{review_id}/claim")
-    def claim_review(review_id: str, body: ReviewClaim) -> Dict[str, Any]:
-        return cp.claim_review(
+    def claim_review(
+        review_id: str,
+        body: ReviewClaim,
+        background_tasks: BackgroundTasks,
+    ) -> Dict[str, Any]:
+        claim = cp.claim_review(
             review_id,
             body.reviewer_agent_id,
             executor_evidence_id=body.executor_evidence_id,
             actor=body.actor,
+            sync_beads=False,
         )
+        if claim.get("status") == "claimed":
+            task = claim.get("task") if isinstance(claim.get("task"), dict) else {}
+            background_tasks.add_task(
+                cp.sync_review_claim_side_effects,
+                str(task.get("id") or ""),
+                review_id,
+                body.reviewer_agent_id,
+            )
+        return claim
 
     @app.post("/reviews/{review_id}/decision")
     def submit_review(review_id: str, body: ReviewDecision) -> Dict[str, Any]:

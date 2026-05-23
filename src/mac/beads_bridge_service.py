@@ -54,14 +54,27 @@ class BeadsBridgeService:
         if actor:
             argv.extend(["--actor", actor])
         argv.extend(str(item) for item in args)
-        completed = self._runner(
-            argv,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            completed = self._runner(
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            if not stderr:
+                stderr = "timed out after %ss" % timeout
+            return BeadsCommandResult(
+                argv=list(argv),
+                cwd=str(cwd),
+                returncode=124,
+                stdout=stdout,
+                stderr=stderr,
+            )
         return BeadsCommandResult(
             argv=list(argv),
             cwd=str(cwd),
