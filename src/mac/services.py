@@ -5952,6 +5952,7 @@ class ControlPlane:
                 "repository_contract_schema": contract["schema"],
                 "repository_contract_project": contract["project"],
             },
+            "publication_target": "git://main",
         }
         return self.import_project_item(
             repo.source,

@@ -2013,6 +2013,7 @@ def test_beads_bridge_imports_ready_open_issues_idempotently(cp, tmp_path):
     assert repo_record.metadata["repository_contract"]["bootstrap"]["command"] == "python3 scripts/bootstrap-project.py"
     assert task.metadata["origin"]["type"] == "beads"
     assert task.metadata["origin"]["repository_contract"]["project"] == "repo-beads-mac"
+    assert task.metadata["publication_target"] == "git://main"
     assert task.metadata["acc_metadata"]["beads_sync_close_on_complete"] is True
     assert task.metadata["acc_metadata"]["repository_contract_schema"] == "mac.repository_contract.v1"
 
