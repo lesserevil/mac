@@ -16,7 +16,7 @@ bootstrap:
     - .venv/bin/python
     - .venv/bin/pytest
 test:
-  command: PATH=.venv/bin:$PATH .venv/bin/python -m pytest
+  command: scripts/run-contract-tests.sh
 evidence:
   required:
     - repo.head_sha

@@ -529,8 +529,12 @@ def test_reviewer_prompt_includes_verdict_contract():
     assert "reviewed_evidence_id=%s" in script
 
 
-def test_mac_repository_contract_test_command_uses_local_venv_path():
+def test_mac_repository_contract_test_command_uses_hermetic_runner():
     contract = yaml.safe_load((ROOT / ".mac" / "project.yaml").read_text(encoding="utf-8"))
+    runner = ROOT / "scripts" / "run-contract-tests.sh"
 
-    assert contract["test"]["command"] == "PATH=.venv/bin:$PATH .venv/bin/python -m pytest"
+    assert contract["test"]["command"] == "scripts/run-contract-tests.sh"
     assert "gh" in contract["toolchain"]["required_commands"]
+    text = runner.read_text(encoding="utf-8")
+    assert 'unset "${!MAC_@}"' in text
+    assert 'exec .venv/bin/python -m pytest "$@"' in text
