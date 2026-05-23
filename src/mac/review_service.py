@@ -84,14 +84,35 @@ class ReviewService:
         elif task.state != TaskState.REVIEWING.value:
             raise TransitionError("task must need review before requesting review")
         now = utcnow()
-        review_id = new_id("review")
-        self.store.execute(
-            """
-            INSERT INTO reviews (id, task_id, reviewer_agent_id, status, reason, evidence_id, created_at, completed_at)
-            VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
-            """,
-            (review_id, task_id, reviewer_agent_id, ReviewStatus.PENDING.value, now),
-        )
+        with self.store.transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM reviews
+                WHERE task_id = ? AND reviewer_agent_id = ? AND status = ?
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (task_id, reviewer_agent_id, ReviewStatus.PENDING.value),
+            ).fetchone()
+            if existing is not None:
+                return self._review_from_row(existing)
+            review_id = new_id("review")
+            conn.execute(
+                """
+                INSERT INTO reviews (id, task_id, reviewer_agent_id, status, reason, evidence_id, created_at, completed_at)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
+                """,
+                (review_id, task_id, reviewer_agent_id, ReviewStatus.PENDING.value, now),
+            )
+            self._record_history(
+                task_id,
+                "task.review_requested",
+                actor,
+                None,
+                None,
+                {"review_id": review_id},
+                conn=conn,
+            )
         # Notify the reviewer via the control-channel. Imported here to
         # avoid a tight bidirectional dep; messaging is composed in.
         from mac.models import MessageType
@@ -102,9 +123,6 @@ class ReviewService:
             MessageType.REVIEW_REQUEST.value,
             {"task_id": task_id, "review_id": review_id},
             task_id=task_id,
-        )
-        self._record_history(
-            task_id, "task.review_requested", actor, None, None, {"review_id": review_id}
         )
         return self.get_review(review_id)
 

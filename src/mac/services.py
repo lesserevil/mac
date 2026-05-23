@@ -3731,6 +3731,10 @@ class ControlPlane:
             r for r in self.list_reviews(task_id)
             if r.status == ReviewStatus.PENDING.value
         ]
+        pending_reviews = self._dedupe_same_reviewer_pending_reviews(
+            pending_reviews,
+            actor,
+        )
         if len(pending_reviews) > 1:
             self._record_default_review_observation(
                 task_id,
@@ -7561,6 +7565,39 @@ class ControlPlane:
         if approved:
             return approved[-1]
         return None
+
+    def _dedupe_same_reviewer_pending_reviews(
+        self,
+        pending_reviews: List[Review],
+        actor: str,
+    ) -> List[Review]:
+        kept: List[Review] = []
+        seen_reviewers: set[str] = set()
+        retracted: List[Review] = []
+        for review in sorted(pending_reviews, key=lambda item: (item.created_at, item.id)):
+            if review.reviewer_agent_id in seen_reviewers:
+                self._retract_default_review(
+                    review,
+                    actor,
+                    "duplicate_pending_review_same_reviewer",
+                )
+                retracted.append(review)
+                continue
+            seen_reviewers.add(review.reviewer_agent_id)
+            kept.append(review)
+        if retracted:
+            self._record_default_review_observation(
+                kept[0].task_id if kept else retracted[0].task_id,
+                "workflow.default_review.duplicate_pending_retracted",
+                "warning",
+                {
+                    "retracted_review_ids": [review.id for review in retracted],
+                    "kept_review_ids": [review.id for review in kept],
+                    "reason": "duplicate_pending_review_same_reviewer",
+                },
+                actor,
+            )
+        return kept
 
     def _find_review_verdict_evidence(
         self,

@@ -1048,6 +1048,64 @@ def test_default_review_workflow_refuses_on_ambiguous_pending_reviews(cp):
     assert "workflow.default_review.ambiguous" in names
 
 
+def test_request_review_reuses_pending_same_reviewer(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("same reviewer", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://x",
+        "done",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    first = cp.request_review(task.id, reviewer.id, "workflow-a")
+    second = cp.request_review(task.id, reviewer.id, "workflow-b")
+
+    assert second.id == first.id
+    assert [review.id for review in cp.list_reviews(task.id)] == [first.id]
+
+
+def test_default_review_workflow_retracts_same_reviewer_duplicate_pending(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("duplicate same reviewer", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://x",
+        "done",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    kept = cp.request_review(task.id, reviewer.id, "workflow-a")
+    cp.store.execute(
+        """
+        INSERT INTO reviews (id, task_id, reviewer_agent_id, status, reason, evidence_id, created_at, completed_at)
+        VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
+        """,
+        ("review_duplicate_same_reviewer", task.id, reviewer.id, ReviewStatus.PENDING.value, utcnow()),
+    )
+
+    result = cp.advance_default_review_workflow(task.id, actor="workflow-b")
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    reviews = {review.id: review for review in cp.list_reviews(task.id)}
+    assert reviews[kept.id].status == ReviewStatus.PENDING.value
+    assert reviews["review_duplicate_same_reviewer"].status == ReviewStatus.RETRACTED.value
+    assert reviews["review_duplicate_same_reviewer"].reason == "duplicate_pending_review_same_reviewer"
+    names = {event.name for event in cp.list_observability(limit=50)}
+    assert "workflow.default_review.duplicate_pending_retracted" in names
+
+
 def test_default_review_workflow_refuses_without_publication_target(cp):
     """mac-w29: when no operator-set publication_target exists, the
     workflow approves the review but does NOT publish — refuses to
