@@ -49,7 +49,7 @@ defaults:
     bind_addr: ""
     port: 3002
   network:
-    provider: tailscale
+    provider: none
     install: auto
     # hostname_prefix: optional string prepended to each agent name as the Tailscale hostname.
     hostname_prefix: ""
