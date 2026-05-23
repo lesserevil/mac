@@ -1348,6 +1348,26 @@ class MacWorker:
         task_dir = self.workspace / "_reviews" / _safe_path_component(review_id)
         task_dir.mkdir(parents=True, exist_ok=True)
         claim = ensure_json_object(claim_result)
+        review_repository_context = self._prepare_review_repository_worktree(
+            task_dir,
+            task_detail,
+            executor_evidence_id,
+            review_id,
+        )
+        review_context: JsonDict = {
+            "task_id": task_id,
+            "review_id": review_id,
+            "executor_evidence_id": executor_evidence_id,
+            "nudge_message_id": message.get("id"),
+            "task_detail": task_detail,
+            "review_claim": (
+                claim.get("claim")
+                if isinstance(claim.get("claim"), dict)
+                else {}
+            ),
+        }
+        if review_repository_context is not None:
+            review_context["review_repository_worktree"] = review_repository_context
         task = {
             "id": "review_%s" % review_id,
             "title": "Review task %s" % task_id,
@@ -1357,25 +1377,115 @@ class MacWorker:
             ),
             "required_capabilities": ["review"],
             "metadata": {
-                "review_context": {
-                    "task_id": task_id,
-                    "review_id": review_id,
-                    "executor_evidence_id": executor_evidence_id,
-                    "nudge_message_id": message.get("id"),
-                    "task_detail": task_detail,
-                    "review_claim": (
-                        claim.get("claim")
-                        if isinstance(claim.get("claim"), dict)
-                        else {}
-                    ),
-                }
+                "review_context": review_context,
             },
         }
+        if review_repository_context is not None:
+            task["metadata"]["runtime"] = review_repository_context
         (task_dir / "task.json").write_text(
             json.dumps({"task": task}, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         return task_dir
+
+    def _prepare_review_repository_worktree(
+        self,
+        task_dir: Path,
+        task_detail: JsonDict,
+        executor_evidence_id: str,
+        review_id: str,
+    ) -> Optional[JsonDict]:
+        evidence = _task_detail_evidence(task_detail, executor_evidence_id)
+        manifest = ensure_json_object(
+            ensure_json_object(evidence.get("metadata")).get("verification")
+        )
+        repo = ensure_json_object(manifest.get("repo"))
+        head_sha = str(repo.get("head_sha") or "").strip()
+        if not GIT_SHA_RE.match(head_sha):
+            return None
+        remote_ref = str(repo.get("remote_ref") or "").strip()
+        remote_url = str(
+            repo.get("remote_url")
+            or repo.get("origin_url")
+            or repo.get("clone_url")
+            or ""
+        ).strip()
+        if not remote_url:
+            repo_path_raw = str(repo.get("path") or "").strip()
+            repo_path = Path(repo_path_raw).expanduser() if repo_path_raw else None
+            if repo_path is not None and repo_path.exists():
+                remote = _run_git(repo_path, ["remote", "get-url", "origin"])
+                if remote.returncode == 0:
+                    remote_url = remote.stdout.strip()
+        if not remote_url:
+            return None
+
+        review_repo = task_dir / "review-repo"
+        if review_repo.exists():
+            shutil.rmtree(review_repo)
+        clone = subprocess.run(
+            ["git", "clone", "--no-checkout", remote_url, str(review_repo)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if clone.returncode != 0:
+            raise RuntimeError(
+                "could not clone review repository %s: %s"
+                % (remote_url, (clone.stderr or clone.stdout or "").strip())
+            )
+
+        branch = _remote_branch_from_ref(remote_ref)
+        if branch:
+            fetch = _run_git(
+                review_repo,
+                [
+                    "fetch",
+                    "origin",
+                    "+refs/heads/%s:refs/remotes/origin/%s" % (branch, branch),
+                ],
+            )
+        elif remote_ref:
+            fetch = _run_git(review_repo, ["fetch", "origin", remote_ref])
+        else:
+            fetch = _run_git(review_repo, ["fetch", "origin"])
+        if fetch.returncode != 0:
+            raise RuntimeError(
+                "could not fetch reviewed ref %s: %s"
+                % (remote_ref or "origin", (fetch.stderr or fetch.stdout or "").strip())
+            )
+
+        checkout = _run_git(review_repo, ["checkout", "--detach", head_sha])
+        if checkout.returncode != 0:
+            raise RuntimeError(
+                "could not checkout reviewed head %s: %s"
+                % (head_sha, (checkout.stderr or checkout.stdout or "").strip())
+            )
+        context: JsonDict = {
+            "schema": "mac.review_repository_worktree.v1",
+            "checkout_policy": "review_git_worktree",
+            "repository_worktree": str(review_repo),
+            "repository_source_path": str(repo.get("path") or ""),
+            "repository_branch": remote_ref or branch or "",
+            "repository_base_sha": head_sha,
+            "repository_origin_remote": remote_url,
+            "repository_review_id": review_id,
+            "repository_executor_evidence_id": executor_evidence_id,
+            "repository_reviewed_head_sha": head_sha,
+            "repository_reviewed_remote_ref": remote_ref,
+        }
+        (task_dir / "repository-worktree.json").write_text(
+            json.dumps(context, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        self._observe_log(
+            "worker.review.repository_worktree_prepared",
+            subject_type="task",
+            subject_id=str((task_detail.get("task") or {}).get("id") or ""),
+            detail=context,
+        )
+        return context
 
     def _review_task_payload(self, task_dir: Path) -> JsonDict:
         loaded = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
@@ -1519,6 +1629,10 @@ class MacWorker:
     def _execution_metadata(self, task_dir: Path, execution: WorkerExecution) -> JsonDict:
         metadata = dict(execution.metadata)
         manifest = metadata.get("verification") or self._load_verification_manifest(task_dir)
+        manifest = _enrich_verification_manifest_from_repository_context(
+            ensure_json_object(manifest),
+            _load_repository_context(task_dir),
+        )
         metadata["verification"] = self._sign_verification_manifest(manifest)
         metadata.setdefault(
             "workspace_outputs",
@@ -1918,6 +2032,16 @@ def _task_payload_from_workspace(task_dir: Path) -> JsonDict:
     return task if isinstance(task, dict) else loaded
 
 
+def _task_detail_evidence(task_detail: JsonDict, evidence_id: str) -> JsonDict:
+    evidence_items = task_detail.get("evidence")
+    if not isinstance(evidence_items, list):
+        return {}
+    for item in evidence_items:
+        if isinstance(item, dict) and str(item.get("id") or "") == evidence_id:
+            return item
+    return {}
+
+
 def _repository_context_env(context: JsonDict) -> Dict[str, str]:
     mapping = {
         "MAC_TASK_REPO_WORKTREE": context.get("repository_worktree"),
@@ -1927,6 +2051,32 @@ def _repository_context_env(context: JsonDict) -> Dict[str, str]:
         "MAC_TASK_REPO_REMOTE": context.get("repository_origin_remote"),
     }
     return {key: str(value) for key, value in mapping.items() if value not in {None, ""}}
+
+
+def _enrich_verification_manifest_from_repository_context(
+    manifest: JsonDict,
+    context: JsonDict,
+) -> JsonDict:
+    if not manifest or not context:
+        return manifest
+    repo = manifest.get("repo")
+    if not isinstance(repo, dict):
+        return manifest
+    enriched = dict(manifest)
+    repo = dict(repo)
+    defaults = {
+        "path": context.get("repository_worktree"),
+        "remote_url": context.get("repository_origin_remote"),
+        "branch": context.get("repository_branch"),
+        "base_sha": context.get("repository_base_sha"),
+    }
+    if context.get("repository_branch") and not repo.get("remote_ref"):
+        defaults["remote_ref"] = "refs/heads/%s" % context.get("repository_branch")
+    for key, value in defaults.items():
+        if value not in {None, ""} and not repo.get(key):
+            repo[key] = value
+    enriched["repo"] = repo
+    return enriched
 
 
 def _repository_context_audit_metadata(context: JsonDict) -> JsonDict:
@@ -1951,6 +2101,21 @@ def _manifest_list(value: Any) -> List[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def _remote_branch_from_ref(remote_ref: str) -> str:
+    ref = str(remote_ref or "").strip()
+    if not ref:
+        return ""
+    for prefix in ("refs/heads/", "heads/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+            break
+    if ref.startswith("origin/"):
+        ref = ref[len("origin/"):]
+    if _safe_git_ref(ref) and not ref.startswith("refs/"):
+        return ref
+    return ""
 
 
 def _worker_verification_contract_problems(

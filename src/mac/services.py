@@ -175,6 +175,29 @@ def _safe_slug(value: str) -> str:
     return slug or "repo"
 
 
+def _safe_git_ref(value: str) -> bool:
+    return bool(
+        value
+        and not value.startswith("-")
+        and re.match(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$", value)
+    )
+
+
+def _remote_branch_from_ref(remote_ref: str) -> str:
+    ref = str(remote_ref or "").strip()
+    if not ref:
+        return ""
+    for prefix in ("refs/heads/", "heads/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+            break
+    if ref.startswith("origin/"):
+        ref = ref[len("origin/"):]
+    if _safe_git_ref(ref) and not ref.startswith("refs/"):
+        return ref
+    return ""
+
+
 REPOSITORY_CONTRACT_SCHEMA = "mac.repository_contract.v1"
 REPOSITORY_CONTRACT_FILES = (
     Path(".mac") / "project.yaml",
@@ -3507,12 +3530,29 @@ class ControlPlane:
 
     def publish_task(self, *args: Any, **kwargs: Any) -> Publication:
         task_id = kwargs.get("task_id") if "task_id" in kwargs else (args[0] if args else None)
+        target = kwargs.get("target") if "target" in kwargs else (args[1] if len(args) >= 2 else None)
         evidence_id = kwargs.get("evidence_id")
         if evidence_id is None and len(args) >= 4:
             evidence_id = args[3]
         if task_id is not None:
             self._validate_publication_evidence(str(task_id), evidence_id)
+        git_publication = None
+        if task_id is not None and target is not None and evidence_id is not None:
+            git_publication = self._publish_git_target_if_needed(
+                str(task_id),
+                str(target),
+                str(evidence_id),
+            )
         publication = self.reviews.publish_task(*args, **kwargs)
+        if git_publication is not None:
+            self.record_log(
+                "task.git_published",
+                layer="control_plane",
+                source=publication.created_by,
+                subject_type="task",
+                subject_id=publication.task_id,
+                detail={**git_publication, "publication_id": publication.id},
+            )
         self._append_beads_ledger_comment(
             self.get_task(publication.task_id),
             publication.created_by,
@@ -3544,6 +3584,97 @@ class ControlPlane:
                     "workflow runtime failed to advance after publish_task"
                 )
         return publication
+
+    def _publish_git_target_if_needed(
+        self,
+        task_id: str,
+        target: str,
+        evidence_id: str,
+    ) -> Optional[JsonDict]:
+        if target not in {"git://main", "git://origin/main"}:
+            return None
+        task = self.get_task(task_id)
+        metadata = ensure_json_object(task.metadata)
+        origin = ensure_json_object(metadata.get("origin"))
+        repo_path_raw = str(origin.get("repository_path") or "").strip()
+        if not repo_path_raw:
+            return {"status": "skipped", "reason": "task_has_no_repository_path"}
+        repo_path = Path(repo_path_raw).expanduser()
+        if not repo_path.exists():
+            raise ValidationError("git publication repository path does not exist: %s" % repo_path)
+
+        evidence = self.get_evidence(evidence_id)
+        manifest = ensure_json_object(evidence.metadata.get("verification"))
+        repo = ensure_json_object(manifest.get("repo"))
+        head_sha = str(repo.get("head_sha") or "").strip()
+        if not _GIT_SHA_RE.match(head_sha):
+            raise ValidationError("git publication requires evidence repo.head_sha")
+        remote_ref = str(repo.get("remote_ref") or "").strip()
+        source_branch = _remote_branch_from_ref(remote_ref)
+        if not source_branch:
+            raise ValidationError("git publication requires branch-like repo.remote_ref")
+
+        top = self._git_output(repo_path, ["rev-parse", "--show-toplevel"])
+        if top["returncode"] != 0 or not top.get("stdout"):
+            return {
+                "status": "skipped",
+                "reason": "repository_path_not_git_worktree",
+                "repository_path": str(repo_path),
+            }
+        root = Path(str(top["stdout"])).expanduser()
+        dirty = self._git_output(root, ["status", "--porcelain"])
+        if dirty["returncode"] != 0:
+            raise ValidationError(
+                "git publication could not inspect worktree: %s"
+                % (dirty.get("stderr") or dirty.get("stdout") or root)
+            )
+        if dirty.get("stdout"):
+            raise ValidationError("git publication requires clean worktree: %s" % root)
+
+        commands: List[JsonDict] = []
+
+        def run_step(name: str, args: List[str], timeout: int = 120) -> JsonDict:
+            result = self._git_output(root, args, timeout=timeout)
+            commands.append({"name": name, "args": args, **result})
+            if result["returncode"] != 0:
+                raise ValidationError(
+                    "git publication %s failed: %s"
+                    % (name, result.get("stderr") or result.get("stdout") or args)
+                )
+            return result
+
+        run_step("fetch_main", ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"])
+        run_step(
+            "fetch_source",
+            [
+                "fetch",
+                "origin",
+                "+refs/heads/%s:refs/remotes/origin/%s" % (source_branch, source_branch),
+            ],
+        )
+        checkout = self._git_output(root, ["checkout", "main"])
+        commands.append({"name": "checkout_main", "args": ["checkout", "main"], **checkout})
+        if checkout["returncode"] != 0:
+            run_step("create_main", ["checkout", "-B", "main", "origin/main"])
+        run_step("pull_main", ["pull", "--ff-only", "origin", "main"])
+        run_step("verify_commit", ["cat-file", "-e", "%s^{commit}" % head_sha])
+        run_step("merge_source", ["merge", "--ff-only", head_sha])
+        run_step("push_main", ["push", "origin", "main"], timeout=180)
+        final_head = run_step("final_head", ["rev-parse", "HEAD"])
+        final_sha = str(final_head.get("stdout") or "").strip()
+        if final_sha != head_sha:
+            raise ValidationError(
+                "git publication finished at %s, expected %s" % (final_sha, head_sha)
+            )
+        return {
+            "status": "published",
+            "target": target,
+            "repository_path": str(root),
+            "source_branch": source_branch,
+            "remote_ref": remote_ref,
+            "head_sha": head_sha,
+            "commands": commands,
+        }
 
     def _validate_publication_evidence(self, task_id: str, evidence_id: Optional[str]) -> None:
         if evidence_id is None:

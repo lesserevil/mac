@@ -521,6 +521,9 @@ def test_executor_prompt_includes_repository_runtime_contract():
 def test_reviewer_prompt_includes_verdict_contract():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 
+    assert "MAC_TASK_REPO_WORKTREE" in script
+    assert "local review checkout" in script
+    assert "run the repository contract test command" in script
     assert "repo copied from the executor verification repo object" in script
     assert "worktree_digest as sha256" in script
     assert "reviewed_evidence_id=%s" in script

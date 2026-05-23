@@ -336,6 +336,119 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
     assert "task.review_claimed" in {event.event_type for event in cp.task_history(task.id)}
 
 
+def test_review_nudge_prepares_review_worktree_and_git_main_publication(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    machine = cp.register_machine("review-host")
+    executor_agent = cp.register_agent(machine.id, "executor", capabilities=["python"])
+    reviewer = cp.register_agent(machine.id, "reviewer", capabilities=["review"])
+    _seed, repo = _git_fixture(tmp_path)
+    _git(repo, "config", "user.email", "mac-tests@example.invalid")
+    _git(repo, "config", "user.name", "mac tests")
+    remote_url = _git(repo, "remote", "get-url", "origin")
+    branch = "mac/review-proof"
+    _git(repo, "checkout", "-b", branch)
+    (repo / "README.md").write_text("reviewed change\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "reviewed change")
+    _git(repo, "push", "-u", "origin", branch)
+    reviewed_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+
+    metadata = _repository_task_metadata(repo)
+    metadata["publication_target"] = "git://main"
+    task = cp.create_task(
+        "Reviewable pushed branch",
+        project="repo-beads-mac",
+        required_capabilities=["python"],
+        metadata=metadata,
+    )
+    cp.claim_task(task.id, executor_agent.id)
+    cp.start_task(task.id, executor_agent.id)
+    executor_manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "repo_change",
+        "repo": {
+            "head_sha": reviewed_head,
+            "remote_ref": "refs/heads/%s" % branch,
+            "remote_url": remote_url,
+            "path": str(repo),
+            "pushed": True,
+            "dirty": False,
+            "files_changed": ["README.md"],
+        },
+        "checks": [{"name": "executor tests", "status": "passed", "returncode": 0}],
+        "signed_by": executor_agent.id,
+    }
+    executor_manifest["signature"] = sign_verification_manifest(
+        cp._agent_attestation_key(executor_agent.id), executor_manifest
+    )
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "file:///tmp/executor-result.json",
+        "executor completed",
+        executor_agent.id,
+        metadata={"returncode": 0, "verification": executor_manifest},
+    )
+    cp.submit_for_review(task.id, executor_agent.id)
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    client = TestClient(create_app(control_plane=cp))
+
+    def review_executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        context = task_payload["metadata"]["review_context"]
+        runtime = task_payload["metadata"]["runtime"]
+        assert context["review_claim"]["project"] == "repo-beads-mac"
+        assert context["review_claim"]["repository_worktree"] == str(repo)
+        assert context["review_claim"]["repository_files_changed"] == ["README.md"]
+        review_worktree = Path(runtime["repository_worktree"])
+        assert review_worktree.is_dir()
+        assert _git(review_worktree, "rev-parse", "HEAD") == reviewed_head
+        assert context["review_repository_worktree"]["repository_worktree"] == str(review_worktree)
+        manifest = {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "review_verdict",
+            "verdict": "approved",
+            "review_id": context["review_id"],
+            "reviewed_evidence_id": context["executor_evidence_id"],
+            "repo": dict(executor_manifest["repo"]),
+            "checks": [
+                {
+                    "name": "reviewer checkout head",
+                    "command": "git rev-parse HEAD",
+                    "returncode": 0,
+                    "status": "pass",
+                }
+            ],
+            "worktree_digest": "sha256:" + ("1" * 64),
+            "findings": ["review worktree checked out pushed executor branch"],
+        }
+        (task_dir / "mac-evidence.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return WorkerExecution(0, "review approved", stdout="approved\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        reviewer.id,
+        tmp_path / "workspaces",
+        review_executor,
+        attestation_key=cp._agent_attestation_key(reviewer.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "review_verdict_recorded"
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+    assert cp.list_publications(task.id)[0].target == "git://main"
+    assert _git(repo, "rev-parse", "HEAD") == reviewed_head
+    _git(repo, "fetch", "origin", "main")
+    assert _git(repo, "rev-parse", "origin/main") == reviewed_head
+
+
 def test_mac_worker_skips_stale_review_nudge_and_processes_next(tmp_path: Path):
     from tests.conftest import submit_review_verdict
 
