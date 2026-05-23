@@ -872,6 +872,45 @@ def test_source_remediation_task_can_target_dirty_registered_checkout(tmp_path: 
     assert result.status == "submitted_for_review"
 
 
+def test_source_remediation_repo_change_allows_empty_files_changed_in_worker(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    metadata = _repository_task_metadata(repo)
+    metadata["origin"]["type"] = "beads_source_remediation"
+    metadata["remediation"] = {
+        "type": "beads_source_refresh",
+        "repository_path": str(repo),
+    }
+    task = cp.create_task(
+        "No-op source refresh",
+        required_capabilities=["python"],
+        metadata=metadata,
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(_task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        _write_worker_manifest(
+            task_dir,
+            evidence_type="repo_change",
+            files_changed=[],
+        )
+        return WorkerExecution(0, "source already clean", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
 def test_mac_worker_renews_lease_while_executor_runs(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)

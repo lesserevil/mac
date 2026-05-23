@@ -1424,6 +1424,7 @@ class MacWorker:
         problems: List[str] = []
         metadata = evidence.get("metadata") if isinstance(evidence, dict) else None
         manifest = metadata.get("verification") if isinstance(metadata, dict) else None
+        task_payload = _task_payload_from_workspace(task_dir)
         if not isinstance(manifest, dict):
             return ["evidence metadata lacks verification manifest"]
         if str(manifest.get("schema") or "").strip() != VERIFICATION_SCHEMA:
@@ -1436,7 +1437,16 @@ class MacWorker:
         if not str(manifest.get("signed_by") or "").strip() or not str(manifest.get("signature") or "").strip():
             problems.append("verification.signed_by and verification.signature are required")
         if evidence_type:
-            problems.extend(_worker_verification_contract_problems(manifest, evidence_type))
+            problems.extend(
+                _worker_verification_contract_problems(
+                    manifest,
+                    evidence_type,
+                    allow_empty_repo_change=_worker_allows_empty_repo_change_evidence(
+                        task_payload,
+                        evidence_type,
+                    ),
+                )
+            )
 
         repository_context = _load_repository_context(task_dir)
         if repository_context:
@@ -1896,6 +1906,18 @@ def _load_repository_context(task_dir: Path) -> JsonDict:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _task_payload_from_workspace(task_dir: Path) -> JsonDict:
+    path = task_dir / "task.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    task = loaded.get("task")
+    return task if isinstance(task, dict) else loaded
+
+
 def _repository_context_env(context: JsonDict) -> Dict[str, str]:
     mapping = {
         "MAC_TASK_REPO_WORKTREE": context.get("repository_worktree"),
@@ -1931,9 +1953,18 @@ def _manifest_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _worker_verification_contract_problems(manifest: JsonDict, evidence_type: str) -> List[str]:
+def _worker_verification_contract_problems(
+    manifest: JsonDict,
+    evidence_type: str,
+    *,
+    allow_empty_repo_change: bool = False,
+) -> List[str]:
     if evidence_type == "repo_change":
-        return _worker_repo_verification_problems(manifest, require_tests=True)
+        return _worker_repo_verification_problems(
+            manifest,
+            require_tests=True,
+            allow_empty_repo_change=allow_empty_repo_change,
+        )
     if evidence_type == "documentation":
         return _worker_repo_verification_problems(manifest, require_tests=False)
     if evidence_type == "deployment":
@@ -1966,15 +1997,33 @@ def _worker_verification_contract_problems(manifest: JsonDict, evidence_type: st
     return ["unsupported verification.evidence_type: %s" % evidence_type]
 
 
-def _worker_repo_verification_problems(manifest: JsonDict, require_tests: bool) -> List[str]:
+def _worker_repo_verification_problems(
+    manifest: JsonDict,
+    require_tests: bool,
+    *,
+    allow_empty_repo_change: bool = False,
+) -> List[str]:
     problems = _worker_require_pushed_repo_anchor(manifest)
     repo = manifest.get("repo") if isinstance(manifest.get("repo"), dict) else {}
     files_changed = _manifest_list(repo.get("files_changed")) if isinstance(repo, dict) else []
-    if not files_changed:
+    if not files_changed and not allow_empty_repo_change:
         problems.append("repo evidence requires changed files")
     if require_tests and _worker_passed_verification_check_count(manifest) < 1:
         problems.append("repo code evidence requires at least one passing test/check")
     return problems
+
+
+def _worker_allows_empty_repo_change_evidence(task: JsonDict, evidence_type: str) -> bool:
+    if str(evidence_type or "").strip().lower() != "repo_change":
+        return False
+    metadata = task.get("metadata") if isinstance(task, dict) else {}
+    if not isinstance(metadata, dict):
+        return False
+    origin = metadata.get("origin")
+    remediation = metadata.get("remediation")
+    origin_type = origin.get("type") if isinstance(origin, dict) else None
+    remediation_type = remediation.get("type") if isinstance(remediation, dict) else None
+    return origin_type == "beads_source_remediation" or remediation_type == "beads_source_refresh"
 
 
 def _worker_require_pushed_repo_anchor(manifest: JsonDict) -> List[str]:
