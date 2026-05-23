@@ -3851,6 +3851,10 @@ def test_rejected_review_verdict_completes_without_clean_pushed_repo(cp):
     review = cp.list_reviews(task.id)[0]
     assert review.status == ReviewStatus.REJECTED.value
     assert review.evidence_id == verdict.id
+    requeued = cp.get_task(task.id)
+    assert requeued.state == TaskState.OPEN.value
+    assert requeued.owner_agent_id is None
+    assert requeued.lease_id is None
     assert cp.list_publications(task.id) == []
 
 

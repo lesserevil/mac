@@ -175,7 +175,7 @@ class ReviewService:
         }:
             self._transition_task(
                 review.task_id,
-                TaskState.RUNNING.value,
+                TaskState.OPEN.value,
                 reviewer_agent_id,
                 {"review_id": review_id},
             )
