@@ -1182,18 +1182,46 @@ def test_fastapi_serializes_beads_authority_drift_health(tmp_path: Path, monkeyp
     )
     fake_bd.chmod(0o755)
     monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
-    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
     registered = client.post(
         "/bridge/beads/repositories",
         json={"name": "mac", "path": str(repo), "source": "repo-beads-mac"},
     ).json()
+    nested_health = {"leaf": True}
+    for depth in range(80):
+        nested_health = {
+            "depth": depth,
+            "repository": {
+                "id": registered["id"],
+                "metadata": {"health": {"detail": nested_health}},
+            },
+        }
+    metadata = dict(registered["metadata"])
+    metadata["health"] = {
+        "schema": "mac.beads_repository_health.v1",
+        "status": "unhealthy",
+        "reason": "authority_drift",
+        "summary": "previous drift response",
+        "checked_at": "2026-05-22T00:00:00+00:00",
+        "detail": nested_health,
+    }
+    cp.store.execute(
+        "UPDATE beads_repositories SET metadata = ? WHERE id = ?",
+        (json.dumps(metadata), registered["id"]),
+    )
 
     response = client.post("/bridge/beads/poll", json={"repository": registered["id"], "force": True})
+    second = client.post("/bridge/beads/poll", json={"repository": registered["id"], "force": True})
 
     assert response.status_code == 200
+    assert second.status_code == 200
     report = response.json()
     assert report["repositories"][0]["status"] == "authority_drift"
     assert report["repositories"][0]["health"]["status"] == "unhealthy"
+    finding_repo = report["repositories"][0]["source_state"]["authority_findings"][0]["detail"]["repository"]
+    assert finding_repo["schema"] == "mac.beads_repository_ref.v1"
+    assert "metadata" not in finding_repo
 
 
 def test_agentbus_rejects_broadcast_oversized_and_unauthorized_readers():

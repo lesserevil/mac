@@ -4225,7 +4225,7 @@ class ControlPlane:
                     subject_id=repo.id,
                     channels=["dashboard", "hermes"],
                     metadata={
-                        "repository": repo.to_dict(),
+                        "repository": self._beads_repository_ref(repo),
                         "source_state": source_state,
                         "remediation_task_id": remediation_task.id if remediation_task else None,
                     },
@@ -4822,7 +4822,7 @@ class ControlPlane:
                 level="warning",
                 subject_type="environment",
                 subject_id=repo.id,
-                detail={"repository": repo.to_dict(), "source_state": source_state},
+                detail={"repository": self._beads_repository_ref(repo), "source_state": source_state},
             )
             return None
         existing = self._existing_beads_source_remediation_task(repo, status)
@@ -4988,6 +4988,19 @@ class ControlPlane:
             ],
         }
 
+    def _beads_repository_ref(self, repo: BeadsRepository) -> JsonDict:
+        return {
+            "schema": "mac.beads_repository_ref.v1",
+            "id": repo.id,
+            "name": repo.name,
+            "path": repo.path,
+            "source": repo.source,
+            "project": repo.project,
+            "required_capabilities": list(repo.required_capabilities),
+            "enabled": repo.enabled,
+            "poll_interval_seconds": repo.poll_interval_seconds,
+        }
+
     def _beads_repository_health(
         self,
         status: str,
@@ -5127,7 +5140,7 @@ class ControlPlane:
             "Canonical Beads DB is unavailable",
             {
                 "schema": "mac.integration.beads_canonical_unavailable.v1",
-                "repository": repo.to_dict(),
+                "repository": self._beads_repository_ref(repo),
                 "poll_path": str(repo_path),
                 "actor": actor,
                 "bd_error": bd_error[:2000],
@@ -5310,7 +5323,7 @@ class ControlPlane:
                 "Beads tracked export cannot be parsed",
                 {
                     "schema": "mac.integration.beads_export_parse_error.v1",
-                    "repository": repo.to_dict(),
+                    "repository": self._beads_repository_ref(repo),
                     "poll_path": str(repo_path),
                     "observation_id": observation_id,
                     "actor": actor,
@@ -5369,7 +5382,7 @@ class ControlPlane:
                 "Beads tracked export ready set differs from canonical DB",
                 {
                     "schema": "mac.integration.beads_export_drift.v1",
-                    "repository": repo.to_dict(),
+                    "repository": self._beads_repository_ref(repo),
                     "poll_path": str(repo_path),
                     "observation_id": observation_id,
                     "actor": actor,
@@ -5477,7 +5490,7 @@ class ControlPlane:
         contract = repository_contract or self._repository_contract_for_beads_repo(repo)
         payload = {
             "schema": "mac.beads_bridge.issue.v1",
-            "repository": repo.to_dict(),
+            "repository": self._beads_repository_ref(repo),
             "repository_contract": contract,
             "issue": issue,
         }
