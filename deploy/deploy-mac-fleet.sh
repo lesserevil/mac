@@ -2793,7 +2793,7 @@ values.setdefault("MAC_API_TOKEN", secrets.token_urlsafe(32))
 values["MAC_DB"] = str(mac_home / "mac.db")
 values["MAC_PORT"] = port
 values["MAC_BIND_HOST"] = configured_bind_host
-if configured_worker_mode == "loop":
+if configured_worker_mode == "loop" and agent_name == shared_services_manager:
     # Hub nodes connect to their own local control plane; the external service
     # DNS may not expose the API port (e.g. K8s Service without port mapping).
     values["MAC_HUB_URL"] = f"http://127.0.0.1:{port}"
@@ -2829,7 +2829,7 @@ if configured_gateway_base_url:
     values["ACC_HERMES_GATEWAY_BASE_URL"] = configured_gateway_base_url
     values["CUSTOM_BASE_URL"] = configured_gateway_base_url
     values["OPENAI_BASE_URL"] = configured_gateway_base_url
-if configured_worker_mode == "loop":
+if configured_worker_mode == "loop" and agent_name == shared_services_manager:
     # Hub node: agent must always use the local API token.
     values["MAC_WORKER_TOKEN"] = values["MAC_API_TOKEN"]
 elif configured_hub_token:
@@ -3934,7 +3934,7 @@ verify_hub_registration() {
   # Hub nodes register with their own local API; the external service DNS may
   # not expose the control-plane port (e.g. K8s Service without port 8789).
   local check_url token
-  if [ "$WORKER_MODE" = "loop" ]; then
+  if [ "$WORKER_MODE" = "loop" ] && [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]; then
     check_url="http://127.0.0.1:${MAC_PORT}"
     token="${MAC_API_TOKEN}"
   else

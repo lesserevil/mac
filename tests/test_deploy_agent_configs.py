@@ -257,8 +257,10 @@ def test_fleet_deploy_network_provider_contract_is_explicit():
     assert 'os.environ.get("MAC_DEPLOY_NETWORK_PROVIDER")' in script
     assert 'or os.environ.get("NETWORK_PROVIDER")' in script
     assert 'or "tailscale"' in script
+    assert 'if configured_worker_mode == "loop" and agent_name == shared_services_manager:' in script
     assert 'elif network_provider in {"tailscale", "headscale"} and configured_hub_url:' in script
     assert 'values["MAC_HUB_URL"] = configured_hub_url.rstrip("/")' in script
+    assert '[ "$WORKER_MODE" = "loop" ] && [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]' in script
     assert "uses_direct_mesh_hub()" in script
     assert 'uses_direct_mesh_hub "$network_provider_field" "$hub_url_field"' in script
     assert "skipping reverse tunnel" in script
