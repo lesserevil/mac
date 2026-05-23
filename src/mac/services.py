@@ -7708,6 +7708,16 @@ class ControlPlane:
             if not isinstance(executor_manifest, dict):
                 problems.append("verdict %s cannot resolve executor verification manifest" % evidence.id)
                 continue
+            verdict = str(manifest.get("verdict") or "").strip().lower()
+            if verdict not in {"approved", "rejected"}:
+                problems.append("verdict %s requires verdict approved or rejected" % evidence.id)
+                continue
+            digest = str(manifest.get("worktree_digest") or "").strip()
+            if not re.match(r"^sha256:[0-9a-f]{64}$", digest):
+                problems.append("verdict %s requires worktree_digest sha256" % evidence.id)
+                continue
+            if verdict == "rejected":
+                return evidence, []
             repo_problems = self._require_pushed_repo_anchor(manifest)
             if repo_problems:
                 problems.extend("verdict %s %s" % (evidence.id, problem) for problem in repo_problems)
@@ -7722,10 +7732,6 @@ class ControlPlane:
                 continue
             if self._passed_verification_check_count(manifest) < 1:
                 problems.append("verdict %s requires at least one independent passing check" % evidence.id)
-                continue
-            digest = str(manifest.get("worktree_digest") or "").strip()
-            if not re.match(r"^sha256:[0-9a-f]{64}$", digest):
-                problems.append("verdict %s requires worktree_digest sha256" % evidence.id)
                 continue
             return evidence, []
         return None, problems

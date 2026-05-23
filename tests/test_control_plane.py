@@ -3799,6 +3799,61 @@ def test_review_verdict_requires_same_repo_head_as_executor_evidence(cp):
     assert cp.list_publications(task.id) == []
 
 
+def test_rejected_review_verdict_completes_without_clean_pushed_repo(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "work",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://publish"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    executor_evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://t",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    verdict_manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "review_verdict",
+        "verdict": "rejected",
+        "reviewed_evidence_id": executor_evidence.id,
+        "repo": {
+            "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+            "pushed": False,
+            "dirty": True,
+        },
+        "blockers": ["executor evidence does not match the inspected checkout"],
+        "worktree_digest": "sha256:" + ("1" * 64),
+    }
+    verdict_manifest = _sign(cp, reviewer.id, verdict_manifest)
+    verdict = cp.add_evidence(
+        task.id,
+        "review",
+        "artifact://review",
+        "review rejected dirty checkout",
+        reviewer.id,
+        metadata={"returncode": 0, "verification": verdict_manifest},
+    )
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "review_not_approved"
+    assert result["review_status"] == ReviewStatus.REJECTED.value
+    review = cp.list_reviews(task.id)[0]
+    assert review.status == ReviewStatus.REJECTED.value
+    assert review.evidence_id == verdict.id
+    assert cp.list_publications(task.id) == []
+
+
 def test_publication_requires_verifiable_review_verdict_not_plain_approval(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])

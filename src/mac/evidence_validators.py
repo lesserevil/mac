@@ -198,17 +198,19 @@ class ReviewVerdictValidator(EvidenceValidator):
         manifest: VerificationManifest,
         context: EvidenceValidationContext,
     ) -> List[str]:
-        problems = self.require_pushed_repo_anchor(manifest)
+        problems: List[str] = []
         verdict = str(manifest.raw.get("verdict") or "").strip().lower()
         if verdict not in {"approved", "rejected"}:
             problems.append("review_verdict evidence requires verdict approved or rejected")
         if not str(manifest.raw.get("reviewed_evidence_id") or "").strip():
             problems.append("review_verdict evidence requires reviewed_evidence_id")
-        if self.passed_checks(manifest, context) < 1:
-            problems.append("review_verdict evidence requires at least one independent passing check")
         digest = str(manifest.raw.get("worktree_digest") or "").strip()
         if not WORKTREE_DIGEST_RE.match(digest):
             problems.append("review_verdict evidence requires worktree_digest sha256")
+        if verdict == "approved":
+            problems.extend(self.require_pushed_repo_anchor(manifest))
+            if self.passed_checks(manifest, context) < 1:
+                problems.append("review_verdict evidence requires at least one independent passing check")
         return problems
 
 
