@@ -248,6 +248,11 @@ class AgentRegister(BaseModel):
     hermes_instance_id: Optional[str] = None
 
 
+class AgentAttestationKeyVerify(BaseModel):
+    challenge: Dict[str, Any] = Field(default_factory=dict)
+    signature: str
+
+
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
     capabilities: Optional[List[str]] = None
@@ -1796,6 +1801,23 @@ def create_app(
         return {
             "agent_id": agent_id,
             "attestation_key": cp.rotate_agent_attestation_key(agent_id),
+        }
+
+    @app.post("/agents/{agent_id}/attestation-key/verify")
+    def verify_agent_attestation_key(
+        agent_id: str,
+        body: AgentAttestationKeyVerify,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        _ensure_payload_bounded(body.challenge, "agent.attestation.challenge")
+        return {
+            "agent_id": agent_id,
+            "valid": cp.verify_agent_attestation_challenge(
+                agent_id,
+                body.challenge,
+                body.signature,
+            ),
         }
 
     @app.get("/agents")

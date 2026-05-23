@@ -3242,6 +3242,7 @@ common=(
   --poll-interval "${MAC_WORKER_POLL_INTERVAL:-2}"
   --attestation-key-env "$HOME/.mac/mac.env"
   --rotate-missing-attestation-key
+  --rotate-invalid-attestation-key
 )
 if [ -n "${MAC_WORKER_RESOURCES:-}" ]; then
   common+=(--resources "$MAC_WORKER_RESOURCES")

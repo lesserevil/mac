@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from mac.api import create_app
-from mac.services import ControlPlane
+from mac.services import ControlPlane, sign_verification_manifest
 
 
 def test_fastapi_exposes_core_workflow_and_redacts_secrets():
@@ -177,6 +177,61 @@ def test_attestation_key_rotation_requires_global_fleet_token():
     rotated_key = rotated.json()["attestation_key"]
     assert rotated_key
     assert rotated_key != original_key
+
+
+def test_attestation_key_verify_uses_challenge_response():
+    cp = ControlPlane.in_memory()
+    client = TestClient(
+        create_app(
+            control_plane=cp,
+            auth_tokens={
+                "tenant": {"scopes": ["write"], "tenant_id": "tenant-a"},
+                "admin": ["admin"],
+            },
+        )
+    )
+    machine = client.post(
+        "/machines",
+        headers={"Authorization": "Bearer admin"},
+        json={"hostname": "host-1"},
+    ).json()
+    agent = client.post(
+        "/agents",
+        headers={"Authorization": "Bearer admin"},
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+    challenge = {
+        "schema": "mac.agent_attestation_challenge.v1",
+        "purpose": "attestation-key-healthcheck",
+        "agent_id": agent["id"],
+        "nonce": "test-nonce",
+    }
+
+    blocked = client.post(
+        "/agents/%s/attestation-key/verify" % agent["id"],
+        headers={"Authorization": "Bearer tenant"},
+        json={"challenge": challenge, "signature": "v1:bad"},
+    )
+    assert blocked.status_code == 403
+
+    valid = client.post(
+        "/agents/%s/attestation-key/verify" % agent["id"],
+        headers={"Authorization": "Bearer admin"},
+        json={
+            "challenge": challenge,
+            "signature": sign_verification_manifest(agent["attestation_key"], challenge),
+        },
+    )
+    assert valid.status_code == 200
+    assert valid.json()["valid"] is True
+
+    invalid = client.post(
+        "/agents/%s/attestation-key/verify" % agent["id"],
+        headers={"Authorization": "Bearer admin"},
+        json={"challenge": challenge, "signature": "v1:wrong"},
+    )
+    assert invalid.status_code == 200
+    assert invalid.json()["valid"] is False
 
 
 def test_fastapi_can_require_scoped_bearer_tokens():

@@ -1210,6 +1210,27 @@ def test_register_worker_creates_identity_then_worker_claims_tasks(tmp_path: Pat
     assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
 
 
+def test_worker_detects_stale_local_attestation_key():
+    from mac.worker import _attestation_key_matches_hub
+
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    api = MacApiClient("http://mac.test", transport=api_transport(client))
+
+    registered = register_worker(
+        api,
+        hostname="natasha.local",
+        agent_name="natasha",
+        capabilities=["review"],
+    )
+    local_key = registered["attestation_key"]
+    assert _attestation_key_matches_hub(api, registered["id"], local_key) is True
+
+    cp.rotate_agent_attestation_key(registered["id"])
+
+    assert _attestation_key_matches_hub(api, registered["id"], local_key) is False
+
+
 def test_mac_worker_dry_run_claim_uses_canary_policy_without_leasing(tmp_path: Path):
     cp = ControlPlane.in_memory()
     client = TestClient(create_app(control_plane=cp))

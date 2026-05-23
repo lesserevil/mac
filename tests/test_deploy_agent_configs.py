@@ -94,6 +94,7 @@ def test_fleet_deploy_persists_or_recovers_worker_attestation_key():
 
     assert '--attestation-key-env "$HOME/.mac/mac.env"' in script
     assert "--rotate-missing-attestation-key" in script
+    assert "--rotate-invalid-attestation-key" in script
     assert "evidence_type=review_verdict" in script
 
 

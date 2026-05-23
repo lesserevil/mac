@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -2115,6 +2116,29 @@ def _write_env_value(path: Path, key: str, value: str) -> None:
     path.chmod(0o600)
 
 
+def _attestation_key_matches_hub(
+    client: MacApiClient,
+    agent_id: str,
+    attestation_key: str,
+) -> bool:
+    from mac.services import sign_verification_manifest
+
+    challenge = {
+        "schema": "mac.agent_attestation_challenge.v1",
+        "purpose": "attestation-key-healthcheck",
+        "agent_id": agent_id,
+        "nonce": secrets.token_urlsafe(32),
+    }
+    response = client.post(
+        "/agents/%s/attestation-key/verify" % quote(agent_id, safe=""),
+        {
+            "challenge": challenge,
+            "signature": sign_verification_manifest(attestation_key, challenge),
+        },
+    )
+    return bool(isinstance(response, dict) and response.get("valid") is True)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -2206,6 +2230,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="rotate and persist this agent's attestation key when no local key is configured",
     )
     parser.add_argument(
+        "--rotate-invalid-attestation-key",
+        action="store_true",
+        default=_env_bool("MAC_ROTATE_INVALID_ATTESTATION_KEY", False),
+        help="rotate and persist this agent's attestation key when the local key no longer matches the hub",
+    )
+    parser.add_argument(
         "--heartbeat-only",
         action="store_true",
         help="register/heartbeat once and exit without claiming tasks",
@@ -2261,6 +2291,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             os.environ["MAC_ATTESTATION_KEY"] = attestation_key
             if attestation_env_path is not None:
                 _write_env_value(attestation_env_path, "MAC_ATTESTATION_KEY", attestation_key)
+        if attestation_key and args.rotate_invalid_attestation_key:
+            if not _attestation_key_matches_hub(client, agent_id, attestation_key):
+                rotated = client.post(
+                    "/agents/%s/attestation-key/rotate" % quote(agent_id, safe=""),
+                    {},
+                )
+                attestation_key = str(rotated["attestation_key"])
+                os.environ["MAC_ATTESTATION_KEY"] = attestation_key
+                if attestation_env_path is not None:
+                    _write_env_value(attestation_env_path, "MAC_ATTESTATION_KEY", attestation_key)
         if args.heartbeat_only:
             heartbeat = client.post(
                 "/agents/%s/heartbeat" % quote(agent_id, safe=""),

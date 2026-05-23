@@ -2600,6 +2600,20 @@ class ControlPlane:
         )
         return key
 
+    def verify_agent_attestation_challenge(
+        self,
+        agent_id: str,
+        challenge: JsonDict,
+        signature: str,
+    ) -> bool:
+        self.get_agent(agent_id)
+        if not isinstance(challenge, dict):
+            return False
+        key = self._agent_attestation_key(agent_id)
+        if key is None:
+            return False
+        return verify_verification_manifest_signature(key, challenge, signature)
+
     def get_agent(self, agent_id: str) -> Agent:
         row = self.store.query_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
         if row is None:
