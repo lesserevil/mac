@@ -3834,20 +3834,7 @@ class ControlPlane:
                     },
                     actor,
                 )
-                # Nudge the reviewer so an autonomous review-executor
-                # has something to react to.
-                self.send_message(
-                    "dispatcher",
-                    review.reviewer_agent_id,
-                    MessageType.NUDGE.value,
-                    {
-                        "task_id": task_id,
-                        "review_id": review.id,
-                        "executor_evidence_id": evidence.id,
-                        "reason": "produce_review_verdict",
-                    },
-                    task_id=task_id,
-                )
+                nudge = self._ensure_review_verdict_nudge(task_id, review, evidence)
                 return {
                     "task_id": task_id,
                     "status": "waiting_for_reviewer_verdict",
@@ -3855,6 +3842,8 @@ class ControlPlane:
                     "reviewer_agent_id": review.reviewer_agent_id,
                     "executor_evidence_id": evidence.id,
                     "problems": verdict_problems,
+                    "nudge_id": nudge.id if nudge is not None else None,
+                    "nudge_status": "queued" if nudge is not None else "already_queued",
                 }
             verdict_value = self._verdict_value(verdict_evidence)
             if verdict_value == "rejected":
@@ -7565,6 +7554,42 @@ class ControlPlane:
         if approved:
             return approved[-1]
         return None
+
+    def _review_verdict_nudge_payload(
+        self,
+        task_id: str,
+        review: Review,
+        evidence: Evidence,
+    ) -> JsonDict:
+        return {
+            "task_id": task_id,
+            "review_id": review.id,
+            "executor_evidence_id": evidence.id,
+            "reason": "produce_review_verdict",
+        }
+
+    def _ensure_review_verdict_nudge(
+        self,
+        task_id: str,
+        review: Review,
+        evidence: Evidence,
+    ) -> Optional[AgentMessage]:
+        payload = self._review_verdict_nudge_payload(task_id, review, evidence)
+        if self.messaging.has_queued_message(
+            recipient_agent_id=review.reviewer_agent_id,
+            task_id=task_id,
+            message_type=MessageType.NUDGE.value,
+            payload_contains=payload,
+        ):
+            return None
+        # Nudge the reviewer so an autonomous review-executor has something to react to.
+        return self.send_message(
+            "dispatcher",
+            review.reviewer_agent_id,
+            MessageType.NUDGE.value,
+            payload,
+            task_id=task_id,
+        )
 
     def _dedupe_same_reviewer_pending_reviews(
         self,

@@ -19,7 +19,7 @@ from mac.agentbus_control import (
 )
 from mac.api import create_app
 from mac.hermes_adapter import MacApiClient, MacApiError
-from mac.models import TaskState
+from mac.models import ReviewStatus, TaskState
 from mac.services import ControlPlane, sign_verification_manifest
 from mac.worker import MacWorker, SubprocessExecutor, WorkerExecution, register_worker
 
@@ -334,6 +334,104 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
         == reviewer.id
     )
     assert "task.review_claimed" in {event.event_type for event in cp.task_history(task.id)}
+
+
+def test_mac_worker_skips_stale_review_nudge_and_processes_next(tmp_path: Path):
+    from tests.conftest import submit_review_verdict
+
+    cp = ControlPlane.in_memory()
+    machine = cp.register_machine("review-host")
+    executor_agent = cp.register_agent(machine.id, "executor", capabilities=["python"])
+    reviewer = cp.register_agent(machine.id, "reviewer", capabilities=["review"])
+
+    def create_reviewable_task(title: str):
+        task = cp.create_task(
+            title,
+            required_capabilities=["python"],
+            metadata={"publication_target": "git://main"},
+        )
+        cp.claim_task(task.id, executor_agent.id)
+        cp.start_task(task.id, executor_agent.id)
+        manifest = {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "repo_change",
+            "repo": {
+                "head_sha": "abc123abc123abc123abc123abc123abc123abcd",
+                "remote_ref": "origin/main",
+                "pushed": True,
+                "dirty": False,
+                "files_changed": ["src/example.py"],
+            },
+            "checks": [{"name": "pytest", "status": "passed", "returncode": 0}],
+            "signed_by": executor_agent.id,
+        }
+        manifest["signature"] = sign_verification_manifest(
+            cp._agent_attestation_key(executor_agent.id), manifest
+        )
+        evidence = cp.add_evidence(
+            task.id,
+            "log",
+            "file:///tmp/executor-result.json",
+            "executor completed",
+            executor_agent.id,
+            metadata={"returncode": 0, "verification": manifest},
+        )
+        cp.submit_for_review(task.id, executor_agent.id)
+        review_tick = cp.advance_default_review_workflow(task.id)
+        return task, evidence, review_tick, manifest
+
+    stale_task, stale_evidence, stale_tick, _ = create_reviewable_task("Stale review")
+    stale_verdict_id = submit_review_verdict(
+        cp, stale_task.id, reviewer.id, stale_evidence.id
+    )
+    cp.submit_review(
+        stale_tick["review_id"],
+        ReviewStatus.APPROVED.value,
+        reviewer.id,
+        evidence_id=stale_verdict_id,
+    )
+    current_task, current_evidence, current_tick, executor_manifest = create_reviewable_task(
+        "Current review"
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def review_executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        context = task_payload["metadata"]["review_context"]
+        assert context["task_id"] == current_task.id
+        assert context["review_id"] == current_tick["review_id"]
+        assert context["executor_evidence_id"] == current_evidence.id
+        manifest = {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "review_verdict",
+            "verdict": "approved",
+            "review_id": context["review_id"],
+            "reviewed_evidence_id": context["executor_evidence_id"],
+            "repo": dict(executor_manifest["repo"]),
+            "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+            "worktree_digest": "sha256:" + ("0" * 64),
+            "findings": ["executor evidence is signed and tests passed"],
+        }
+        (task_dir / "mac-evidence.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return WorkerExecution(0, "review approved", stdout="approved\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        reviewer.id,
+        tmp_path,
+        review_executor,
+        attestation_key=cp._agent_attestation_key(reviewer.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "review_verdict_recorded"
+    assert cp.list_reviews(current_task.id)[0].status == ReviewStatus.APPROVED.value
+    assert cp.get_task(current_task.id).state == TaskState.COMPLETED.value
 
 
 def test_mac_worker_forwards_notifier_status_updates_to_slack_home_channels(

@@ -125,6 +125,47 @@ class MessagingService:
             raise NotFoundError("message not found: %s" % message_id)
         return self._from_row(row)
 
+    def has_queued_message(
+        self,
+        *,
+        recipient_agent_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        message_type: Optional[str] = None,
+        payload_contains: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if recipient_agent_id is not None:
+            self._get_agent(recipient_agent_id)
+        if task_id is not None:
+            self._get_task(task_id)
+        clauses = ["status = ?"]
+        params: List[Any] = [MessageStatus.QUEUED.value]
+        if recipient_agent_id is not None:
+            clauses.append("recipient_agent_id = ?")
+            params.append(recipient_agent_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if message_type is not None:
+            message_type_value = _state_value(message_type)
+            try:
+                MessageType(message_type_value)
+            except ValueError:
+                raise ValidationError("unsupported message type: %s" % message_type)
+            clauses.append("message_type = ?")
+            params.append(message_type_value)
+        rows = self.store.query_all(
+            "SELECT * FROM messages WHERE %s ORDER BY created_at, id"
+            % " AND ".join(clauses),
+            tuple(params),
+        )
+        if not payload_contains:
+            return bool(rows)
+        for row in rows:
+            payload = json_loads(row["payload"], {})
+            if all(payload.get(key) == value for key, value in payload_contains.items()):
+                return True
+        return False
+
     def deliver_messages(self, agent_id: str, limit: int = 50) -> List[AgentMessage]:
         self._get_agent(agent_id)
         rows = self.store.query_all(

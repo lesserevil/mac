@@ -657,6 +657,7 @@ class MacWorker:
 
         if not isinstance(messages, list):
             return None
+        skipped_result: Optional[WorkerRunResult] = None
         for message in messages:
             if not isinstance(message, dict):
                 continue
@@ -670,8 +671,12 @@ class MacWorker:
                 continue
             if str(payload.get("reason") or "") != "produce_review_verdict":
                 continue
-            return self._handle_review_verdict_nudge(message, payload)
-        return None
+            result = self._handle_review_verdict_nudge(message, payload)
+            if result.status in {"review_not_claimable", "review_nudge_invalid"}:
+                skipped_result = result
+                continue
+            return result
+        return skipped_result
 
     def _handle_status_update_message(self, message: JsonDict) -> None:
         payload = message.get("payload")

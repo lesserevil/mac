@@ -11,6 +11,7 @@ from mac.models import (
     AuthorizationError,
     HealthStatus,
     LeaseStatus,
+    MessageStatus,
     MessageType,
     NotFoundError,
     PublicationStatus,
@@ -705,6 +706,45 @@ def test_default_review_workflow_assigns_reviewer_and_publishes(cp):
     assert "workflow.default_review.assigned" in names
     assert "workflow.default_review.approved" in names
     assert "workflow.default_review.published" in names
+
+
+def test_default_review_workflow_reuses_pending_verdict_nudge(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "Implement thing",
+        required_capabilities=["python"],
+        metadata={"publication_target": "test://publish"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    first = cp.advance_default_review_workflow(task.id)
+    second = cp.advance_default_review_workflow(task.id)
+    nudges = [
+        message
+        for message in cp.list_messages(reviewer.id)
+        if message.message_type == MessageType.NUDGE.value
+        and message.status == MessageStatus.QUEUED.value
+        and message.payload.get("reason") == "produce_review_verdict"
+        and message.payload.get("review_id") == first["review_id"]
+        and message.payload.get("executor_evidence_id") == evidence.id
+    ]
+
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    assert first["nudge_status"] == "queued"
+    assert second["status"] == "waiting_for_reviewer_verdict"
+    assert second["nudge_status"] == "already_queued"
+    assert len(nudges) == 1
 
 
 def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
