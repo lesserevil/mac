@@ -194,6 +194,14 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert any("mac-hermes web-search" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes agents" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("hgmac agents create" in command for command in work_context["operations"]["hgmac_cli"])
+    assert work_context["operations"]["dashboard"]["entrypoint"] == "/ui"
+    assert {"work", "map", "agents", "tasks", "hermes"} <= set(
+        work_context["operations"]["dashboard"]["views"]
+    )
+    assert {"view", "project", "task_state", "selected"} <= set(
+        work_context["operations"]["dashboard"]["url_state_parameters"]
+    )
+    assert "/ui?view=work&project={project}" in work_context["operations"]["dashboard"]["deep_link_templates"]["projects"]
 
     runtime_proof = client.get("/hermes-instances/%s/runtime-proof" % hermes["id"]).json()
     assert runtime_proof["schema"] == "mac.hermes_runtime_proof.v1"
@@ -205,7 +213,23 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert runtime_proof["checks"]["runtime_session_capabilities_available"] is True
     assert runtime_proof["checks"]["first_class_object_matrix_ready"] is True
     assert runtime_proof["checks"]["dashboard_projection_available"] is True
+    assert runtime_proof["checks"]["dashboard_url_state_contract_present"] is True
+    assert runtime_proof["checks"]["work_context_dashboard_contract_present"] is True
     assert runtime_proof["evidence"]["work_context"]["bound_agent_ids"] == [agent["id"]]
+    dashboard_url_contract = runtime_proof["evidence"]["ui"]["dashboard_url_contract"]
+    assert dashboard_url_contract["schema"] == "mac.hermes.dashboard_url_contract.v1"
+    assert dashboard_url_contract["ready"] is True
+    assert dashboard_url_contract["entrypoint"] == "/ui"
+    assert "/ui?view=work&project=nanolang" in dashboard_url_contract["object_deep_links"]["projects"]["samples"]
+    assert any(
+        url.startswith("/ui?view=agents&selected=%s" % agent["id"])
+        for url in dashboard_url_contract["object_deep_links"]["agents"]["samples"]
+    )
+    assert any(
+        url.startswith("/ui?view=work&selected=")
+        for url in dashboard_url_contract["object_deep_links"]["tasks"]["samples"]
+    )
+    assert runtime_proof["evidence"]["ui"]["dashboard_operation_contract"]["entrypoint"] == "/ui"
     live_alignment = runtime_proof["evidence"]["live_alignment"]
     assert live_alignment["schema"] == "mac.hermes.live_object_alignment.v1"
     assert live_alignment["ready"] is True

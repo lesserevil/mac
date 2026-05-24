@@ -178,6 +178,8 @@ def test_fleet_deploy_applies_hermes_patch_set():
     assert "First-Class Objects" in script
     assert "Project Bridge" in script
     assert "Agent View" in script
+    assert "Dashboard Views" in script
+    assert "/ui?view=work" in script
     assert "mac-hermes tasks" in script
     assert "mac-hermes projects" in script
     assert "shell_execution" in script

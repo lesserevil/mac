@@ -75,6 +75,9 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert stored["first_class_objects"]["objects"]["projects"]["authority"] == "mac"
     assert stored["first_class_objects"]["objects"]["agents"]["authority"] == "mac"
     assert "hgmac agents identity agent_rocky_host" in stored["first_class_objects"]["objects"]["agents"]["hgmac_cli"]
+    assert "/ui?view=work&selected={task_id}" in stored["first_class_objects"]["objects"]["tasks"]["dashboard_urls"]
+    assert "/ui?view=work&project={project}" in stored["first_class_objects"]["objects"]["projects"]["dashboard_urls"]
+    assert "/ui?view=agents&selected={agent_id}" in stored["first_class_objects"]["objects"]["agents"]["dashboard_urls"]
     assert stored["endpoints"]["mac_api"] == "http://hub.example.internal:8789/path"
     assert stored["workspace"]["path"] == str(workspace)
     assert stored["workspace"]["project_contract"]["project"] == "repo-beads-mac"
@@ -107,6 +110,10 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "mac-hermes agents" in markdown
     assert "mac-hermes claim-next agent_rocky_host --dry-run" in markdown
     assert "mac-hermes command-audit list --agent-id agent_rocky_host" in markdown
+    assert "Dashboard Views" in markdown
+    assert "/ui?view=work&selected={task_id}" in markdown
+    assert "/ui?view=work&project={project}" in markdown
+    assert "/ui?view=agents&selected={agent_id}" in markdown
     assert "Web Research" in markdown
     assert 'mac-hermes web-search "current project dependency release notes" --limit 5' in markdown
     assert "hgmac agents claim-next agent_rocky_host --dry-run" in markdown

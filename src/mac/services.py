@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import urllib.parse
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -874,6 +875,40 @@ class ControlPlane:
             for agent in work_context.get("agents", [])
             if agent.get("hermes_instance_id") == hermes_instance_id
         ]
+        dashboard_url_contract = self._hermes_dashboard_url_contract(
+            hermes_instance_id,
+            tasks=context_tasks,
+            projects=project_contexts,
+            agents=bound_agents or context_agents,
+        )
+        dashboard_operation_contract = (
+            operations.get("dashboard")
+            if isinstance(operations.get("dashboard"), dict)
+            else {}
+        )
+        dashboard_operation_ready = (
+            dashboard_operation_contract.get("entrypoint") == "/ui"
+            and {
+                "work",
+                "map",
+                "agents",
+                "tasks",
+                "hermes",
+                "runtime",
+            }
+            <= set(dashboard_operation_contract.get("views") or [])
+            and {
+                "view",
+                "project",
+                "task_state",
+                "selected",
+                "agent_q",
+                "agent_filter",
+                "agent_sort",
+                "agent_page",
+            }
+            <= set(dashboard_operation_contract.get("url_state_parameters") or [])
+        )
         relationships = (
             work_context.get("relationships")
             if isinstance(work_context.get("relationships"), dict)
@@ -979,11 +1014,14 @@ class ControlPlane:
                 "dashboard_projection": {
                     "state_key": "hermes_work_contexts",
                     "fields": ["tasks", "relationships.task_dependencies", "operations.task_state_transitions"],
+                    "urls": dashboard_url_contract["object_deep_links"]["tasks"]["templates"],
                 },
                 "dashboard_ready": (
                     isinstance(work_context.get("tasks"), list)
                     and isinstance(relationships.get("task_dependencies"), list)
                     and isinstance(operations.get("task_state_transitions"), dict)
+                    and dashboard_operation_ready
+                    and bool(dashboard_url_contract["object_deep_links"]["tasks"]["ready"])
                 ),
                 "runtime_capabilities": sorted(
                     session_capabilities
@@ -1041,8 +1079,13 @@ class ControlPlane:
                 "dashboard_projection": {
                     "state_key": "hermes_work_contexts",
                     "fields": ["projects", "projects.bridge_item_count", "projects.repository_count"],
+                    "urls": dashboard_url_contract["object_deep_links"]["projects"]["templates"],
                 },
-                "dashboard_ready": isinstance(work_context.get("projects"), list),
+                "dashboard_ready": (
+                    isinstance(work_context.get("projects"), list)
+                    and dashboard_operation_ready
+                    and bool(dashboard_url_contract["object_deep_links"]["projects"]["ready"])
+                ),
                 "runtime_capabilities": sorted(
                     session_capabilities
                     & {
@@ -1070,10 +1113,13 @@ class ControlPlane:
                 "dashboard_projection": {
                     "state_key": "hermes_work_contexts",
                     "fields": ["agents", "relationships.agent_assignments", "agents.active_task_ids"],
+                    "urls": dashboard_url_contract["object_deep_links"]["agents"]["templates"],
                 },
                 "dashboard_ready": (
                     isinstance(work_context.get("agents"), list)
                     and isinstance(relationships.get("agent_assignments"), list)
+                    and dashboard_operation_ready
+                    and bool(dashboard_url_contract["object_deep_links"]["agents"]["ready"])
                 ),
                 "runtime_capabilities": sorted(
                     session_capabilities
@@ -1159,6 +1205,8 @@ class ControlPlane:
             "dashboard_projection_available": all(
                 bool(item.get("dashboard_ready")) for item in first_class_objects.values()
             ),
+            "dashboard_url_state_contract_present": bool(dashboard_url_contract.get("ready")),
+            "work_context_dashboard_contract_present": bool(dashboard_operation_ready),
         }
         missing = [name for name, ok in checks.items() if not ok]
         return {
@@ -1192,6 +1240,8 @@ class ControlPlane:
                     "dashboard_state_keys": ["hermes_work_contexts", "hermes_runtime_proofs"],
                     "dashboard_state_key": "hermes_runtime_proofs",
                     "dashboard_record_key": hermes_instance_id,
+                    "dashboard_operation_contract": dashboard_operation_contract,
+                    "dashboard_url_contract": dashboard_url_contract,
                     "first_class_object_projection": {
                         name: proof.get("dashboard_projection")
                         for name, proof in first_class_objects.items()
@@ -1235,6 +1285,125 @@ class ControlPlane:
                 "first_class_objects": first_class_objects,
             },
         }
+
+    def _hermes_dashboard_url_contract(
+        self,
+        hermes_instance_id: str,
+        *,
+        tasks: List[JsonDict],
+        projects: List[JsonDict],
+        agents: List[JsonDict],
+    ) -> JsonDict:
+        """Bookmarkable dashboard URL contract for Hermes-visible objects."""
+
+        task_id = str(tasks[0].get("id")) if tasks else "{task_id}"
+        project = str(projects[0].get("project")) if projects else "{project}"
+        agent_id = str(agents[0].get("id")) if agents else "{agent_id}"
+        contract = {
+            "schema": "mac.hermes.dashboard_url_contract.v1",
+            "entrypoint": "/ui",
+            "required_views": ["work", "map", "agents", "tasks", "hermes", "runtime"],
+            "url_state_parameters": [
+                {"name": "view", "purpose": "selected dashboard pane"},
+                {"name": "project", "purpose": "project or epic scope"},
+                {"name": "task_state", "purpose": "task lane/status filter"},
+                {"name": "selected", "purpose": "selected task, agent, or Hermes instance id"},
+                {"name": "agent_q", "purpose": "agent search query"},
+                {"name": "agent_filter", "purpose": "agent status/health/eligibility filter"},
+                {"name": "agent_sort", "purpose": "agent table ordering"},
+                {"name": "agent_page", "purpose": "agent table page"},
+            ],
+            "object_deep_links": {
+                "tasks": {
+                    "required_params": ["view", "selected"],
+                    "required_views": ["work", "tasks", "map"],
+                    "templates": [
+                        "/ui?view=work&selected={task_id}",
+                        "/ui?view=tasks&task_state=open&selected={task_id}",
+                        "/ui?view=map&selected={task_id}",
+                    ],
+                    "samples": [
+                        self._dashboard_url(view="work", selected=task_id),
+                        self._dashboard_url(view="tasks", task_state="open", selected=task_id),
+                        self._dashboard_url(view="map", selected=task_id),
+                    ],
+                },
+                "projects": {
+                    "required_params": ["view", "project"],
+                    "required_views": ["work", "agents", "map"],
+                    "templates": [
+                        "/ui?view=work&project={project}",
+                        "/ui?view=agents&project={project}",
+                        "/ui?view=map&project={project}",
+                    ],
+                    "samples": [
+                        self._dashboard_url(view="work", project=project),
+                        self._dashboard_url(view="agents", project=project),
+                        self._dashboard_url(view="map", project=project),
+                    ],
+                },
+                "agents": {
+                    "required_params": ["view", "selected"],
+                    "required_views": ["agents", "work", "map"],
+                    "templates": [
+                        "/ui?view=agents&selected={agent_id}",
+                        "/ui?view=work&selected={agent_id}",
+                        "/ui?view=map&selected={agent_id}",
+                    ],
+                    "samples": [
+                        self._dashboard_url(view="agents", selected=agent_id),
+                        self._dashboard_url(view="work", selected=agent_id),
+                        self._dashboard_url(view="map", selected=agent_id),
+                    ],
+                },
+                "hermes_instances": {
+                    "required_params": ["view", "selected"],
+                    "required_views": ["hermes", "runtime"],
+                    "templates": [
+                        "/ui?view=hermes&selected={hermes_instance_id}",
+                        "/ui?view=runtime&selected={hermes_instance_id}",
+                    ],
+                    "samples": [
+                        self._dashboard_url(view="hermes", selected=hermes_instance_id),
+                        self._dashboard_url(view="runtime", selected=hermes_instance_id),
+                    ],
+                },
+            },
+        }
+        required_params = {
+            str(item.get("name"))
+            for item in contract["url_state_parameters"]
+            if isinstance(item, dict)
+        }
+        missing: List[str] = []
+        for object_name, links in contract["object_deep_links"].items():
+            templates = [str(item) for item in links.get("templates", [])]
+            samples = [str(item) for item in links.get("samples", [])]
+            params = set(links.get("required_params", []))
+            views = set(links.get("required_views", []))
+            if not templates:
+                missing.append("%s.templates" % object_name)
+            if not samples:
+                missing.append("%s.samples" % object_name)
+            if not params <= required_params:
+                missing.append("%s.required_params" % object_name)
+            for view in sorted(views):
+                if any("view=%s" % view in url for url in templates + samples):
+                    continue
+                missing.append("%s.view:%s" % (object_name, view))
+            links["ready"] = not any(item.startswith("%s." % object_name) for item in missing)
+        contract["missing"] = sorted(set(missing))
+        contract["ready"] = not contract["missing"]
+        return contract
+
+    @staticmethod
+    def _dashboard_url(**params: str) -> str:
+        filtered = {
+            key: value
+            for key, value in params.items()
+            if value is not None and str(value).strip()
+        }
+        return "/ui?%s" % urllib.parse.urlencode(filtered)
 
     def record_hermes_runtime_proof(
         self,
@@ -1715,6 +1884,42 @@ class ControlPlane:
                 "hgmac agents nap next {agent_id}",
                 "hgmac agents command-audit list --agent-id {agent_id}",
             ],
+            "dashboard": {
+                "schema": "mac.hermes.dashboard_operation_contract.v1",
+                "entrypoint": "/ui",
+                "views": ["work", "map", "agents", "tasks", "hermes", "runtime"],
+                "url_state_parameters": [
+                    "view",
+                    "project",
+                    "task_state",
+                    "selected",
+                    "agent_q",
+                    "agent_filter",
+                    "agent_sort",
+                    "agent_page",
+                ],
+                "deep_link_templates": {
+                    "tasks": [
+                        "/ui?view=work&selected={task_id}",
+                        "/ui?view=tasks&task_state=open&selected={task_id}",
+                        "/ui?view=map&selected={task_id}",
+                    ],
+                    "projects": [
+                        "/ui?view=work&project={project}",
+                        "/ui?view=agents&project={project}",
+                        "/ui?view=map&project={project}",
+                    ],
+                    "agents": [
+                        "/ui?view=agents&selected={agent_id}",
+                        "/ui?view=work&selected={agent_id}",
+                        "/ui?view=map&selected={agent_id}",
+                    ],
+                    "hermes_instances": [
+                        "/ui?view=hermes&selected=%s" % hermes_instance_id,
+                        "/ui?view=runtime&selected=%s" % hermes_instance_id,
+                    ],
+                },
+            },
             "task_state_transitions": {
                 state: sorted(targets)
                 for state, targets in TASK_TRANSITIONS.items()

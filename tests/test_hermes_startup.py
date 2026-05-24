@@ -622,6 +622,9 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["first_class_objects"]["projects"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["hgmac_cli"]
+    assert "/ui?view=work&selected={task_id}" in report["task_project_runtime"]["first_class_objects"]["tasks"]["dashboard_urls"]
+    assert "/ui?view=work&project={project}" in report["task_project_runtime"]["first_class_objects"]["projects"]["dashboard_urls"]
+    assert "/ui?view=agents&selected={agent_id}" in report["task_project_runtime"]["first_class_objects"]["agents"]["dashboard_urls"]
     assert report["task_project_runtime"]["markdown_contract"]["ready"] is True
     assert report["task_project_runtime"]["markdown_contract"]["missing_snippets"] == []
     assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]

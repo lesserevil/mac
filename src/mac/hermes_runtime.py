@@ -285,6 +285,11 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "hermes_work_contexts.{hermes_instance_id}.tasks",
                     "hermes_work_contexts.{hermes_instance_id}.relationships.task_dependencies",
                 ],
+                "dashboard_urls": [
+                    "/ui?view=work&selected={task_id}",
+                    "/ui?view=tasks&task_state=open&selected={task_id}",
+                    "/ui?view=map&selected={task_id}",
+                ],
                 "runtime_rule": "Refresh MAC work context before selecting, changing, or reporting on tasks.",
             },
             "projects": {
@@ -321,6 +326,11 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "beads_repositories",
                     "hermes_work_contexts.{hermes_instance_id}.projects",
                 ],
+                "dashboard_urls": [
+                    "/ui?view=work&project={project}",
+                    "/ui?view=agents&project={project}",
+                    "/ui?view=map&project={project}",
+                ],
                 "runtime_rule": "Treat project frontier, Beads bridge state, and cross-project dependencies as MAC state.",
             },
             "agents": {
@@ -356,6 +366,11 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "agents",
                     "hermes_work_contexts.{hermes_instance_id}.agents",
                     "hermes_work_contexts.{hermes_instance_id}.relationships.agent_assignments",
+                ],
+                "dashboard_urls": [
+                    "/ui?view=agents&selected={agent_id}",
+                    "/ui?view=work&selected={agent_id}",
+                    "/ui?view=map&selected={agent_id}",
                 ],
                 "runtime_rule": "Use MAC and hgmac for agent state and operations; Hermes owns personality and private memory.",
             },
@@ -580,6 +595,11 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
     lines.extend(["", "## Agent View", ""])
     for command in operations.get("agent_view", []):
         lines.append("- `%s`" % command)
+    lines.extend(["", "## Dashboard Views", ""])
+    for name in ("tasks", "projects", "agents"):
+        object_contract = object_map.get(name) if isinstance(object_map.get(name), dict) else {}
+        for url in object_contract.get("dashboard_urls") or []:
+            lines.append("- `%s`: `%s`" % (name, url))
     lines.extend(["", "## Web Research", ""])
     for command in operations.get("web_research", []):
         lines.append("- `%s`" % command)

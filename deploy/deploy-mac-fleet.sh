@@ -1403,6 +1403,8 @@ required = [
     "`agents`: authority `mac`",
     "Project Bridge",
     "Agent View",
+    "Dashboard Views",
+    "/ui?view=work",
     "Direct Session Parity",
     "mac-hermes work-context",
     "mac-hermes tasks",

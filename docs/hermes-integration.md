@@ -227,10 +227,14 @@ context, MAC and Hermes CLI affordances, dashboard projection, deployed runtime
 context, prompt bridge, and bound agent identity all agree on the same
 task/project/agent authority model. Its evidence includes a first-class object
 matrix for tasks, projects, and agents across API operations, MAC CLI commands,
-Hermes-facing commands, dashboard projection fields, and runtime session
-capabilities. It also includes a live alignment section that compares current
+Hermes-facing commands, dashboard projection fields, bookmarkable dashboard
+URLs, and runtime session capabilities. It also includes a live alignment section that compares current
 MAC task, project, and agent records against the Hermes work-context projection
 so a ready proof means Hermes is seeing the same operational objects MAC sees.
+The dashboard proof covers `/ui` views and URL state parameters such as
+`view`, `project`, `task_state`, `selected`, and agent table filters, so a
+task, project, agent, or Hermes runtime proof can be shared as a direct URL
+rather than reconstructed from local UI state.
 
 When `mac-hermes runtime-proof` runs inside a Hermes agent, it sends that
 agent's local `build_hermes_startup_report()` to the hub proof endpoint. That
@@ -258,10 +262,10 @@ task/project graph the MAC API, CLI, and dashboard show.
 The JSON context also carries a `first_class_objects` contract for `tasks`,
 `projects`, and `agents`. Each object records MAC authority, the source of
 truth, identity fields, API paths, MAC CLI and `mac-hermes` commands, dashboard
-state keys, and the runtime rule Hermes should follow. Startup health fails a
-required runtime context when that object model is missing or incomplete, so a
-deployed Hermes agent cannot silently regress to treating tasks, projects, or
-agents as informal prompt text.
+state keys, dashboard deep-link templates, and the runtime rule Hermes should
+follow. Startup health fails a required runtime context when that object model
+is missing or incomplete, so a deployed Hermes agent cannot silently regress to
+treating tasks, projects, or agents as informal prompt text.
 
 The same runtime context now carries a direct-session capability contract. A
 Hermes session sees the MAC source workspace, the repository Beads contract,

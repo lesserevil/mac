@@ -53,6 +53,10 @@ RUNTIME_MARKDOWN_REQUIRED_SNIPPETS = (
     "mac-hermes agents",
     "Project Bridge",
     "Agent View",
+    "Dashboard Views",
+    "/ui?view=work",
+    "project={project}",
+    "selected={task_id}",
     "Direct Session Parity",
     "`shell_execution`",
     "`workspace_file_access`",
@@ -584,6 +588,9 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
                     "dashboard_state_keys": value.get("dashboard_state_keys")
                     if isinstance(value.get("dashboard_state_keys"), list)
                     else [],
+                    "dashboard_urls": value.get("dashboard_urls")
+                    if isinstance(value.get("dashboard_urls"), list)
+                    else [],
                     "runtime_rule": value.get("runtime_rule"),
                 }
                 for name, value in first_class_objects.items()
@@ -636,7 +643,14 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         item = object_model.get(key) if isinstance(object_model.get(key), dict) else {}
         if item.get("authority") != "mac":
             object_model_errors.append("%s.authority" % key)
-        for field in ("source_of_truth", "identity_fields", "api_paths", "mac_hermes_cli", "dashboard_state_keys"):
+        for field in (
+            "source_of_truth",
+            "identity_fields",
+            "api_paths",
+            "mac_hermes_cli",
+            "dashboard_state_keys",
+            "dashboard_urls",
+        ):
             value = item.get(field)
             if not value:
                 object_model_errors.append("%s.%s" % (key, field))
