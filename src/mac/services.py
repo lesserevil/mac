@@ -678,6 +678,13 @@ class ControlPlane:
             for operation in operations.get("api", [])
             if isinstance(operation, dict)
         }
+        expected_project_api_operations = {
+            "import_project_item",
+            "list_project_items",
+            "register_beads_repository",
+            "list_beads_repositories",
+            "poll_beads_repositories",
+        }
         mac_hermes_commands = [
             str(command) for command in operations.get("mac_hermes_cli", [])
         ]
@@ -696,10 +703,15 @@ class ControlPlane:
             "submit_review",
             "publish_task",
             "write_completed_task_to_memory",
-        }
+        } | expected_project_api_operations
         expected_cli_fragments = (
             "mac-hermes work-context",
             "mac-hermes runtime-proof",
+            "mac-hermes import-project-item",
+            "mac-hermes project-items",
+            "mac-hermes beads-repositories",
+            "mac-hermes register-beads-repository",
+            "mac-hermes poll-beads-repositories",
             "mac-hermes task ",
             "mac-hermes task-detail",
             "mac-hermes claim",
@@ -714,6 +726,11 @@ class ControlPlane:
             "mac-hermes writeback",
         )
         authority = work_context.get("authority", {})
+        project_contexts = [
+            project
+            for project in work_context.get("projects", [])
+            if isinstance(project, dict)
+        ]
         bound_agents = [
             agent
             for agent in work_context.get("agents", [])
@@ -802,6 +819,9 @@ class ControlPlane:
                     "work_context_schema": work_context.get("schema"),
                     "work_context_path": "/hermes-instances/%s/work-context" % hermes_instance_id,
                     "operation_names": sorted(api_operation_names),
+                    "project_operation_names": sorted(
+                        api_operation_names & expected_project_api_operations
+                    ),
                 },
                 "cli": {
                     "mac_hermes_commands": mac_hermes_commands,
@@ -826,7 +846,15 @@ class ControlPlane:
                 },
                 "work_context": {
                     "task_count": work_context.get("task_count"),
-                    "project_count": len(work_context.get("projects", [])),
+                    "project_count": len(project_contexts),
+                    "project_bridge_item_count": sum(
+                        int(project.get("bridge_item_count") or 0)
+                        for project in project_contexts
+                    ),
+                    "beads_repository_count": sum(
+                        int(project.get("repository_count") or 0)
+                        for project in project_contexts
+                    ),
                     "agent_count": len(work_context.get("agents", [])),
                     "bound_agent_ids": [agent.get("id") for agent in bound_agents],
                     "relationship_counts": {
@@ -1133,6 +1161,31 @@ class ControlPlane:
                     "path": "/memory",
                 },
                 {
+                    "name": "import_project_item",
+                    "method": "POST",
+                    "path": "/bridge/items",
+                },
+                {
+                    "name": "list_project_items",
+                    "method": "GET",
+                    "path": "/bridge/items",
+                },
+                {
+                    "name": "register_beads_repository",
+                    "method": "POST",
+                    "path": "/bridge/beads/repositories",
+                },
+                {
+                    "name": "list_beads_repositories",
+                    "method": "GET",
+                    "path": "/bridge/beads/repositories",
+                },
+                {
+                    "name": "poll_beads_repositories",
+                    "method": "POST",
+                    "path": "/bridge/beads/poll",
+                },
+                {
                     "name": "track_conversation_thread",
                     "method": "POST",
                     "path": "/conversation-threads",
@@ -1141,12 +1194,22 @@ class ControlPlane:
             "mac_cli": [
                 "mac hermes work-context %s" % hermes_instance_id,
                 "mac hermes runtime-proof %s" % hermes_instance_id,
+                "mac bridge import <source> <external_id> <title>",
+                "mac bridge list",
+                "mac bridge beads register <name> <path> --project <project>",
+                "mac bridge beads repos",
+                "mac bridge beads poll --repository <repository>",
                 "mac task show {task_id}",
                 "mac task create --title ...",
             ],
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
                 "mac-hermes runtime-proof %s" % hermes_instance_id,
+                "mac-hermes import-project-item <source> <external_id> <title>",
+                "mac-hermes project-items",
+                "mac-hermes beads-repositories",
+                "mac-hermes register-beads-repository <name> <path> --project <project>",
+                "mac-hermes poll-beads-repositories --repository <repository>",
                 "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
                 "mac-hermes task-detail {task_id}",
                 "mac-hermes summary {task_id}",

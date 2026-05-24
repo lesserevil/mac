@@ -1871,10 +1871,12 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const proofEvidence = (proof?.evidence || {}) as JsonObject;
   const proofRuntime = (proofEvidence.hermes_runtime || {}) as JsonObject;
   const proofWork = (proofEvidence.work_context || {}) as JsonObject;
+  const proofApi = (proofEvidence.api || {}) as JsonObject;
   const proofSessionCapabilities = (proofRuntime.session_capability_names || []) as unknown[];
   const proofSessionAvailability = (proofRuntime.session_capability_availability || {}) as JsonObject;
   const unavailableSessionCapabilities = (proofSessionAvailability.missing || []) as unknown[];
   const availableSessionCapabilityCount = Math.max(0, proofSessionCapabilities.length - unavailableSessionCapabilities.length);
+  const projectOperationCount = ((proofApi.project_operation_names || []) as unknown[]).length;
   const proofMissing = proof?.missing || [];
   return `
     <article class="record">
@@ -1920,6 +1922,8 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", ((proofRuntime.prompt_bridge || {}) as JsonObject).present ? "active" : "not required")}
             ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}
+            ${field("Project ops", String(projectOperationCount))}
+            ${field("Project links", `${proofWork.project_bridge_item_count || 0}/${proofWork.beads_repository_count || 0}`)}
             ${field("Bound agents", String(((proofWork.bound_agent_ids || []) as unknown[]).length))}
           </div>
         </div>

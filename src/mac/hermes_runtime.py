@@ -193,6 +193,8 @@ def _session_capability_contract(
             "bd prime",
             "mac-hermes runtime-proof %s" % hermes_instance_id,
             "mac-hermes work-context %s --active-only" % hermes_instance_id,
+            "mac-hermes project-items",
+            "mac-hermes beads-repositories",
             "hgmac agents identity %s" % agent_id,
             "git status --short --branch",
             test_command,
@@ -290,6 +292,14 @@ def build_runtime_context(
                 "mac-hermes work-context %s --active-only" % resolved_instance_id,
                 "mac-hermes work-brief %s" % resolved_instance_id,
             ],
+            "project_bridge": [
+                "mac-hermes import-project-item <source> <external_id> <title>",
+                "mac-hermes project-items",
+                "mac-hermes beads-repositories",
+                "mac-hermes register-beads-repository <name> <path> --project <project>",
+                "mac-hermes poll-beads-repositories --repository <repository> --force --actor %s"
+                % resolved_agent_id,
+            ],
             "create_task": [
                 "mac-hermes task %s <title> --summary <summary> --project <project>"
                 % resolved_instance_id,
@@ -361,6 +371,9 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
         "",
     ]
     lines.extend("- `%s`" % command for command in operations["refresh_context"])
+    lines.extend(["", "## Project Bridge", ""])
+    for command in operations.get("project_bridge", []):
+        lines.append("- `%s`" % command)
     lines.extend(["", "## Task Lifecycle", ""])
     for command in operations["create_task"] + operations["task_lifecycle"]:
         lines.append("- `%s`" % command)

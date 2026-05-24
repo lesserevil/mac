@@ -158,6 +158,24 @@ mac hermes work-context <hermes_instance_id>
 mac-hermes work-context <hermes_instance_id>
 ```
 
+Hermes can also use the same project bridge operators use. This keeps
+Beads-backed project registration, issue import, and repository polling as MAC
+state instead of hidden local Hermes state:
+
+```python
+adapter.list_project_items()
+adapter.register_beads_repository("nanolang", "/Users/jordanh/Src/nanolang", project="repo-beads-nanolang")
+adapter.list_beads_repositories()
+adapter.poll_beads_repositories(repository="nanolang", force=True)
+```
+
+```bash
+mac-hermes project-items
+mac-hermes beads-repositories
+mac-hermes register-beads-repository nanolang /Users/jordanh/Src/nanolang --project repo-beads-nanolang
+mac-hermes poll-beads-repositories --repository nanolang --force
+```
+
 Operators and Hermes agents can also request an auditable readiness proof for
 the bridge:
 

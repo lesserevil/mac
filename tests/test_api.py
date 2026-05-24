@@ -157,8 +157,16 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
         operation["name"] == "get_runtime_proof"
         for operation in work_context["operations"]["api"]
     )
+    operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
+    assert {
+        "list_project_items",
+        "register_beads_repository",
+        "list_beads_repositories",
+        "poll_beads_repositories",
+    } <= operation_names
     assert any("mac-hermes work-context" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes runtime-proof" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("mac-hermes project-items" in command for command in work_context["operations"]["mac_hermes_cli"])
 
     runtime_proof = client.get("/hermes-instances/%s/runtime-proof" % hermes["id"]).json()
     assert runtime_proof["schema"] == "mac.hermes_runtime_proof.v1"
@@ -168,6 +176,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert runtime_proof["checks"]["runtime_session_capabilities_available"] is True
     assert runtime_proof["evidence"]["work_context"]["bound_agent_ids"] == [agent["id"]]
     assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
+    assert "list_project_items" in runtime_proof["evidence"]["api"]["project_operation_names"]
     degraded_runtime_proof = cp.hermes_runtime_proof(
         hermes["id"],
         hermes_startup={
@@ -1083,6 +1092,7 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "hermes_runtime_proofs" in app_js
     assert "Runtime Proof" in app_js
     assert "Session caps" in app_js
+    assert "Project ops" in app_js
     assert 'data-view="work"' in index_html
     assert 'data-view="map"' in index_html
     assert 'data-view="workflows"' in index_html

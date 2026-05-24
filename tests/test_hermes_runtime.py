@@ -85,6 +85,9 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         "web_search",
     } <= capability_names
     assert "mac-hermes work-context hermes_rocky_host --active-only" in markdown
+    assert "Project Bridge" in markdown
+    assert "mac-hermes project-items" in markdown
+    assert "mac-hermes register-beads-repository <name> <path> --project <project>" in markdown
     assert "mac-hermes claim {task_id} agent_rocky_host" in markdown
     assert "Direct Session Parity" in markdown
     assert "`bd prime`" in markdown

@@ -148,9 +148,87 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         operation["name"] == "create_task_from_conversation"
         for operation in work_context["operations"]["api"]
     )
+    operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
+    assert {
+        "list_project_items",
+        "register_beads_repository",
+        "list_beads_repositories",
+        "poll_beads_repositories",
+    } <= operation_names
+    assert any(
+        "mac-hermes project-items" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
     assert adapter.work_context_brief(registration["hermes_instance"]["id"]).startswith(
         "MAC work context:"
     )
+
+
+def test_hermes_adapter_exposes_project_bridge_operations():
+    calls = []
+
+    def transport(method, path, payload):
+        calls.append((method, path, payload))
+        return {"path": path, "payload": payload}
+
+    adapter = HermesMacAdapter(MacApiClient("http://hub:8789", transport=transport))
+
+    adapter.import_project_item(
+        "repo-beads-mac",
+        "mac-123",
+        "Ship project bridge",
+        payload={"summary": "track this", "secret": "drop"},
+        required_capabilities=["ops"],
+    )
+    adapter.list_project_items()
+    adapter.register_beads_repository(
+        "mac",
+        "/repo/mac",
+        source="repo-beads-mac",
+        project="repo-beads-mac",
+        required_capabilities=["ops", "tests"],
+        poll_interval_seconds=30,
+        metadata={"team": "core", "api_token": "drop"},
+    )
+    adapter.list_beads_repositories(enabled=True)
+    adapter.poll_beads_repositories(repository="mac", force=True, actor="agent_1")
+
+    assert calls == [
+        (
+            "POST",
+            "/bridge/items",
+            {
+                "source": "repo-beads-mac",
+                "external_id": "mac-123",
+                "title": "Ship project bridge",
+                "payload": {"summary": "track this"},
+                "required_capabilities": ["ops"],
+                "actor": "hermes",
+            },
+        ),
+        ("GET", "/bridge/items", None),
+        (
+            "POST",
+            "/bridge/beads/repositories",
+            {
+                "name": "mac",
+                "path": "/repo/mac",
+                "source": "repo-beads-mac",
+                "project": "repo-beads-mac",
+                "required_capabilities": ["ops", "tests"],
+                "enabled": True,
+                "poll_interval_seconds": 30,
+                "metadata": {"team": "core"},
+                "actor": "hermes",
+            },
+        ),
+        ("GET", "/bridge/beads/repositories?enabled=true", None),
+        (
+            "POST",
+            "/bridge/beads/poll",
+            {"repository": "mac", "force": True, "actor": "agent_1"},
+        ),
+    ]
 
 
 def test_hermes_adapter_summarizes_result_and_prepares_memory_writeback():
@@ -422,6 +500,99 @@ def test_mac_hermes_cli_fetches_runtime_proof(monkeypatch, capsys):
             "/hermes-instances/hermes_1/runtime-proof",
             None,
         )
+    ]
+
+
+def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((method, path, payload))
+        return {"schema": "ok", "path": path, "payload": payload}
+
+    monkeypatch.setattr(MacApiClient, "request", request)
+    commands = [
+        ["project-items"],
+        [
+            "import-project-item",
+            "repo-beads-mac",
+            "mac-123",
+            "Ship project bridge",
+            "--payload",
+            '{"summary":"track this","secret":"drop"}',
+            "--required-capabilities",
+            "ops,tests",
+            "--actor",
+            "agent_1",
+        ],
+        ["beads-repositories", "--enabled"],
+        [
+            "register-beads-repository",
+            "mac",
+            "/repo/mac",
+            "--source",
+            "repo-beads-mac",
+            "--project",
+            "repo-beads-mac",
+            "--required-capabilities",
+            "ops",
+            "--poll-interval-seconds",
+            "30",
+            "--metadata",
+            '{"team":"core","api_token":"drop"}',
+            "--actor",
+            "agent_1",
+        ],
+        [
+            "poll-beads-repositories",
+            "--repository",
+            "mac",
+            "--force",
+            "--actor",
+            "agent_1",
+        ],
+    ]
+
+    for command in commands:
+        rc = mac_hermes_main(["--url", "http://hub:8789", *command])
+        assert rc == 0
+        capsys.readouterr()
+
+    assert calls == [
+        ("GET", "/bridge/items", None),
+        (
+            "POST",
+            "/bridge/items",
+            {
+                "source": "repo-beads-mac",
+                "external_id": "mac-123",
+                "title": "Ship project bridge",
+                "payload": {"summary": "track this"},
+                "required_capabilities": ["ops", "tests"],
+                "actor": "agent_1",
+            },
+        ),
+        ("GET", "/bridge/beads/repositories?enabled=true", None),
+        (
+            "POST",
+            "/bridge/beads/repositories",
+            {
+                "name": "mac",
+                "path": "/repo/mac",
+                "source": "repo-beads-mac",
+                "project": "repo-beads-mac",
+                "required_capabilities": ["ops"],
+                "enabled": True,
+                "poll_interval_seconds": 30,
+                "metadata": {"team": "core"},
+                "actor": "agent_1",
+            },
+        ),
+        (
+            "POST",
+            "/bridge/beads/poll",
+            {"repository": "mac", "force": True, "actor": "agent_1"},
+        ),
     ]
 
 

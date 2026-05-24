@@ -264,6 +264,82 @@ class HermesMacAdapter:
             "/hermes-instances/%s/runtime-proof" % _path_part(hermes_instance_id)
         )
 
+    def import_project_item(
+        self,
+        source: str,
+        external_id: str,
+        title: str,
+        *,
+        payload: Optional[JsonDict] = None,
+        required_capabilities: Sequence[str] = (),
+        actor: str = "hermes",
+    ) -> JsonDict:
+        return self.client.post(
+            "/bridge/items",
+            {
+                "source": source,
+                "external_id": external_id,
+                "title": title,
+                "payload": _sanitize_json_object(payload or {}),
+                "required_capabilities": list(required_capabilities),
+                "actor": actor,
+            },
+        )
+
+    def list_project_items(self) -> Any:
+        return self.client.get("/bridge/items")
+
+    def register_beads_repository(
+        self,
+        name: str,
+        path: str,
+        *,
+        source: Optional[str] = None,
+        project: Optional[str] = None,
+        required_capabilities: Sequence[str] = (),
+        enabled: bool = True,
+        poll_interval_seconds: int = 60,
+        metadata: Optional[JsonDict] = None,
+        actor: str = "hermes",
+    ) -> JsonDict:
+        return self.client.post(
+            "/bridge/beads/repositories",
+            {
+                "name": name,
+                "path": path,
+                "source": source,
+                "project": project,
+                "required_capabilities": list(required_capabilities),
+                "enabled": enabled,
+                "poll_interval_seconds": int(poll_interval_seconds),
+                "metadata": _sanitize_json_object(metadata or {}),
+                "actor": actor,
+            },
+        )
+
+    def list_beads_repositories(self, *, enabled: Optional[bool] = None) -> Any:
+        query = _query((("enabled", enabled),))
+        path = "/bridge/beads/repositories"
+        if query:
+            path = "%s?%s" % (path, query)
+        return self.client.get(path)
+
+    def poll_beads_repositories(
+        self,
+        *,
+        repository: Optional[str] = None,
+        force: bool = False,
+        actor: str = "hermes",
+    ) -> JsonDict:
+        return self.client.post(
+            "/bridge/beads/poll",
+            {
+                "repository": repository,
+                "force": force,
+                "actor": actor,
+            },
+        )
+
     def claim_task(
         self,
         task_id: str,
@@ -583,6 +659,53 @@ def _cmd_runtime_proof(args: argparse.Namespace) -> None:
     _print(_adapter(args).runtime_proof(args.hermes_instance_id))
 
 
+def _cmd_import_project_item(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).import_project_item(
+            args.source,
+            args.external_id,
+            args.title,
+            payload=_json_arg(args.payload, {}),
+            required_capabilities=_csv(args.required_capabilities),
+            actor=args.actor,
+        )
+    )
+
+
+def _cmd_project_items(args: argparse.Namespace) -> None:
+    _print(_adapter(args).list_project_items())
+
+
+def _cmd_register_beads_repository(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).register_beads_repository(
+            args.name,
+            args.path,
+            source=args.source,
+            project=args.project,
+            required_capabilities=_csv(args.required_capabilities),
+            enabled=not args.disabled,
+            poll_interval_seconds=args.poll_interval_seconds,
+            metadata=_json_arg(args.metadata, {}),
+            actor=args.actor,
+        )
+    )
+
+
+def _cmd_beads_repositories(args: argparse.Namespace) -> None:
+    _print(_adapter(args).list_beads_repositories(enabled=args.enabled))
+
+
+def _cmd_poll_beads_repositories(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).poll_beads_repositories(
+            repository=args.repository,
+            force=args.force,
+            actor=args.actor,
+        )
+    )
+
+
 def _cmd_claim(args: argparse.Namespace) -> None:
     _print(_adapter(args).claim_task(args.task_id, args.agent_id, lease_seconds=args.lease_seconds))
 
@@ -739,6 +862,40 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_proof = sub.add_parser("runtime-proof", help="prove MAC/Hermes task-project bridge readiness")
     runtime_proof.add_argument("hermes_instance_id")
     runtime_proof.set_defaults(func=_cmd_runtime_proof)
+
+    import_project_item = sub.add_parser("import-project-item", help="import an external project item into MAC")
+    import_project_item.add_argument("source")
+    import_project_item.add_argument("external_id")
+    import_project_item.add_argument("title")
+    import_project_item.add_argument("--payload", default="{}")
+    import_project_item.add_argument("--required-capabilities")
+    import_project_item.add_argument("--actor", default="hermes")
+    import_project_item.set_defaults(func=_cmd_import_project_item)
+
+    project_items = sub.add_parser("project-items", help="list MAC bridge project items")
+    project_items.set_defaults(func=_cmd_project_items)
+
+    beads_repositories = sub.add_parser("beads-repositories", help="list registered Beads repositories")
+    beads_repositories.add_argument("--enabled", action="store_true", default=None)
+    beads_repositories.set_defaults(func=_cmd_beads_repositories)
+
+    register_beads_repository = sub.add_parser("register-beads-repository", help="register a Beads-backed project repository")
+    register_beads_repository.add_argument("name")
+    register_beads_repository.add_argument("path")
+    register_beads_repository.add_argument("--source")
+    register_beads_repository.add_argument("--project")
+    register_beads_repository.add_argument("--required-capabilities")
+    register_beads_repository.add_argument("--poll-interval-seconds", type=int, default=60)
+    register_beads_repository.add_argument("--metadata", default="{}")
+    register_beads_repository.add_argument("--disabled", action="store_true")
+    register_beads_repository.add_argument("--actor", default="hermes")
+    register_beads_repository.set_defaults(func=_cmd_register_beads_repository)
+
+    poll_beads_repositories = sub.add_parser("poll-beads-repositories", help="poll registered Beads repositories")
+    poll_beads_repositories.add_argument("--repository")
+    poll_beads_repositories.add_argument("--force", action="store_true")
+    poll_beads_repositories.add_argument("--actor", default="hermes")
+    poll_beads_repositories.set_defaults(func=_cmd_poll_beads_repositories)
 
     claim = sub.add_parser("claim", help="claim a MAC task for an agent")
     claim.add_argument("task_id")
