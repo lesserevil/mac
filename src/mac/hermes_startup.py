@@ -58,6 +58,8 @@ RUNTIME_MARKDOWN_REQUIRED_SNIPPETS = (
     "project={project}",
     "selected={task_id}",
     "Direct Session Parity",
+    "`hermes_oneshot_executor`",
+    "mac-hermes-task-executor",
     "`shell_execution`",
     "`workspace_file_access`",
     "bd prime",
@@ -675,6 +677,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         "beads_issue_tracker",
         "git_source_control",
         "quality_gate",
+        "hermes_oneshot_executor",
         "command_audit",
         "web_search",
     }
@@ -1667,6 +1670,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "beads_issue_tracker",
                 "git_source_control",
                 "quality_gate",
+                "hermes_oneshot_executor",
                 "command_audit",
                 "web_search",
             }

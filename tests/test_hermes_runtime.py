@@ -92,6 +92,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         "beads_issue_tracker",
         "git_source_control",
         "quality_gate",
+        "hermes_oneshot_executor",
         "command_audit",
         "web_search",
     } <= capability_names
@@ -122,6 +123,9 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "`bd prime`" in markdown
     assert "`hgmac agents list`" in markdown
     assert "`scripts/run-contract-tests.sh`" in markdown
+    assert "`hermes_oneshot_executor`" in markdown
+    assert "mac-hermes-task-executor" in markdown
+    assert "mac-agent --loop --executor" in markdown
     assert "`git commit -m \"<message>\"`" in markdown
     assert "`bd dolt push`" in markdown
     assert "`git push`" in markdown

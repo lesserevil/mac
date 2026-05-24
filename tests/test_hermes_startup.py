@@ -86,7 +86,8 @@ def _executable(path, content: str = "#!/bin/sh\nexit 0\n") -> None:
 def _prepare_direct_session_tools(monkeypatch, mac_home, workspace) -> None:
     for name in ("mac", "mac-hermes", "hgmac", "mac-firecrawl-gateway"):
         _executable(mac_home / "venv" / "bin" / name)
-    _executable(mac_home / "bin" / "bd")
+    for name in ("bd", "mac-hermes-task-executor"):
+        _executable(mac_home / "bin" / name)
     _executable(workspace / "scripts" / "run-contract-tests.sh")
     monkeypatch.setenv(
         "PATH",
@@ -631,6 +632,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert "shell_execution" in report["task_project_runtime"]["session_capability_names"]
     assert "workspace_file_access" in report["task_project_runtime"]["session_capability_names"]
     assert "beads_issue_tracker" in report["task_project_runtime"]["session_capability_names"]
+    assert "hermes_oneshot_executor" in report["task_project_runtime"]["session_capability_names"]
     assert "command_audit" in report["task_project_runtime"]["session_capability_names"]
     availability = report["task_project_runtime"]["session_capability_availability"]
     assert availability["ready"] is True
@@ -646,6 +648,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
         "hgmac_agent_ops_cli",
         "beads_issue_tracker",
         "quality_gate",
+        "hermes_oneshot_executor",
         "command_audit",
         "web_search",
     }

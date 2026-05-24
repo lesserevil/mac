@@ -1406,6 +1406,7 @@ required = [
     "Dashboard Views",
     "/ui?view=work",
     "Direct Session Parity",
+    "mac-hermes-task-executor",
     "mac-hermes work-context",
     "mac-hermes tasks",
     "mac-hermes projects",

@@ -949,6 +949,7 @@ class ControlPlane:
             "beads_issue_tracker",
             "git_source_control",
             "quality_gate",
+            "hermes_oneshot_executor",
             "command_audit",
             "web_search",
         }
@@ -1032,6 +1033,7 @@ class ControlPlane:
                         "shell_execution",
                         "workspace_file_access",
                         "quality_gate",
+                        "hermes_oneshot_executor",
                         "command_audit",
                     }
                 ),
@@ -1096,6 +1098,7 @@ class ControlPlane:
                         "workspace_file_access",
                         "git_source_control",
                         "beads_issue_tracker",
+                        "hermes_oneshot_executor",
                     }
                 ),
                 "runtime_ready": runtime_capabilities_ready,
@@ -1130,6 +1133,7 @@ class ControlPlane:
                         "shell_execution",
                         "workspace_file_access",
                         "hgmac_agent_ops_cli",
+                        "hermes_oneshot_executor",
                         "command_audit",
                     }
                 ),

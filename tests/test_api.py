@@ -265,6 +265,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                     "beads_issue_tracker",
                     "git_source_control",
                     "quality_gate",
+                    "hermes_oneshot_executor",
                     "command_audit",
                     "web_search",
                 ],
@@ -301,6 +302,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                         "beads_issue_tracker",
                         "git_source_control",
                         "quality_gate",
+                        "hermes_oneshot_executor",
                         "command_audit",
                         "web_search",
                     ],
@@ -315,6 +317,8 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert posted_runtime_proof["ready"] is True
     assert posted_runtime_proof["checks"]["runtime_first_class_object_model_declared"] is True
     assert posted_runtime_proof["evidence"]["hermes_runtime"]["hermes_instance_id"] == hermes["id"]
+    assert "hermes_oneshot_executor" in posted_runtime_proof["evidence"]["first_class_objects"]["tasks"]["runtime_capabilities"]
+    assert "hermes_oneshot_executor" in posted_runtime_proof["evidence"]["hermes_runtime"]["session_capability_names"]
 
     active_only = client.get(
         "/hermes-instances/%s/work-context?include_completed=false&task_limit=1" % hermes["id"]

@@ -184,6 +184,7 @@ def test_fleet_deploy_applies_hermes_patch_set():
     assert "mac-hermes projects" in script
     assert "shell_execution" in script
     assert "workspace_file_access" in script
+    assert "mac-hermes-task-executor" in script
     assert "_load_mac_runtime_context" in runtime_patch.read_text(encoding="utf-8")
     assert "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN" in runtime_patch.read_text(encoding="utf-8")
     assert "Shutdown chat notifications disabled by MAC deployment policy." in quench_patch.read_text(
@@ -236,6 +237,7 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
     assert env_example["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"
     assert env_example["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_example"
+    assert env_example["MAC_WORKER_EXECUTOR"] == "/home/mac/.mac/bin/mac-hermes-task-executor"
     assert env_example["MAC_HERMES_WORKSPACE"] == "/home/mac/.mac/src/mac"
     assert env_example["MAC_PROJECT_CONTRACT_FILE"] == "/home/mac/.mac/src/mac/.mac/project.yaml"
     assert '--workspace "$SRC_DIR"' in script

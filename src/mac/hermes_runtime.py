@@ -194,6 +194,14 @@ def _session_capability_contract(
                 "purpose": "Run the repository contract test gate before completion.",
             },
             {
+                "name": "hermes_oneshot_executor",
+                "kind": "executor",
+                "required": True,
+                "command": "mac-hermes-task-executor",
+                "expected_path": str(mac_home / "bin" / "mac-hermes-task-executor"),
+                "purpose": "Run a MAC task through Hermes oneshot mode with the same workspace, prompt context, and command audit envelope as deployed agents.",
+            },
+            {
                 "name": "command_audit",
                 "kind": "cli",
                 "required": True,
@@ -226,6 +234,7 @@ def _session_capability_contract(
             "mac-hermes web-search \"project dependency release notes\" --limit 5",
             "hgmac agents identity %s" % agent_id,
             "hgmac agents claim-next %s --dry-run" % agent_id,
+            "mac-agent --loop --executor %s" % (mac_home / "bin" / "mac-hermes-task-executor"),
             "git status --short --branch",
             test_command,
             "git add <files>",
@@ -240,6 +249,7 @@ def _session_capability_contract(
             "Use hgmac for agent CRUD and operational agent state, not ad hoc database edits.",
             "Record command audit phases for shell work that changes or verifies task state.",
             "Use mac-hermes web-search/web-scrape/web-crawl when current external information is required.",
+            "Use mac-hermes-task-executor through mac-agent loop mode for production Hermes oneshot task execution.",
             "Commit, pull/rebase, push Beads, and push Git before reporting completed code work.",
         ],
     }

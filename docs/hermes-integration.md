@@ -270,12 +270,13 @@ treating tasks, projects, or agents as informal prompt text.
 The same runtime context now carries a direct-session capability contract. A
 Hermes session sees the MAC source workspace, the repository Beads contract,
 the `bd prime` workflow, the `mac`, `mac-hermes`, and `hgmac` CLIs, Git status
-and quality-gate commands, shell execution, writable workspace access, and the
-hub Firecrawl web-search affordance. Startup health and runtime proof reports
-treat those declarations as part of the MAC/Hermes bridge rather than as tribal
-knowledge from an operator shell. Startup proof also verifies the declared
-commands, workspace, project contract, quality gate, workspace file access, and
-web-search environment are available in the Hermes runtime.
+and quality-gate commands, shell execution, writable workspace access, the
+`mac-hermes-task-executor` oneshot worker path, and the hub Firecrawl web-search
+affordance. Startup health and runtime proof reports treat those declarations
+as part of the MAC/Hermes bridge rather than as tribal knowledge from an
+operator shell. Startup proof also verifies the declared commands, workspace,
+project contract, quality gate, Hermes oneshot executor, workspace file access,
+and web-search environment are available in the Hermes runtime.
 
 Deployment also patches Hermes' prompt builder to load
 `mac-runtime-context.md` as a normal context source. That means gateway, CLI,
@@ -317,6 +318,7 @@ mac-hermes web-crawl https://example.com --limit 1
 mac-hermes submit-review <task_id> <agent_id>
 mac-hermes request-review <task_id> <reviewer_agent_id>
 mac-hermes publish <task_id> git://main <reviewer_agent_id> --evidence-id <evidence_id>
+mac-agent --loop --executor ~/.mac/bin/mac-hermes-task-executor
 ```
 
 ## User Replies

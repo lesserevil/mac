@@ -48,6 +48,7 @@ deploying more than one writer.
 | `MAC_HERMES_RUNTIME_CONTEXT_REQUIRED` | no | Set `1` to make startup readiness fail if the MAC task/project runtime contract is missing, invalid, or not injected into the Hermes prompt builder. Fleet deploy enables this. |
 | `MAC_HERMES_WORKSPACE` | no | Source workspace Hermes should treat as equivalent to an operator/Codex shell in the MAC repo. Fleet deploy sets this to `$MAC_HOME/src/mac`. |
 | `MAC_PROJECT_CONTRACT_FILE` | no | Repository contract file for the Hermes direct-session capability bridge. Fleet deploy sets this to `$MAC_HERMES_WORKSPACE/.mac/project.yaml`. |
+| `MAC_WORKER_EXECUTOR` | no | Executor command used by loop-mode workers. The default `~/.mac/bin/mac-hermes-task-executor` is part of the Hermes direct-session capability proof. |
 | `MAC_SUPERVISOR_KIND` | no | Runtime supervisor selected by fleet deploy: `systemd`, `launchd`, or `supervisord`. |
 | `MAC_MEMORY_TOPOLOGY_FILE` | no | Hermes-visible memory topology JSON. Default `~/.hermes/mac-memory-topology.json`. |
 | `MAC_SHARED_SERVICES_MANAGER_AGENT` | no | Agent that owns hub-managed shared services. Defaults to the configured fleet hub. |
@@ -321,7 +322,10 @@ MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=mac-canary
 The generated service then runs `mac-agent --register --loop` against
 `MAC_HUB_URL`, using `MAC_WORKER_TOKEN` from `~/.mac/mac.env`. The default
 executor wrapper is `~/.mac/bin/mac-hermes-task-executor`, which calls the
-deployed upstream Hermes checkout in one-shot mode.
+deployed upstream Hermes checkout in one-shot mode. The runtime proof treats
+that executable as a required session capability, so a deployed agent is not
+considered ready for Codex-like task work unless the executor path is present
+and executable.
 
 Fleet deploy deliberately avoids printing the mac-agent process command line.
 On Linux it reports `mac-agent.service` with `systemctl show` summary fields
