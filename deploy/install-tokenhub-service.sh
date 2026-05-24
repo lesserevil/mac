@@ -566,24 +566,36 @@ EOF
 }
 
 wait_for_tokenhub() {
-  local health_url="http://127.0.0.1:${TOKENHUB_PORT}/healthz"
+  local health_urls=("http://127.0.0.1:${TOKENHUB_PORT}/healthz" "${TOKENHUB_URL%/}/healthz")
+  local health_url
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if curl -fsS --connect-timeout 2 --max-time 5 "$health_url" >/dev/null 2>&1; then
-      log "TokenHub ready at $health_url"
-      return
-    fi
+    for health_url in "${health_urls[@]}"; do
+      if curl -fsS --connect-timeout 2 --max-time 5 "$health_url" >/dev/null 2>&1; then
+        log "TokenHub ready at $health_url"
+        return
+      fi
+    done
     sleep 2
   done
-  echo "[tokenhub] ERROR: TokenHub did not become ready at $health_url" >&2
+  echo "[tokenhub] ERROR: TokenHub did not become ready at ${health_urls[*]}" >&2
   exit 1
 }
 
+tokenhub_admin_base_url() {
+  if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${TOKENHUB_PORT}/healthz" >/dev/null 2>&1; then
+    printf 'http://127.0.0.1:%s\n' "$TOKENHUB_PORT"
+  else
+    printf '%s\n' "${TOKENHUB_URL%/}"
+  fi
+}
+
 configure_aliases() {
-  local admin_token api_key models_json selected_model
+  local admin_token api_key models_json selected_model admin_base_url
   admin_token="$(read_env_value "$TOKENHUB_STATE_DIR/env" TOKENHUB_ADMIN_TOKEN || read_env_value "$TOKENHUB_STATE_DIR/service.env" TOKENHUB_ADMIN_TOKEN || true)"
   api_key="$(read_env_value "$TOKENHUB_STATE_DIR/env" TOKENHUB_API_KEY || true)"
   [ -n "$admin_token" ] || return 0
-  models_json="$(curl -fsS --connect-timeout 2 --max-time 10 -H "Authorization: Bearer ${api_key:-$admin_token}" "http://127.0.0.1:${TOKENHUB_PORT}/v1/models" || true)"
+  admin_base_url="$(tokenhub_admin_base_url)"
+  models_json="$(curl -fsS --connect-timeout 2 --max-time 10 -H "Authorization: Bearer ${api_key:-$admin_token}" "${admin_base_url%/}/v1/models" || true)"
   selected_model="$("$PYTHON_BIN" - "$models_json" <<'PY'
 import json
 import sys
@@ -616,12 +628,12 @@ print("")
 PY
 )"
   [ -n "$selected_model" ] || return 0
-  "$PYTHON_BIN" - "$admin_token" "$selected_model" "$TOKENHUB_PORT" <<'PY'
+  "$PYTHON_BIN" - "$admin_token" "$selected_model" "$admin_base_url" <<'PY'
 import json
 import sys
 import urllib.request
 
-admin_token, selected_model, port = sys.argv[1], sys.argv[2], sys.argv[3]
+admin_token, selected_model, base_url = sys.argv[1], sys.argv[2], sys.argv[3].rstrip("/")
 aliases = [
     "mac-chat",
     "mac-embedding",
@@ -639,7 +651,7 @@ body = json.dumps(
 ).encode("utf-8")
 for alias in aliases:
     req = urllib.request.Request(
-        "http://127.0.0.1:%s/admin/v1/aliases/%s" % (port, alias),
+        "%s/admin/v1/aliases/%s" % (base_url, alias),
         data=body,
         method="PUT",
         headers={
