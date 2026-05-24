@@ -1370,6 +1370,7 @@ write_hermes_runtime_context() {
     --mac-url "${MAC_HUB_URL:-${HUB_URL:-}}" \
     --hermes-home "${HERMES_HOME:-$HOME/.hermes}" \
     --mac-home "$MAC_HOME" \
+    --workspace "$SRC_DIR" \
     --tenant-id "${MAC_FLEET_TENANT_ID:-}" \
     --persona-id "${MAC_HERMES_PERSONA_ID:-}" \
     --hermes-instance-id "${MAC_HERMES_INSTANCE_ID:-}" \
@@ -2909,6 +2910,8 @@ values["MAC_WORKER_HERMES_INSTANCE_ID"] = values["MAC_HERMES_INSTANCE_ID"]
 values["MAC_HERMES_RUNTIME_CONTEXT_FILE"] = str(home / ".hermes" / "mac-runtime-context.json")
 values["MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN"] = str(home / ".hermes" / "mac-runtime-context.md")
 values["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] = "1"
+values["MAC_HERMES_WORKSPACE"] = str(mac_home / "src" / "mac")
+values["MAC_PROJECT_CONTRACT_FILE"] = str(mac_home / "src" / "mac" / ".mac" / "project.yaml")
 values["MAC_SELF_UPDATE_REPO"] = str(mac_home / "src" / "mac")
 values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")
 values.setdefault("MAC_BEADS_BRIDGE_ROOT", str(mac_home / "beads-checkouts"))

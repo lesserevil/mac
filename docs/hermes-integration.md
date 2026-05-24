@@ -180,7 +180,8 @@ Fleet deployment now also writes a Hermes-visible runtime bootstrap contract:
 - `~/.hermes/mac-runtime-context.json` (`mac.hermes.runtime_context.v1`)
 - `~/.hermes/mac-runtime-context.md`
 - `MAC_HERMES_INSTANCE_ID`, `MAC_WORKER_HERMES_INSTANCE_ID`, `MAC_AGENT_ID`,
-  and `MAC_URL` in the Hermes environment
+  `MAC_HERMES_WORKSPACE`, `MAC_PROJECT_CONTRACT_FILE`, and `MAC_URL` in the
+  Hermes environment
 
 That contract is the runtime reminder that MAC owns tasks, projects,
 dependencies, agent assignments, reviews, and publications while Hermes owns
@@ -188,6 +189,13 @@ soul, personality, private memory, and conversation state. Deployed workers are
 registered against the same deterministic Hermes instance id, so
 `mac-hermes work-context $MAC_HERMES_INSTANCE_ID` gives the agent the same
 task/project graph the MAC API, CLI, and dashboard show.
+
+The same runtime context now carries a direct-session capability contract. A
+Hermes session sees the MAC source workspace, the repository Beads contract,
+the `bd prime` workflow, the `mac`, `mac-hermes`, and `hgmac` CLIs, Git status
+and quality-gate commands, and the hub Firecrawl web-search affordance. Startup
+health and runtime proof reports treat those declarations as part of the
+MAC/Hermes bridge rather than as tribal knowledge from an operator shell.
 
 Deployment also patches Hermes' prompt builder to load
 `mac-runtime-context.md` as a normal context source. That means gateway, CLI,

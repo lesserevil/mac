@@ -728,6 +728,22 @@ class ControlPlane:
         prompt_bridge = runtime.get("prompt_bridge") if isinstance(runtime.get("prompt_bridge"), dict) else {}
         runtime_required = bool(runtime.get("required"))
         runtime_instance_id = runtime.get("hermes_instance_id")
+        session_capabilities = {
+            str(name)
+            for name in (runtime.get("session_capability_names") or [])
+            if str(name).strip()
+        }
+        expected_session_capabilities = {
+            "mac_api",
+            "mac_cli",
+            "mac_hermes_cli",
+            "hgmac_agent_ops_cli",
+            "beads_issue_tracker",
+            "git_source_control",
+            "quality_gate",
+            "web_search",
+        }
+        session_contract_required = runtime_required or bool(session_capabilities)
         checks: JsonDict = {
             "api_work_context_schema": work_context.get("schema") == "mac.hermes_work_context.v1",
             "mac_authority_declared": (
@@ -754,6 +770,11 @@ class ControlPlane:
             "runtime_prompt_bridge_active": (
                 bool(prompt_bridge.get("present"))
                 if bool(prompt_bridge.get("required")) or runtime_required
+                else True
+            ),
+            "runtime_session_capabilities_declared": (
+                expected_session_capabilities <= session_capabilities
+                if session_contract_required
                 else True
             ),
             "dashboard_projection_available": True,
@@ -788,6 +809,9 @@ class ControlPlane:
                     "context_file": runtime.get("context_file"),
                     "markdown_file": runtime.get("markdown_file"),
                     "prompt_bridge": prompt_bridge,
+                    "workspace": runtime.get("workspace"),
+                    "session_capability_names": sorted(session_capabilities),
+                    "session_capabilities": runtime.get("session_capabilities", []),
                 },
                 "work_context": {
                     "task_count": work_context.get("task_count"),

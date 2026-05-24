@@ -236,6 +236,9 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         "mac_url": _redact_url(os.environ.get("MAC_URL") or os.environ.get("MAC_HUB_URL")),
         "authority": {},
         "operation_groups": [],
+        "workspace": {},
+        "session_capability_names": [],
+        "session_capabilities": [],
         "warning": "",
         "error": "",
     }
@@ -268,6 +271,27 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
     authority = data.get("authority") if isinstance(data.get("authority"), dict) else {}
     endpoints = data.get("endpoints") if isinstance(data.get("endpoints"), dict) else {}
     operations = data.get("operations") if isinstance(data.get("operations"), dict) else {}
+    session = data.get("session_capabilities") if isinstance(data.get("session_capabilities"), dict) else {}
+    workspace = session.get("workspace") if isinstance(session.get("workspace"), dict) else {}
+    if not workspace and isinstance(data.get("workspace"), dict):
+        workspace = data.get("workspace")
+    raw_capabilities = session.get("capabilities") if isinstance(session.get("capabilities"), list) else []
+    session_capabilities = [
+        {
+            "name": item.get("name"),
+            "kind": item.get("kind"),
+            "required": bool(item.get("required")),
+            "command": item.get("command"),
+            "endpoint": _redact_url(item.get("endpoint")) if isinstance(item.get("endpoint"), str) else None,
+        }
+        for item in raw_capabilities
+        if isinstance(item, dict) and item.get("name")
+    ]
+    session_capability_names = sorted(
+        str(item["name"])
+        for item in session_capabilities
+        if str(item.get("name") or "").strip()
+    )
     summary.update(
         {
             "schema": data.get("schema"),
@@ -288,6 +312,22 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
                 "user_memory": authority.get("user_memory"),
             },
             "operation_groups": sorted(str(key) for key in operations.keys()),
+            "workspace": {
+                "path": workspace.get("path"),
+                "project_contract": (
+                    {
+                        "path": workspace.get("project_contract", {}).get("path"),
+                        "exists": workspace.get("project_contract", {}).get("exists"),
+                        "schema": workspace.get("project_contract", {}).get("schema"),
+                        "project": workspace.get("project_contract", {}).get("project"),
+                        "test_command": workspace.get("project_contract", {}).get("test_command"),
+                    }
+                    if isinstance(workspace.get("project_contract"), dict)
+                    else {}
+                ),
+            },
+            "session_capability_names": session_capability_names,
+            "session_capabilities": session_capabilities,
         }
     )
     if data.get("schema") != RUNTIME_CONTEXT_SCHEMA:
@@ -310,6 +350,24 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
             if required:
                 summary["warning"] = summary["error"]
             return summary
+    expected_capabilities = {
+        "mac_api",
+        "mac_cli",
+        "mac_hermes_cli",
+        "hgmac_agent_ops_cli",
+        "beads_issue_tracker",
+        "git_source_control",
+        "quality_gate",
+        "web_search",
+    }
+    if not expected_capabilities <= set(session_capability_names):
+        missing = sorted(expected_capabilities - set(session_capability_names))
+        summary["ready"] = not required
+        summary["status"] = "session_capability_contract_missing"
+        summary["error"] = "runtime context is missing session capabilities: %s" % ", ".join(missing)
+        if required:
+            summary["warning"] = summary["error"]
+        return summary
     summary["status"] = "ready"
     return summary
 
@@ -1249,6 +1307,20 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 and task_project_runtime["authority"].get("projects") == "mac"
                 and task_project_runtime["authority"].get("agents") == "mac"
             )
+        ),
+        "mac_session_capability_contract_declared": (
+            not task_project_runtime["required"]
+            or {
+                "mac_api",
+                "mac_cli",
+                "mac_hermes_cli",
+                "hgmac_agent_ops_cli",
+                "beads_issue_tracker",
+                "git_source_control",
+                "quality_gate",
+                "web_search",
+            }
+            <= set(task_project_runtime["session_capability_names"])
         ),
         "gateway_runtime_override_active": (
             not (

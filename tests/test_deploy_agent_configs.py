@@ -225,6 +225,9 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
     assert env_example["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"
     assert env_example["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_example"
+    assert env_example["MAC_HERMES_WORKSPACE"] == "/home/mac/.mac/src/mac"
+    assert env_example["MAC_PROJECT_CONTRACT_FILE"] == "/home/mac/.mac/src/mac/.mac/project.yaml"
+    assert '--workspace "$SRC_DIR"' in script
     assert cfg["defaults"]["firecrawl"]["install"] == "auto"
     assert cfg["defaults"]["firecrawl"]["required"] is True
     assert cfg["defaults"]["firecrawl"]["port"] == 3002

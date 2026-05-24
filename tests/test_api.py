@@ -1053,6 +1053,7 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "workflowGraph" in app_js
     assert "hermes_runtime_proofs" in app_js
     assert "Runtime Proof" in app_js
+    assert "Session caps" in app_js
     assert 'data-view="work"' in index_html
     assert 'data-view="map"' in index_html
     assert 'data-view="workflows"' in index_html

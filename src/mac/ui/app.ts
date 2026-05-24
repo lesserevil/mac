@@ -1871,6 +1871,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const proofEvidence = (proof?.evidence || {}) as JsonObject;
   const proofRuntime = (proofEvidence.hermes_runtime || {}) as JsonObject;
   const proofWork = (proofEvidence.work_context || {}) as JsonObject;
+  const proofSessionCapabilities = (proofRuntime.session_capability_names || []) as unknown[];
   const proofMissing = proof?.missing || [];
   return `
     <article class="record">
@@ -1915,6 +1916,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Schema", proof.schema)}
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", ((proofRuntime.prompt_bridge || {}) as JsonObject).present ? "active" : "not required")}
+            ${field("Session caps", proofSessionCapabilities.length)}
             ${field("Bound agents", String(((proofWork.bound_agent_ids || []) as unknown[]).length))}
           </div>
         </div>

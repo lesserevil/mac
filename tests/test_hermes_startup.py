@@ -32,6 +32,7 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_HERMES_RUNTIME_CONTEXT_FILE",
         "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN",
         "MAC_HERMES_RUNTIME_CONTEXT_REQUIRED",
+        "MAC_HERMES_WORKSPACE",
         "MAC_HERMES_INSTANCE_ID",
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
@@ -44,6 +45,7 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_REQUIRE_HERMES_STARTUP_READY",
         "MAC_REQUIRE_QDRANT_MEMORY",
         "MAC_SHARED_SERVICES_MANAGER_AGENT",
+        "MAC_PROJECT_CONTRACT_FILE",
         "MAC_URL",
         "MAC_WORKER_HERMES_INSTANCE_ID",
         "ACC_HERMES_GATEWAY_BASE_URL",
@@ -525,12 +527,30 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
     agent_dir = tmp_path / "hermes-agent"
+    workspace = tmp_path / "workspace" / "mac"
     context_path = hermes_home / "mac-runtime-context.json"
     markdown_path = hermes_home / "mac-runtime-context.md"
     _write(hermes_home / "config.yaml", "model: local\n")
     _write(hermes_home / "SOUL.md", "soul")
     _write(hermes_home / "MEMORY.md", "memory")
     _write(hermes_home / "state.db", "state")
+    _write(
+        workspace / ".mac" / "project.yaml",
+        "\n".join(
+            [
+                "schema: mac.repository_contract.v1",
+                "project: repo-beads-mac",
+                "toolchain:",
+                "  required_commands:",
+                "    - python3",
+                "    - git",
+                "    - bd",
+                "test:",
+                "  command: scripts/run-contract-tests.sh",
+                "",
+            ]
+        ),
+    )
     context = build_runtime_context(
         agent_name="rocky",
         fleet_name="classic",
@@ -539,6 +559,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
         mac_home=tmp_path / ".mac",
         hermes_instance_id="hermes_rocky",
         agent_id="agent_rocky",
+        workspace_path=workspace,
     )
     _write(context_path, json.dumps(context))
     _write(markdown_path, "private runtime command notes")
@@ -562,9 +583,14 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["hermes_instance_id"] == "hermes_rocky"
     assert report["task_project_runtime"]["agent_id"] == "agent_rocky"
     assert report["task_project_runtime"]["mac_url"] == "http://hub.example.internal:8789"
+    assert report["task_project_runtime"]["workspace"]["path"] == str(workspace)
+    assert report["task_project_runtime"]["workspace"]["project_contract"]["project"] == "repo-beads-mac"
+    assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]
+    assert "beads_issue_tracker" in report["task_project_runtime"]["session_capability_names"]
     assert report["checks"]["task_project_runtime_context_available"] is True
     assert report["checks"]["task_project_runtime_prompt_bridge_active"] is True
     assert report["checks"]["mac_task_project_authority_declared"] is True
+    assert report["checks"]["mac_session_capability_contract_declared"] is True
     assert report["task_project_runtime"]["prompt_bridge"]["present"] is True
     rendered = str(report)
     assert "token=hidden" not in rendered

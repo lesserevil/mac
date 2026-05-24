@@ -18,6 +18,31 @@ def parse_env(path):
 def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     hermes_home = tmp_path / ".hermes"
     mac_home = tmp_path / ".mac"
+    workspace = tmp_path / "workspace" / "mac"
+    (workspace / ".mac").mkdir(parents=True)
+    (workspace / ".mac" / "project.yaml").write_text(
+        "\n".join(
+            [
+                "schema: mac.repository_contract.v1",
+                "project: repo-beads-mac",
+                "toolchain:",
+                "  required_commands:",
+                "    - python3",
+                "    - git",
+                "    - bd",
+                "bootstrap:",
+                "  command: python3 scripts/bootstrap-project.py",
+                "test:",
+                "  command: scripts/run-contract-tests.sh",
+                "evidence:",
+                "  required:",
+                "    - repo.pushed",
+                "    - tests",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     context_path = hermes_home / "mac-runtime-context.json"
     markdown_path = hermes_home / "mac-runtime-context.md"
     env_path = hermes_home / ".env"
@@ -31,6 +56,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         mac_url="http://hub.example.internal:8789/path?token=hidden",
         hermes_home=hermes_home,
         mac_home=mac_home,
+        workspace_path=workspace,
     )
 
     stored = json.loads(context_path.read_text(encoding="utf-8"))
@@ -45,8 +71,25 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert stored["authority"]["agents"] == "mac"
     assert stored["authority"]["personality"] == "hermes"
     assert stored["endpoints"]["mac_api"] == "http://hub.example.internal:8789/path"
+    assert stored["workspace"]["path"] == str(workspace)
+    assert stored["workspace"]["project_contract"]["project"] == "repo-beads-mac"
+    capability_names = {item["name"] for item in stored["session_capabilities"]["capabilities"]}
+    assert {
+        "mac_api",
+        "mac_cli",
+        "mac_hermes_cli",
+        "hgmac_agent_ops_cli",
+        "beads_issue_tracker",
+        "git_source_control",
+        "quality_gate",
+        "web_search",
+    } <= capability_names
     assert "mac-hermes work-context hermes_rocky_host --active-only" in markdown
     assert "mac-hermes claim {task_id} agent_rocky_host" in markdown
+    assert "Direct Session Parity" in markdown
+    assert "`bd prime`" in markdown
+    assert "`hgmac agents list`" in markdown
+    assert "`scripts/run-contract-tests.sh`" in markdown
     assert env["MAC_HERMES_RUNTIME_CONTEXT_FILE"] == str(context_path)
     assert env["MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN"] == str(markdown_path)
     assert env["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"
@@ -54,6 +97,8 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert env["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_rocky_host"
     assert env["MAC_AGENT_ID"] == "agent_rocky_host"
     assert env["MAC_URL"] == "http://hub.example.internal:8789/path"
+    assert env["MAC_HERMES_WORKSPACE"] == str(workspace)
+    assert env["MAC_PROJECT_CONTRACT_FILE"] == str(workspace / ".mac" / "project.yaml")
     assert "token=hidden" not in str(stored)
     assert "MAC_TOKEN" not in env
 

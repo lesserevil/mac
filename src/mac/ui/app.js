@@ -1460,6 +1460,7 @@ function hermesRecord(instance, data) {
     const proofEvidence = (proof?.evidence || {});
     const proofRuntime = (proofEvidence.hermes_runtime || {});
     const proofWork = (proofEvidence.work_context || {});
+    const proofSessionCapabilities = (proofRuntime.session_capability_names || []);
     const proofMissing = proof?.missing || [];
     return `
     <article class="record">
@@ -1504,6 +1505,7 @@ function hermesRecord(instance, data) {
             ${field("Schema", proof.schema)}
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", (proofRuntime.prompt_bridge || {}).present ? "active" : "not required")}
+            ${field("Session caps", proofSessionCapabilities.length)}
             ${field("Bound agents", String((proofWork.bound_agent_ids || []).length))}
           </div>
         </div>
