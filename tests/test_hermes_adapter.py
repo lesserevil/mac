@@ -178,6 +178,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         for command in work_context["operations"]["mac_hermes_cli"]
     )
     assert any(
+        "mac-hermes web-search" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
+    assert any(
         "hgmac agents create" in command
         for command in work_context["operations"]["hgmac_cli"]
     )
@@ -455,6 +459,40 @@ def test_hermes_adapter_records_and_lists_command_audit():
     assert record["metadata"] == {"purpose": "test"}
     records = adapter.list_command_audit(agent_id=worker.id, task_id=task.id, limit=5)
     assert [item["id"] for item in records] == [record["id"]]
+
+
+def test_hermes_adapter_exposes_firecrawl_web_research_bridge():
+    calls = []
+
+    def request(method, path, payload):
+        calls.append((method, path, payload))
+        if path.startswith("/v2/crawl/"):
+            return {"success": True, "status": "completed", "data": []}
+        return {"success": True, "path": path, "payload": payload}
+
+    adapter = HermesMacAdapter(
+        MacApiClient("http://mac.invalid"),
+        web_client=MacApiClient("http://firecrawl:3002", transport=request),
+    )
+
+    assert adapter.web_search("release notes", limit=2)["success"] is True
+    assert adapter.web_scrape("https://example.com", formats=["markdown", "html"])["success"] is True
+    assert adapter.web_crawl("https://example.com", limit=1, formats=["markdown"])["success"] is True
+    assert adapter.web_crawl_status("crawl_1")["status"] == "completed"
+    assert calls == [
+        ("POST", "/v2/search", {"query": "release notes", "limit": 2}),
+        ("POST", "/v2/scrape", {"url": "https://example.com", "formats": ["markdown", "html"]}),
+        (
+            "POST",
+            "/v2/crawl",
+            {
+                "url": "https://example.com",
+                "limit": 1,
+                "scrapeOptions": {"formats": ["markdown"]},
+            },
+        ),
+        ("GET", "/v2/crawl/crawl_1", None),
+    ]
 
 
 def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
@@ -979,4 +1017,48 @@ def test_mac_hermes_cli_exposes_command_audit_operations(monkeypatch, capsys):
             "/command-audit?agent_id=agent_1&task_id=task_1&phase=completed&limit=5",
             None,
         ),
+    ]
+
+
+def test_mac_hermes_cli_exposes_firecrawl_web_research_commands(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((self.base_url, method, path, payload))
+        if path.startswith("/v2/crawl/"):
+            return {"success": True, "status": "completed", "data": []}
+        return {"success": True, "path": path, "payload": payload}
+
+    monkeypatch.setattr(MacApiClient, "request", request)
+    commands = [
+        ["web-search", "release notes", "--limit", "2"],
+        ["web-scrape", "https://example.com", "--format", "markdown", "--format", "html"],
+        ["web-crawl", "https://example.com", "--limit", "1", "--format", "markdown"],
+        ["web-crawl-status", "crawl_1"],
+    ]
+
+    for command in commands:
+        rc = mac_hermes_main(["--web-url", "http://firecrawl:3002", *command])
+        assert rc == 0
+        capsys.readouterr()
+
+    assert calls == [
+        ("http://firecrawl:3002", "POST", "/v2/search", {"query": "release notes", "limit": 2}),
+        (
+            "http://firecrawl:3002",
+            "POST",
+            "/v2/scrape",
+            {"url": "https://example.com", "formats": ["markdown", "html"]},
+        ),
+        (
+            "http://firecrawl:3002",
+            "POST",
+            "/v2/crawl",
+            {
+                "url": "https://example.com",
+                "limit": 1,
+                "scrapeOptions": {"formats": ["markdown"]},
+            },
+        ),
+        ("http://firecrawl:3002", "GET", "/v2/crawl/crawl_1", None),
     ]

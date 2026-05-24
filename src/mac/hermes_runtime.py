@@ -190,10 +190,10 @@ def _session_capability_contract(
                 "name": "web_search",
                 "kind": "service",
                 "required": True,
-                "command": "mac-firecrawl-gateway --help",
-                "expected_path": str(mac_home / "venv" / "bin" / "mac-firecrawl-gateway"),
+                "command": "mac-hermes web-search \"mac release notes\" --limit 1",
+                "expected_path": str(mac_home / "venv" / "bin" / "mac-hermes"),
                 "environment": ["FIRECRAWL_API_URL", "FIRECRAWL_GATEWAY_URL", "MAC_WEB_SEARCH_PROVIDER"],
-                "purpose": "Web search, extraction, and crawl access through the hub Firecrawl-compatible service.",
+                "purpose": "Web search, extraction, and crawl access through the Hermes bridge to the hub Firecrawl-compatible service.",
             },
         ],
         "direct_session_workflow": [
@@ -206,6 +206,7 @@ def _session_capability_contract(
             "mac-hermes agents",
             "mac-hermes claim-next %s --dry-run" % agent_id,
             "mac-hermes command-audit list --agent-id %s --limit 5" % agent_id,
+            "mac-hermes web-search \"project dependency release notes\" --limit 5",
             "hgmac agents identity %s" % agent_id,
             "hgmac agents claim-next %s --dry-run" % agent_id,
             "git status --short --branch",
@@ -216,7 +217,7 @@ def _session_capability_contract(
             "Use Beads for issue tracking in registered project repositories that declare it.",
             "Use hgmac for agent CRUD and operational agent state, not ad hoc database edits.",
             "Record command audit phases for shell work that changes or verifies task state.",
-            "Use Firecrawl-backed web search when current external information is required.",
+            "Use mac-hermes web-search/web-scrape/web-crawl when current external information is required.",
             "Commit, pull/rebase, push Beads, and push Git before reporting completed code work.",
         ],
     }
@@ -429,6 +430,12 @@ def build_runtime_context(
                 "hgmac agents identity %s" % resolved_agent_id,
                 "hgmac agents claim-next %s --dry-run" % resolved_agent_id,
             ],
+            "web_research": [
+                "mac-hermes web-search \"current project dependency release notes\" --limit 5",
+                "mac-hermes web-scrape https://example.com --format markdown",
+                "mac-hermes web-crawl https://example.com --limit 1",
+                "mac-hermes web-crawl-status {crawl_id}",
+            ],
             "create_task": [
                 "mac-hermes task %s <title> --summary <summary> --project <project>"
                 % resolved_instance_id,
@@ -463,6 +470,7 @@ def build_runtime_context(
             "Hermes is authoritative for soul, personality, private memory, and conversation state.",
             "Refresh MAC work context before selecting, changing, or reporting on work.",
             "Record MAC command audit entries for shell phases that produce task evidence or change repository state.",
+            "Use the mac-hermes web research commands instead of undocumented local web-search state.",
             "Do not copy MAC task state into Hermes memory as a source of truth; write only completed-task summaries back to Hermes memory.",
         ],
     }
@@ -534,6 +542,9 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
         lines.append("- `%s`" % command)
     lines.extend(["", "## Agent View", ""])
     for command in operations.get("agent_view", []):
+        lines.append("- `%s`" % command)
+    lines.extend(["", "## Web Research", ""])
+    for command in operations.get("web_research", []):
         lines.append("- `%s`" % command)
     lines.extend(["", "## Task Lifecycle", ""])
     for command in operations["create_task"] + operations["task_lifecycle"]:

@@ -175,6 +175,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert any("mac-hermes project-items" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes claim-next" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes command-audit" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("mac-hermes web-search" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes agents" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("hgmac agents create" in command for command in work_context["operations"]["hgmac_cli"])
 

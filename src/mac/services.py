@@ -741,6 +741,9 @@ class ControlPlane:
             "mac-hermes review-decision",
             "mac-hermes publish",
             "mac-hermes command-audit",
+            "mac-hermes web-search",
+            "mac-hermes web-scrape",
+            "mac-hermes web-crawl",
             "mac-hermes writeback",
         )
         expected_agent_cli_fragments = (
@@ -1506,6 +1509,10 @@ class ControlPlane:
                 "mac-hermes publish {task_id} {target} {created_by}",
                 "mac-hermes command-audit record {agent_id} --phase started --argv-json '[\"git\",\"status\"]' --cwd /workspace",
                 "mac-hermes command-audit list --agent-id {agent_id}",
+                "mac-hermes web-search \"current release notes\" --limit 5",
+                "mac-hermes web-scrape https://example.com --format markdown",
+                "mac-hermes web-crawl https://example.com --limit 1",
+                "mac-hermes web-crawl-status {crawl_id}",
                 "mac-hermes writeback %s {task_id}" % hermes_instance_id,
             ],
             "hgmac_cli": [

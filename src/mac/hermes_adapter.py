@@ -135,11 +135,32 @@ class MacApiClient:
         return json.loads(raw) if raw else None
 
 
+def _default_web_url() -> str:
+    return (
+        os.environ.get("FIRECRAWL_API_URL")
+        or os.environ.get("FIRECRAWL_GATEWAY_URL")
+        or os.environ.get("MAC_WEB_SEARCH_URL")
+        or ""
+    ).rstrip("/")
+
+
 class HermesMacAdapter:
     """High-level helper intended to be called from Hermes skills/gateways."""
 
-    def __init__(self, client: MacApiClient) -> None:
+    def __init__(self, client: MacApiClient, web_client: Optional[MacApiClient] = None) -> None:
         self.client = client
+        self.web_client = web_client
+
+    def _web_client(self) -> MacApiClient:
+        if self.web_client is not None:
+            return self.web_client
+        web_url = _default_web_url()
+        if not web_url:
+            raise MacApiError(
+                "web search requires FIRECRAWL_API_URL, FIRECRAWL_GATEWAY_URL, or MAC_WEB_SEARCH_URL"
+            )
+        self.web_client = MacApiClient(web_url, token=os.environ.get("FIRECRAWL_API_KEY"))
+        return self.web_client
 
     def register_identity(
         self,
@@ -589,6 +610,47 @@ class HermesMacAdapter:
         )
         return self.client.get("/command-audit?%s" % query)
 
+    def web_search(self, query: str, *, limit: int = 5) -> JsonDict:
+        if not str(query).strip():
+            raise MacApiError("web search query is required")
+        return self._web_client().post(
+            "/v2/search",
+            {"query": str(query).strip(), "limit": int(limit)},
+        )
+
+    def web_scrape(self, url: str, *, formats: Sequence[str] = ("markdown",)) -> JsonDict:
+        if not str(url).strip():
+            raise MacApiError("web scrape url is required")
+        selected_formats = [str(item).strip() for item in formats if str(item).strip()]
+        return self._web_client().post(
+            "/v2/scrape",
+            {"url": str(url).strip(), "formats": selected_formats or ["markdown"]},
+        )
+
+    def web_crawl(
+        self,
+        url: str,
+        *,
+        limit: int = 1,
+        formats: Sequence[str] = ("markdown",),
+    ) -> JsonDict:
+        if not str(url).strip():
+            raise MacApiError("web crawl url is required")
+        selected_formats = [str(item).strip() for item in formats if str(item).strip()]
+        return self._web_client().post(
+            "/v2/crawl",
+            {
+                "url": str(url).strip(),
+                "limit": int(limit),
+                "scrapeOptions": {"formats": selected_formats or ["markdown"]},
+            },
+        )
+
+    def web_crawl_status(self, job_id: str) -> JsonDict:
+        if not str(job_id).strip():
+            raise MacApiError("web crawl job id is required")
+        return self._web_client().get("/v2/crawl/%s" % _path_part(str(job_id).strip()))
+
     def user_reply_for_task(self, task_id: str) -> str:
         summary = self.task_summary(task_id)
         if summary["state"] == "completed":
@@ -735,7 +797,9 @@ def _print(value: Any) -> None:
 
 def _adapter(args: argparse.Namespace) -> HermesMacAdapter:
     client = MacApiClient(args.url, token=args.token)
-    return HermesMacAdapter(client)
+    web_url = (args.web_url or "").rstrip()
+    web_client = MacApiClient(web_url, token=args.web_token) if web_url else None
+    return HermesMacAdapter(client, web_client=web_client)
 
 
 def _cmd_register(args: argparse.Namespace) -> None:
@@ -1011,6 +1075,28 @@ def _cmd_command_audit_list(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_web_search(args: argparse.Namespace) -> None:
+    _print(_adapter(args).web_search(args.query, limit=args.limit))
+
+
+def _cmd_web_scrape(args: argparse.Namespace) -> None:
+    _print(_adapter(args).web_scrape(args.url, formats=args.format or ("markdown",)))
+
+
+def _cmd_web_crawl(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).web_crawl(
+            args.url,
+            limit=args.limit,
+            formats=args.format or ("markdown",),
+        )
+    )
+
+
+def _cmd_web_crawl_status(args: argparse.Namespace) -> None:
+    _print(_adapter(args).web_crawl_status(args.job_id))
+
+
 def _cmd_reply(args: argparse.Namespace) -> None:
     print(_adapter(args).user_reply_for_task(args.task_id))
 
@@ -1034,6 +1120,8 @@ def build_parser() -> argparse.ArgumentParser:
         or os.environ.get("MAC_WORKER_TOKEN")
         or os.environ.get("MAC_API_TOKEN"),
     )
+    parser.add_argument("--web-url", default=_default_web_url())
+    parser.add_argument("--web-token", default=os.environ.get("FIRECRAWL_API_KEY"))
     sub = parser.add_subparsers(dest="command", required=True)
 
     register = sub.add_parser("register", help="register tenant, persona, Hermes instance, and optional platform bindings")
@@ -1237,6 +1325,26 @@ def build_parser() -> argparse.ArgumentParser:
     command_audit_list.add_argument("--until")
     command_audit_list.add_argument("--limit", type=int, default=200)
     command_audit_list.set_defaults(func=_cmd_command_audit_list)
+
+    web_search = sub.add_parser("web-search", help="search through the hub Firecrawl-compatible gateway")
+    web_search.add_argument("query")
+    web_search.add_argument("--limit", type=int, default=5)
+    web_search.set_defaults(func=_cmd_web_search)
+
+    web_scrape = sub.add_parser("web-scrape", help="extract one page through the hub Firecrawl-compatible gateway")
+    web_scrape.add_argument("url")
+    web_scrape.add_argument("--format", action="append", choices=("markdown", "html"), default=None)
+    web_scrape.set_defaults(func=_cmd_web_scrape)
+
+    web_crawl = sub.add_parser("web-crawl", help="start a bounded crawl through the hub Firecrawl-compatible gateway")
+    web_crawl.add_argument("url")
+    web_crawl.add_argument("--limit", type=int, default=1)
+    web_crawl.add_argument("--format", action="append", choices=("markdown", "html"), default=None)
+    web_crawl.set_defaults(func=_cmd_web_crawl)
+
+    web_crawl_status = sub.add_parser("web-crawl-status", help="fetch a Firecrawl-compatible crawl status")
+    web_crawl_status.add_argument("job_id")
+    web_crawl_status.set_defaults(func=_cmd_web_crawl_status)
 
     reply = sub.add_parser("reply", help="render a concise user-facing task status")
     reply.add_argument("task_id")
