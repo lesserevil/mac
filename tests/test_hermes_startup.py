@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,8 +58,11 @@ def _clear_startup_env(monkeypatch) -> None:
         "ACC_LLM_MODEL",
         "ACC_SLACK_HOME_CHANNEL_NAME",
         "CUSTOM_BASE_URL",
+        "FIRECRAWL_API_URL",
+        "FIRECRAWL_GATEWAY_URL",
         "HERMES_INFERENCE_MODEL",
         "HERMES_INFERENCE_PROVIDER",
+        "MAC_WEB_SEARCH_PROVIDER",
         "OPENAI_BASE_URL",
         "QDRANT_ADDRESS",
         "QDRANT_API_KEY",
@@ -72,6 +76,28 @@ def _clear_startup_env(monkeypatch) -> None:
         "TOKENHUB_URL",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def _executable(path, content: str = "#!/bin/sh\nexit 0\n") -> None:
+    _write(path, content)
+    path.chmod(0o755)
+
+
+def _prepare_direct_session_tools(monkeypatch, mac_home, workspace) -> None:
+    for name in ("mac", "mac-hermes", "hgmac", "mac-firecrawl-gateway"):
+        _executable(mac_home / "venv" / "bin" / name)
+    _executable(mac_home / "bin" / "bd")
+    _executable(workspace / "scripts" / "run-contract-tests.sh")
+    monkeypatch.setenv(
+        "PATH",
+        "%s:%s:%s"
+        % (
+            mac_home / "venv" / "bin",
+            mac_home / "bin",
+            os.environ.get("PATH", ""),
+        ),
+    )
+    monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "http://hub.example.internal:3002")
 
 
 def test_startup_report_inventories_hermes_state_without_contents(monkeypatch, tmp_path):
@@ -527,6 +553,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
     agent_dir = tmp_path / "hermes-agent"
+    mac_home = tmp_path / ".mac"
     workspace = tmp_path / "workspace" / "mac"
     context_path = hermes_home / "mac-runtime-context.json"
     markdown_path = hermes_home / "mac-runtime-context.md"
@@ -551,12 +578,13 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
             ]
         ),
     )
+    _prepare_direct_session_tools(monkeypatch, mac_home, workspace)
     context = build_runtime_context(
         agent_name="rocky",
         fleet_name="classic",
         mac_url="http://secret@hub.example.internal:8789?token=hidden",
         hermes_home=hermes_home,
-        mac_home=tmp_path / ".mac",
+        mac_home=mac_home,
         hermes_instance_id="hermes_rocky",
         agent_id="agent_rocky",
         workspace_path=workspace,
@@ -587,14 +615,91 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["workspace"]["project_contract"]["project"] == "repo-beads-mac"
     assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]
     assert "beads_issue_tracker" in report["task_project_runtime"]["session_capability_names"]
+    availability = report["task_project_runtime"]["session_capability_availability"]
+    assert availability["ready"] is True
+    assert availability["missing"] == []
+    assert {item["name"] for item in availability["capabilities"] if item["ready"]} >= {
+        "mac_cli",
+        "mac_hermes_cli",
+        "hgmac_agent_ops_cli",
+        "beads_issue_tracker",
+        "quality_gate",
+        "web_search",
+    }
     assert report["checks"]["task_project_runtime_context_available"] is True
     assert report["checks"]["task_project_runtime_prompt_bridge_active"] is True
     assert report["checks"]["mac_task_project_authority_declared"] is True
     assert report["checks"]["mac_session_capability_contract_declared"] is True
+    assert report["checks"]["mac_session_capabilities_available"] is True
     assert report["task_project_runtime"]["prompt_bridge"]["present"] is True
     rendered = str(report)
     assert "token=hidden" not in rendered
     assert "private runtime command notes" not in rendered
+
+
+def test_required_task_project_runtime_context_blocks_when_session_tools_missing(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    workspace = tmp_path / "workspace" / "mac"
+    context_path = hermes_home / "mac-runtime-context.json"
+    markdown_path = hermes_home / "mac-runtime-context.md"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        workspace / ".mac" / "project.yaml",
+        "\n".join(
+            [
+                "schema: mac.repository_contract.v1",
+                "project: repo-beads-mac",
+                "toolchain:",
+                "  required_commands:",
+                "    - bd",
+                "test:",
+                "  command: scripts/run-contract-tests.sh",
+                "",
+            ]
+        ),
+    )
+    _write(
+        context_path,
+        json.dumps(
+            build_runtime_context(
+                agent_name="rocky",
+                fleet_name="classic",
+                mac_url="http://hub.example.internal:8789",
+                hermes_home=hermes_home,
+                mac_home=tmp_path / ".mac",
+                hermes_instance_id="hermes_rocky",
+                agent_id="agent_rocky",
+                workspace_path=workspace,
+            )
+        ),
+    )
+    _write(markdown_path, "runtime")
+    _write(
+        agent_dir / "agent" / "prompt_builder.py",
+        "_load_mac_runtime_context\nMAC_HERMES_RUNTIME_CONTEXT_MARKDOWN\nmac-runtime-context.md\n",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", str(context_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", str(markdown_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["task_project_runtime"]["status"] == "session_capability_unavailable"
+    assert report["checks"]["mac_session_capabilities_available"] is False
+    missing = report["task_project_runtime"]["session_capability_availability"]["missing"]
+    assert "mac_cli" in missing
+    assert "quality_gate" in missing
 
 
 def test_required_task_project_runtime_context_blocks_readiness_when_missing(

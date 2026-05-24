@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -181,6 +183,155 @@ def _runtime_prompt_bridge_report(
     return report
 
 
+def _command_name(command: Optional[str]) -> str:
+    if not command:
+        return ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    return parts[0] if parts else ""
+
+
+def _command_resolution(
+    command: Optional[str],
+    *,
+    expected_path: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> Dict[str, Any]:
+    executable = _command_name(command)
+    expected = Path(expected_path).expanduser() if expected_path else None
+    cwd_path = Path(cwd).expanduser() if cwd else None
+    expected_ref = (
+        {
+            **_file_ref(expected, "session_capability_executable", False),
+            "executable": expected.exists() and os.access(expected, os.X_OK),
+        }
+        if expected is not None
+        else None
+    )
+    resolved = None
+    local_candidate = None
+    if executable:
+        executable_path = Path(executable)
+        if executable_path.is_absolute():
+            if executable_path.exists() and os.access(executable_path, os.X_OK):
+                resolved = str(executable_path)
+        elif "/" in executable or "\\" in executable:
+            if cwd_path is not None:
+                candidate = cwd_path / executable
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    local_candidate = str(candidate)
+                    resolved = local_candidate
+        else:
+            resolved = shutil.which(executable)
+    if expected_ref and expected_ref["executable"] and not resolved:
+        resolved = expected_ref["path"]
+    return {
+        "command": command,
+        "executable": executable,
+        "resolved": resolved,
+        "expected_path": expected_ref,
+        "cwd": str(cwd_path) if cwd_path is not None else None,
+        "cwd_exists": cwd_path.exists() if cwd_path is not None else None,
+        "local_candidate": local_candidate,
+        "available": bool(resolved),
+    }
+
+
+def _session_capability_availability(
+    capabilities: List[Dict[str, Any]],
+    *,
+    workspace: Dict[str, Any],
+) -> Dict[str, Any]:
+    workspace_path = str(workspace.get("path") or "").strip()
+    workspace_ref = _file_ref(Path(workspace_path).expanduser(), "mac_hermes_workspace", False) if workspace_path else None
+    project_contract = workspace.get("project_contract") if isinstance(workspace.get("project_contract"), dict) else {}
+    contract_path = str(project_contract.get("path") or "").strip()
+    contract_ref = _file_ref(Path(contract_path).expanduser(), "mac_project_contract", False) if contract_path else None
+    required_commands = [
+        str(command).strip()
+        for command in (project_contract.get("required_commands") or [])
+        if str(command).strip()
+    ]
+    toolchain = [
+        {
+            "command": command,
+            "resolved": shutil.which(command),
+            "available": bool(shutil.which(command)),
+        }
+        for command in required_commands
+    ]
+    rows: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for item in capabilities:
+        name = str(item.get("name") or "").strip()
+        checks: Dict[str, bool] = {}
+        command_info = _command_resolution(
+            item.get("command") if isinstance(item.get("command"), str) else None,
+            expected_path=item.get("expected_path") if isinstance(item.get("expected_path"), str) else None,
+            cwd=item.get("cwd") if isinstance(item.get("cwd"), str) else workspace_path or None,
+        )
+        if item.get("command"):
+            checks["command_available"] = bool(command_info["available"])
+        if command_info["expected_path"] is not None:
+            checks["expected_path_executable"] = bool(command_info["expected_path"]["executable"])
+        if item.get("cwd"):
+            checks["cwd_exists"] = bool(command_info["cwd_exists"])
+        if name == "mac_api":
+            endpoint = item.get("endpoint")
+            checks["endpoint_configured"] = bool(endpoint and endpoint != "<invalid-url>")
+        if name == "web_search":
+            env_names = [
+                str(env_name)
+                for env_name in (item.get("environment") or [])
+                if str(env_name).strip()
+            ]
+            checks["web_search_environment_configured"] = any(
+                bool(os.environ.get(env_name)) for env_name in env_names
+            )
+        ready = all(checks.values()) if checks else True
+        row = {
+            "name": name,
+            "kind": item.get("kind"),
+            "required": bool(item.get("required")),
+            "ready": ready,
+            "checks": checks,
+            "command": command_info,
+            "environment": [
+                str(env_name)
+                for env_name in (item.get("environment") or [])
+                if str(env_name).strip()
+            ],
+        }
+        rows.append(row)
+        if item.get("required") and not ready:
+            missing.append(name or "unnamed_capability")
+    workspace_ready = bool(workspace_ref and workspace_ref["exists"] and workspace_ref.get("kind") == "dir")
+    contract_ready = bool(
+        contract_ref
+        and contract_ref["exists"]
+        and project_contract.get("schema") == "mac.repository_contract.v1"
+    )
+    missing.extend(
+        "project_toolchain:%s" % item["command"]
+        for item in toolchain
+        if not item["available"]
+    )
+    if not workspace_ready:
+        missing.append("workspace")
+    if not contract_ready:
+        missing.append("project_contract")
+    return {
+        "ready": not missing,
+        "missing": sorted(set(missing)),
+        "workspace": workspace_ref,
+        "project_contract": contract_ref,
+        "toolchain": toolchain,
+        "capabilities": rows,
+    }
+
+
 def _topology_summary(path: Path) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "file": _file_ref(path, "memory_topology", False),
@@ -239,6 +390,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         "workspace": {},
         "session_capability_names": [],
         "session_capabilities": [],
+        "session_capability_availability": {"ready": True, "missing": []},
         "warning": "",
         "error": "",
     }
@@ -283,6 +435,9 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
             "required": bool(item.get("required")),
             "command": item.get("command"),
             "endpoint": _redact_url(item.get("endpoint")) if isinstance(item.get("endpoint"), str) else None,
+            "expected_path": item.get("expected_path"),
+            "cwd": item.get("cwd"),
+            "environment": item.get("environment") if isinstance(item.get("environment"), list) else [],
         }
         for item in raw_capabilities
         if isinstance(item, dict) and item.get("name")
@@ -320,6 +475,8 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
                         "exists": workspace.get("project_contract", {}).get("exists"),
                         "schema": workspace.get("project_contract", {}).get("schema"),
                         "project": workspace.get("project_contract", {}).get("project"),
+                        "required_commands": workspace.get("project_contract", {}).get("required_commands") or [],
+                        "bootstrap_command": workspace.get("project_contract", {}).get("bootstrap_command"),
                         "test_command": workspace.get("project_contract", {}).get("test_command"),
                     }
                     if isinstance(workspace.get("project_contract"), dict)
@@ -365,6 +522,20 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         summary["ready"] = not required
         summary["status"] = "session_capability_contract_missing"
         summary["error"] = "runtime context is missing session capabilities: %s" % ", ".join(missing)
+        if required:
+            summary["warning"] = summary["error"]
+        return summary
+    availability = _session_capability_availability(
+        session_capabilities,
+        workspace=summary["workspace"],
+    )
+    summary["session_capability_availability"] = availability
+    if not availability["ready"]:
+        summary["ready"] = not required
+        summary["status"] = "session_capability_unavailable"
+        summary["error"] = "runtime session capabilities are unavailable: %s" % ", ".join(
+            availability["missing"]
+        )
         if required:
             summary["warning"] = summary["error"]
         return summary
@@ -1322,6 +1493,10 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             }
             <= set(task_project_runtime["session_capability_names"])
         ),
+        "mac_session_capabilities_available": (
+            not task_project_runtime["required"]
+            or bool(task_project_runtime["session_capability_availability"]["ready"])
+        ),
         "gateway_runtime_override_active": (
             not (
                 runtime["configured_model"]
@@ -1368,5 +1543,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "task_project_runtime_present": task_project_runtime["context_file"]["exists"],
             "task_project_runtime_prompt_bridge_present": task_project_runtime["prompt_bridge"]["present"],
             "task_project_runtime_hermes_instance_id": task_project_runtime["hermes_instance_id"],
+            "task_project_runtime_session_capabilities_ready": task_project_runtime[
+                "session_capability_availability"
+            ]["ready"],
         },
     }

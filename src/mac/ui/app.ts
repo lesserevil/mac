@@ -1872,6 +1872,9 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const proofRuntime = (proofEvidence.hermes_runtime || {}) as JsonObject;
   const proofWork = (proofEvidence.work_context || {}) as JsonObject;
   const proofSessionCapabilities = (proofRuntime.session_capability_names || []) as unknown[];
+  const proofSessionAvailability = (proofRuntime.session_capability_availability || {}) as JsonObject;
+  const unavailableSessionCapabilities = (proofSessionAvailability.missing || []) as unknown[];
+  const availableSessionCapabilityCount = Math.max(0, proofSessionCapabilities.length - unavailableSessionCapabilities.length);
   const proofMissing = proof?.missing || [];
   return `
     <article class="record">
@@ -1916,7 +1919,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Schema", proof.schema)}
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", ((proofRuntime.prompt_bridge || {}) as JsonObject).present ? "active" : "not required")}
-            ${field("Session caps", proofSessionCapabilities.length)}
+            ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}
             ${field("Bound agents", String(((proofWork.bound_agent_ids || []) as unknown[]).length))}
           </div>
         </div>

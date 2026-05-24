@@ -165,8 +165,37 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert runtime_proof["ready"] is True
     assert runtime_proof["checks"]["api_work_context_schema"] is True
     assert runtime_proof["checks"]["agent_bound_to_hermes_instance"] is True
+    assert runtime_proof["checks"]["runtime_session_capabilities_available"] is True
     assert runtime_proof["evidence"]["work_context"]["bound_agent_ids"] == [agent["id"]]
     assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
+    degraded_runtime_proof = cp.hermes_runtime_proof(
+        hermes["id"],
+        hermes_startup={
+            "task_project_runtime": {
+                "required": True,
+                "ready": True,
+                "hermes_instance_id": hermes["id"],
+                "prompt_bridge": {"required": True, "present": True},
+                "session_capability_names": [
+                    "mac_api",
+                    "mac_cli",
+                    "mac_hermes_cli",
+                    "hgmac_agent_ops_cli",
+                    "beads_issue_tracker",
+                    "git_source_control",
+                    "quality_gate",
+                    "web_search",
+                ],
+                "session_capability_availability": {
+                    "ready": False,
+                    "missing": ["mac_cli"],
+                },
+            },
+        },
+    )
+    assert degraded_runtime_proof["ready"] is False
+    assert degraded_runtime_proof["checks"]["runtime_session_capabilities_available"] is False
+    assert "runtime_session_capabilities_available" in degraded_runtime_proof["missing"]
 
     active_only = client.get(
         "/hermes-instances/%s/work-context?include_completed=false&task_limit=1" % hermes["id"]

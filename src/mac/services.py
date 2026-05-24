@@ -744,6 +744,11 @@ class ControlPlane:
             "web_search",
         }
         session_contract_required = runtime_required or bool(session_capabilities)
+        session_availability = (
+            runtime.get("session_capability_availability")
+            if isinstance(runtime.get("session_capability_availability"), dict)
+            else {}
+        )
         checks: JsonDict = {
             "api_work_context_schema": work_context.get("schema") == "mac.hermes_work_context.v1",
             "mac_authority_declared": (
@@ -774,6 +779,11 @@ class ControlPlane:
             ),
             "runtime_session_capabilities_declared": (
                 expected_session_capabilities <= session_capabilities
+                if session_contract_required
+                else True
+            ),
+            "runtime_session_capabilities_available": (
+                bool(session_availability.get("ready"))
                 if session_contract_required
                 else True
             ),
@@ -812,6 +822,7 @@ class ControlPlane:
                     "workspace": runtime.get("workspace"),
                     "session_capability_names": sorted(session_capabilities),
                     "session_capabilities": runtime.get("session_capabilities", []),
+                    "session_capability_availability": session_availability,
                 },
                 "work_context": {
                     "task_count": work_context.get("task_count"),
