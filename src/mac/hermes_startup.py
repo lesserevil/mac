@@ -154,6 +154,33 @@ def _runtime_context_markdown_path(hermes_home: Path) -> Path:
     return hermes_home / "mac-runtime-context.md"
 
 
+def _runtime_prompt_bridge_report(
+    agent_dir: Optional[Path],
+    *,
+    required: bool,
+) -> Dict[str, Any]:
+    path = agent_dir / "agent" / "prompt_builder.py" if agent_dir is not None else Path("")
+    report: Dict[str, Any] = {
+        "required": required,
+        "file": _file_ref(path, "hermes_prompt_builder", False) if agent_dir is not None else None,
+        "present": False,
+        "warning": "",
+    }
+    if agent_dir is None:
+        if required:
+            report["warning"] = "Hermes MAC runtime prompt bridge cannot be verified without MAC_HERMES_AGENT_DIR"
+        return report
+    text = _read_small_text(path, limit=1_000_000)
+    report["present"] = (
+        "_load_mac_runtime_context" in text
+        and "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN" in text
+        and "mac-runtime-context.md" in text
+    )
+    if required and not report["present"]:
+        report["warning"] = "Hermes MAC task/project runtime prompt bridge is missing from %s" % path
+    return report
+
+
 def _topology_summary(path: Path) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "file": _file_ref(path, "memory_topology", False),
@@ -1146,6 +1173,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "status": "startup_check_disabled",
                 "ready": True,
                 "required": False,
+                "prompt_bridge": {"required": False, "present": False},
             },
             "operator_health": {"status": "healthy"},
         }
@@ -1161,6 +1189,13 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     logs = _log_classification_report()
     qdrant = _qdrant_memory_report(hermes_home)
     task_project_runtime = _runtime_context_summary(hermes_home)
+    agent_dir, _explicit_agent_dir = _hermes_agent_dir_info()
+    task_project_runtime["prompt_bridge"] = _runtime_prompt_bridge_report(
+        agent_dir,
+        required=bool(task_project_runtime["required"]),
+    )
+    if task_project_runtime["prompt_bridge"]["warning"]:
+        task_project_runtime["ready"] = False
 
     warnings: List[str] = []
     if not hermes_home.exists():
@@ -1182,6 +1217,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         warnings.append(qdrant["warning"])
     if task_project_runtime["warning"]:
         warnings.append(task_project_runtime["warning"])
+    if task_project_runtime["prompt_bridge"]["warning"]:
+        warnings.append(task_project_runtime["prompt_bridge"]["warning"])
 
     checks = {
         "hermes_home_exists": hermes_home.exists(),
@@ -1201,6 +1238,10 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             not qdrant["required"] or bool(qdrant["topology"]["file"]["exists"])
         ),
         "task_project_runtime_context_available": bool(task_project_runtime["ready"]),
+        "task_project_runtime_prompt_bridge_active": bool(
+            task_project_runtime["prompt_bridge"]["present"]
+        )
+        or not task_project_runtime["prompt_bridge"]["required"],
         "mac_task_project_authority_declared": (
             not task_project_runtime["required"]
             or (
@@ -1247,8 +1288,13 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "qdrant_level2_ready": qdrant["ready"],
             "memory_topology_present": qdrant["topology"]["file"]["exists"],
             "task_project_runtime_status": task_project_runtime["status"],
-            "task_project_runtime_ready": task_project_runtime["ready"],
+            "task_project_runtime_ready": task_project_runtime["ready"]
+            and (
+                task_project_runtime["prompt_bridge"]["present"]
+                or not task_project_runtime["prompt_bridge"]["required"]
+            ),
             "task_project_runtime_present": task_project_runtime["context_file"]["exists"],
+            "task_project_runtime_prompt_bridge_present": task_project_runtime["prompt_bridge"]["present"],
             "task_project_runtime_hermes_instance_id": task_project_runtime["hermes_instance_id"],
         },
     }

@@ -149,7 +149,7 @@ def test_fleet_deploy_installs_github_cli_for_workers():
     assert 'brew install gh' in script
     assert 'sudo apt-get install -y gh' in script
     assert 'https://cli.github.com/packages' in script
-    assert 'export PATH="$HOME/.mac/bin:$PATH"' in script
+    assert 'export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"' in script
 
 
 def test_fleet_deploy_does_not_print_worker_token_in_systemd_status():
@@ -167,10 +167,14 @@ def test_fleet_deploy_does_not_print_worker_token_in_systemd_status():
 def test_fleet_deploy_applies_hermes_patch_set():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
     quench_patch = ROOT / "deploy" / "hermes" / "disable-shutdown-chat-notices.patch"
+    runtime_patch = ROOT / "deploy" / "hermes" / "mac-runtime-context-prompt.patch"
 
     assert "multi-slack-mvp.patch" in script
+    assert "mac-runtime-context-prompt.patch" in script
     assert "disable-shutdown-chat-notices.patch" in script
     assert "upstream plus mac-managed patches" in script
+    assert "_load_mac_runtime_context" in runtime_patch.read_text(encoding="utf-8")
+    assert "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN" in runtime_patch.read_text(encoding="utf-8")
     assert "Shutdown chat notifications disabled by MAC deployment policy." in quench_patch.read_text(
         encoding="utf-8"
     )
@@ -200,6 +204,7 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert 'values["MAC_HERMES_INSTANCE_ID"] = stable_id("hermes", agent_name)' in script
     assert 'values["MAC_WORKER_HERMES_INSTANCE_ID"] = values["MAC_HERMES_INSTANCE_ID"]' in script
     assert 'common+=(--hermes-instance-id "${MAC_WORKER_HERMES_INSTANCE_ID:-${MAC_HERMES_INSTANCE_ID:-}}")' in script
+    assert 'export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"' in script
     assert "install_or_validate_shared_services" in script
     assert "mac.hermes.memory_topology.v1" in script
     assert "QDRANT_FLEET_URL" in script

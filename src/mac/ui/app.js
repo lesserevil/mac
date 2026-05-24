@@ -630,6 +630,7 @@ function hermesStartupPanel(startup) {
     const logs = startup.logs || {};
     const runtime = startup.task_project_runtime || {};
     const runtimeAuthority = (runtime.authority || {});
+    const promptBridge = (runtime.prompt_bridge || {});
     const warnings = startup.warnings || [];
     return `
     <section class="surface">
@@ -647,6 +648,7 @@ function hermesStartupPanel(startup) {
         ${field("Log classes", logs.classes?.length ?? 0)}
         ${field("Hermes instance", runtime.hermes_instance_id || operator.task_project_runtime_hermes_instance_id || "unbound")}
         ${field("MAC authority", `tasks ${runtimeAuthority.tasks || "?"}, projects ${runtimeAuthority.projects || "?"}`)}
+        ${field("Prompt bridge", promptBridge.present ? "active" : "missing")}
       </div>
       ${warnings.length ? `<div class="timeline">${warnings.map((warning) => timelineItem("warning", warning, "")).join("")}</div>` : ""}
     </section>

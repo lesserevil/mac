@@ -1577,6 +1577,12 @@ try:
     hermes_run_text = hermes_run.read_text(encoding="utf-8", errors="ignore")
 except OSError:
     pass
+hermes_prompt_builder = hermes_dir / "agent" / "prompt_builder.py"
+hermes_prompt_builder_text = ""
+try:
+    hermes_prompt_builder_text = hermes_prompt_builder.read_text(encoding="utf-8", errors="ignore")
+except OSError:
+    pass
 
 manifest = {
     "schema_version": 1,
@@ -1705,6 +1711,10 @@ manifest = {
             and "resolve_runtime_provider" in hermes_run_text
         ),
         "task_project_runtime_context": file_ref(os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_FILE") or (Path.home() / ".hermes" / "mac-runtime-context.json")),
+        "task_project_runtime_prompt_bridge_present": (
+            "_load_mac_runtime_context" in hermes_prompt_builder_text
+            and "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN" in hermes_prompt_builder_text
+        ),
         "messaging_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-messaging-deps.json"),
         "web_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-web-deps.json"),
         "log_summary": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-log-summary.json"),
@@ -3066,6 +3076,7 @@ git clone --quiet https://github.com/NousResearch/hermes-agent.git "$HERMES_DIR"
 git -C "$HERMES_DIR" rev-parse HEAD > "$LOG_DIR/hermes-upstream-rev.txt"
 for patch_path in \
   "$SRC_DIR/deploy/hermes/multi-slack-mvp.patch" \
+  "$SRC_DIR/deploy/hermes/mac-runtime-context-prompt.patch" \
   "$SRC_DIR/deploy/hermes/disable-shutdown-chat-notices.patch"
 do
   if git -C "$HERMES_DIR" apply --check "$patch_path"; then
@@ -3192,7 +3203,7 @@ set -euo pipefail
 set -a
 . "$HOME/.mac/mac.env"
 set +a
-export PATH="$HOME/.mac/bin:$PATH"
+export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"
 export HERMES_REDACT_SECRETS=true
 exec "$HOME/.mac/venv/bin/uvicorn" mac.api:create_app --factory --host "${MAC_BIND_HOST:-127.0.0.1}" --port "${MAC_PORT:-8789}" --workers 1 --log-level info
 EOF
@@ -3253,7 +3264,7 @@ set +u
 [ -f "$HOME/.mac/mac.env" ] && . "$HOME/.mac/mac.env"
 set -u
 set +a
-export PATH="$HOME/.mac/bin:$PATH"
+export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 export HERMES_DISABLE_LAZY_INSTALLS=1
 export HERMES_REDACT_SECRETS=true
@@ -3286,7 +3297,7 @@ set -euo pipefail
 set -a
 . "$HOME/.mac/mac.env"
 set +a
-export PATH="$HOME/.mac/bin:$PATH"
+export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"
 
 : "${MAC_HUB_URL:?MAC_HUB_URL is required}"
 : "${MAC_WORKER_TOKEN:?MAC_WORKER_TOKEN is required}"
@@ -3831,7 +3842,7 @@ set -euo pipefail
 set -a
 . "$HOME/.mac/mac.env"
 set +a
-export PATH="$HOME/.mac/bin:$PATH"
+export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"
 export HERMES_REDACT_SECRETS=true
 exec "$HOME/.mac/venv/bin/uvicorn" mac.api:create_app --factory --host "${MAC_BIND_HOST:-127.0.0.1}" --port "${MAC_PORT:-8789}" --workers 1 --log-level info
 EOF
@@ -4103,6 +4114,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 slack = data.get("slack") or {}
 qdrant = data.get("qdrant_level2") or {}
 runtime = data.get("task_project_runtime") or {}
+prompt_bridge = runtime.get("prompt_bridge") or {}
 refs = data.get("state_refs") or []
 existing = sum(1 for ref in refs if ref.get("exists"))
 patch = slack.get("account_file_activation_shim_patch") or {}
@@ -4110,7 +4122,7 @@ print(
     "startup: ready=%s warnings=%d state_refs_existing=%d "
     "slack_activation=%s shim_present=%s redaction=%s operator_status=%s "
     "qdrant_status=%s qdrant_ready=%s topology=%s "
-    "runtime_status=%s runtime_ready=%s runtime_context=%s hermes_instance=%s "
+    "runtime_status=%s runtime_ready=%s runtime_context=%s prompt_bridge=%s hermes_instance=%s "
     "patch_attempted=%s patch_applied=%s patch_error=%s"
     % (
         data.get("ready"),
@@ -4126,6 +4138,7 @@ print(
         runtime.get("status"),
         runtime.get("ready"),
         (runtime.get("context_file") or {}).get("exists"),
+        prompt_bridge.get("present"),
         runtime.get("hermes_instance_id"),
         patch.get("attempted"),
         patch.get("applied"),

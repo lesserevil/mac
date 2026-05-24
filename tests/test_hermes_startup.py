@@ -524,6 +524,7 @@ def test_required_qdrant_endpoint_uses_redacted_topology(monkeypatch, tmp_path):
 def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch, tmp_path):
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
     context_path = hermes_home / "mac-runtime-context.json"
     markdown_path = hermes_home / "mac-runtime-context.md"
     _write(hermes_home / "config.yaml", "model: local\n")
@@ -541,7 +542,12 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     )
     _write(context_path, json.dumps(context))
     _write(markdown_path, "private runtime command notes")
+    _write(
+        agent_dir / "agent" / "prompt_builder.py",
+        "_load_mac_runtime_context\nMAC_HERMES_RUNTIME_CONTEXT_MARKDOWN\nmac-runtime-context.md\n",
+    )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
     monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", str(context_path))
     monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", str(markdown_path))
     monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
@@ -557,7 +563,9 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["agent_id"] == "agent_rocky"
     assert report["task_project_runtime"]["mac_url"] == "http://hub.example.internal:8789"
     assert report["checks"]["task_project_runtime_context_available"] is True
+    assert report["checks"]["task_project_runtime_prompt_bridge_active"] is True
     assert report["checks"]["mac_task_project_authority_declared"] is True
+    assert report["task_project_runtime"]["prompt_bridge"]["present"] is True
     rendered = str(report)
     assert "token=hidden" not in rendered
     assert "private runtime command notes" not in rendered
@@ -582,6 +590,49 @@ def test_required_task_project_runtime_context_blocks_readiness_when_missing(
     assert report["task_project_runtime"]["status"] == "missing_context"
     assert report["checks"]["task_project_runtime_context_available"] is False
     assert "runtime context file is missing" in " ".join(report["warnings"])
+
+
+def test_required_task_project_runtime_context_blocks_when_prompt_bridge_missing(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    context_path = hermes_home / "mac-runtime-context.json"
+    markdown_path = hermes_home / "mac-runtime-context.md"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        context_path,
+        json.dumps(
+            build_runtime_context(
+                agent_name="rocky",
+                fleet_name="classic",
+                mac_url="http://hub.example.internal:8789",
+                hermes_home=hermes_home,
+                mac_home=tmp_path / ".mac",
+                hermes_instance_id="hermes_rocky",
+                agent_id="agent_rocky",
+            )
+        ),
+    )
+    _write(markdown_path, "runtime")
+    _write(agent_dir / "agent" / "prompt_builder.py", "def build_context_files_prompt(): pass\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", str(context_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", str(markdown_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["task_project_runtime"]["prompt_bridge"]["present"] is False
+    assert report["checks"]["task_project_runtime_prompt_bridge_active"] is False
+    assert "runtime prompt bridge is missing" in " ".join(report["warnings"])
 
 
 def test_qdrant_degraded_override_allows_startup(monkeypatch, tmp_path):
