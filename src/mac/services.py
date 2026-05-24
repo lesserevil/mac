@@ -899,6 +899,51 @@ class ControlPlane:
                     "path": "/tasks/{task_id}/summary",
                 },
                 {
+                    "name": "claim_task",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/claim?agent_id={agent_id}",
+                },
+                {
+                    "name": "start_task",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/start?agent_id={agent_id}",
+                },
+                {
+                    "name": "transition_task",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/transition",
+                },
+                {
+                    "name": "add_evidence",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/evidence",
+                },
+                {
+                    "name": "submit_for_review",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/submit-for-review?agent_id={agent_id}",
+                },
+                {
+                    "name": "request_review",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/reviews",
+                },
+                {
+                    "name": "claim_review",
+                    "method": "POST",
+                    "path": "/reviews/{review_id}/claim",
+                },
+                {
+                    "name": "submit_review",
+                    "method": "POST",
+                    "path": "/reviews/{review_id}/decision",
+                },
+                {
+                    "name": "publish_task",
+                    "method": "POST",
+                    "path": "/publications",
+                },
+                {
                     "name": "write_completed_task_to_memory",
                     "method": "POST",
                     "path": "/memory",
@@ -917,7 +962,17 @@ class ControlPlane:
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
                 "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
+                "mac-hermes task-detail {task_id}",
                 "mac-hermes summary {task_id}",
+                "mac-hermes claim {task_id} {agent_id}",
+                "mac-hermes start {task_id} {agent_id}",
+                "mac-hermes transition {task_id} {target_state} --actor {actor}",
+                "mac-hermes evidence {task_id} --kind test --uri artifact://... --summary ... --created-by {agent_id}",
+                "mac-hermes submit-review {task_id} {agent_id}",
+                "mac-hermes request-review {task_id} {reviewer_agent_id}",
+                "mac-hermes claim-review {review_id} {reviewer_agent_id}",
+                "mac-hermes review-decision {review_id} approved {reviewer_agent_id} --evidence-id {evidence_id}",
+                "mac-hermes publish {task_id} {target} {created_by}",
                 "mac-hermes writeback %s {task_id}" % hermes_instance_id,
             ],
             "task_state_transitions": {

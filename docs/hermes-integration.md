@@ -148,11 +148,34 @@ The payload is `mac.hermes_work_context.v1`. It keeps task, project, and agent
 authority in MAC while preserving Hermes as the authority for personality and
 user memory. It includes visible tasks, project frontier summaries, agent
 assignments, task dependencies, Hermes task origins, and stable API/CLI
-operation hints. The same contract is available from:
+operation hints. Hermes should treat those operations as affordances over MAC's
+durable task objects, not as local state to copy.
+
+The same contract is available from:
 
 ```bash
 mac hermes work-context <hermes_instance_id>
 mac-hermes work-context <hermes_instance_id>
+```
+
+Hermes can then perform lifecycle operations through the adapter or CLI:
+
+```python
+adapter.claim_task(task_id, agent_id)
+adapter.start_task(task_id, agent_id)
+adapter.add_evidence(task_id, "test", "artifact://pytest", "tests passed", agent_id)
+adapter.submit_for_review(task_id, agent_id)
+adapter.request_review(task_id, reviewer_agent_id)
+adapter.publish_task(task_id, "git://main", reviewer_agent_id, evidence_id=evidence_id)
+```
+
+```bash
+mac-hermes claim <task_id> <agent_id>
+mac-hermes start <task_id> <agent_id>
+mac-hermes evidence <task_id> --kind test --uri artifact://pytest --summary "tests passed" --created-by <agent_id>
+mac-hermes submit-review <task_id> <agent_id>
+mac-hermes request-review <task_id> <reviewer_agent_id>
+mac-hermes publish <task_id> git://main <reviewer_agent_id> --evidence-id <evidence_id>
 ```
 
 ## User Replies

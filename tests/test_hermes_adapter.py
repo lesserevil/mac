@@ -178,6 +178,119 @@ def test_hermes_adapter_summarizes_result_and_prepares_memory_writeback():
     assert cp.search_memory(task_id=task["id"])[0].record_type == "task_result_writeback"
 
 
+def test_hermes_adapter_performs_task_lifecycle_operations_through_api():
+    from mac.services import sign_verification_manifest
+    from tests.conftest import submit_review_verdict
+
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    adapter = HermesMacAdapter(MacApiClient("http://testserver", transport=api_transport(client)))
+    registration = adapter.register_identity(
+        "team",
+        "Rocky",
+        "rocky",
+        "hermes://team/rocky/SOUL.md",
+        "hermes://team/rocky/memory",
+    )
+    worker = register_agent(cp, "worker", ["ops"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = adapter.create_task_from_conversation(
+        registration["hermes_instance"]["id"],
+        ConversationTaskInput(
+            title="Ship lifecycle bridge",
+            summary="Exercise the task operation bridge.",
+            project="mac",
+            required_capabilities=["ops"],
+        ),
+    )
+
+    claim = adapter.claim_task(task["id"], worker.id, lease_seconds=300)
+    assert claim["task"]["state"] == TaskState.CLAIMED.value
+    assert claim["lease"]["agent_id"] == worker.id
+    assert adapter.start_task(task["id"], worker.id)["state"] == TaskState.RUNNING.value
+
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "test",
+        "repo": {
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "pushed": True,
+            "remote_ref": "refs/heads/task/hermes-bridge",
+            "dirty": False,
+        },
+        "checks": [{"name": "pytest", "returncode": 0}],
+    }
+    manifest["signed_by"] = worker.id
+    manifest["signature"] = sign_verification_manifest(
+        cp._agent_attestation_key(worker.id),
+        manifest,
+    )
+    evidence = adapter.add_evidence(
+        task["id"],
+        "test",
+        "artifact://pytest",
+        "tests passed",
+        worker.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
+    assert evidence["task_id"] == task["id"]
+    assert adapter.submit_for_review(task["id"], worker.id)["state"] == TaskState.NEEDS_REVIEW.value
+
+    review = adapter.request_review(task["id"], reviewer.id, actor="hermes")
+    assert review["reviewer_agent_id"] == reviewer.id
+    claim_review = adapter.claim_review(
+        review["id"],
+        reviewer.id,
+        executor_evidence_id=evidence["id"],
+        actor="hermes",
+    )
+    assert claim_review["status"] == "claimed"
+    verdict_id = submit_review_verdict(cp, task["id"], reviewer.id, evidence["id"])
+    decision = adapter.submit_review(
+        review["id"],
+        ReviewStatus.APPROVED.value,
+        reviewer.id,
+        evidence_id=verdict_id,
+    )
+    assert decision["status"] == ReviewStatus.APPROVED.value
+    publication = adapter.publish_task(
+        task["id"],
+        "git://main",
+        reviewer.id,
+        evidence_id=evidence["id"],
+    )
+    assert publication["status"] == "published"
+    assert adapter.task_summary(task["id"])["state"] == TaskState.COMPLETED.value
+
+
+def test_hermes_adapter_transition_operation_updates_mac_task_state():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    adapter = HermesMacAdapter(MacApiClient("http://testserver", transport=api_transport(client)))
+    registration = adapter.register_identity(
+        "team",
+        "Natasha",
+        "natasha",
+        "hermes://team/natasha/SOUL.md",
+        "hermes://team/natasha/memory",
+    )
+    task = adapter.create_task_from_conversation(
+        registration["hermes_instance"]["id"],
+        ConversationTaskInput(title="Pause task", summary="Mark this blocked."),
+    )
+
+    blocked = adapter.transition_task(
+        task["id"],
+        TaskState.BLOCKED.value,
+        "hermes",
+        {"reason": "waiting for user"},
+    )
+
+    assert blocked["state"] == TaskState.BLOCKED.value
+    assert cp.task_history(task["id"])[-1].detail["reason"] == "waiting for user"
+
+
 def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
     db = tmp_path / "mac.db"
     monkeypatch.setenv("MAC_SECRET_KEY", "test-secret-key-for-cli-work-context")
@@ -246,4 +359,106 @@ def test_mac_hermes_cli_fetches_work_context(monkeypatch, capsys):
             "/hermes-instances/hermes_1/work-context?include_completed=false&task_limit=7",
             None,
         )
+    ]
+
+
+def test_mac_hermes_cli_exposes_task_lifecycle_operations(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((method, path, payload))
+        return {"schema": "ok", "path": path, "payload": payload}
+
+    monkeypatch.setattr(MacApiClient, "request", request)
+    commands = [
+        ["task-detail", "task_1"],
+        ["claim", "task_1", "agent_1", "--lease-seconds", "30"],
+        ["start", "task_1", "agent_1"],
+        ["transition", "task_1", "blocked", "--actor", "hermes", "--detail", '{"reason":"waiting"}'],
+        [
+            "evidence",
+            "task_1",
+            "--kind",
+            "test",
+            "--uri",
+            "artifact://pytest",
+            "--summary",
+            "tests passed",
+            "--created-by",
+            "agent_1",
+            "--metadata",
+            '{"result":"pass"}',
+        ],
+        ["submit-review", "task_1", "agent_1", "--advance-default-workflow"],
+        ["request-review", "task_1", "agent_2", "--actor", "hermes"],
+        ["claim-review", "review_1", "agent_2", "--executor-evidence-id", "ev_1"],
+        ["review-decision", "review_1", "approved", "agent_2", "--evidence-id", "ev_review"],
+        ["publish", "task_1", "git://main", "agent_2", "--evidence-id", "ev_1"],
+    ]
+
+    for command in commands:
+        rc = mac_hermes_main(["--url", "http://hub:8789", *command])
+        assert rc == 0
+        capsys.readouterr()
+
+    assert calls == [
+        ("GET", "/tasks/task_1", None),
+        ("POST", "/tasks/task_1/claim?agent_id=agent_1&lease_seconds=30", {}),
+        ("POST", "/tasks/task_1/start?agent_id=agent_1", {}),
+        (
+            "POST",
+            "/tasks/task_1/transition",
+            {"target_state": "blocked", "actor": "hermes", "detail": {"reason": "waiting"}},
+        ),
+        (
+            "POST",
+            "/tasks/task_1/evidence",
+            {
+                "kind": "test",
+                "uri": "artifact://pytest",
+                "summary": "tests passed",
+                "created_by": "agent_1",
+                "checksum": None,
+                "metadata": {"result": "pass"},
+            },
+        ),
+        (
+            "POST",
+            "/tasks/task_1/submit-for-review?agent_id=agent_1&advance_default_workflow=true",
+            {},
+        ),
+        (
+            "POST",
+            "/tasks/task_1/reviews",
+            {"reviewer_agent_id": "agent_2", "actor": "hermes"},
+        ),
+        (
+            "POST",
+            "/reviews/review_1/claim",
+            {
+                "reviewer_agent_id": "agent_2",
+                "executor_evidence_id": "ev_1",
+                "actor": "hermes",
+            },
+        ),
+        (
+            "POST",
+            "/reviews/review_1/decision",
+            {
+                "status": "approved",
+                "reviewer_agent_id": "agent_2",
+                "reason": None,
+                "evidence_id": "ev_review",
+            },
+        ),
+        (
+            "POST",
+            "/publications",
+            {
+                "task_id": "task_1",
+                "target": "git://main",
+                "created_by": "agent_2",
+                "evidence_id": "ev_1",
+            },
+        ),
     ]

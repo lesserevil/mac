@@ -1869,6 +1869,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Operations", operationCount)}
           </div>
           <div class="chip-row">${contextProjects.slice(0, 8).map((project) => chip(`${project.project}:${project.active_count}/${project.task_count}`, project.active_count ? "info" : "good")).join("") || chip("no projects", "warn")}</div>
+          <p class="muted small mono">${escapeHtml((context.operations.mac_hermes_cli || []).slice(0, 3).join(" | "))}</p>
           <div class="timeline">
             ${(context.tasks || []).slice(0, 4).map((task) => timelineItem(task.state, task.title, `${task.project || taskProject(task)} / ${task.id}`)).join("") || timelineItem("idle", "No visible tasks", "")}
           </div>
