@@ -1949,6 +1949,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
           </div>
           <h4>First-Class Objects</h4>
           <div class="chip-row">${proofObjectEntries.map(([name, value]) => chip(`${name}:${value.authority || "?"}`, value.ready ? "good" : "bad")).join("") || chip("object proof missing", "warn")}</div>
+          ${firstClassCouplingMatrix(proofObjectEntries)}
           <h4>Session Capabilities</h4>
           <div class="chip-row">
             ${proofSessionCapabilities.map((name) => {
@@ -1960,6 +1961,60 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
       ` : ""}
     </article>
   `;
+}
+
+function firstClassCouplingMatrix(entries: Array<[string, JsonObject]>): string {
+  if (!entries.length) return `<div class="empty-state">First-class coupling proof missing</div>`;
+  return `
+    <div class="table-wrap">
+      <table class="data-table compact-table">
+        <thead>
+          <tr>
+            <th>Object</th>
+            <th>API</th>
+            <th>MAC CLI</th>
+            <th>Hermes CLI</th>
+            <th>UI Projection</th>
+            <th>Runtime</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${entries.map(([name, proof]) => firstClassCouplingRow(name, proof)).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function firstClassCouplingRow(name: string, proof: JsonObject): string {
+  const dashboardProjection = (proof.dashboard_projection || {}) as JsonObject;
+  const dashboardFields = arrayOfStrings(dashboardProjection.fields).slice(0, 4);
+  const stateKey = String(dashboardProjection.state_key || "dashboard");
+  return `
+    <tr>
+      <td>${chip(name, proof.ready ? "good" : "bad")}</td>
+      <td>${proofList(proof, "api_operations", "api")}</td>
+      <td>${proofList(proof, "mac_cli_commands", "mac")}</td>
+      <td>${proofList(proof, "mac_hermes_cli_commands", "hermes")}</td>
+      <td>
+        ${chip(stateKey, proof.dashboard_ready ? "good" : "bad")}
+        <div class="chip-row">${dashboardFields.map((fieldName) => chip(fieldName, "info")).join("") || chip("fields missing", "bad")}</div>
+      </td>
+      <td>${proofList(proof, "runtime_capabilities", "runtime")}</td>
+    </tr>
+  `;
+}
+
+function proofList(proof: JsonObject, key: string, emptyLabel: string): string {
+  const values = arrayOfStrings(proof[key]).slice(0, 4);
+  if (!values.length) return chip(`${emptyLabel} missing`, "bad");
+  return `<div class="chip-row">${values.map((value) => chip(value, "info")).join("")}</div>`;
+}
+
+function arrayOfStrings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item)).filter((item) => item.trim())
+    : [];
 }
 
 function runtimeRecord(runtime: ApiRecord, data: DashboardData): string {

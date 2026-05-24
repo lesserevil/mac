@@ -1168,6 +1168,11 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "Session Capabilities" in app_js
     assert "Bridge Commands" in app_js
     assert "First-Class Objects" in app_js
+    assert "firstClassCouplingMatrix" in app_js
+    assert "UI Projection" in app_js
+    assert "Hermes CLI" in app_js
+    assert "mac_cli_commands" in app_js
+    assert "runtime_capabilities" in app_js
     assert "web research" in app_js
     assert "command audit" in app_js
     assert "Objects" in app_js
