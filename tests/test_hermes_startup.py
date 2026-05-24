@@ -623,14 +623,21 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["hgmac_cli"]
     assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]
+    assert "shell_execution" in report["task_project_runtime"]["session_capability_names"]
+    assert "workspace_file_access" in report["task_project_runtime"]["session_capability_names"]
     assert "beads_issue_tracker" in report["task_project_runtime"]["session_capability_names"]
     assert "command_audit" in report["task_project_runtime"]["session_capability_names"]
     availability = report["task_project_runtime"]["session_capability_availability"]
     assert availability["ready"] is True
     assert availability["missing"] == []
+    rows_by_name = {item["name"]: item for item in availability["capabilities"]}
+    assert rows_by_name["shell_execution"]["checks"]["shell_probe_succeeded"] is True
+    assert rows_by_name["workspace_file_access"]["checks"]["workspace_write_probe"] is True
     assert {item["name"] for item in availability["capabilities"] if item["ready"]} >= {
         "mac_cli",
         "mac_hermes_cli",
+        "shell_execution",
+        "workspace_file_access",
         "hgmac_agent_ops_cli",
         "beads_issue_tracker",
         "quality_gate",

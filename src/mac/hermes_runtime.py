@@ -147,6 +147,21 @@ def _session_capability_contract(
                 "purpose": "Hermes-safe task/project lifecycle bridge.",
             },
             {
+                "name": "shell_execution",
+                "kind": "shell",
+                "required": True,
+                "command": "sh -c true",
+                "cwd": str(workspace_path),
+                "purpose": "Run non-interactive shell commands from the MAC workspace like a direct Codex or Claude session.",
+            },
+            {
+                "name": "workspace_file_access",
+                "kind": "filesystem",
+                "required": True,
+                "cwd": str(workspace_path),
+                "purpose": "Read and write repository source files in the MAC workspace before committing work.",
+            },
+            {
                 "name": "hgmac_agent_ops_cli",
                 "kind": "cli",
                 "required": True,
@@ -212,6 +227,11 @@ def _session_capability_contract(
             "hgmac agents claim-next %s --dry-run" % agent_id,
             "git status --short --branch",
             test_command,
+            "git add <files>",
+            "git commit -m \"<message>\"",
+            "git pull --rebase",
+            "bd dolt push",
+            "git push",
         ],
         "rules": [
             "Treat MAC tasks, projects, agents, reviews, and publications as first-class operational objects.",

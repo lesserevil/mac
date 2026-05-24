@@ -5,6 +5,8 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -278,6 +280,55 @@ def _session_capability_availability(
             checks["expected_path_executable"] = bool(command_info["expected_path"]["executable"])
         if item.get("cwd"):
             checks["cwd_exists"] = bool(command_info["cwd_exists"])
+        if name == "shell_execution":
+            shell_probe_ready = False
+            try:
+                result = subprocess.run(
+                    ["sh", "-c", "true"],
+                    cwd=workspace_path or None,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+                shell_probe_ready = result.returncode == 0
+            except (OSError, subprocess.SubprocessError, ValueError):
+                shell_probe_ready = False
+            checks["shell_probe_succeeded"] = shell_probe_ready
+        if name == "workspace_file_access":
+            workspace_path_obj = Path(workspace_path).expanduser() if workspace_path else None
+            checks["workspace_readable"] = bool(
+                workspace_path_obj is not None and os.access(workspace_path_obj, os.R_OK)
+            )
+            checks["workspace_writable"] = bool(
+                workspace_path_obj is not None and os.access(workspace_path_obj, os.W_OK)
+            )
+            checks["workspace_searchable"] = bool(
+                workspace_path_obj is not None and os.access(workspace_path_obj, os.X_OK)
+            )
+            write_probe_ready = False
+            probe_path: Optional[Path] = None
+            if workspace_path_obj is not None:
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        "w",
+                        encoding="utf-8",
+                        dir=workspace_path_obj,
+                        prefix=".mac-runtime-probe-",
+                        delete=False,
+                    ) as handle:
+                        probe_path = Path(handle.name)
+                        handle.write("ok")
+                    write_probe_ready = probe_path.read_text(encoding="utf-8") == "ok"
+                except OSError:
+                    write_probe_ready = False
+                finally:
+                    if probe_path is not None:
+                        try:
+                            probe_path.unlink()
+                        except OSError:
+                            pass
+            checks["workspace_write_probe"] = write_probe_ready
         if name == "mac_api":
             endpoint = item.get("endpoint")
             checks["endpoint_configured"] = bool(endpoint and endpoint != "<invalid-url>")
@@ -1543,6 +1594,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "mac_api",
                 "mac_cli",
                 "mac_hermes_cli",
+                "shell_execution",
+                "workspace_file_access",
                 "hgmac_agent_ops_cli",
                 "beads_issue_tracker",
                 "git_source_control",

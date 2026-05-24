@@ -83,6 +83,8 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         "mac_api",
         "mac_cli",
         "mac_hermes_cli",
+        "shell_execution",
+        "workspace_file_access",
         "hgmac_agent_ops_cli",
         "beads_issue_tracker",
         "git_source_control",
@@ -112,6 +114,9 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "`bd prime`" in markdown
     assert "`hgmac agents list`" in markdown
     assert "`scripts/run-contract-tests.sh`" in markdown
+    assert "`git commit -m \"<message>\"`" in markdown
+    assert "`bd dolt push`" in markdown
+    assert "`git push`" in markdown
     assert env["MAC_HERMES_RUNTIME_CONTEXT_FILE"] == str(context_path)
     assert env["MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN"] == str(markdown_path)
     assert env["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"

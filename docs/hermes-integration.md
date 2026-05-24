@@ -262,11 +262,12 @@ agents as informal prompt text.
 The same runtime context now carries a direct-session capability contract. A
 Hermes session sees the MAC source workspace, the repository Beads contract,
 the `bd prime` workflow, the `mac`, `mac-hermes`, and `hgmac` CLIs, Git status
-and quality-gate commands, and the hub Firecrawl web-search affordance. Startup
-health and runtime proof reports treat those declarations as part of the
-MAC/Hermes bridge rather than as tribal knowledge from an operator shell.
-Startup proof also verifies the declared commands, workspace, project contract,
-quality gate, and web-search environment are available in the Hermes runtime.
+and quality-gate commands, shell execution, writable workspace access, and the
+hub Firecrawl web-search affordance. Startup health and runtime proof reports
+treat those declarations as part of the MAC/Hermes bridge rather than as tribal
+knowledge from an operator shell. Startup proof also verifies the declared
+commands, workspace, project contract, quality gate, workspace file access, and
+web-search environment are available in the Hermes runtime.
 
 Deployment also patches Hermes' prompt builder to load
 `mac-runtime-context.md` as a normal context source. That means gateway, CLI,

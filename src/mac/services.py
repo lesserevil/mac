@@ -808,6 +808,8 @@ class ControlPlane:
             "mac_api",
             "mac_cli",
             "mac_hermes_cli",
+            "shell_execution",
+            "workspace_file_access",
             "hgmac_agent_ops_cli",
             "beads_issue_tracker",
             "git_source_control",
@@ -879,7 +881,16 @@ class ControlPlane:
                     and isinstance(operations.get("task_state_transitions"), dict)
                 ),
                 "runtime_capabilities": sorted(
-                    session_capabilities & {"mac_api", "mac_cli", "mac_hermes_cli", "quality_gate"}
+                    session_capabilities
+                    & {
+                        "mac_api",
+                        "mac_cli",
+                        "mac_hermes_cli",
+                        "shell_execution",
+                        "workspace_file_access",
+                        "quality_gate",
+                        "command_audit",
+                    }
                 ),
                 "runtime_ready": runtime_capabilities_ready,
             },
@@ -928,7 +939,16 @@ class ControlPlane:
                 },
                 "dashboard_ready": isinstance(work_context.get("projects"), list),
                 "runtime_capabilities": sorted(
-                    session_capabilities & {"mac_api", "mac_cli", "mac_hermes_cli", "beads_issue_tracker"}
+                    session_capabilities
+                    & {
+                        "mac_api",
+                        "mac_cli",
+                        "mac_hermes_cli",
+                        "shell_execution",
+                        "workspace_file_access",
+                        "git_source_control",
+                        "beads_issue_tracker",
+                    }
                 ),
                 "runtime_ready": runtime_capabilities_ready,
             },
@@ -951,7 +971,16 @@ class ControlPlane:
                     and isinstance(relationships.get("agent_assignments"), list)
                 ),
                 "runtime_capabilities": sorted(
-                    session_capabilities & {"mac_api", "mac_cli", "mac_hermes_cli", "hgmac_agent_ops_cli"}
+                    session_capabilities
+                    & {
+                        "mac_api",
+                        "mac_cli",
+                        "mac_hermes_cli",
+                        "shell_execution",
+                        "workspace_file_access",
+                        "hgmac_agent_ops_cli",
+                        "command_audit",
+                    }
                 ),
                 "runtime_ready": runtime_capabilities_ready,
             },
