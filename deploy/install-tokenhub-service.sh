@@ -590,13 +590,13 @@ tokenhub_admin_base_url() {
 }
 
 configure_aliases() {
-  local admin_token api_key models_json selected_model admin_base_url
+  local admin_token api_key models_json selected_models admin_base_url
   admin_token="$(read_env_value "$TOKENHUB_STATE_DIR/env" TOKENHUB_ADMIN_TOKEN || read_env_value "$TOKENHUB_STATE_DIR/service.env" TOKENHUB_ADMIN_TOKEN || true)"
   api_key="$(read_env_value "$TOKENHUB_STATE_DIR/env" TOKENHUB_API_KEY || true)"
   [ -n "$admin_token" ] || return 0
   admin_base_url="$(tokenhub_admin_base_url)"
   models_json="$(curl -fsS --connect-timeout 2 --max-time 10 -H "Authorization: Bearer ${api_key:-$admin_token}" "${admin_base_url%/}/v1/models" || true)"
-  selected_model="$("$PYTHON_BIN" - "$models_json" <<'PY'
+  selected_models="$("$PYTHON_BIN" - "$models_json" <<'PY'
 import json
 import sys
 raw = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -609,32 +609,42 @@ models = data.get("data") if isinstance(data, dict) else []
 if not isinstance(models, list):
     models = []
 preferred = [
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o-mini",
+    "gpt-4o",
     "gpt-5",
     "claude-sonnet-4-5",
     "nvidia/llama-3.1-nemotron-ultra-253b-v1",
     "meta/llama-3.1-70b-instruct",
 ]
 ids = [str(item.get("id") or "") for item in models if isinstance(item, dict)]
+selected = []
 for pref in preferred:
     for model_id in ids:
-        if model_id == pref or model_id.endswith("/" + pref):
-            print(model_id)
+        if model_id and (model_id == pref or model_id.endswith("/" + pref)) and model_id not in selected:
+            selected.append(model_id)
+        if len(selected) >= 3:
+            print(json.dumps(selected))
             raise SystemExit(0)
 for model_id in ids:
-    if model_id:
-        print(model_id)
-        raise SystemExit(0)
-print("")
+    if model_id and model_id not in selected:
+        selected.append(model_id)
+    if len(selected) >= 3:
+        break
+print(json.dumps(selected))
 PY
 )"
-  [ -n "$selected_model" ] || return 0
-  "$PYTHON_BIN" - "$admin_token" "$selected_model" "$admin_base_url" <<'PY'
+  [ -n "$selected_models" ] && [ "$selected_models" != "[]" ] || return 0
+  "$PYTHON_BIN" - "$admin_token" "$selected_models" "$admin_base_url" <<'PY'
 import json
 import sys
 import urllib.request
 
-admin_token, selected_model, base_url = sys.argv[1], sys.argv[2], sys.argv[3].rstrip("/")
+admin_token, selected_models_raw, base_url = sys.argv[1], sys.argv[2], sys.argv[3].rstrip("/")
+selected_models = [str(item) for item in json.loads(selected_models_raw) if str(item)]
 aliases = [
+    "*",
     "mac-chat",
     "mac-embedding",
     "mac-search",
@@ -645,8 +655,11 @@ aliases = [
 body = json.dumps(
     {
         "enabled": True,
-        "sticky_by": "request",
-        "variants": [{"model_id": selected_model, "weight": 100}],
+        "sticky_by": "round_robin" if len(selected_models) > 1 else "request",
+        "variants": [
+            {"model_id": model_id, "weight": max(1, 100 - index)}
+            for index, model_id in enumerate(selected_models)
+        ],
     }
 ).encode("utf-8")
 for alias in aliases:
@@ -669,9 +682,11 @@ PY
 
 write_client_env() {
   local api_key tokenhub_v1
-  api_key="$(read_env_value "$TOKENHUB_STATE_DIR/env" TOKENHUB_API_KEY || true)"
-  if [ -z "$api_key" ] && [ -f "$TOKENHUB_STATE_DIR/.host-api-key" ]; then
+  if [ -f "$TOKENHUB_STATE_DIR/.host-api-key" ]; then
     api_key="$(tr -d '\r\n' < "$TOKENHUB_STATE_DIR/.host-api-key")"
+  fi
+  if [ -z "$api_key" ]; then
+    api_key="$(read_env_value "$TOKENHUB_STATE_DIR/env" TOKENHUB_API_KEY || true)"
   fi
   [ -n "$api_key" ] || {
     echo "[tokenhub] ERROR: TokenHub did not provision a host API key" >&2

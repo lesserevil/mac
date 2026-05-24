@@ -2465,6 +2465,109 @@ else:
 PY
 }
 
+sync_hermes_tokenhub_client_env() {
+  log "syncing Hermes TokenHub client environment"
+  "$PY" - "$ENV_FILE" "$HOME/.hermes/.env" <<'PY'
+from pathlib import Path
+import sys
+
+source_path = Path(sys.argv[1])
+target_path = Path(sys.argv[2])
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def write_env(path: Path, updates: dict[str, str | None]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in lines:
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            output.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            seen.add(key)
+            if updates[key] is not None:
+                output.append(f"{key}={updates[key]}")
+        else:
+            output.append(line)
+    for key in sorted(updates):
+        if key not in seen and updates[key] is not None:
+            output.append(f"{key}={updates[key]}")
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+source = read_env(source_path)
+tokenhub_url = source.get("TOKENHUB_URL", "").strip().rstrip("/")
+tokenhub_key = (source.get("TOKENHUB_API_KEY") or source.get("TOKENHUB_AGENT_KEY") or "").strip()
+if not tokenhub_url and not tokenhub_key:
+    print("TokenHub client env: skipped; TOKENHUB_URL/TOKENHUB_API_KEY absent")
+    raise SystemExit(0)
+
+updates: dict[str, str | None] = {
+    "NVIDIA_API_KEY": None,
+    "NVIDIA_API_BASE": None,
+    "NVIDIA_BASE_URL": None,
+    "ANTHROPIC_API_KEY": None,
+    "ANTHROPIC_BASE_URL": None,
+    "PERPLEXITY_API_KEY": None,
+    "PERPLEXITY_BASE_URL": None,
+    "PERPLEXITY_API_BASE": None,
+    "LLM_KEY": None,
+    "LLM_URL": None,
+}
+if tokenhub_url:
+    tokenhub_v1 = tokenhub_url + "/v1"
+    updates.update(
+        {
+            "TOKENHUB_URL": tokenhub_url,
+            "OPENAI_BASE_URL": tokenhub_v1,
+            "CUSTOM_BASE_URL": tokenhub_v1,
+            "MAC_HERMES_GATEWAY_BASE_URL": tokenhub_v1,
+            "ACC_HERMES_GATEWAY_BASE_URL": tokenhub_v1,
+            "MAC_HERMES_GATEWAY_PROVIDER": "custom",
+            "ACC_HERMES_GATEWAY_PROVIDER": "custom",
+            "HERMES_INFERENCE_PROVIDER": "custom",
+            "MAC_REQUIRE_TOKENHUB": source.get("MAC_REQUIRE_TOKENHUB") or "1",
+            "MAC_TOKENHUB_PORT": source.get("MAC_TOKENHUB_PORT") or "8090",
+        }
+    )
+if tokenhub_key:
+    updates["TOKENHUB_API_KEY"] = tokenhub_key
+    updates["OPENAI_API_KEY"] = tokenhub_key
+else:
+    updates["TOKENHUB_API_KEY"] = None
+    updates["OPENAI_API_KEY"] = None
+
+model = (
+    source.get("MAC_HERMES_GATEWAY_MODEL")
+    or source.get("HERMES_INFERENCE_MODEL")
+    or source.get("ACC_HERMES_GATEWAY_MODEL")
+    or "*"
+)
+updates["MAC_HERMES_GATEWAY_MODEL"] = model
+updates["ACC_HERMES_GATEWAY_MODEL"] = model
+updates["HERMES_INFERENCE_MODEL"] = model
+updates["ACC_LLM_MODEL"] = model
+
+write_env(target_path, updates)
+print("TokenHub client env: synced to %s" % target_path)
+PY
+}
+
 apply_hermes_gateway_runtime_shim() {
   log "applying Hermes gateway runtime/model shim"
   MAC_HERMES_AGENT_DIR="$HERMES_DIR" "$VENV/bin/python" - <<'PY'
@@ -3292,6 +3395,7 @@ install_or_validate_tokenhub_service
 set -a
 . "$ENV_FILE"
 set +a
+sync_hermes_tokenhub_client_env
 [ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories || true
 [ -x "$MAC_HOME/bin/bd" ] && restore_beads_tracked_exports || true
 if [ "$WORKER_MODE" = "loop" ]; then

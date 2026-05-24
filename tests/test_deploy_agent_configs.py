@@ -320,11 +320,14 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
         "set -a\n"
         '. "$ENV_FILE"\n'
         "set +a\n"
+        "sync_hermes_tokenhub_client_env\n"
         '[ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories'
     ) in script
     assert "provider_secret_keys" in script
     assert 'values["TOKENHUB_URL"] = derived_tokenhub_url' in script
     assert 'values["OPENAI_API_KEY"] = configured_tokenhub_api_key' in script
+    assert 'updates["TOKENHUB_API_KEY"] = tokenhub_key' in script
+    assert 'write_env(target_path, updates)' in script
     assert '[ -f "$HOME/.acc/.env" ]' not in gateway_wrapper
     assert '[ -f "$HOME/.acc/.env" ]' not in executor_wrapper
     assert 'or os.environ.get("NVIDIA_API_KEY")' not in startup
