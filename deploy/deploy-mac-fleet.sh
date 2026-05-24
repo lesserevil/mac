@@ -4691,6 +4691,23 @@ main() {
       tokenhub_api_key="$(read_hub_tokenhub_api_key)"
       upsert_local_env "MAC_DEPLOY_TOKENHUB_API_KEY" "$tokenhub_api_key"
     fi
+    if [ "$agent" != "$hub_agent" ] && ! uses_direct_mesh_hub "$network_provider_field" "$hub_url_field"; then
+      # Update the hub's reverse-tunnel conf and wait for it BEFORE deploying the
+      # worker. The worker validates tokenhub at the tunnel-forwarded port (18090)
+      # during its deploy; the tunnel must be established first.
+      install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
+      echo "==> ${agent}: waiting for hub reverse tunnel to establish before worker deploy"
+      local attempt tunnel_ok=0
+      for attempt in $(seq 1 6); do
+        sleep 5
+        if ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$local_target" \
+          "curl -fsS --max-time 3 http://127.0.0.1:18789/health >/dev/null 2>&1" 2>/dev/null; then
+          echo "==> ${agent}: hub tunnel reachable after $((attempt * 5))s"
+          tunnel_ok=1
+          break
+        fi
+      done
+    fi
     deploy_host "$spec" "$hub_token" "$hub_tunnel_pubkey" "$tokenhub_api_key"
     if [ "$agent" = "$hub_agent" ]; then
       if [ -z "$hub_token" ]; then
@@ -4708,25 +4725,11 @@ main() {
     else
       if uses_direct_mesh_hub "$network_provider_field" "$hub_url_field"; then
         echo "==> ${agent}: using ${network_provider_field} hub URL ${hub_url_field}; skipping reverse tunnel"
-      else
-        install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
-        echo "==> ${agent}: waiting for hub reverse tunnel to establish"
-        local attempt tunnel_ok=0
-        for attempt in $(seq 1 6); do
-          sleep 5
-          if ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$local_target" \
-            "curl -fsS --max-time 3 http://127.0.0.1:18789/health >/dev/null 2>&1" 2>/dev/null; then
-            echo "==> ${agent}: hub tunnel reachable after $((attempt * 5))s"
-            tunnel_ok=1
-            break
-          fi
-        done
-        if [ "$tunnel_ok" = "1" ]; then
-          local agent_prog="${fleet_name_field}-agent"
-          ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$local_target" \
-            "sudo supervisorctl restart '$agent_prog' >/dev/null 2>&1 || sudo supervisorctl start '$agent_prog' >/dev/null 2>&1 || true" 2>/dev/null || true
-          echo "==> ${agent}: restarted mac-agent with tunnel now available"
-        fi
+      elif [ "${tunnel_ok:-0}" = "1" ]; then
+        local agent_prog="${fleet_name_field}-agent"
+        ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$local_target" \
+          "sudo supervisorctl restart '$agent_prog' >/dev/null 2>&1 || sudo supervisorctl start '$agent_prog' >/dev/null 2>&1 || true" 2>/dev/null || true
+        echo "==> ${agent}: restarted mac-agent with tunnel now available"
       fi
     fi
   done < <(selected_hosts "${REQUESTED_AGENTS[@]}")
