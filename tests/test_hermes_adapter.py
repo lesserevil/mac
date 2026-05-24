@@ -334,6 +334,26 @@ def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
     assert payload["projects"][0]["project"] == "mac"
     assert payload["operations"]["mac_cli"][0].startswith("mac hermes work-context")
 
+    rc = mac_cli_main(
+        [
+            "--db",
+            str(db),
+            "hermes",
+            "runtime-proof",
+            hermes.id,
+            "--skip-startup-report",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "mac.hermes_runtime_proof.v1"
+    assert payload["evidence"]["cli"]["mac_cli_commands"][0].startswith("mac hermes work-context")
+    assert any(
+        command.startswith("mac hermes runtime-proof")
+        for command in payload["evidence"]["cli"]["mac_cli_commands"]
+    )
+
 
 def test_mac_hermes_cli_fetches_work_context(monkeypatch, capsys):
     calls = []
@@ -370,6 +390,36 @@ def test_mac_hermes_cli_fetches_work_context(monkeypatch, capsys):
             "http://hub:8789",
             "GET",
             "/hermes-instances/hermes_1/work-context?include_completed=false&task_limit=7",
+            None,
+        )
+    ]
+
+
+def test_mac_hermes_cli_fetches_runtime_proof(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((self.base_url, method, path, payload))
+        return {"schema": "mac.hermes_runtime_proof.v1", "ready": True}
+
+    monkeypatch.setattr(MacApiClient, "request", request)
+
+    rc = mac_hermes_main(
+        [
+            "--url",
+            "http://hub:8789",
+            "runtime-proof",
+            "hermes_1",
+        ]
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["schema"] == "mac.hermes_runtime_proof.v1"
+    assert calls == [
+        (
+            "http://hub:8789",
+            "GET",
+            "/hermes-instances/hermes_1/runtime-proof",
             None,
         )
     ]

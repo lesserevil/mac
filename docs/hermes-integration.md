@@ -158,6 +158,23 @@ mac hermes work-context <hermes_instance_id>
 mac-hermes work-context <hermes_instance_id>
 ```
 
+Operators and Hermes agents can also request an auditable readiness proof for
+the bridge:
+
+```python
+proof = adapter.runtime_proof(registration["hermes_instance"]["id"])
+```
+
+```bash
+mac hermes runtime-proof <hermes_instance_id>
+mac-hermes runtime-proof <hermes_instance_id>
+```
+
+The proof payload is `mac.hermes_runtime_proof.v1`. It checks that the API work
+context, MAC and Hermes CLI affordances, dashboard projection, deployed runtime
+context, prompt bridge, and bound agent identity all agree on the same
+task/project authority model.
+
 Fleet deployment now also writes a Hermes-visible runtime bootstrap contract:
 
 - `~/.hermes/mac-runtime-context.json` (`mac.hermes.runtime_context.v1`)

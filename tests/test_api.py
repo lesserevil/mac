@@ -59,7 +59,16 @@ def test_fastapi_exposes_core_workflow_and_redacts_secrets():
     assert revealed["value"] == "never-return-this"
 
 
-def test_fastapi_exposes_hermes_identity_boundary():
+def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", raising=False)
+    monkeypatch.delenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", raising=False)
+    monkeypatch.delenv("MAC_HERMES_INSTANCE_ID", raising=False)
+    monkeypatch.delenv("MAC_WORKER_HERMES_INSTANCE_ID", raising=False)
+
     cp = ControlPlane.in_memory()
     client = TestClient(create_app(control_plane=cp))
 
@@ -144,7 +153,20 @@ def test_fastapi_exposes_hermes_identity_boundary():
         operation["name"] == "get_work_context"
         for operation in work_context["operations"]["api"]
     )
+    assert any(
+        operation["name"] == "get_runtime_proof"
+        for operation in work_context["operations"]["api"]
+    )
     assert any("mac-hermes work-context" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("mac-hermes runtime-proof" in command for command in work_context["operations"]["mac_hermes_cli"])
+
+    runtime_proof = client.get("/hermes-instances/%s/runtime-proof" % hermes["id"]).json()
+    assert runtime_proof["schema"] == "mac.hermes_runtime_proof.v1"
+    assert runtime_proof["ready"] is True
+    assert runtime_proof["checks"]["api_work_context_schema"] is True
+    assert runtime_proof["checks"]["agent_bound_to_hermes_instance"] is True
+    assert runtime_proof["evidence"]["work_context"]["bound_agent_ids"] == [agent["id"]]
+    assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
 
     active_only = client.get(
         "/hermes-instances/%s/work-context?include_completed=false&task_limit=1" % hermes["id"]
@@ -154,6 +176,7 @@ def test_fastapi_exposes_hermes_identity_boundary():
 
     state = client.get("/dashboard/state").json()
     assert state["hermes_work_contexts"][hermes["id"]]["projects"][0]["project"] == "nanolang"
+    assert state["hermes_runtime_proofs"][hermes["id"]]["ready"] is True
 
 
 def test_workflow_runs_route_is_not_shadowed_by_workflow_slug_route():
@@ -1028,6 +1051,8 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "Agent Resource Table" in app_js
     assert "renderWorkflows" in app_js
     assert "workflowGraph" in app_js
+    assert "hermes_runtime_proofs" in app_js
+    assert "Runtime Proof" in app_js
     assert 'data-view="work"' in index_html
     assert 'data-view="map"' in index_html
     assert 'data-view="workflows"' in index_html

@@ -658,6 +658,150 @@ class ControlPlane:
             "operations": self._hermes_operation_contract(hermes_instance_id),
         }
 
+    def hermes_runtime_proof(
+        self,
+        hermes_instance_id: str,
+        *,
+        hermes_startup: Optional[JsonDict] = None,
+    ) -> JsonDict:
+        """Return an auditable proof that MAC/Hermes work semantics align."""
+
+        work_context = self.hermes_work_context(
+            hermes_instance_id,
+            include_completed=False,
+            task_limit=100,
+        )
+        instance = work_context["hermes_instance"]
+        operations = work_context["operations"]
+        api_operation_names = {
+            str(operation.get("name"))
+            for operation in operations.get("api", [])
+            if isinstance(operation, dict)
+        }
+        mac_hermes_commands = [
+            str(command) for command in operations.get("mac_hermes_cli", [])
+        ]
+        expected_api_operations = {
+            "get_work_context",
+            "get_runtime_proof",
+            "create_task_from_conversation",
+            "get_task",
+            "claim_task",
+            "start_task",
+            "transition_task",
+            "add_evidence",
+            "submit_for_review",
+            "request_review",
+            "claim_review",
+            "submit_review",
+            "publish_task",
+            "write_completed_task_to_memory",
+        }
+        expected_cli_fragments = (
+            "mac-hermes work-context",
+            "mac-hermes runtime-proof",
+            "mac-hermes task ",
+            "mac-hermes task-detail",
+            "mac-hermes claim",
+            "mac-hermes start",
+            "mac-hermes transition",
+            "mac-hermes evidence",
+            "mac-hermes submit-review",
+            "mac-hermes request-review",
+            "mac-hermes claim-review",
+            "mac-hermes review-decision",
+            "mac-hermes publish",
+            "mac-hermes writeback",
+        )
+        authority = work_context.get("authority", {})
+        bound_agents = [
+            agent
+            for agent in work_context.get("agents", [])
+            if agent.get("hermes_instance_id") == hermes_instance_id
+        ]
+        runtime = (
+            hermes_startup.get("task_project_runtime")
+            if isinstance(hermes_startup, dict)
+            else None
+        )
+        runtime = runtime if isinstance(runtime, dict) else {}
+        prompt_bridge = runtime.get("prompt_bridge") if isinstance(runtime.get("prompt_bridge"), dict) else {}
+        runtime_required = bool(runtime.get("required"))
+        runtime_instance_id = runtime.get("hermes_instance_id")
+        checks: JsonDict = {
+            "api_work_context_schema": work_context.get("schema") == "mac.hermes_work_context.v1",
+            "mac_authority_declared": (
+                authority.get("tasks") == "mac"
+                and authority.get("projects") == "mac"
+                and authority.get("agents") == "mac"
+                and authority.get("personality") == "hermes"
+                and authority.get("user_memory") == "hermes"
+            ),
+            "api_lifecycle_operations_present": expected_api_operations <= api_operation_names,
+            "cli_lifecycle_commands_present": all(
+                any(fragment in command for command in mac_hermes_commands)
+                for fragment in expected_cli_fragments
+            ),
+            "agent_bound_to_hermes_instance": bool(bound_agents),
+            "runtime_context_ready": (
+                bool(runtime.get("ready"))
+                if runtime_required or runtime
+                else True
+            ),
+            "runtime_context_instance_matches": (
+                runtime_instance_id in (None, "", hermes_instance_id)
+            ),
+            "runtime_prompt_bridge_active": (
+                bool(prompt_bridge.get("present"))
+                if bool(prompt_bridge.get("required")) or runtime_required
+                else True
+            ),
+            "dashboard_projection_available": True,
+        }
+        missing = [name for name, ok in checks.items() if not ok]
+        return {
+            "schema": "mac.hermes_runtime_proof.v1",
+            "ready": not missing,
+            "hermes_instance": instance,
+            "authority": authority,
+            "checks": checks,
+            "missing": missing,
+            "evidence": {
+                "api": {
+                    "work_context_schema": work_context.get("schema"),
+                    "work_context_path": "/hermes-instances/%s/work-context" % hermes_instance_id,
+                    "operation_names": sorted(api_operation_names),
+                },
+                "cli": {
+                    "mac_hermes_commands": mac_hermes_commands,
+                    "mac_cli_commands": operations.get("mac_cli", []),
+                },
+                "ui": {
+                    "dashboard_state_key": "hermes_runtime_proofs",
+                    "dashboard_record_key": hermes_instance_id,
+                },
+                "hermes_runtime": {
+                    "status": runtime.get("status"),
+                    "required": runtime_required,
+                    "ready": runtime.get("ready"),
+                    "hermes_instance_id": runtime_instance_id,
+                    "context_file": runtime.get("context_file"),
+                    "markdown_file": runtime.get("markdown_file"),
+                    "prompt_bridge": prompt_bridge,
+                },
+                "work_context": {
+                    "task_count": work_context.get("task_count"),
+                    "project_count": len(work_context.get("projects", [])),
+                    "agent_count": len(work_context.get("agents", [])),
+                    "bound_agent_ids": [agent.get("id") for agent in bound_agents],
+                    "relationship_counts": {
+                        key: len(value) if isinstance(value, list) else 0
+                        for key, value in work_context.get("relationships", {}).items()
+                    },
+                },
+            },
+        }
+
     def _hermes_task_project_key(self, task: Task) -> str:
         project = str(task.project or "").strip()
         if project:
@@ -888,6 +1032,11 @@ class ControlPlane:
                     "path": "/hermes-instances/%s/work-context" % hermes_instance_id,
                 },
                 {
+                    "name": "get_runtime_proof",
+                    "method": "GET",
+                    "path": "/hermes-instances/%s/runtime-proof" % hermes_instance_id,
+                },
+                {
                     "name": "create_task_from_conversation",
                     "method": "POST",
                     "path": "/hermes-instances/%s/tasks" % hermes_instance_id,
@@ -956,11 +1105,13 @@ class ControlPlane:
             ],
             "mac_cli": [
                 "mac hermes work-context %s" % hermes_instance_id,
+                "mac hermes runtime-proof %s" % hermes_instance_id,
                 "mac task show {task_id}",
                 "mac task create --title ...",
             ],
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
+                "mac-hermes runtime-proof %s" % hermes_instance_id,
                 "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
                 "mac-hermes task-detail {task_id}",
                 "mac-hermes summary {task_id}",

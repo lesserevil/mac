@@ -259,6 +259,11 @@ class HermesMacAdapter:
             )
         )
 
+    def runtime_proof(self, hermes_instance_id: str) -> JsonDict:
+        return self.client.get(
+            "/hermes-instances/%s/runtime-proof" % _path_part(hermes_instance_id)
+        )
+
     def claim_task(
         self,
         task_id: str,
@@ -574,6 +579,10 @@ def _cmd_work_brief(args: argparse.Namespace) -> None:
     print(_adapter(args).work_context_brief(args.hermes_instance_id))
 
 
+def _cmd_runtime_proof(args: argparse.Namespace) -> None:
+    _print(_adapter(args).runtime_proof(args.hermes_instance_id))
+
+
 def _cmd_claim(args: argparse.Namespace) -> None:
     _print(_adapter(args).claim_task(args.task_id, args.agent_id, lease_seconds=args.lease_seconds))
 
@@ -726,6 +735,10 @@ def build_parser() -> argparse.ArgumentParser:
     work_brief = sub.add_parser("work-brief", help="render a concise MAC work-context status line")
     work_brief.add_argument("hermes_instance_id")
     work_brief.set_defaults(func=_cmd_work_brief)
+
+    runtime_proof = sub.add_parser("runtime-proof", help="prove MAC/Hermes task-project bridge readiness")
+    runtime_proof.add_argument("hermes_instance_id")
+    runtime_proof.set_defaults(func=_cmd_runtime_proof)
 
     claim = sub.add_parser("claim", help="claim a MAC task for an agent")
     claim.add_argument("task_id")

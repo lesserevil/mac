@@ -1319,6 +1319,13 @@ def _dashboard_state(
         instance["id"]: cp.hermes_work_context(instance["id"], task_limit=40)
         for instance in hermes_instances
     }
+    hermes_runtime_proofs = {
+        instance["id"]: cp.hermes_runtime_proof(
+            instance["id"],
+            hermes_startup=hermes_startup,
+        )
+        for instance in hermes_instances
+    }
     swarm_summary = _dashboard_swarm_summary(agents, tasks, machines_by_id)
     return {
         "overview": {
@@ -1368,6 +1375,7 @@ def _dashboard_state(
         "personas": personas,
         "hermes_instances": hermes_instances,
         "hermes_work_contexts": hermes_work_contexts,
+        "hermes_runtime_proofs": hermes_runtime_proofs,
         "platform_bindings": bindings,
         "roles": roles,
         "provisioning_requests": provisioning_requests,
@@ -1620,6 +1628,14 @@ def create_app(
             instance_id,
             include_completed=include_completed,
             task_limit=task_limit,
+        )
+
+    @app.get("/hermes-instances/{instance_id}/runtime-proof")
+    def hermes_runtime_proof(instance_id: str) -> Dict[str, Any]:
+        app.state.hermes_startup = build_hermes_startup_report()
+        return cp.hermes_runtime_proof(
+            instance_id,
+            hermes_startup=app.state.hermes_startup,
         )
 
     @app.post("/hermes-instances/{instance_id}/tasks")

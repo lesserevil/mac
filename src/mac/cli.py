@@ -112,6 +112,15 @@ def cmd_hermes_work_context(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_hermes_runtime_proof(args: argparse.Namespace) -> None:
+    startup = None
+    if not args.skip_startup_report:
+        from mac.hermes_startup import build_hermes_startup_report
+
+        startup = build_hermes_startup_report()
+    _print(_plane(args).hermes_runtime_proof(args.instance_id, hermes_startup=startup))
+
+
 def cmd_binding_register(args: argparse.Namespace) -> None:
     _print(
         _plane(args).register_platform_binding(
@@ -940,6 +949,10 @@ def build_parser() -> argparse.ArgumentParser:
     hermes_work_context.add_argument("--active-only", action="store_true")
     hermes_work_context.add_argument("--task-limit", type=int, default=100)
     _set(cmd_hermes_work_context, hermes_work_context)
+    hermes_runtime_proof = hermes.add_parser("runtime-proof")
+    hermes_runtime_proof.add_argument("instance_id")
+    hermes_runtime_proof.add_argument("--skip-startup-report", action="store_true")
+    _set(cmd_hermes_runtime_proof, hermes_runtime_proof)
 
     binding = sub.add_parser("binding", help="Hermes platform binding commands").add_subparsers(dest="binding_command", required=True)
     binding_register = binding.add_parser("register")

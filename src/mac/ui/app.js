@@ -606,6 +606,8 @@ function notifierChannelRecord(channel) {
 function renderHermes() {
     const data = mustData();
     const contexts = Object.values(data.hermes_work_contexts || {});
+    const proofs = Object.values(data.hermes_runtime_proofs || {});
+    const readyProofs = proofs.filter((proof) => proof.ready).length;
     return `
     <section class="metric-grid">
       ${metric("Tenants", data.tenants.length, `${data.users.length} users`)}
@@ -613,6 +615,7 @@ function renderHermes() {
       ${metric("Instances", data.hermes_instances.length, `${data.platform_bindings.length} bindings`)}
       ${metric("Interaction Tasks", data.tasks.filter((detail) => taskOrigin(detail.task).hermes_instance_id).length, "from Hermes")}
       ${metric("Context Projects", new Set(contexts.flatMap((context) => context.projects.map((project) => project.project))).size, `${contexts.reduce((sum, context) => sum + context.task_count, 0)} visible tasks`)}
+      ${metric("Runtime Proof", `${readyProofs}/${proofs.length}`, proofs.length === readyProofs ? "ready" : "degraded")}
     </section>
     ${hermesStartupPanel(data.hermes_startup)}
     <section class="record-list">
@@ -1450,9 +1453,14 @@ function hermesRecord(instance, data) {
     const bindings = data.platform_bindings.filter((binding) => binding.hermes_instance_id === instance.id);
     const tasks = data.tasks.filter((detail) => taskOrigin(detail.task).hermes_instance_id === instance.id);
     const context = data.hermes_work_contexts?.[String(instance.id)];
+    const proof = data.hermes_runtime_proofs?.[String(instance.id)];
     const contextProjects = context?.projects || [];
     const contextAgents = context?.agents || [];
     const operationCount = (context?.operations.api || []).length + (context?.operations.mac_hermes_cli || []).length;
+    const proofEvidence = (proof?.evidence || {});
+    const proofRuntime = (proofEvidence.hermes_runtime || {});
+    const proofWork = (proofEvidence.work_context || {});
+    const proofMissing = proof?.missing || [];
     return `
     <article class="record">
       <div class="record-header"><div><h2>${escapeHtml(instance.name)}</h2><p class="muted small mono">${escapeHtml(instance.id)}</p></div>${chip(instance.status, instance.status === "active" ? "good" : "warn")}</div>
@@ -1482,6 +1490,21 @@ function hermesRecord(instance, data) {
           <p class="muted small mono">${escapeHtml((context.operations.mac_hermes_cli || []).slice(0, 3).join(" | "))}</p>
           <div class="timeline">
             ${(context.tasks || []).slice(0, 4).map((task) => timelineItem(task.state, task.title, `${task.project || taskProject(task)} / ${task.id}`)).join("") || timelineItem("idle", "No visible tasks", "")}
+          </div>
+        </div>
+      ` : ""}
+      ${proof ? `
+        <div class="record-section">
+          <h3>Runtime Proof</h3>
+          <div class="chip-row">
+            ${chip(proof.ready ? "ready" : "degraded", proof.ready ? "good" : "bad")}
+            ${proofMissing.slice(0, 4).map((item) => chip(item, "warn")).join("")}
+          </div>
+          <div class="row-grid">
+            ${field("Schema", proof.schema)}
+            ${field("Runtime", proofRuntime.status || "not required")}
+            ${field("Prompt bridge", (proofRuntime.prompt_bridge || {}).present ? "active" : "not required")}
+            ${field("Bound agents", String((proofWork.bound_agent_ids || []).length))}
           </div>
         </div>
       ` : ""}
