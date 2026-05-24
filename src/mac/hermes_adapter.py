@@ -244,6 +244,15 @@ class HermesMacAdapter:
     def task_summary(self, task_id: str) -> JsonDict:
         return self.client.get("/tasks/%s/summary" % _path_part(task_id))
 
+    def list_tasks(
+        self,
+        *,
+        state: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> Any:
+        query = _query((("state", state), ("tenant_id", tenant_id)))
+        return self.client.get("/tasks%s" % (("?%s" % query) if query else ""))
+
     def task_detail(self, task_id: str) -> JsonDict:
         return self.client.get("/tasks/%s" % _path_part(task_id))
 
@@ -853,6 +862,10 @@ def _cmd_summary(args: argparse.Namespace) -> None:
     _print(_adapter(args).task_summary(args.task_id))
 
 
+def _cmd_tasks(args: argparse.Namespace) -> None:
+    _print(_adapter(args).list_tasks(state=args.state, tenant_id=args.tenant_id))
+
+
 def _cmd_task_detail(args: argparse.Namespace) -> None:
     _print(_adapter(args).task_detail(args.task_id))
 
@@ -1168,6 +1181,11 @@ def build_parser() -> argparse.ArgumentParser:
     task_detail = sub.add_parser("task-detail", help="fetch MAC's full task detail")
     task_detail.add_argument("task_id")
     task_detail.set_defaults(func=_cmd_task_detail)
+
+    tasks = sub.add_parser("tasks", help="list MAC task records")
+    tasks.add_argument("--state")
+    tasks.add_argument("--tenant-id")
+    tasks.set_defaults(func=_cmd_tasks)
 
     work_context = sub.add_parser("work-context", help="fetch MAC's task/project/agent context for this Hermes instance")
     work_context.add_argument("hermes_instance_id")

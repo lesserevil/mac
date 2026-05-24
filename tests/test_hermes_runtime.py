@@ -93,6 +93,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         "web_search",
     } <= capability_names
     assert "mac-hermes work-context hermes_rocky_host --active-only" in markdown
+    assert "mac-hermes tasks --state open" in markdown
     assert "First-Class Objects" in markdown
     assert "`tasks`: authority `mac`" in markdown
     assert "`projects`: authority `mac`" in markdown

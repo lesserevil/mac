@@ -216,6 +216,7 @@ def _session_capability_contract(
             "bd prime",
             "mac-hermes runtime-proof %s" % hermes_instance_id,
             "mac-hermes work-context %s --active-only" % hermes_instance_id,
+            "mac-hermes tasks --state open",
             "mac-hermes projects",
             "mac-hermes project-items",
             "mac-hermes beads-repositories",
@@ -255,6 +256,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                 "api_paths": [
                     "/hermes-instances/%s/work-context" % hermes_instance_id,
                     "/hermes-instances/%s/tasks" % hermes_instance_id,
+                    "/tasks",
                     "/tasks/{task_id}",
                     "/tasks/{task_id}/summary",
                     "/agents/%s/claim-next" % agent_id,
@@ -262,8 +264,13 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "/command-audit?task_id={task_id}",
                     "/tasks/{task_id}/transition",
                 ],
-                "mac_cli": ["mac task show {task_id}", "mac task create --title ..."],
+                "mac_cli": [
+                    "mac task list",
+                    "mac task show {task_id}",
+                    "mac task create --title ...",
+                ],
                 "mac_hermes_cli": [
+                    "mac-hermes tasks --state open",
                     "mac-hermes task %s <title> --summary <summary> --project <project>"
                     % hermes_instance_id,
                     "mac-hermes task-detail {task_id}",
@@ -438,6 +445,7 @@ def build_runtime_context(
                 "mac hermes work-context %s" % resolved_instance_id,
                 "mac-hermes work-context %s --active-only" % resolved_instance_id,
                 "mac-hermes work-brief %s" % resolved_instance_id,
+                "mac-hermes tasks --state open",
             ],
             "project_bridge": [
                 "mac-hermes projects",

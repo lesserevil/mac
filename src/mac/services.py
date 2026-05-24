@@ -680,6 +680,7 @@ class ControlPlane:
         }
         expected_task_api_operations = {
             "create_task_from_conversation",
+            "list_tasks",
             "get_task",
             "get_task_summary",
             "claim_next_task",
@@ -733,6 +734,7 @@ class ControlPlane:
             "mac-hermes register-beads-repository",
             "mac-hermes poll-beads-repositories",
             "mac-hermes claim-next",
+            "mac-hermes tasks",
             "mac-hermes task ",
             "mac-hermes task-detail",
             "mac-hermes claim",
@@ -846,10 +848,14 @@ class ControlPlane:
                 "api_operations": sorted(api_operation_names & expected_task_api_operations),
                 "api_ready": expected_task_api_operations <= api_operation_names,
                 "mac_cli_commands": matching(mac_cli_commands, ("mac task ",)),
-                "mac_cli_ready": has_all(mac_cli_commands, ("mac task show", "mac task create")),
+                "mac_cli_ready": has_all(
+                    mac_cli_commands,
+                    ("mac task list", "mac task show", "mac task create"),
+                ),
                 "mac_hermes_cli_commands": matching(
                     mac_hermes_commands,
                     (
+                        "mac-hermes tasks",
                         "mac-hermes task ",
                         "mac-hermes task-detail",
                         "mac-hermes claim-next",
@@ -862,6 +868,7 @@ class ControlPlane:
                 "mac_hermes_cli_ready": has_all(
                     mac_hermes_commands,
                     (
+                        "mac-hermes tasks",
                         "mac-hermes task ",
                         "mac-hermes task-detail",
                         "mac-hermes claim-next",
@@ -1406,6 +1413,7 @@ class ControlPlane:
                     "method": "POST",
                     "path": "/hermes-instances/%s/tasks" % hermes_instance_id,
                 },
+                {"name": "list_tasks", "method": "GET", "path": "/tasks"},
                 {"name": "get_task", "method": "GET", "path": "/tasks/{task_id}"},
                 {
                     "name": "get_task_summary",
@@ -1543,6 +1551,7 @@ class ControlPlane:
                 "mac bridge beads register <name> <path> --project <project>",
                 "mac bridge beads repos",
                 "mac bridge beads poll --repository <repository>",
+                "mac task list",
                 "mac task show {task_id}",
                 "mac task create --title ...",
                 "mac agent register <machine_id> <name>",
@@ -1563,6 +1572,7 @@ class ControlPlane:
                 "mac-hermes agent-detail {agent_id}",
                 "mac-hermes agent-identity {agent_id}",
                 "mac-hermes claim-next {agent_id} --dry-run",
+                "mac-hermes tasks --state open",
                 "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
                 "mac-hermes task-detail {task_id}",
                 "mac-hermes summary {task_id}",

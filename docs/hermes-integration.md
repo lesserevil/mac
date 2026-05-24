@@ -142,6 +142,7 @@ instance:
 
 ```python
 context = adapter.work_context(registration["hermes_instance"]["id"])
+open_tasks = adapter.list_tasks(state="open")
 ```
 
 The payload is `mac.hermes_work_context.v1`. It keeps task, project, and agent
@@ -156,6 +157,7 @@ The same contract is available from:
 ```bash
 mac hermes work-context <hermes_instance_id>
 mac-hermes work-context <hermes_instance_id>
+mac-hermes tasks --state open
 ```
 
 Hermes can also use the same project bridge operators use. This keeps
@@ -280,6 +282,7 @@ missing, invalid, or not wired into the Hermes prompt builder.
 Hermes can then perform lifecycle operations through the adapter or CLI:
 
 ```python
+adapter.list_tasks(state="open")
 adapter.claim_task(task_id, agent_id)
 adapter.claim_next_task(agent_id, dry_run=True)
 adapter.start_task(task_id, agent_id)
@@ -293,6 +296,7 @@ adapter.publish_task(task_id, "git://main", reviewer_agent_id, evidence_id=evide
 ```
 
 ```bash
+mac-hermes tasks --state open
 mac-hermes claim <task_id> <agent_id>
 mac-hermes claim-next <agent_id> --dry-run
 mac-hermes start <task_id> <agent_id>

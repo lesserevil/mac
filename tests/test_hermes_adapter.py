@@ -150,6 +150,7 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     )
     operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
     assert {
+        "list_tasks",
         "list_projects",
         "get_project",
         "list_project_items",
@@ -163,6 +164,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         "get_agent",
         "get_agent_identity",
     } <= operation_names
+    assert any(
+        "mac-hermes tasks" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
     assert any(
         "mac-hermes projects" in command
         for command in work_context["operations"]["mac_hermes_cli"]
@@ -346,6 +351,9 @@ def test_hermes_adapter_performs_task_lifecycle_operations_through_api():
             required_capabilities=["ops"],
         ),
     )
+
+    open_tasks = adapter.list_tasks(state=TaskState.OPEN.value)
+    assert [item["id"] for item in open_tasks] == [task["id"]]
 
     dry_run = adapter.claim_next_task(
         worker.id,
@@ -847,6 +855,7 @@ def test_mac_hermes_cli_exposes_task_lifecycle_operations(monkeypatch, capsys):
 
     monkeypatch.setattr(MacApiClient, "request", request)
     commands = [
+        ["tasks", "--state", "open", "--tenant-id", "tenant_1"],
         ["task-detail", "task_1"],
         [
             "claim-next",
@@ -890,6 +899,7 @@ def test_mac_hermes_cli_exposes_task_lifecycle_operations(monkeypatch, capsys):
         capsys.readouterr()
 
     assert calls == [
+        ("GET", "/tasks?state=open&tenant_id=tenant_1", None),
         ("GET", "/tasks/task_1", None),
         (
             "POST",
