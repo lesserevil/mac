@@ -1382,6 +1382,38 @@ write_hermes_runtime_context() {
   set +a
 }
 
+verify_hermes_prompt_bridge() {
+  log "verifying Hermes prompt bridge sees MAC runtime context"
+  HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" \
+  MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN="${MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN:-$HOME/.hermes/mac-runtime-context.md}" \
+  PYTHONPATH="$HERMES_DIR:${PYTHONPATH:-}" \
+  "$HERMES_DIR/.venv/bin/python" - "$SRC_DIR" <<'PY'
+from __future__ import annotations
+
+import sys
+
+from agent import prompt_builder
+
+workspace = sys.argv[1]
+required = [
+    "MAC Task and Project Runtime",
+    "Direct Session Parity",
+    "mac-hermes work-context",
+    "hgmac agents list",
+    "bd prime",
+]
+runtime_context = prompt_builder._load_mac_runtime_context()
+missing = [item for item in required if item not in runtime_context]
+if missing:
+    raise SystemExit("Hermes MAC runtime prompt bridge did not load: %s" % ", ".join(missing))
+prompt = prompt_builder.build_context_files_prompt(cwd=workspace, skip_soul=True)
+missing = [item for item in required if item not in prompt]
+if missing:
+    raise SystemExit("Hermes MAC runtime prompt is missing: %s" % ", ".join(missing))
+print("Hermes prompt bridge verified for %s" % workspace)
+PY
+}
+
 register_hermes_runtime_identity() {
   log "registering Hermes runtime identity in mac"
   "$VENV/bin/python" - <<'PY'
@@ -3104,6 +3136,7 @@ log "initializing mac database"
 "$VENV/bin/mac" --db "$MAC_DB" init >/dev/null
 register_hermes_runtime_identity
 write_hermes_runtime_context
+verify_hermes_prompt_bridge
 
 ACC_DB=""
 for candidate in "$HOME/.acc/data/fleet.db" "$HOME/.acc/data/acc.db"; do
