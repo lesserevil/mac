@@ -189,7 +189,10 @@ default_tokenhub_bind_addr() {
     case "$host" in
       ""|localhost|127.*|::1)
         ;;
-      *)
+      # Bare IP addresses (including Tailscale 100.x.x.x) are directly bindable.
+      # DNS hostnames (e.g. K8s service FQDNs) resolve to IPs the pod can't bind
+      # to from the inside, so fall through and use 0.0.0.0 for those.
+      [0-9]*.*.*.*|[0-9a-fA-F:]*:*)
         printf '%s\n' "$host"
         return
         ;;
@@ -199,7 +202,7 @@ default_tokenhub_bind_addr() {
   if [ -n "$ts_ip" ]; then
     printf '%s\n' "$ts_ip"
   else
-    printf '%s\n' "127.0.0.1"
+    printf '%s\n' "0.0.0.0"
   fi
 }
 
