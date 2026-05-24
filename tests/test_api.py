@@ -1246,6 +1246,39 @@ def test_fastapi_publishes_agentbus_repo_update_to_all_agents():
     assert chunks[0]["payload"]["request_id"] == "req-api"
 
 
+def test_fastapi_project_import_preserves_first_class_task_fields():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    parent = cp.create_task("Parent task", project="repo-beads-mac")
+
+    item = client.post(
+        "/bridge/items",
+        json={
+            "source": "repo-beads-mac",
+            "external_id": "mac-api",
+            "title": "API imported project item",
+            "description": "Imported with explicit project fields.",
+            "project": "repo-beads-mac",
+            "priority": 42,
+            "payload": {"summary": "track this"},
+            "required_capabilities": ["python"],
+            "dependencies": [parent.id],
+            "metadata": {"team": "core"},
+            "actor": "api-test",
+        },
+    ).json()
+    task = client.get("/tasks/%s" % item["task_id"]).json()["task"]
+
+    assert task["project"] == "repo-beads-mac"
+    assert task["description"] == "Imported with explicit project fields."
+    assert task["priority"] == 42
+    assert task["required_capabilities"] == ["python"]
+    assert task["dependencies"] == [parent.id]
+    assert task["metadata"]["team"] == "core"
+    assert task["metadata"]["source"] == "repo-beads-mac"
+    assert task["metadata"]["external_id"] == "mac-api"
+
+
 def test_fastapi_registers_and_polls_beads_repositories(tmp_path: Path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

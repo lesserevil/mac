@@ -164,6 +164,14 @@ state instead of hidden local Hermes state:
 
 ```python
 adapter.list_project_items()
+adapter.import_project_item(
+    "repo-beads-nanolang",
+    "nanolang-42",
+    "Update parser dependency",
+    project="repo-beads-nanolang",
+    priority=10,
+    dependencies=["task_parent"],
+)
 adapter.register_beads_repository("nanolang", "/Users/jordanh/Src/nanolang", project="repo-beads-nanolang")
 adapter.list_beads_repositories()
 adapter.poll_beads_repositories(repository="nanolang", force=True)
@@ -171,6 +179,7 @@ adapter.poll_beads_repositories(repository="nanolang", force=True)
 
 ```bash
 mac-hermes project-items
+mac-hermes import-project-item repo-beads-nanolang nanolang-42 "Update parser dependency" --project repo-beads-nanolang --priority 10 --dependencies task_parent
 mac-hermes beads-repositories
 mac-hermes register-beads-repository nanolang /Users/jordanh/Src/nanolang --project repo-beads-nanolang
 mac-hermes poll-beads-repositories --repository nanolang --force

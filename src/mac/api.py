@@ -682,8 +682,13 @@ class ProjectImport(BaseModel):
     source: str
     external_id: str
     title: str
+    description: Optional[str] = None
+    project: Optional[str] = None
+    priority: int = 0
     payload: Dict[str, Any] = Field(default_factory=dict)
     required_capabilities: List[str] = Field(default_factory=list)
+    dependencies: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     actor: str = "bridge"
 
 

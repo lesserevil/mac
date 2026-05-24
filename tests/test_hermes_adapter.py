@@ -189,7 +189,12 @@ def test_hermes_adapter_exposes_project_bridge_operations():
         "mac-123",
         "Ship project bridge",
         payload={"summary": "track this", "secret": "drop"},
+        description="Track project bridge work",
+        project="repo-beads-mac",
+        priority=7,
         required_capabilities=["ops"],
+        dependencies=["task_parent"],
+        metadata={"team": "core", "api_token": "drop"},
     )
     adapter.list_project_items()
     adapter.register_beads_repository(
@@ -215,8 +220,13 @@ def test_hermes_adapter_exposes_project_bridge_operations():
                 "source": "repo-beads-mac",
                 "external_id": "mac-123",
                 "title": "Ship project bridge",
+                "description": "Track project bridge work",
+                "project": "repo-beads-mac",
+                "priority": 7,
                 "payload": {"summary": "track this"},
                 "required_capabilities": ["ops"],
+                "dependencies": ["task_parent"],
+                "metadata": {"team": "core"},
                 "actor": "hermes",
             },
         ),
@@ -450,6 +460,51 @@ def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
     )
 
 
+def test_mac_cli_bridge_import_preserves_project_fields(tmp_path, capsys, monkeypatch):
+    db = tmp_path / "mac.db"
+    monkeypatch.setenv("MAC_SECRET_KEY", "test-secret-key-for-cli-project-import")
+    cp = ControlPlane(SQLiteStore(str(db)))
+    parent = cp.create_task("Parent task", project="repo-beads-mac")
+
+    rc = mac_cli_main(
+        [
+            "--db",
+            str(db),
+            "bridge",
+            "import",
+            "repo-beads-mac",
+            "mac-cli",
+            "CLI imported project item",
+            "--description",
+            "Imported through the MAC CLI.",
+            "--project",
+            "repo-beads-mac",
+            "--priority",
+            "13",
+            "--payload",
+            '{"summary":"track this"}',
+            "--required-capabilities",
+            "python,ops",
+            "--dependencies",
+            parent.id,
+            "--metadata",
+            '{"team":"core"}',
+            "--actor",
+            "cli-test",
+        ]
+    )
+
+    assert rc == 0
+    item = json.loads(capsys.readouterr().out)
+    task = ControlPlane(SQLiteStore(str(db))).get_task(item["task_id"])
+    assert task.project == "repo-beads-mac"
+    assert task.description == "Imported through the MAC CLI."
+    assert task.priority == 13
+    assert sorted(task.required_capabilities) == ["ops", "python"]
+    assert task.dependencies == [parent.id]
+    assert task.metadata["team"] == "core"
+
+
 def test_mac_hermes_cli_fetches_work_context(monkeypatch, capsys):
     calls = []
 
@@ -575,8 +630,18 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
             "Ship project bridge",
             "--payload",
             '{"summary":"track this","secret":"drop"}',
+            "--description",
+            "Track project bridge work",
+            "--project",
+            "repo-beads-mac",
+            "--priority",
+            "7",
             "--required-capabilities",
             "ops,tests",
+            "--dependencies",
+            "task_parent",
+            "--metadata",
+            '{"team":"core","api_token":"drop"}',
             "--actor",
             "agent_1",
         ],
@@ -625,8 +690,13 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
                 "source": "repo-beads-mac",
                 "external_id": "mac-123",
                 "title": "Ship project bridge",
+                "description": "Track project bridge work",
+                "project": "repo-beads-mac",
+                "priority": 7,
                 "payload": {"summary": "track this"},
                 "required_capabilities": ["ops", "tests"],
+                "dependencies": ["task_parent"],
+                "metadata": {"team": "core"},
                 "actor": "agent_1",
             },
         ),

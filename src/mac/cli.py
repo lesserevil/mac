@@ -627,6 +627,11 @@ def cmd_bridge_import(args: argparse.Namespace) -> None:
             args.title,
             _json_arg(args.payload, {}),
             required_capabilities=_csv(args.required_capabilities),
+            description=args.description,
+            project=args.project,
+            priority=args.priority,
+            dependencies=_csv(args.dependencies),
+            metadata=_json_arg(args.metadata, {}),
             actor=args.actor,
         )
     )
@@ -1361,7 +1366,12 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_import.add_argument("external_id")
     bridge_import.add_argument("title")
     bridge_import.add_argument("--payload", default="{}")
+    bridge_import.add_argument("--description")
+    bridge_import.add_argument("--project")
+    bridge_import.add_argument("--priority", type=int, default=0)
     bridge_import.add_argument("--required-capabilities")
+    bridge_import.add_argument("--dependencies")
+    bridge_import.add_argument("--metadata", default="{}")
     bridge_import.add_argument("--actor", default="bridge")
     _set(cmd_bridge_import, bridge_import)
     bridge_list = bridge.add_parser("list")

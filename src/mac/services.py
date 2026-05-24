@@ -1406,7 +1406,7 @@ class ControlPlane:
             "mac_cli": [
                 "mac hermes work-context %s" % hermes_instance_id,
                 "mac hermes runtime-proof %s" % hermes_instance_id,
-                "mac bridge import <source> <external_id> <title>",
+                "mac bridge import <source> <external_id> <title> --project <project>",
                 "mac bridge list",
                 "mac bridge beads register <name> <path> --project <project>",
                 "mac bridge beads repos",
@@ -1420,7 +1420,7 @@ class ControlPlane:
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
                 "mac-hermes runtime-proof %s" % hermes_instance_id,
-                "mac-hermes import-project-item <source> <external_id> <title>",
+                "mac-hermes import-project-item <source> <external_id> <title> --project <project>",
                 "mac-hermes project-items",
                 "mac-hermes beads-repositories",
                 "mac-hermes register-beads-repository <name> <path> --project <project>",

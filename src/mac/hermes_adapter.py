@@ -277,7 +277,12 @@ class HermesMacAdapter:
         title: str,
         *,
         payload: Optional[JsonDict] = None,
+        description: Optional[str] = None,
+        project: Optional[str] = None,
+        priority: int = 0,
         required_capabilities: Sequence[str] = (),
+        dependencies: Sequence[str] = (),
+        metadata: Optional[JsonDict] = None,
         actor: str = "hermes",
     ) -> JsonDict:
         return self.client.post(
@@ -286,8 +291,13 @@ class HermesMacAdapter:
                 "source": source,
                 "external_id": external_id,
                 "title": title,
+                "description": description,
+                "project": project,
+                "priority": int(priority),
                 "payload": _sanitize_json_object(payload or {}),
                 "required_capabilities": list(required_capabilities),
+                "dependencies": list(dependencies),
+                "metadata": _sanitize_json_object(metadata or {}),
                 "actor": actor,
             },
         )
@@ -686,7 +696,12 @@ def _cmd_import_project_item(args: argparse.Namespace) -> None:
             args.external_id,
             args.title,
             payload=_json_arg(args.payload, {}),
+            description=args.description,
+            project=args.project,
+            priority=args.priority,
             required_capabilities=_csv(args.required_capabilities),
+            dependencies=_csv(args.dependencies),
+            metadata=_json_arg(args.metadata, {}),
             actor=args.actor,
         )
     )
@@ -905,7 +920,12 @@ def build_parser() -> argparse.ArgumentParser:
     import_project_item.add_argument("external_id")
     import_project_item.add_argument("title")
     import_project_item.add_argument("--payload", default="{}")
+    import_project_item.add_argument("--description")
+    import_project_item.add_argument("--project")
+    import_project_item.add_argument("--priority", type=int, default=0)
     import_project_item.add_argument("--required-capabilities")
+    import_project_item.add_argument("--dependencies")
+    import_project_item.add_argument("--metadata", default="{}")
     import_project_item.add_argument("--actor", default="hermes")
     import_project_item.set_defaults(func=_cmd_import_project_item)
 

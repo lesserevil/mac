@@ -252,11 +252,13 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "/bridge/beads/poll",
                 ],
                 "mac_cli": [
+                    "mac bridge import <source> <external_id> <title> --project <project>",
                     "mac bridge list",
                     "mac bridge beads register <name> <path> --project <project>",
                     "mac bridge beads poll --repository <repository>",
                 ],
                 "mac_hermes_cli": [
+                    "mac-hermes import-project-item <source> <external_id> <title> --project <project>",
                     "mac-hermes project-items",
                     "mac-hermes beads-repositories",
                     "mac-hermes register-beads-repository <name> <path> --project <project>",
@@ -390,7 +392,7 @@ def build_runtime_context(
                 "mac-hermes work-brief %s" % resolved_instance_id,
             ],
             "project_bridge": [
-                "mac-hermes import-project-item <source> <external_id> <title>",
+                "mac-hermes import-project-item <source> <external_id> <title> --project <project>",
                 "mac-hermes project-items",
                 "mac-hermes beads-repositories",
                 "mac-hermes register-beads-repository <name> <path> --project <project>",
