@@ -179,6 +179,14 @@ def _session_capability_contract(
                 "purpose": "Run the repository contract test gate before completion.",
             },
             {
+                "name": "command_audit",
+                "kind": "cli",
+                "required": True,
+                "command": "mac-hermes command-audit list --agent-id %s --limit 5" % agent_id,
+                "expected_path": str(mac_home / "venv" / "bin" / "mac-hermes"),
+                "purpose": "Record and inspect auditable shell work tied to MAC agents and tasks.",
+            },
+            {
                 "name": "web_search",
                 "kind": "service",
                 "required": True,
@@ -197,6 +205,7 @@ def _session_capability_contract(
             "mac-hermes beads-repositories",
             "mac-hermes agents",
             "mac-hermes claim-next %s --dry-run" % agent_id,
+            "mac-hermes command-audit list --agent-id %s --limit 5" % agent_id,
             "hgmac agents identity %s" % agent_id,
             "hgmac agents claim-next %s --dry-run" % agent_id,
             "git status --short --branch",
@@ -206,6 +215,7 @@ def _session_capability_contract(
             "Treat MAC tasks, projects, agents, reviews, and publications as first-class operational objects.",
             "Use Beads for issue tracking in registered project repositories that declare it.",
             "Use hgmac for agent CRUD and operational agent state, not ad hoc database edits.",
+            "Record command audit phases for shell work that changes or verifies task state.",
             "Use Firecrawl-backed web search when current external information is required.",
             "Commit, pull/rebase, push Beads, and push Git before reporting completed code work.",
         ],
@@ -226,6 +236,8 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "/tasks/{task_id}",
                     "/tasks/{task_id}/summary",
                     "/agents/%s/claim-next" % agent_id,
+                    "/agents/%s/command-audit" % agent_id,
+                    "/command-audit?task_id={task_id}",
                     "/tasks/{task_id}/transition",
                 ],
                 "mac_cli": ["mac task show {task_id}", "mac task create --title ..."],
@@ -237,6 +249,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac-hermes claim {task_id} %s" % agent_id,
                     "mac-hermes start {task_id} %s" % agent_id,
                     "mac-hermes transition {task_id} {target_state} --actor %s" % agent_id,
+                    "mac-hermes command-audit list --task-id {task_id}",
                 ],
                 "dashboard_state_keys": [
                     "tasks",
@@ -284,6 +297,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "/agents/{agent_id}",
                     "/agents/{agent_id}/identity",
                     "/agents/{agent_id}/claim-next",
+                    "/agents/{agent_id}/command-audit",
                     "/agents/{agent_id}/heartbeat",
                 ],
                 "mac_cli": [
@@ -296,6 +310,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac-hermes agent-detail %s" % agent_id,
                     "mac-hermes agent-identity %s" % agent_id,
                     "mac-hermes claim-next %s --dry-run" % agent_id,
+                    "mac-hermes command-audit list --agent-id %s" % agent_id,
                 ],
                 "hgmac_cli": [
                     "hgmac agents list",
@@ -409,6 +424,7 @@ def build_runtime_context(
                 "mac-hermes agent-detail %s" % resolved_agent_id,
                 "mac-hermes agent-identity %s" % resolved_agent_id,
                 "mac-hermes claim-next %s --dry-run" % resolved_agent_id,
+                "mac-hermes command-audit list --agent-id %s --limit 20" % resolved_agent_id,
                 "hgmac agents list",
                 "hgmac agents identity %s" % resolved_agent_id,
                 "hgmac agents claim-next %s --dry-run" % resolved_agent_id,
@@ -424,6 +440,8 @@ def build_runtime_context(
                 "mac-hermes start {task_id} %s" % resolved_agent_id,
                 "mac-hermes evidence {task_id} --kind test --uri artifact://... --summary ... --created-by %s"
                 % resolved_agent_id,
+                "mac-hermes command-audit record %s --phase started --argv-json '[\"git\",\"status\"]' --cwd %s --task-id {task_id}"
+                % (resolved_agent_id, resolved_workspace),
                 "mac-hermes submit-review {task_id} %s" % resolved_agent_id,
                 "mac-hermes request-review {task_id} {reviewer_agent_id}",
                 "mac-hermes claim-review {review_id} %s" % resolved_agent_id,
@@ -444,6 +462,7 @@ def build_runtime_context(
             "MAC is authoritative for task, project, dependency, assignment, review, and publication state.",
             "Hermes is authoritative for soul, personality, private memory, and conversation state.",
             "Refresh MAC work context before selecting, changing, or reporting on work.",
+            "Record MAC command audit entries for shell phases that produce task evidence or change repository state.",
             "Do not copy MAC task state into Hermes memory as a source of truth; write only completed-task summaries back to Hermes memory.",
         ],
     }

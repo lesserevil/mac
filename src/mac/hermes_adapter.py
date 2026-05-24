@@ -17,6 +17,7 @@ MemorySink = Callable[[JsonDict], None]
 
 
 SECRET_FIELD_HINTS = ("secret", "token", "password", "private_key", "credential")
+SECRET_ARGUMENT_FLAGS = {"--token", "--api-key", "--key", "--secret", "--password"}
 
 
 class MacApiError(RuntimeError):
@@ -523,6 +524,71 @@ class HermesMacAdapter:
             },
         )
 
+    def record_command_audit(
+        self,
+        agent_id: str,
+        *,
+        phase: str,
+        argv: Sequence[str],
+        cwd: str,
+        command_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        lease_id: Optional[str] = None,
+        started_at: Optional[str] = None,
+        completed_at: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+        returncode: Optional[int] = None,
+        stdout_sha256: Optional[str] = None,
+        stderr_sha256: Optional[str] = None,
+        stdout_bytes: Optional[int] = None,
+        stderr_bytes: Optional[int] = None,
+        metadata: Optional[JsonDict] = None,
+    ) -> JsonDict:
+        return self.client.post(
+            "/agents/%s/command-audit" % _path_part(agent_id),
+            {
+                "command_id": command_id,
+                "phase": phase,
+                "argv": _sanitize_command_argv(argv),
+                "cwd": cwd,
+                "task_id": task_id,
+                "lease_id": lease_id,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "duration_ms": duration_ms,
+                "returncode": returncode,
+                "stdout_sha256": stdout_sha256,
+                "stderr_sha256": stderr_sha256,
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": stderr_bytes,
+                "metadata": _sanitize_json_object(metadata or {}),
+            },
+        )
+
+    def list_command_audit(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        command_id: Optional[str] = None,
+        phase: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        limit: int = 200,
+    ) -> Any:
+        query = _query(
+            (
+                ("agent_id", agent_id),
+                ("task_id", task_id),
+                ("command_id", command_id),
+                ("phase", phase),
+                ("since", since),
+                ("until", until),
+                ("limit", int(limit)),
+            )
+        )
+        return self.client.get("/command-audit?%s" % query)
+
     def user_reply_for_task(self, task_id: str) -> str:
         summary = self.task_summary(task_id)
         if summary["state"] == "completed":
@@ -617,6 +683,33 @@ def _sanitize_json(value: Any, path: Sequence[str]) -> Any:
     return value
 
 
+def _sanitize_command_argv(argv: Sequence[str]) -> List[str]:
+    sanitized: List[str] = []
+    redact_next = False
+    for raw in argv:
+        arg = str(raw)
+        lowered = arg.lower()
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+            continue
+        if lowered in SECRET_ARGUMENT_FLAGS:
+            sanitized.append(arg)
+            redact_next = True
+            continue
+        if any(
+            marker in lowered
+            for marker in ("bearer ", "token=", "api_key=", "apikey=", "password=", "secret=")
+        ):
+            sanitized.append("<redacted>")
+            continue
+        if len(arg) > 512:
+            sanitized.append("<truncated:chars=%d>" % len(arg))
+            continue
+        sanitized.append(arg)
+    return sanitized
+
+
 def _csv(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -627,6 +720,13 @@ def _json_arg(value: Optional[str], default: Any) -> Any:
     if value is None:
         return default
     return json.loads(value)
+
+
+def _json_list_arg(value: Optional[str]) -> List[Any]:
+    parsed = _json_arg(value, [])
+    if not isinstance(parsed, list):
+        raise MacApiError("expected JSON array")
+    return parsed
 
 
 def _print(value: Any) -> None:
@@ -874,6 +974,43 @@ def _cmd_publish(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_command_audit_record(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).record_command_audit(
+            args.agent_id,
+            phase=args.phase,
+            argv=_json_list_arg(args.argv_json),
+            cwd=args.cwd,
+            command_id=args.command_id,
+            task_id=args.task_id,
+            lease_id=args.lease_id,
+            started_at=args.started_at,
+            completed_at=args.completed_at,
+            duration_ms=args.duration_ms,
+            returncode=args.returncode,
+            stdout_sha256=args.stdout_sha256,
+            stderr_sha256=args.stderr_sha256,
+            stdout_bytes=args.stdout_bytes,
+            stderr_bytes=args.stderr_bytes,
+            metadata=_json_arg(args.metadata, {}),
+        )
+    )
+
+
+def _cmd_command_audit_list(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).list_command_audit(
+            agent_id=args.agent_id,
+            task_id=args.task_id,
+            command_id=args.command_id,
+            phase=args.phase,
+            since=args.since,
+            until=args.until,
+            limit=args.limit,
+        )
+    )
+
+
 def _cmd_reply(args: argparse.Namespace) -> None:
     print(_adapter(args).user_reply_for_task(args.task_id))
 
@@ -1069,6 +1206,37 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("created_by")
     publish.add_argument("--evidence-id")
     publish.set_defaults(func=_cmd_publish)
+
+    command_audit = sub.add_parser("command-audit", help="record or list MAC command audit entries")
+    command_audit_sub = command_audit.add_subparsers(dest="command_audit_action", required=True)
+    command_audit_record = command_audit_sub.add_parser("record", help="record an audited command phase")
+    command_audit_record.add_argument("agent_id")
+    command_audit_record.add_argument("--phase", required=True)
+    command_audit_record.add_argument("--argv-json", required=True)
+    command_audit_record.add_argument("--cwd", required=True)
+    command_audit_record.add_argument("--command-id")
+    command_audit_record.add_argument("--task-id")
+    command_audit_record.add_argument("--lease-id")
+    command_audit_record.add_argument("--started-at")
+    command_audit_record.add_argument("--completed-at")
+    command_audit_record.add_argument("--duration-ms", type=float)
+    command_audit_record.add_argument("--returncode", type=int)
+    command_audit_record.add_argument("--stdout-sha256")
+    command_audit_record.add_argument("--stderr-sha256")
+    command_audit_record.add_argument("--stdout-bytes", type=int)
+    command_audit_record.add_argument("--stderr-bytes", type=int)
+    command_audit_record.add_argument("--metadata", default="{}")
+    command_audit_record.set_defaults(func=_cmd_command_audit_record)
+
+    command_audit_list = command_audit_sub.add_parser("list", help="list MAC command audit entries")
+    command_audit_list.add_argument("--agent-id")
+    command_audit_list.add_argument("--task-id")
+    command_audit_list.add_argument("--command-id")
+    command_audit_list.add_argument("--phase")
+    command_audit_list.add_argument("--since")
+    command_audit_list.add_argument("--until")
+    command_audit_list.add_argument("--limit", type=int, default=200)
+    command_audit_list.set_defaults(func=_cmd_command_audit_list)
 
     reply = sub.add_parser("reply", help="render a concise user-facing task status")
     reply.add_argument("task_id")

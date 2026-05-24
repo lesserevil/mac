@@ -572,6 +572,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         "beads_issue_tracker",
         "git_source_control",
         "quality_gate",
+        "command_audit",
         "web_search",
     }
     if not expected_capabilities <= set(session_capability_names):
@@ -1546,6 +1547,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "beads_issue_tracker",
                 "git_source_control",
                 "quality_gate",
+                "command_audit",
                 "web_search",
             }
             <= set(task_project_runtime["session_capability_names"])

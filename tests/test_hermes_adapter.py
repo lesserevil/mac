@@ -155,6 +155,8 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         "list_beads_repositories",
         "poll_beads_repositories",
         "claim_next_task",
+        "record_command_audit",
+        "list_command_audit",
         "list_agents",
         "get_agent",
         "get_agent_identity",
@@ -169,6 +171,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     )
     assert any(
         "mac-hermes claim-next" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
+    assert any(
+        "mac-hermes command-audit" in command
         for command in work_context["operations"]["mac_hermes_cli"]
     )
     assert any(
@@ -424,6 +430,31 @@ def test_hermes_adapter_transition_operation_updates_mac_task_state():
 
     assert blocked["state"] == TaskState.BLOCKED.value
     assert cp.task_history(task["id"])[-1].detail["reason"] == "waiting for user"
+
+
+def test_hermes_adapter_records_and_lists_command_audit():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    adapter = HermesMacAdapter(MacApiClient("http://testserver", transport=api_transport(client)))
+    worker = register_agent(cp, "worker", ["ops"])
+    task = cp.create_task("Audit shell work", project="mac")
+
+    record = adapter.record_command_audit(
+        worker.id,
+        phase="started",
+        argv=["git", "status", "--token", "secret-token", "password=hidden"],
+        cwd="/workspace/mac",
+        task_id=task.id,
+        metadata={"purpose": "test", "api_token": "hidden"},
+    )
+
+    assert record["agent_id"] == worker.id
+    assert record["task_id"] == task.id
+    assert record["phase"] == "started"
+    assert record["argv"] == ["git", "status", "--token", "<redacted>", "<redacted>"]
+    assert record["metadata"] == {"purpose": "test"}
+    records = adapter.list_command_audit(agent_id=worker.id, task_id=task.id, limit=5)
+    assert [item["id"] for item in records] == [record["id"]]
 
 
 def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
@@ -865,5 +896,87 @@ def test_mac_hermes_cli_exposes_task_lifecycle_operations(monkeypatch, capsys):
                 "created_by": "agent_2",
                 "evidence_id": "ev_1",
             },
+        ),
+    ]
+
+
+def test_mac_hermes_cli_exposes_command_audit_operations(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((method, path, payload))
+        return {"schema": "ok", "path": path, "payload": payload}
+
+    monkeypatch.setattr(MacApiClient, "request", request)
+
+    rc = mac_hermes_main(
+        [
+            "--url",
+            "http://hub:8789",
+            "command-audit",
+            "record",
+            "agent_1",
+            "--phase",
+            "completed",
+            "--argv-json",
+            '["git","status","--token","secret"]',
+            "--cwd",
+            "/workspace/mac",
+            "--task-id",
+            "task_1",
+            "--returncode",
+            "0",
+            "--metadata",
+            '{"purpose":"test","api_token":"hidden"}',
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    rc = mac_hermes_main(
+        [
+            "--url",
+            "http://hub:8789",
+            "command-audit",
+            "list",
+            "--agent-id",
+            "agent_1",
+            "--task-id",
+            "task_1",
+            "--phase",
+            "completed",
+            "--limit",
+            "5",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    assert calls == [
+        (
+            "POST",
+            "/agents/agent_1/command-audit",
+            {
+                "command_id": None,
+                "phase": "completed",
+                "argv": ["git", "status", "--token", "<redacted>"],
+                "cwd": "/workspace/mac",
+                "task_id": "task_1",
+                "lease_id": None,
+                "started_at": None,
+                "completed_at": None,
+                "duration_ms": None,
+                "returncode": 0,
+                "stdout_sha256": None,
+                "stderr_sha256": None,
+                "stdout_bytes": None,
+                "stderr_bytes": None,
+                "metadata": {"purpose": "test"},
+            },
+        ),
+        (
+            "GET",
+            "/command-audit?agent_id=agent_1&task_id=task_1&phase=completed&limit=5",
+            None,
         ),
     ]

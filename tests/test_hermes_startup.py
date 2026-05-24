@@ -624,6 +624,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["hgmac_cli"]
     assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]
     assert "beads_issue_tracker" in report["task_project_runtime"]["session_capability_names"]
+    assert "command_audit" in report["task_project_runtime"]["session_capability_names"]
     availability = report["task_project_runtime"]["session_capability_availability"]
     assert availability["ready"] is True
     assert availability["missing"] == []
@@ -633,6 +634,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
         "hgmac_agent_ops_cli",
         "beads_issue_tracker",
         "quality_gate",
+        "command_audit",
         "web_search",
     }
     assert report["checks"]["task_project_runtime_context_available"] is True

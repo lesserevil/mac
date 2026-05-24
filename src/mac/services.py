@@ -692,6 +692,8 @@ class ControlPlane:
             "claim_review",
             "submit_review",
             "publish_task",
+            "record_command_audit",
+            "list_command_audit",
             "write_completed_task_to_memory",
         }
         expected_project_api_operations = {
@@ -706,6 +708,8 @@ class ControlPlane:
             "get_agent",
             "get_agent_identity",
             "claim_next_task",
+            "record_command_audit",
+            "list_command_audit",
         }
         mac_cli_commands = [str(command) for command in operations.get("mac_cli", [])]
         mac_hermes_commands = [
@@ -736,6 +740,7 @@ class ControlPlane:
             "mac-hermes claim-review",
             "mac-hermes review-decision",
             "mac-hermes publish",
+            "mac-hermes command-audit",
             "mac-hermes writeback",
         )
         expected_agent_cli_fragments = (
@@ -743,6 +748,7 @@ class ControlPlane:
             "mac-hermes agent-detail",
             "mac-hermes agent-identity",
             "mac-hermes claim-next",
+            "mac-hermes command-audit",
         )
         expected_hgmac_fragments = (
             "hgmac agents list",
@@ -799,6 +805,7 @@ class ControlPlane:
             "beads_issue_tracker",
             "git_source_control",
             "quality_gate",
+            "command_audit",
             "web_search",
         }
         session_contract_required = runtime_required or bool(session_capabilities)
@@ -840,6 +847,7 @@ class ControlPlane:
                         "mac-hermes claim",
                         "mac-hermes start",
                         "mac-hermes transition",
+                        "mac-hermes command-audit",
                     ),
                 ),
                 "mac_hermes_cli_ready": has_all(
@@ -851,6 +859,7 @@ class ControlPlane:
                         "mac-hermes claim",
                         "mac-hermes start",
                         "mac-hermes transition",
+                        "mac-hermes command-audit",
                     ),
                 ),
                 "dashboard_projection": {
@@ -1397,6 +1406,16 @@ class ControlPlane:
                     "path": "/publications",
                 },
                 {
+                    "name": "record_command_audit",
+                    "method": "POST",
+                    "path": "/agents/{agent_id}/command-audit",
+                },
+                {
+                    "name": "list_command_audit",
+                    "method": "GET",
+                    "path": "/command-audit",
+                },
+                {
                     "name": "write_completed_task_to_memory",
                     "method": "POST",
                     "path": "/memory",
@@ -1485,6 +1504,8 @@ class ControlPlane:
                 "mac-hermes claim-review {review_id} {reviewer_agent_id}",
                 "mac-hermes review-decision {review_id} approved {reviewer_agent_id} --evidence-id {evidence_id}",
                 "mac-hermes publish {task_id} {target} {created_by}",
+                "mac-hermes command-audit record {agent_id} --phase started --argv-json '[\"git\",\"status\"]' --cwd /workspace",
+                "mac-hermes command-audit list --agent-id {agent_id}",
                 "mac-hermes writeback %s {task_id}" % hermes_instance_id,
             ],
             "hgmac_cli": [

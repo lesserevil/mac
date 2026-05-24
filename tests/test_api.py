@@ -164,6 +164,8 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
         "list_beads_repositories",
         "poll_beads_repositories",
         "claim_next_task",
+        "record_command_audit",
+        "list_command_audit",
         "list_agents",
         "get_agent",
         "get_agent_identity",
@@ -172,6 +174,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert any("mac-hermes runtime-proof" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes project-items" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes claim-next" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("mac-hermes command-audit" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes agents" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("hgmac agents create" in command for command in work_context["operations"]["hgmac_cli"])
 
@@ -207,6 +210,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                     "beads_issue_tracker",
                     "git_source_control",
                     "quality_gate",
+                    "command_audit",
                     "web_search",
                 ],
                 "session_capability_availability": {
@@ -239,6 +243,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                         "beads_issue_tracker",
                         "git_source_control",
                         "quality_gate",
+                        "command_audit",
                         "web_search",
                     ],
                     "session_capability_availability": {

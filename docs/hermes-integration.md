@@ -277,6 +277,7 @@ adapter.claim_task(task_id, agent_id)
 adapter.claim_next_task(agent_id, dry_run=True)
 adapter.start_task(task_id, agent_id)
 adapter.add_evidence(task_id, "test", "artifact://pytest", "tests passed", agent_id)
+adapter.record_command_audit(agent_id, phase="completed", argv=["git", "status"], cwd="/workspace/mac", task_id=task_id)
 adapter.submit_for_review(task_id, agent_id)
 adapter.request_review(task_id, reviewer_agent_id)
 adapter.publish_task(task_id, "git://main", reviewer_agent_id, evidence_id=evidence_id)
@@ -287,6 +288,8 @@ mac-hermes claim <task_id> <agent_id>
 mac-hermes claim-next <agent_id> --dry-run
 mac-hermes start <task_id> <agent_id>
 mac-hermes evidence <task_id> --kind test --uri artifact://pytest --summary "tests passed" --created-by <agent_id>
+mac-hermes command-audit record <agent_id> --phase completed --argv-json '["git","status"]' --cwd /workspace/mac --task-id <task_id>
+mac-hermes command-audit list --agent-id <agent_id> --task-id <task_id>
 mac-hermes submit-review <task_id> <agent_id>
 mac-hermes request-review <task_id> <reviewer_agent_id>
 mac-hermes publish <task_id> git://main <reviewer_agent_id> --evidence-id <evidence_id>

@@ -87,6 +87,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         "beads_issue_tracker",
         "git_source_control",
         "quality_gate",
+        "command_audit",
         "web_search",
     } <= capability_names
     assert "mac-hermes work-context hermes_rocky_host --active-only" in markdown
@@ -100,6 +101,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "Agent View" in markdown
     assert "mac-hermes agents" in markdown
     assert "mac-hermes claim-next agent_rocky_host --dry-run" in markdown
+    assert "mac-hermes command-audit list --agent-id agent_rocky_host" in markdown
     assert "hgmac agents claim-next agent_rocky_host --dry-run" in markdown
     assert "mac-hermes claim {task_id} agent_rocky_host" in markdown
     assert "Direct Session Parity" in markdown
