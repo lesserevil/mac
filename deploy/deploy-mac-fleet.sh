@@ -1241,7 +1241,7 @@ install_or_validate_tokenhub_service() {
     export TOKENHUB_REPO_URL="$TOKENHUB_REPO_URL_CONFIGURED"
     export TOKENHUB_REF="$TOKENHUB_REF_CONFIGURED"
     export FLEET_NAME="$FLEET_NAME"
-    export TOKENHUB_SUPERVISOR="$SUPERVISOR_KIND"
+    export TOKENHUB_SUPERVISOR="${TOKENHUB_SUPERVISOR:-auto}"
     MAC_HOME="$MAC_HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" WORKSPACE="$SRC_DIR" \
       bash "$SRC_DIR/deploy/install-tokenhub-service.sh"
     set -a
