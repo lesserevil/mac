@@ -781,6 +781,12 @@ class ControlPlane:
             for name in (runtime.get("session_capability_names") or [])
             if str(name).strip()
         }
+        runtime_first_class_objects = {
+            str(name)
+            for name in (runtime.get("first_class_object_names") or [])
+            if str(name).strip()
+        }
+        expected_first_class_objects = {"tasks", "projects", "agents"}
         expected_session_capabilities = {
             "mac_api",
             "mac_cli",
@@ -965,6 +971,11 @@ class ControlPlane:
                 else True
             ),
             "runtime_session_capabilities_declared": runtime_capabilities_ready,
+            "runtime_first_class_object_model_declared": (
+                expected_first_class_objects <= runtime_first_class_objects
+                if session_contract_required
+                else True
+            ),
             "runtime_session_capabilities_available": (
                 bool(session_availability.get("ready"))
                 if session_contract_required
@@ -1023,6 +1034,8 @@ class ControlPlane:
                     "markdown_file": runtime.get("markdown_file"),
                     "prompt_bridge": prompt_bridge,
                     "workspace": runtime.get("workspace"),
+                    "first_class_object_names": sorted(runtime_first_class_objects),
+                    "first_class_objects": runtime.get("first_class_objects", {}),
                     "session_capability_names": sorted(session_capabilities),
                     "session_capabilities": runtime.get("session_capabilities", []),
                     "session_capability_availability": session_availability,

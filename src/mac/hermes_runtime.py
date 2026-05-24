@@ -210,6 +210,102 @@ def _session_capability_contract(
     }
 
 
+def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict[str, Any]:
+    return {
+        "schema": "mac.hermes.first_class_objects.v1",
+        "objects": {
+            "tasks": {
+                "authority": "mac",
+                "source_of_truth": "mac task records and task history",
+                "identity_fields": ["id", "title", "state", "project", "owner_agent_id"],
+                "api_paths": [
+                    "/hermes-instances/%s/work-context" % hermes_instance_id,
+                    "/hermes-instances/%s/tasks" % hermes_instance_id,
+                    "/tasks/{task_id}",
+                    "/tasks/{task_id}/summary",
+                    "/tasks/{task_id}/transition",
+                ],
+                "mac_cli": ["mac task show {task_id}", "mac task create --title ..."],
+                "mac_hermes_cli": [
+                    "mac-hermes task %s <title> --summary <summary> --project <project>"
+                    % hermes_instance_id,
+                    "mac-hermes task-detail {task_id}",
+                    "mac-hermes claim {task_id} %s" % agent_id,
+                    "mac-hermes start {task_id} %s" % agent_id,
+                    "mac-hermes transition {task_id} {target_state} --actor %s" % agent_id,
+                ],
+                "dashboard_state_keys": [
+                    "tasks",
+                    "hermes_work_contexts.{hermes_instance_id}.tasks",
+                    "hermes_work_contexts.{hermes_instance_id}.relationships.task_dependencies",
+                ],
+                "runtime_rule": "Refresh MAC work context before selecting, changing, or reporting on tasks.",
+            },
+            "projects": {
+                "authority": "mac",
+                "source_of_truth": "MAC project summaries, ProjectItem rows, and registered Beads repositories",
+                "identity_fields": ["project", "task_count", "frontier_tasks", "repository_count"],
+                "api_paths": [
+                    "/hermes-instances/%s/work-context" % hermes_instance_id,
+                    "/bridge/items",
+                    "/bridge/beads/repositories",
+                    "/bridge/beads/poll",
+                ],
+                "mac_cli": [
+                    "mac bridge list",
+                    "mac bridge beads register <name> <path> --project <project>",
+                    "mac bridge beads poll --repository <repository>",
+                ],
+                "mac_hermes_cli": [
+                    "mac-hermes project-items",
+                    "mac-hermes beads-repositories",
+                    "mac-hermes register-beads-repository <name> <path> --project <project>",
+                    "mac-hermes poll-beads-repositories --repository <repository>",
+                ],
+                "dashboard_state_keys": [
+                    "bridge_items",
+                    "beads_repositories",
+                    "hermes_work_contexts.{hermes_instance_id}.projects",
+                ],
+                "runtime_rule": "Treat project frontier, Beads bridge state, and cross-project dependencies as MAC state.",
+            },
+            "agents": {
+                "authority": "mac",
+                "source_of_truth": "MAC agent registry, identity composition, leases, and heartbeats",
+                "identity_fields": ["id", "name", "status", "health_status", "hermes_instance_id"],
+                "api_paths": [
+                    "/agents",
+                    "/agents/{agent_id}",
+                    "/agents/{agent_id}/identity",
+                    "/agents/{agent_id}/claim-next",
+                    "/agents/{agent_id}/heartbeat",
+                ],
+                "mac_cli": [
+                    "mac agent list",
+                    "mac agent register <machine_id> <name>",
+                    "mac agent heartbeat {agent_id}",
+                ],
+                "mac_hermes_cli": [
+                    "mac-hermes agents",
+                    "mac-hermes agent-detail %s" % agent_id,
+                    "mac-hermes agent-identity %s" % agent_id,
+                ],
+                "hgmac_cli": [
+                    "hgmac agents list",
+                    "hgmac agents identity %s" % agent_id,
+                    "hgmac agents claim-next %s --dry-run" % agent_id,
+                ],
+                "dashboard_state_keys": [
+                    "agents",
+                    "hermes_work_contexts.{hermes_instance_id}.agents",
+                    "hermes_work_contexts.{hermes_instance_id}.relationships.agent_assignments",
+                ],
+                "runtime_rule": "Use MAC and hgmac for agent state and operations; Hermes owns personality and private memory.",
+            },
+        },
+    }
+
+
 def build_runtime_context(
     *,
     agent_name: str,
@@ -329,6 +425,10 @@ def build_runtime_context(
                 "mac-hermes writeback %s {task_id}" % resolved_instance_id,
             ],
         },
+        "first_class_objects": _first_class_object_contract(
+            resolved_instance_id,
+            resolved_agent_id,
+        ),
         "workspace": session_capabilities["workspace"],
         "session_capabilities": session_capabilities,
         "runtime_rules": [
@@ -345,6 +445,16 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
     agent = context["agent"]
     operations = context["operations"]
     authority = context["authority"]
+    first_class = (
+        context.get("first_class_objects")
+        if isinstance(context.get("first_class_objects"), dict)
+        else {}
+    )
+    object_map = (
+        first_class.get("objects")
+        if isinstance(first_class.get("objects"), dict)
+        else {}
+    )
     session = context.get("session_capabilities") if isinstance(context.get("session_capabilities"), dict) else {}
     workspace = session.get("workspace") if isinstance(session.get("workspace"), dict) else {}
     project_contract = (
@@ -380,6 +490,17 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
         "",
     ]
     lines.extend("- `%s`" % command for command in operations["refresh_context"])
+    lines.extend(["", "## First-Class Objects", ""])
+    for name in ("tasks", "projects", "agents"):
+        object_contract = object_map.get(name) if isinstance(object_map.get(name), dict) else {}
+        lines.append(
+            "- `%s`: authority `%s`; source `%s`"
+            % (
+                name,
+                object_contract.get("authority") or "unknown",
+                object_contract.get("source_of_truth") or "unconfigured",
+            )
+        )
     lines.extend(["", "## Project Bridge", ""])
     for command in operations.get("project_bridge", []):
         lines.append("- `%s`" % command)

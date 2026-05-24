@@ -196,6 +196,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                 "ready": True,
                 "hermes_instance_id": hermes["id"],
                 "prompt_bridge": {"required": True, "present": True},
+                "first_class_object_names": ["tasks", "projects", "agents"],
                 "session_capability_names": [
                     "mac_api",
                     "mac_cli",
@@ -214,6 +215,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
         },
     )
     assert degraded_runtime_proof["ready"] is False
+    assert degraded_runtime_proof["checks"]["runtime_first_class_object_model_declared"] is True
     assert degraded_runtime_proof["checks"]["runtime_session_capabilities_available"] is False
     assert "runtime_session_capabilities_available" in degraded_runtime_proof["missing"]
 

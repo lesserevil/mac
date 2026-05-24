@@ -70,6 +70,11 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert stored["authority"]["projects"] == "mac"
     assert stored["authority"]["agents"] == "mac"
     assert stored["authority"]["personality"] == "hermes"
+    assert set(stored["first_class_objects"]["objects"]) == {"tasks", "projects", "agents"}
+    assert stored["first_class_objects"]["objects"]["tasks"]["authority"] == "mac"
+    assert stored["first_class_objects"]["objects"]["projects"]["authority"] == "mac"
+    assert stored["first_class_objects"]["objects"]["agents"]["authority"] == "mac"
+    assert "hgmac agents identity agent_rocky_host" in stored["first_class_objects"]["objects"]["agents"]["hgmac_cli"]
     assert stored["endpoints"]["mac_api"] == "http://hub.example.internal:8789/path"
     assert stored["workspace"]["path"] == str(workspace)
     assert stored["workspace"]["project_contract"]["project"] == "repo-beads-mac"
@@ -85,6 +90,10 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
         "web_search",
     } <= capability_names
     assert "mac-hermes work-context hermes_rocky_host --active-only" in markdown
+    assert "First-Class Objects" in markdown
+    assert "`tasks`: authority `mac`" in markdown
+    assert "`projects`: authority `mac`" in markdown
+    assert "`agents`: authority `mac`" in markdown
     assert "Project Bridge" in markdown
     assert "mac-hermes project-items" in markdown
     assert "mac-hermes register-beads-repository <name> <path> --project <project>" in markdown

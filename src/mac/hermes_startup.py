@@ -386,6 +386,8 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         or None,
         "mac_url": _redact_url(os.environ.get("MAC_URL") or os.environ.get("MAC_HUB_URL")),
         "authority": {},
+        "first_class_object_names": [],
+        "first_class_objects": {},
         "operation_groups": [],
         "workspace": {},
         "session_capability_names": [],
@@ -423,6 +425,12 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
     authority = data.get("authority") if isinstance(data.get("authority"), dict) else {}
     endpoints = data.get("endpoints") if isinstance(data.get("endpoints"), dict) else {}
     operations = data.get("operations") if isinstance(data.get("operations"), dict) else {}
+    first_class = data.get("first_class_objects") if isinstance(data.get("first_class_objects"), dict) else {}
+    first_class_objects = (
+        first_class.get("objects")
+        if isinstance(first_class.get("objects"), dict)
+        else {}
+    )
     session = data.get("session_capabilities") if isinstance(data.get("session_capabilities"), dict) else {}
     workspace = session.get("workspace") if isinstance(session.get("workspace"), dict) else {}
     if not workspace and isinstance(data.get("workspace"), dict):
@@ -466,6 +474,34 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
                 "personality": authority.get("personality"),
                 "user_memory": authority.get("user_memory"),
             },
+            "first_class_object_names": sorted(
+                str(name)
+                for name, value in first_class_objects.items()
+                if isinstance(value, dict) and str(name).strip()
+            ),
+            "first_class_objects": {
+                str(name): {
+                    "authority": value.get("authority"),
+                    "source_of_truth": value.get("source_of_truth"),
+                    "identity_fields": value.get("identity_fields")
+                    if isinstance(value.get("identity_fields"), list)
+                    else [],
+                    "api_paths": value.get("api_paths")
+                    if isinstance(value.get("api_paths"), list)
+                    else [],
+                    "mac_cli": value.get("mac_cli") if isinstance(value.get("mac_cli"), list) else [],
+                    "mac_hermes_cli": value.get("mac_hermes_cli")
+                    if isinstance(value.get("mac_hermes_cli"), list)
+                    else [],
+                    "hgmac_cli": value.get("hgmac_cli") if isinstance(value.get("hgmac_cli"), list) else [],
+                    "dashboard_state_keys": value.get("dashboard_state_keys")
+                    if isinstance(value.get("dashboard_state_keys"), list)
+                    else [],
+                    "runtime_rule": value.get("runtime_rule"),
+                }
+                for name, value in first_class_objects.items()
+                if isinstance(value, dict)
+            },
             "operation_groups": sorted(str(key) for key in operations.keys()),
             "workspace": {
                 "path": workspace.get("path"),
@@ -507,6 +543,27 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
             if required:
                 summary["warning"] = summary["error"]
             return summary
+    object_model = summary["first_class_objects"]
+    object_model_errors = []
+    for key in ("tasks", "projects", "agents"):
+        item = object_model.get(key) if isinstance(object_model.get(key), dict) else {}
+        if item.get("authority") != "mac":
+            object_model_errors.append("%s.authority" % key)
+        for field in ("source_of_truth", "identity_fields", "api_paths", "mac_hermes_cli", "dashboard_state_keys"):
+            value = item.get(field)
+            if not value:
+                object_model_errors.append("%s.%s" % (key, field))
+        if key == "agents" and not item.get("hgmac_cli"):
+            object_model_errors.append("agents.hgmac_cli")
+    if object_model_errors:
+        summary["ready"] = not required
+        summary["status"] = "first_class_object_contract_missing"
+        summary["error"] = "runtime context is missing first-class object contract fields: %s" % ", ".join(
+            sorted(object_model_errors)
+        )
+        if required:
+            summary["warning"] = summary["error"]
+        return summary
     expected_capabilities = {
         "mac_api",
         "mac_cli",
@@ -1492,6 +1549,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "web_search",
             }
             <= set(task_project_runtime["session_capability_names"])
+        ),
+        "mac_first_class_object_model_declared": (
+            not task_project_runtime["required"]
+            or {"tasks", "projects", "agents"}
+            <= set(task_project_runtime["first_class_object_names"])
         ),
         "mac_session_capabilities_available": (
             not task_project_runtime["required"]

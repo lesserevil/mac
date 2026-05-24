@@ -228,6 +228,14 @@ registered against the same deterministic Hermes instance id, so
 `mac-hermes work-context $MAC_HERMES_INSTANCE_ID` gives the agent the same
 task/project graph the MAC API, CLI, and dashboard show.
 
+The JSON context also carries a `first_class_objects` contract for `tasks`,
+`projects`, and `agents`. Each object records MAC authority, the source of
+truth, identity fields, API paths, MAC CLI and `mac-hermes` commands, dashboard
+state keys, and the runtime rule Hermes should follow. Startup health fails a
+required runtime context when that object model is missing or incomplete, so a
+deployed Hermes agent cannot silently regress to treating tasks, projects, or
+agents as informal prompt text.
+
 The same runtime context now carries a direct-session capability contract. A
 Hermes session sees the MAC source workspace, the repository Beads contract,
 the `bd prime` workflow, the `mac`, `mac-hermes`, and `hgmac` CLIs, Git status

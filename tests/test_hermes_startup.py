@@ -613,6 +613,15 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["mac_url"] == "http://hub.example.internal:8789"
     assert report["task_project_runtime"]["workspace"]["path"] == str(workspace)
     assert report["task_project_runtime"]["workspace"]["project_contract"]["project"] == "repo-beads-mac"
+    assert set(report["task_project_runtime"]["first_class_object_names"]) == {
+        "tasks",
+        "projects",
+        "agents",
+    }
+    assert report["task_project_runtime"]["first_class_objects"]["tasks"]["authority"] == "mac"
+    assert report["task_project_runtime"]["first_class_objects"]["projects"]["authority"] == "mac"
+    assert report["task_project_runtime"]["first_class_objects"]["agents"]["authority"] == "mac"
+    assert report["task_project_runtime"]["first_class_objects"]["agents"]["hgmac_cli"]
     assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]
     assert "beads_issue_tracker" in report["task_project_runtime"]["session_capability_names"]
     availability = report["task_project_runtime"]["session_capability_availability"]
@@ -629,6 +638,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["checks"]["task_project_runtime_context_available"] is True
     assert report["checks"]["task_project_runtime_prompt_bridge_active"] is True
     assert report["checks"]["mac_task_project_authority_declared"] is True
+    assert report["checks"]["mac_first_class_object_model_declared"] is True
     assert report["checks"]["mac_session_capability_contract_declared"] is True
     assert report["checks"]["mac_session_capabilities_available"] is True
     assert report["task_project_runtime"]["prompt_bridge"]["present"] is True
@@ -721,6 +731,49 @@ def test_required_task_project_runtime_context_blocks_readiness_when_missing(
     assert report["task_project_runtime"]["status"] == "missing_context"
     assert report["checks"]["task_project_runtime_context_available"] is False
     assert "runtime context file is missing" in " ".join(report["warnings"])
+
+
+def test_required_task_project_runtime_context_blocks_when_object_model_missing(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    context_path = hermes_home / "mac-runtime-context.json"
+    markdown_path = hermes_home / "mac-runtime-context.md"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    context = build_runtime_context(
+        agent_name="rocky",
+        fleet_name="classic",
+        mac_url="http://hub.example.internal:8789",
+        hermes_home=hermes_home,
+        mac_home=tmp_path / ".mac",
+        hermes_instance_id="hermes_rocky",
+        agent_id="agent_rocky",
+    )
+    context.pop("first_class_objects")
+    _write(context_path, json.dumps(context))
+    _write(markdown_path, "runtime")
+    _write(
+        agent_dir / "agent" / "prompt_builder.py",
+        "_load_mac_runtime_context\nMAC_HERMES_RUNTIME_CONTEXT_MARKDOWN\nmac-runtime-context.md\n",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", str(context_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", str(markdown_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["task_project_runtime"]["status"] == "first_class_object_contract_missing"
+    assert report["checks"]["mac_first_class_object_model_declared"] is False
+    assert "first-class object contract" in " ".join(report["warnings"])
 
 
 def test_required_task_project_runtime_context_blocks_when_prompt_bridge_missing(
