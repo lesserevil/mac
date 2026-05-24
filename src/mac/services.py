@@ -81,6 +81,7 @@ from mac.models import (
     SecretHandle,
     SecretRecord,
     Task,
+    TASK_TRANSITIONS,
     TaskState,
     TaskTransitionOutbox,
     Tenant,
@@ -596,6 +597,334 @@ class ControlPlane:
 
     def hermes_context(self, hermes_instance_id: str) -> JsonDict:
         return self.identity.hermes_context(hermes_instance_id)
+
+    def hermes_work_context(
+        self,
+        hermes_instance_id: str,
+        *,
+        include_completed: bool = True,
+        task_limit: int = 100,
+    ) -> JsonDict:
+        """MAC-authoritative operational view for a Hermes runtime.
+
+        Hermes owns personality and user memory, but MAC owns task/project/agent
+        state. This projection is the bridge contract Hermes can load when it
+        needs to reason about work with the same durable objects operators see.
+        """
+
+        identity_context = self.hermes_context(hermes_instance_id)
+        instance = self.get_hermes_instance(hermes_instance_id)
+        tenant_id = instance.tenant_id
+        all_tenant_tasks = self.list_tasks(tenant_id=tenant_id)
+        visible_tasks = [
+            task
+            for task in all_tenant_tasks
+            if include_completed or task.state not in TERMINAL_TASK_STATES
+        ]
+        limit = min(max(1, int(task_limit)), 500)
+        limited_tasks = visible_tasks[:limit]
+        agents = self.list_agents()
+        project_items = [item.to_dict() for item in self.list_project_items()]
+        repositories = [repo.to_dict() for repo in self.list_beads_repositories()]
+        return {
+            "schema": "mac.hermes_work_context.v1",
+            "authority": {
+                "tasks": "mac",
+                "projects": "mac",
+                "agents": "mac",
+                "personality": "hermes",
+                "user_memory": "hermes",
+            },
+            "tenant": identity_context["tenant"],
+            "hermes_instance": identity_context["hermes_instance"],
+            "persona": identity_context["persona"],
+            "platform_bindings": identity_context["platform_bindings"],
+            "memory_contract": identity_context["memory_contract"],
+            "projects": self._hermes_project_contexts(
+                all_tenant_tasks,
+                agents,
+                project_items,
+                repositories,
+            ),
+            "tasks": [self._hermes_task_context(task) for task in limited_tasks],
+            "task_count": len(visible_tasks),
+            "task_limit": limit,
+            "task_truncated": len(visible_tasks) > limit,
+            "agents": [
+                self._hermes_agent_context(agent, all_tenant_tasks)
+                for agent in agents
+            ],
+            "relationships": self._hermes_work_relationships(all_tenant_tasks, agents),
+            "operations": self._hermes_operation_contract(hermes_instance_id),
+        }
+
+    def _hermes_task_project_key(self, task: Task) -> str:
+        project = str(task.project or "").strip()
+        if project:
+            return project
+        for key in ("project", "repository", "repo"):
+            value = str(task.metadata.get(key) or "").strip()
+            if value:
+                return value
+        origin = task.metadata.get("origin")
+        if isinstance(origin, dict):
+            for key in ("project", "repository", "repo", "source"):
+                value = str(origin.get(key) or "").strip()
+                if value:
+                    return value
+        return "unassigned"
+
+    def _hermes_task_context(self, task: Task) -> JsonDict:
+        origin = task.metadata.get("origin")
+        memory_boundary = task.metadata.get("memory_boundary")
+        return {
+            "id": task.id,
+            "title": task.title,
+            "project": self._hermes_task_project_key(task),
+            "declared_project": task.project,
+            "state": task.state,
+            "priority": task.priority,
+            "owner_agent_id": task.owner_agent_id,
+            "required_capabilities": list(task.required_capabilities),
+            "dependencies": list(task.dependencies),
+            "origin": origin if isinstance(origin, dict) else {},
+            "memory_boundary": memory_boundary if isinstance(memory_boundary, dict) else {},
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+
+    def _hermes_project_contexts(
+        self,
+        tasks: List[Task],
+        agents: List[Agent],
+        project_items: List[JsonDict],
+        repositories: List[JsonDict],
+    ) -> List[JsonDict]:
+        task_by_id = {task.id: task for task in tasks}
+        agent_by_id = {agent.id: agent for agent in agents}
+        buckets: Dict[str, JsonDict] = {}
+
+        def bucket(project: str) -> JsonDict:
+            if project not in buckets:
+                buckets[project] = {
+                    "project": project,
+                    "task_count": 0,
+                    "active_count": 0,
+                    "ready_count": 0,
+                    "blocked_count": 0,
+                    "review_count": 0,
+                    "completed_count": 0,
+                    "state_counts": {},
+                    "dependency_edge_count": 0,
+                    "cross_project_dependency_count": 0,
+                    "active_agent_ids": set(),
+                    "active_agent_names": set(),
+                    "required_capabilities": set(),
+                    "frontier_tasks": [],
+                    "waiting_tasks": [],
+                    "active_tasks": [],
+                    "bridge_item_count": 0,
+                    "repository_count": 0,
+                }
+            return buckets[project]
+
+        for task in tasks:
+            project = self._hermes_task_project_key(task)
+            item = bucket(project)
+            item["task_count"] += 1
+            state_counts = item["state_counts"]
+            state_counts[task.state] = state_counts.get(task.state, 0) + 1
+            item["dependency_edge_count"] += len(task.dependencies)
+            for capability in task.required_capabilities:
+                item["required_capabilities"].add(str(capability))
+            if task.owner_agent_id:
+                item["active_agent_ids"].add(task.owner_agent_id)
+                agent = agent_by_id.get(task.owner_agent_id)
+                if agent is not None:
+                    item["active_agent_names"].add(agent.name)
+            if task.state not in TERMINAL_TASK_STATES:
+                item["active_count"] += 1
+            if task.state in {TaskState.NEEDS_REVIEW.value, TaskState.REVIEWING.value}:
+                item["review_count"] += 1
+            if task.state == TaskState.COMPLETED.value:
+                item["completed_count"] += 1
+            waiting_on = []
+            for dependency_id in task.dependencies:
+                dependency = task_by_id.get(dependency_id)
+                if dependency is None or dependency.state != TaskState.COMPLETED.value:
+                    waiting_on.append(dependency_id)
+                if dependency is not None and self._hermes_task_project_key(dependency) != project:
+                    item["cross_project_dependency_count"] += 1
+            compact = self._hermes_task_context(task)
+            if task.state == TaskState.OPEN.value and not waiting_on:
+                item["ready_count"] += 1
+                if len(item["frontier_tasks"]) < 10:
+                    item["frontier_tasks"].append(compact)
+            elif task.state in {TaskState.OPEN.value, TaskState.BLOCKED.value} and waiting_on:
+                item["blocked_count"] += 1
+                if len(item["waiting_tasks"]) < 10:
+                    item["waiting_tasks"].append({**compact, "waiting_on": waiting_on[:8]})
+            elif task.state in {
+                TaskState.CLAIMED.value,
+                TaskState.RUNNING.value,
+                TaskState.NEEDS_REVIEW.value,
+                TaskState.REVIEWING.value,
+            }:
+                if len(item["active_tasks"]) < 10:
+                    item["active_tasks"].append(compact)
+
+        for bridge_item in project_items:
+            bucket(str(bridge_item.get("project") or bridge_item.get("source") or "unassigned"))[
+                "bridge_item_count"
+            ] += 1
+        for repository in repositories:
+            bucket(str(repository.get("project") or repository.get("name") or "unassigned"))[
+                "repository_count"
+            ] += 1
+
+        normalized = []
+        for item in buckets.values():
+            normalized.append(
+                {
+                    **item,
+                    "active_agent_ids": sorted(item["active_agent_ids"]),
+                    "active_agent_names": sorted(item["active_agent_names"]),
+                    "required_capabilities": sorted(item["required_capabilities"]),
+                }
+            )
+        return sorted(
+            normalized,
+            key=lambda item: (
+                -int(item["ready_count"]),
+                -int(item["active_count"]),
+                str(item["project"]),
+            ),
+        )
+
+    def _hermes_agent_context(self, agent: Agent, tasks: List[Task]) -> JsonDict:
+        active_tasks = [
+            task
+            for task in tasks
+            if task.owner_agent_id == agent.id and task.state not in TERMINAL_TASK_STATES
+        ]
+        return {
+            "id": agent.id,
+            "name": agent.name,
+            "status": agent.status,
+            "health_status": agent.health_status,
+            "capabilities": list(agent.capabilities),
+            "resources": dict(agent.resources),
+            "role_id": agent.role_id,
+            "hermes_instance_id": agent.hermes_instance_id,
+            "current_task_id": agent.current_task_id,
+            "capacity": self._agent_capacity(agent),
+            "active_lease_count": self._agent_active_lease_count(agent.id),
+            "active_task_ids": [task.id for task in active_tasks],
+            "active_projects": sorted(
+                {self._hermes_task_project_key(task) for task in active_tasks}
+            ),
+        }
+
+    def _hermes_work_relationships(self, tasks: List[Task], agents: List[Agent]) -> JsonDict:
+        task_by_id = {task.id: task for task in tasks}
+        agent_ids = {agent.id for agent in agents}
+        dependency_edges = []
+        assignment_edges = []
+        hermes_origins = []
+        for task in tasks:
+            task_project = self._hermes_task_project_key(task)
+            for dependency_id in task.dependencies:
+                dependency = task_by_id.get(dependency_id)
+                dependency_edges.append(
+                    {
+                        "task_id": task.id,
+                        "task_project": task_project,
+                        "depends_on_task_id": dependency_id,
+                        "depends_on_project": (
+                            self._hermes_task_project_key(dependency)
+                            if dependency is not None
+                            else None
+                        ),
+                        "depends_on_state": dependency.state if dependency is not None else None,
+                        "cross_project": (
+                            dependency is not None
+                            and self._hermes_task_project_key(dependency) != task_project
+                        ),
+                    }
+                )
+            if task.owner_agent_id:
+                assignment_edges.append(
+                    {
+                        "agent_id": task.owner_agent_id,
+                        "task_id": task.id,
+                        "project": task_project,
+                        "state": task.state,
+                        "agent_registered": task.owner_agent_id in agent_ids,
+                    }
+                )
+            origin = task.metadata.get("origin")
+            if isinstance(origin, dict) and origin.get("hermes_instance_id"):
+                hermes_origins.append(
+                    {
+                        "hermes_instance_id": origin.get("hermes_instance_id"),
+                        "task_id": task.id,
+                        "project": task_project,
+                        "origin_type": origin.get("type"),
+                        "conversation_ref": origin.get("conversation_ref"),
+                    }
+                )
+        return {
+            "task_dependencies": dependency_edges,
+            "agent_assignments": assignment_edges,
+            "hermes_task_origins": hermes_origins,
+        }
+
+    def _hermes_operation_contract(self, hermes_instance_id: str) -> JsonDict:
+        return {
+            "api": [
+                {
+                    "name": "get_work_context",
+                    "method": "GET",
+                    "path": "/hermes-instances/%s/work-context" % hermes_instance_id,
+                },
+                {
+                    "name": "create_task_from_conversation",
+                    "method": "POST",
+                    "path": "/hermes-instances/%s/tasks" % hermes_instance_id,
+                },
+                {"name": "get_task", "method": "GET", "path": "/tasks/{task_id}"},
+                {
+                    "name": "get_task_summary",
+                    "method": "GET",
+                    "path": "/tasks/{task_id}/summary",
+                },
+                {
+                    "name": "write_completed_task_to_memory",
+                    "method": "POST",
+                    "path": "/memory",
+                },
+                {
+                    "name": "track_conversation_thread",
+                    "method": "POST",
+                    "path": "/conversation-threads",
+                },
+            ],
+            "mac_cli": [
+                "mac hermes work-context %s" % hermes_instance_id,
+                "mac task show {task_id}",
+                "mac task create --title ...",
+            ],
+            "mac_hermes_cli": [
+                "mac-hermes work-context %s" % hermes_instance_id,
+                "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
+                "mac-hermes summary {task_id}",
+                "mac-hermes writeback %s {task_id}" % hermes_instance_id,
+            ],
+            "task_state_transitions": {
+                state: sorted(targets)
+                for state, targets in TASK_TRANSITIONS.items()
+            },
+        }
 
     # Agent roles: thin facade over ``self.roles``.
 

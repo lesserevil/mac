@@ -102,6 +102,16 @@ def cmd_hermes_context(args: argparse.Namespace) -> None:
     _print(_plane(args).hermes_context(args.instance_id))
 
 
+def cmd_hermes_work_context(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).hermes_work_context(
+            args.instance_id,
+            include_completed=not args.active_only,
+            task_limit=args.task_limit,
+        )
+    )
+
+
 def cmd_binding_register(args: argparse.Namespace) -> None:
     _print(
         _plane(args).register_platform_binding(
@@ -924,6 +934,11 @@ def build_parser() -> argparse.ArgumentParser:
     hermes_context = hermes.add_parser("context")
     hermes_context.add_argument("instance_id")
     _set(cmd_hermes_context, hermes_context)
+    hermes_work_context = hermes.add_parser("work-context")
+    hermes_work_context.add_argument("instance_id")
+    hermes_work_context.add_argument("--active-only", action="store_true")
+    hermes_work_context.add_argument("--task-limit", type=int, default=100)
+    _set(cmd_hermes_work_context, hermes_work_context)
 
     binding = sub.add_parser("binding", help="Hermes platform binding commands").add_subparsers(dest="binding_command", required=True)
     binding_register = binding.add_parser("register")

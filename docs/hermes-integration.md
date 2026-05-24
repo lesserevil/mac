@@ -135,6 +135,26 @@ Do not pass raw transcripts, private memory, provider tokens, or full
 `MEMORY.md` contents. The adapter drops obvious secret and private-memory
 metadata keys, but Hermes should still choose a minimal task brief.
 
+## Work Context
+
+Hermes can load MAC's authoritative task, project, and agent projection for an
+instance:
+
+```python
+context = adapter.work_context(registration["hermes_instance"]["id"])
+```
+
+The payload is `mac.hermes_work_context.v1`. It keeps task, project, and agent
+authority in MAC while preserving Hermes as the authority for personality and
+user memory. It includes visible tasks, project frontier summaries, agent
+assignments, task dependencies, Hermes task origins, and stable API/CLI
+operation hints. The same contract is available from:
+
+```bash
+mac hermes work-context <hermes_instance_id>
+mac-hermes work-context <hermes_instance_id>
+```
+
 ## User Replies
 
 Hermes can poll a durable task summary:

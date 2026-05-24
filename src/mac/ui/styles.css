@@ -594,6 +594,17 @@ details.action-box summary {
   box-shadow: none;
 }
 
+.record-section {
+  border-top: 1px solid var(--border);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.record-section h3 {
+  font-size: 0.96rem;
+  margin: 0 0 10px;
+}
+
 .timeline {
   display: grid;
   gap: 8px;

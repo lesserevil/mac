@@ -1,5 +1,8 @@
+import json
+
 from fastapi.testclient import TestClient
 
+from mac.cli import main as mac_cli_main
 from mac.api import create_app
 from mac.hermes_adapter import (
     ConversationTaskInput,
@@ -7,9 +10,11 @@ from mac.hermes_adapter import (
     MacApiClient,
     MacApiError,
     PlatformBindingSpec,
+    main as mac_hermes_main,
 )
 from mac.models import ReviewStatus, TaskState
 from mac.services import ControlPlane
+from mac.store import SQLiteStore
 
 
 def api_transport(client):
@@ -101,6 +106,7 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
             summary="Deploy failed after the package publish step.",
             platform_binding_id=registration["platform_bindings"][0]["id"],
             conversation_ref="slack://T123/C456/1712345678.000100",
+            project="deploy",
             required_capabilities=["ops"],
             snippets=["User-visible error: publish returned 500"],
             metadata={
@@ -119,6 +125,19 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     assert "api_token" not in task["metadata"]
     assert "raw_messages" not in task["metadata"]
     assert "do not copy" not in task["description"]
+
+    work_context = adapter.work_context(registration["hermes_instance"]["id"])
+    assert work_context["schema"] == "mac.hermes_work_context.v1"
+    assert work_context["projects"][0]["project"] == "deploy"
+    assert work_context["tasks"][0]["id"] == task["id"]
+    assert work_context["tasks"][0]["origin"]["hermes_instance_id"] == registration["hermes_instance"]["id"]
+    assert any(
+        operation["name"] == "create_task_from_conversation"
+        for operation in work_context["operations"]["api"]
+    )
+    assert adapter.work_context_brief(registration["hermes_instance"]["id"]).startswith(
+        "MAC work context:"
+    )
 
 
 def test_hermes_adapter_summarizes_result_and_prepares_memory_writeback():
@@ -157,3 +176,74 @@ def test_hermes_adapter_summarizes_result_and_prepares_memory_writeback():
     assert writes[0]["content"] == "Fix build is complete and published to git://main."
     assert writeback["record"]["subject_type"] == "hermes_memory"
     assert cp.search_memory(task_id=task["id"])[0].record_type == "task_result_writeback"
+
+
+def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
+    db = tmp_path / "mac.db"
+    monkeypatch.setenv("MAC_SECRET_KEY", "test-secret-key-for-cli-work-context")
+    cp = ControlPlane(
+        SQLiteStore(str(db)),
+        secret_key="test-secret-key-for-cli-work-context",
+    )
+    tenant = cp.register_tenant("team")
+    persona = cp.register_persona(
+        tenant.id,
+        "Rocky",
+        "hermes://team/rocky/SOUL.md",
+        "hermes://team/rocky/memory",
+    )
+    hermes = cp.register_hermes_instance(tenant.id, "rocky", persona_id=persona.id)
+    cp.create_interaction_task(
+        hermes.id,
+        "Track project from Hermes",
+        project="mac",
+        description="Created through the Hermes boundary.",
+    )
+
+    rc = mac_cli_main(["--db", str(db), "hermes", "work-context", hermes.id])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "mac.hermes_work_context.v1"
+    assert payload["projects"][0]["project"] == "mac"
+    assert payload["operations"]["mac_cli"][0].startswith("mac hermes work-context")
+
+
+def test_mac_hermes_cli_fetches_work_context(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((self.base_url, method, path, payload))
+        return {
+            "schema": "mac.hermes_work_context.v1",
+            "projects": [],
+            "tasks": [],
+            "agents": [],
+            "relationships": {},
+            "operations": {},
+        }
+
+    monkeypatch.setattr(MacApiClient, "request", request)
+
+    rc = mac_hermes_main(
+        [
+            "--url",
+            "http://hub:8789",
+            "work-context",
+            "hermes_1",
+            "--active-only",
+            "--task-limit",
+            "7",
+        ]
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["schema"] == "mac.hermes_work_context.v1"
+    assert calls == [
+        (
+            "http://hub:8789",
+            "GET",
+            "/hermes-instances/hermes_1/work-context?include_completed=false&task_limit=7",
+            None,
+        )
+    ]

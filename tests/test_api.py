@@ -60,7 +60,8 @@ def test_fastapi_exposes_core_workflow_and_redacts_secrets():
 
 
 def test_fastapi_exposes_hermes_identity_boundary():
-    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
 
     tenant = client.post("/tenants", json={"name": "team"}).json()
     persona = client.post(
@@ -95,16 +96,64 @@ def test_fastapi_exposes_hermes_identity_boundary():
     assert context["memory_contract"]["user_memory_authority"] == "hermes"
     assert context["platform_bindings"][0]["id"] == binding["id"]
 
+    machine = client.post("/machines", json={"hostname": "rocky-host"}).json()
+    agent = client.post(
+        "/agents",
+        json={
+            "machine_id": machine["id"],
+            "name": "rocky",
+            "capabilities": ["ops"],
+            "hermes_instance_id": hermes["id"],
+        },
+    ).json()
+    dependency = client.post(
+        "/hermes-instances/%s/tasks" % hermes["id"],
+        json={
+            "title": "Prepare project",
+            "project": "nanolang",
+            "required_capabilities": ["ops"],
+        },
+    ).json()
     task = client.post(
         "/hermes-instances/%s/tasks" % hermes["id"],
         json={
             "title": "Follow up from chat",
+            "project": "nanolang",
             "platform_binding_id": binding["id"],
             "conversation_ref": "telegram://chat-42/99",
+            "dependencies": [dependency["id"]],
         },
     ).json()
+    cp.claim_task(dependency["id"], agent["id"])
     assert task["metadata"]["origin"]["hermes_instance_id"] == hermes["id"]
     assert task["metadata"]["memory_boundary"]["mac_records_operational_provenance_only"] is True
+
+    work_context = client.get("/hermes-instances/%s/work-context" % hermes["id"]).json()
+    assert work_context["schema"] == "mac.hermes_work_context.v1"
+    assert work_context["authority"]["tasks"] == "mac"
+    assert work_context["authority"]["projects"] == "mac"
+    assert {item["id"] for item in work_context["tasks"]} == {dependency["id"], task["id"]}
+    assert work_context["projects"][0]["project"] == "nanolang"
+    assert work_context["projects"][0]["task_count"] == 2
+    assert work_context["projects"][0]["blocked_count"] == 1
+    assert work_context["agents"][0]["hermes_instance_id"] == hermes["id"]
+    assert work_context["agents"][0]["active_task_ids"] == [dependency["id"]]
+    assert work_context["relationships"]["task_dependencies"][0]["task_id"] == task["id"]
+    assert work_context["relationships"]["agent_assignments"][0]["agent_id"] == agent["id"]
+    assert any(
+        operation["name"] == "get_work_context"
+        for operation in work_context["operations"]["api"]
+    )
+    assert any("mac-hermes work-context" in command for command in work_context["operations"]["mac_hermes_cli"])
+
+    active_only = client.get(
+        "/hermes-instances/%s/work-context?include_completed=false&task_limit=1" % hermes["id"]
+    ).json()
+    assert active_only["task_limit"] == 1
+    assert active_only["task_truncated"] is True
+
+    state = client.get("/dashboard/state").json()
+    assert state["hermes_work_contexts"][hermes["id"]]["projects"][0]["project"] == "nanolang"
 
 
 def test_workflow_runs_route_is_not_shadowed_by_workflow_slug_route():

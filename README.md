@@ -124,7 +124,7 @@ handle requests. It deliberately does not expose a casual secret reveal action.
 Key route groups:
 
 - `/tenants`, `/users`, `/personas`
-- `/hermes-instances`, `/hermes-instances/{id}/context`, `/platform-bindings`
+- `/hermes-instances`, `/hermes-instances/{id}/context`, `/hermes-instances/{id}/work-context`, `/platform-bindings`
 - `/dashboard/state`, `/dashboard/agents/{id}`, `/dashboard/tasks/{id}/timeline`, `/dashboard/dispatch/explain`, `/dashboard/hermes/{id}/activity`, `/dashboard/rollouts/{id}/status`
 - `/tasks`, `/tasks/{id}/evidence`, `/tasks/{id}/reviews`, `/reviews/default/tick`, `/publications`
 - `/machines`, `/agents`, `/agents/{id}/heartbeat`, `/agents/{id}/claim-next`, `/dispatch/tick`, `/dispatch/dead-letters`

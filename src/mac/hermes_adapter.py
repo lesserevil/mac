@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
@@ -206,6 +207,40 @@ class HermesMacAdapter:
     def task_summary(self, task_id: str) -> JsonDict:
         return self.client.get("/tasks/%s/summary" % task_id)
 
+    def work_context(
+        self,
+        hermes_instance_id: str,
+        *,
+        include_completed: bool = True,
+        task_limit: int = 100,
+    ) -> JsonDict:
+        query = urllib.parse.urlencode(
+            {
+                "include_completed": "true" if include_completed else "false",
+                "task_limit": int(task_limit),
+            }
+        )
+        return self.client.get(
+            "/hermes-instances/%s/work-context?%s" % (hermes_instance_id, query)
+        )
+
+    def work_context_brief(self, hermes_instance_id: str) -> str:
+        context = self.work_context(hermes_instance_id, include_completed=False, task_limit=20)
+        projects = context.get("projects") or []
+        tasks = context.get("tasks") or []
+        agents = context.get("agents") or []
+        project_names = ", ".join(str(project.get("project")) for project in projects[:5])
+        return (
+            "MAC work context: %d active task(s), %d project(s), %d agent(s). "
+            "Projects: %s."
+            % (
+                len(tasks),
+                len(projects),
+                len(agents),
+                project_names or "none",
+            )
+        )
+
     def user_reply_for_task(self, task_id: str) -> str:
         summary = self.task_summary(task_id)
         if summary["state"] == "completed":
@@ -360,6 +395,20 @@ def _cmd_summary(args: argparse.Namespace) -> None:
     _print(_adapter(args).task_summary(args.task_id))
 
 
+def _cmd_work_context(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).work_context(
+            args.hermes_instance_id,
+            include_completed=not args.active_only,
+            task_limit=args.task_limit,
+        )
+    )
+
+
+def _cmd_work_brief(args: argparse.Namespace) -> None:
+    print(_adapter(args).work_context_brief(args.hermes_instance_id))
+
+
 def _cmd_reply(args: argparse.Namespace) -> None:
     print(_adapter(args).user_reply_for_task(args.task_id))
 
@@ -403,6 +452,16 @@ def build_parser() -> argparse.ArgumentParser:
     summary = sub.add_parser("summary", help="fetch a task summary for a user-facing response")
     summary.add_argument("task_id")
     summary.set_defaults(func=_cmd_summary)
+
+    work_context = sub.add_parser("work-context", help="fetch MAC's task/project/agent context for this Hermes instance")
+    work_context.add_argument("hermes_instance_id")
+    work_context.add_argument("--active-only", action="store_true")
+    work_context.add_argument("--task-limit", type=int, default=100)
+    work_context.set_defaults(func=_cmd_work_context)
+
+    work_brief = sub.add_parser("work-brief", help="render a concise MAC work-context status line")
+    work_brief.add_argument("hermes_instance_id")
+    work_brief.set_defaults(func=_cmd_work_brief)
 
     reply = sub.add_parser("reply", help="render a concise user-facing task status")
     reply.add_argument("task_id")

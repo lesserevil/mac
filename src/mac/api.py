@@ -1315,6 +1315,10 @@ def _dashboard_state(
         bridge_items,
         beads_repositories,
     )
+    hermes_work_contexts = {
+        instance["id"]: cp.hermes_work_context(instance["id"], task_limit=40)
+        for instance in hermes_instances
+    }
     swarm_summary = _dashboard_swarm_summary(agents, tasks, machines_by_id)
     return {
         "overview": {
@@ -1363,6 +1367,7 @@ def _dashboard_state(
         "users": users,
         "personas": personas,
         "hermes_instances": hermes_instances,
+        "hermes_work_contexts": hermes_work_contexts,
         "platform_bindings": bindings,
         "roles": roles,
         "provisioning_requests": provisioning_requests,
@@ -1604,6 +1609,18 @@ def create_app(
     @app.get("/hermes-instances/{instance_id}/context")
     def hermes_context(instance_id: str) -> Dict[str, Any]:
         return cp.hermes_context(instance_id)
+
+    @app.get("/hermes-instances/{instance_id}/work-context")
+    def hermes_work_context(
+        instance_id: str,
+        include_completed: bool = Query(default=True),
+        task_limit: int = Query(default=100),
+    ) -> Dict[str, Any]:
+        return cp.hermes_work_context(
+            instance_id,
+            include_completed=include_completed,
+            task_limit=task_limit,
+        )
 
     @app.post("/hermes-instances/{instance_id}/tasks")
     def create_interaction_task(

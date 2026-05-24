@@ -605,12 +605,14 @@ function notifierChannelRecord(channel) {
 }
 function renderHermes() {
     const data = mustData();
+    const contexts = Object.values(data.hermes_work_contexts || {});
     return `
     <section class="metric-grid">
       ${metric("Tenants", data.tenants.length, `${data.users.length} users`)}
       ${metric("Personas", data.personas.length, "soul refs only")}
       ${metric("Instances", data.hermes_instances.length, `${data.platform_bindings.length} bindings`)}
       ${metric("Interaction Tasks", data.tasks.filter((detail) => taskOrigin(detail.task).hermes_instance_id).length, "from Hermes")}
+      ${metric("Context Projects", new Set(contexts.flatMap((context) => context.projects.map((project) => project.project))).size, `${contexts.reduce((sum, context) => sum + context.task_count, 0)} visible tasks`)}
     </section>
     ${hermesStartupPanel(data.hermes_startup)}
     <section class="record-list">
@@ -1440,6 +1442,10 @@ function hermesRecord(instance, data) {
     const persona = data.personas.find((item) => item.id === instance.persona_id);
     const bindings = data.platform_bindings.filter((binding) => binding.hermes_instance_id === instance.id);
     const tasks = data.tasks.filter((detail) => taskOrigin(detail.task).hermes_instance_id === instance.id);
+    const context = data.hermes_work_contexts?.[String(instance.id)];
+    const contextProjects = context?.projects || [];
+    const contextAgents = context?.agents || [];
+    const operationCount = (context?.operations.api || []).length + (context?.operations.mac_hermes_cli || []).length;
     return `
     <article class="record">
       <div class="record-header"><div><h2>${escapeHtml(instance.name)}</h2><p class="muted small mono">${escapeHtml(instance.id)}</p></div>${chip(instance.status, instance.status === "active" ? "good" : "warn")}</div>
@@ -1454,6 +1460,23 @@ function hermesRecord(instance, data) {
         ${field("Last seen", formatAge(String(instance.last_seen_at || "")))}
       </div>
       <div class="chip-row">${bindings.length ? bindings.map((binding) => chip(`${binding.platform}:${binding.display_name || binding.external_id}`, "info")).join("") : chip("no platform bindings", "warn")}</div>
+      ${context ? `
+        <div class="record-section">
+          <h3>Work Context</h3>
+          <div class="row-grid">
+            ${field("Task authority", context.authority.tasks || "mac")}
+            ${field("Project authority", context.authority.projects || "mac")}
+            ${field("Visible tasks", context.task_count)}
+            ${field("Projects", contextProjects.length)}
+            ${field("Agents", contextAgents.length)}
+            ${field("Operations", operationCount)}
+          </div>
+          <div class="chip-row">${contextProjects.slice(0, 8).map((project) => chip(`${project.project}:${project.active_count}/${project.task_count}`, project.active_count ? "info" : "good")).join("") || chip("no projects", "warn")}</div>
+          <div class="timeline">
+            ${(context.tasks || []).slice(0, 4).map((task) => timelineItem(task.state, task.title, `${task.project || taskProject(task)} / ${task.id}`)).join("") || timelineItem("idle", "No visible tasks", "")}
+          </div>
+        </div>
+      ` : ""}
     </article>
   `;
 }
