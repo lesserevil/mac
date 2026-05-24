@@ -1871,10 +1871,13 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const hermesBridgeCommands = context?.operations.mac_hermes_cli || [];
   const operationCount = (context?.operations.api || []).length + hermesBridgeCommands.length;
   const proofEvidence = (proof?.evidence || {}) as JsonObject;
+  const proofUi = (proofEvidence.ui || {}) as JsonObject;
   const proofRuntime = (proofEvidence.hermes_runtime || {}) as JsonObject;
   const proofWork = (proofEvidence.work_context || {}) as JsonObject;
   const proofApi = (proofEvidence.api || {}) as JsonObject;
   const liveAlignment = (proofEvidence.live_alignment || {}) as JsonObject;
+  const dashboardUrlContract = (proofUi.dashboard_url_contract || {}) as JsonObject;
+  const dashboardOperationContract = (proofUi.dashboard_operation_contract || {}) as JsonObject;
   const proofObjects = (proofEvidence.first_class_objects || {}) as Record<string, JsonObject>;
   const proofObjectEntries = Object.entries(proofObjects);
   const readyObjectCount = proofObjectEntries.filter(([, value]) => Boolean(value.ready)).length;
@@ -1941,6 +1944,8 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Live alignment", liveAlignment.ready ? "aligned" : "not proven")}
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", ((proofRuntime.prompt_bridge || {}) as JsonObject).present ? "active" : "not required")}
+            ${field("Dashboard URLs", dashboardUrlContract.ready ? "ready" : "not proven")}
+            ${field("URL params", dashboardParameterNames(dashboardUrlContract).length || dashboardParameterNames(dashboardOperationContract).length)}
             ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}
             ${field("Objects", `${readyObjectCount}/${proofObjectEntries.length || 3}`)}
             ${field("Task ops", String(taskOperationCount))}
@@ -1952,6 +1957,8 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
           <h4>First-Class Objects</h4>
           <div class="chip-row">${proofObjectEntries.map(([name, value]) => chip(`${name}:${value.authority || "?"}`, value.ready ? "good" : "bad")).join("") || chip("object proof missing", "warn")}</div>
           ${firstClassCouplingMatrix(proofObjectEntries)}
+          <h4>Dashboard Links</h4>
+          ${dashboardUrlContractPanel(dashboardUrlContract)}
           <h4>Session Capabilities</h4>
           <div class="chip-row">
             ${proofSessionCapabilities.map((name) => {
@@ -1991,6 +1998,7 @@ function firstClassCouplingMatrix(entries: Array<[string, JsonObject]>): string 
 function firstClassCouplingRow(name: string, proof: JsonObject): string {
   const dashboardProjection = (proof.dashboard_projection || {}) as JsonObject;
   const dashboardFields = arrayOfStrings(dashboardProjection.fields).slice(0, 4);
+  const dashboardUrls = arrayOfStrings(dashboardProjection.urls).slice(0, 3);
   const stateKey = String(dashboardProjection.state_key || "dashboard");
   return `
     <tr>
@@ -2001,6 +2009,7 @@ function firstClassCouplingRow(name: string, proof: JsonObject): string {
       <td>
         ${chip(stateKey, proof.dashboard_ready ? "good" : "bad")}
         <div class="chip-row">${dashboardFields.map((fieldName) => chip(fieldName, "info")).join("") || chip("fields missing", "bad")}</div>
+        <div class="chip-row">${dashboardLinkChips(dashboardUrls, "urls missing")}</div>
       </td>
       <td>${proofList(proof, "runtime_capabilities", "runtime")}</td>
     </tr>
@@ -2011,6 +2020,66 @@ function proofList(proof: JsonObject, key: string, emptyLabel: string): string {
   const values = arrayOfStrings(proof[key]).slice(0, 4);
   if (!values.length) return chip(`${emptyLabel} missing`, "bad");
   return `<div class="chip-row">${values.map((value) => chip(value, "info")).join("")}</div>`;
+}
+
+function dashboardUrlContractPanel(contract: JsonObject): string {
+  if (!contract.schema) return `<div class="empty-state">Dashboard URL proof missing</div>`;
+  const objectLinks = (contract.object_deep_links || {}) as Record<string, JsonObject>;
+  const params = dashboardParameterNames(contract);
+  const missing = arrayOfStrings(contract.missing);
+  return `
+    <div class="row-grid">
+      ${field("Entrypoint", contract.entrypoint || "/ui")}
+      ${field("Contract", contract.ready ? "ready" : "degraded")}
+      ${field("Views", arrayOfStrings(contract.required_views).join(", ") || "none")}
+      ${field("Parameters", params.join(", ") || "none")}
+    </div>
+    ${missing.length ? `<div class="chip-row">${missing.map((item) => chip(item, "warn")).join("")}</div>` : ""}
+    <div class="record-list">
+      ${Object.entries(objectLinks).map(([name, links]) => dashboardDeepLinkRecord(name, links)).join("") || `<div class="empty-state">No dashboard links</div>`}
+    </div>
+  `;
+}
+
+function dashboardDeepLinkRecord(name: string, links: JsonObject): string {
+  const templates = arrayOfStrings(links.templates).slice(0, 4);
+  const samples = arrayOfStrings(links.samples).slice(0, 4);
+  return `
+    <article class="record compact">
+      <div class="record-header"><div><h3>${escapeHtml(labelize(name))}</h3><p class="muted small">${templates.length} templates, ${samples.length} samples</p></div>${chip(links.ready ? "ready" : "missing", links.ready ? "good" : "bad")}</div>
+      <div class="chip-row">${dashboardLinkChips(samples, "samples missing")}</div>
+      <div class="chip-row">${templates.map((url) => chip(url, "info")).join("") || chip("templates missing", "bad")}</div>
+    </article>
+  `;
+}
+
+function dashboardParameterNames(contract: JsonObject): string[] {
+  const params = contract.url_state_parameters;
+  if (!Array.isArray(params)) return [];
+  return params
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object" && "name" in item) return String((item as JsonObject).name || "");
+      return "";
+    })
+    .filter((item) => item.trim());
+}
+
+function dashboardLinkChips(urls: string[], emptyLabel: string): string {
+  if (!urls.length) return chip(emptyLabel, "bad");
+  return urls.map((url) => dashboardLinkChip(url)).join("");
+}
+
+function dashboardLinkChip(url: string): string {
+  return `<a class="chip tone-info" href="${escapeHtml(url)}" title="${escapeHtml(url)}">${escapeHtml(shortDashboardLink(url))}</a>`;
+}
+
+function shortDashboardLink(url: string): string {
+  const query = url.includes("?") ? url.split("?", 2)[1] : "";
+  const params = new URLSearchParams(query);
+  const view = params.get("view") || "ui";
+  const scope = params.get("project") || params.get("task_state") || params.get("selected") || "";
+  return scope ? truncate(`${view}:${scope}`, 42) : truncate(view, 42);
 }
 
 function arrayOfStrings(value: unknown): string[] {

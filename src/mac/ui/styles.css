@@ -691,6 +691,7 @@ details.action-box summary {
   font-size: 0.82rem;
   font-weight: 700;
   white-space: nowrap;
+  text-decoration: none;
 }
 
 .tone-good {

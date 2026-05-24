@@ -1215,6 +1215,11 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "Runtime Proof" in app_js
     assert "Live alignment" in app_js
     assert "live_alignment" in app_js
+    assert "Dashboard URLs" in app_js
+    assert "Dashboard Links" in app_js
+    assert "dashboard_url_contract" in app_js
+    assert "dashboardLinkChip" in app_js
+    assert "object_deep_links" in app_js
     assert "Session caps" in app_js
     assert "Session Capabilities" in app_js
     assert "Bridge Commands" in app_js
