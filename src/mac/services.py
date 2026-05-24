@@ -1062,6 +1062,39 @@ class ControlPlane:
             },
         }
 
+    def record_hermes_runtime_proof(
+        self,
+        hermes_instance_id: str,
+        proof: JsonDict,
+        *,
+        actor: str = "hermes",
+    ) -> HermesInstance:
+        instance = self.get_hermes_instance(hermes_instance_id)
+        metadata = ensure_json_object(instance.metadata)
+        now = utcnow()
+        stored_proof = json_loads(json_dumps(ensure_json_object(proof)), {})
+        evidence = ensure_json_object(stored_proof.get("evidence"))
+        ui = ensure_json_object(evidence.get("ui"))
+        ui["dashboard_source"] = "agent_submitted_runtime_proof"
+        ui["submitted_at"] = now
+        evidence["ui"] = ui
+        stored_proof["evidence"] = evidence
+        metadata["latest_runtime_proof"] = {
+            "schema": "mac.hermes.submitted_runtime_proof.v1",
+            "actor": actor,
+            "recorded_at": now,
+            "proof": stored_proof,
+        }
+        self.store.execute(
+            """
+            UPDATE hermes_instances
+            SET metadata = ?, updated_at = ?, last_seen_at = ?
+            WHERE id = ?
+            """,
+            (json_dumps(metadata), now, now, hermes_instance_id),
+        )
+        return self.get_hermes_instance(hermes_instance_id)
+
     def _hermes_task_project_key(self, task: Task) -> str:
         project = str(task.project or "").strip()
         if project:

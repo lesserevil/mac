@@ -1328,13 +1328,13 @@ def _dashboard_state(
         instance["id"]: cp.hermes_work_context(instance["id"], task_limit=40)
         for instance in hermes_instances
     }
-    hermes_runtime_proofs = {
-        instance["id"]: cp.hermes_runtime_proof(
+    hermes_runtime_proofs = {}
+    for instance in hermes_instances:
+        submitted = _latest_submitted_runtime_proof(instance)
+        hermes_runtime_proofs[instance["id"]] = submitted or cp.hermes_runtime_proof(
             instance["id"],
             hermes_startup=hermes_startup,
         )
-        for instance in hermes_instances
-    }
     swarm_summary = _dashboard_swarm_summary(agents, tasks, machines_by_id)
     return {
         "overview": {
@@ -1426,6 +1426,19 @@ def _dashboard_state(
         "observability": cp.observability_summary(),
         "hermes_startup": hermes_startup,
     }
+
+
+def _latest_submitted_runtime_proof(instance: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    metadata = instance.get("metadata") if isinstance(instance.get("metadata"), dict) else {}
+    record = (
+        metadata.get("latest_runtime_proof")
+        if isinstance(metadata.get("latest_runtime_proof"), dict)
+        else {}
+    )
+    proof = record.get("proof") if isinstance(record.get("proof"), dict) else None
+    if not proof or proof.get("schema") != "mac.hermes_runtime_proof.v1":
+        return None
+    return json.loads(json.dumps(proof))
 
 
 def create_app(
@@ -1652,10 +1665,12 @@ def create_app(
         instance_id: str,
         body: HermesRuntimeProofCreate,
     ) -> Dict[str, Any]:
-        return cp.hermes_runtime_proof(
+        proof = cp.hermes_runtime_proof(
             instance_id,
             hermes_startup=body.hermes_startup,
         )
+        cp.record_hermes_runtime_proof(instance_id, proof)
+        return proof
 
     @app.post("/hermes-instances/{instance_id}/tasks")
     def create_interaction_task(

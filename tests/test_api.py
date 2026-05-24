@@ -223,6 +223,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
         json={
             "hermes_startup": {
                 "task_project_runtime": {
+                    "status": "agent_submitted_ready",
                     "required": True,
                     "ready": True,
                     "hermes_instance_id": hermes["id"],
@@ -259,6 +260,14 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     state = client.get("/dashboard/state").json()
     assert state["hermes_work_contexts"][hermes["id"]]["projects"][0]["project"] == "nanolang"
     assert state["hermes_runtime_proofs"][hermes["id"]]["ready"] is True
+    assert (
+        state["hermes_runtime_proofs"][hermes["id"]]["evidence"]["ui"]["dashboard_source"]
+        == "agent_submitted_runtime_proof"
+    )
+    assert (
+        state["hermes_runtime_proofs"][hermes["id"]]["evidence"]["hermes_runtime"]["status"]
+        == "agent_submitted_ready"
+    )
 
 
 def test_workflow_runs_route_is_not_shadowed_by_workflow_slug_route():
