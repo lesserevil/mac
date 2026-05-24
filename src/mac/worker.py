@@ -210,6 +210,7 @@ def register_worker(
             "trusted": True,
         },
     )
+    _register_runtime_identity_for_worker(client, name, hermes_instance_id)
     return client.post(
         "/agents",
         {
@@ -2281,6 +2282,61 @@ def _run_git(repo: Path, args: List[str]) -> subprocess.CompletedProcess[str]:
 
 def _stable_id(prefix: str, value: str) -> str:
     return "%s_%s" % (prefix, _safe_path_component(value.lower()).strip("_") or "default")
+
+
+def _register_runtime_identity_for_worker(
+    client: MacApiClient,
+    agent_name: str,
+    hermes_instance_id: Optional[str],
+) -> None:
+    if not hermes_instance_id:
+        return
+    tenant_id = (os.environ.get("MAC_FLEET_TENANT_ID") or "").strip()
+    if not tenant_id:
+        return
+    persona_id = (
+        os.environ.get("MAC_HERMES_PERSONA_ID")
+        or os.environ.get("MAC_WORKER_PERSONA_ID")
+        or _stable_id("persona", agent_name)
+    )
+    hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    fleet_name = (
+        os.environ.get("MAC_FLEET_NAME")
+        or os.environ.get("FLEET_NAME")
+        or tenant_id.removeprefix("tenant_")
+        or "mac"
+    )
+    agent_id = os.environ.get("MAC_AGENT_ID") or _stable_id("agent", agent_name)
+    client.post(
+        "/tenants",
+        {
+            "name": fleet_name,
+            "tenant_id": tenant_id,
+            "metadata": {"source": "mac-agent", "fleet": fleet_name},
+        },
+    )
+    client.post(
+        "/personas",
+        {
+            "tenant_id": tenant_id,
+            "name": agent_name,
+            "soul_ref": str(hermes_home / "SOUL.md"),
+            "memory_scope": str(hermes_home),
+            "persona_id": persona_id,
+            "metadata": {"source": "mac-agent", "agent_id": agent_id},
+        },
+    )
+    client.post(
+        "/hermes-instances",
+        {
+            "tenant_id": tenant_id,
+            "name": agent_name,
+            "persona_id": persona_id,
+            "home_ref": str(hermes_home),
+            "instance_id": hermes_instance_id,
+            "metadata": {"source": "mac-agent", "agent_id": agent_id, "fleet": fleet_name},
+        },
+    )
 
 
 def _csv_arg(value: Optional[str]) -> List[str]:

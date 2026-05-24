@@ -1395,6 +1395,28 @@ def test_register_worker_binds_agent_to_hermes_instance():
     assert cp.get_agent(registered["id"]).hermes_instance_id == hermes.id
 
 
+def test_register_worker_bootstraps_hermes_identity_from_env(monkeypatch, tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    api = MacApiClient("http://mac.test", transport=api_transport(client))
+    monkeypatch.setenv("MAC_FLEET_TENANT_ID", "tenant_mac")
+    monkeypatch.setenv("MAC_HERMES_PERSONA_ID", "persona_natasha")
+    monkeypatch.setenv("MAC_AGENT_ID", "agent_natasha")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    registered = register_worker(
+        api,
+        hostname="sparky.local",
+        agent_name="natasha",
+        capabilities=["python"],
+        hermes_instance_id="hermes_natasha",
+    )
+
+    assert registered["hermes_instance_id"] == "hermes_natasha"
+    assert cp.get_hermes_instance("hermes_natasha").persona_id == "persona_natasha"
+    assert cp.get_agent(registered["id"]).hermes_instance_id == "hermes_natasha"
+
+
 def test_worker_detects_stale_local_attestation_key():
     from mac.worker import _attestation_key_matches_hub
 
