@@ -154,6 +154,7 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         "register_beads_repository",
         "list_beads_repositories",
         "poll_beads_repositories",
+        "claim_next_task",
         "list_agents",
         "get_agent",
         "get_agent_identity",
@@ -164,6 +165,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     )
     assert any(
         "mac-hermes agents" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
+    assert any(
+        "mac-hermes claim-next" in command
         for command in work_context["operations"]["mac_hermes_cli"]
     )
     assert any(
@@ -321,6 +326,18 @@ def test_hermes_adapter_performs_task_lifecycle_operations_through_api():
             required_capabilities=["ops"],
         ),
     )
+
+    dry_run = adapter.claim_next_task(
+        worker.id,
+        lease_seconds=120,
+        allowed_projects=["mac"],
+        dry_run=True,
+    )
+    assert dry_run is not None
+    assert dry_run["dry_run"] is True
+    assert dry_run["task"]["id"] == task["id"]
+    assert dry_run["lease"] is None
+    assert cp.get_task(task["id"]).state == TaskState.OPEN.value
 
     claim = adapter.claim_task(task["id"], worker.id, lease_seconds=300)
     assert claim["task"]["state"] == TaskState.CLAIMED.value
@@ -737,6 +754,18 @@ def test_mac_hermes_cli_exposes_task_lifecycle_operations(monkeypatch, capsys):
     monkeypatch.setattr(MacApiClient, "request", request)
     commands = [
         ["task-detail", "task_1"],
+        [
+            "claim-next",
+            "agent_1",
+            "--lease-seconds",
+            "45",
+            "--allowed-project",
+            "mac",
+            "--required-metadata",
+            '{"canary":true}',
+            "--require-canary",
+            "--dry-run",
+        ],
         ["claim", "task_1", "agent_1", "--lease-seconds", "30"],
         ["start", "task_1", "agent_1"],
         ["transition", "task_1", "blocked", "--actor", "hermes", "--detail", '{"reason":"waiting"}'],
@@ -768,6 +797,17 @@ def test_mac_hermes_cli_exposes_task_lifecycle_operations(monkeypatch, capsys):
 
     assert calls == [
         ("GET", "/tasks/task_1", None),
+        (
+            "POST",
+            "/agents/agent_1/claim-next",
+            {
+                "lease_seconds": 45,
+                "allowed_projects": ["mac"],
+                "required_metadata": {"canary": True},
+                "require_canary": True,
+                "dry_run": True,
+            },
+        ),
         ("POST", "/tasks/task_1/claim?agent_id=agent_1&lease_seconds=30", {}),
         ("POST", "/tasks/task_1/start?agent_id=agent_1", {}),
         (

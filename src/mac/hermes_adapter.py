@@ -365,6 +365,27 @@ class HermesMacAdapter:
     def agent_identity(self, agent_id: str) -> JsonDict:
         return self.client.get("/agents/%s/identity" % _path_part(agent_id))
 
+    def claim_next_task(
+        self,
+        agent_id: str,
+        *,
+        lease_seconds: int = 900,
+        allowed_projects: Sequence[str] = (),
+        required_metadata: Optional[JsonDict] = None,
+        require_canary: bool = False,
+        dry_run: bool = False,
+    ) -> Optional[JsonDict]:
+        return self.client.post(
+            "/agents/%s/claim-next" % _path_part(agent_id),
+            {
+                "lease_seconds": int(lease_seconds),
+                "allowed_projects": list(allowed_projects),
+                "required_metadata": _sanitize_json_object(required_metadata or {}),
+                "require_canary": require_canary,
+                "dry_run": dry_run,
+            },
+        )
+
     def claim_task(
         self,
         task_id: str,
@@ -753,6 +774,19 @@ def _cmd_agent_identity(args: argparse.Namespace) -> None:
     _print(_adapter(args).agent_identity(args.agent_id))
 
 
+def _cmd_claim_next(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).claim_next_task(
+            args.agent_id,
+            lease_seconds=args.lease_seconds,
+            allowed_projects=args.allowed_project,
+            required_metadata=_json_arg(args.required_metadata, {}),
+            require_canary=args.require_canary,
+            dry_run=args.dry_run,
+        )
+    )
+
+
 def _cmd_claim(args: argparse.Namespace) -> None:
     _print(_adapter(args).claim_task(args.task_id, args.agent_id, lease_seconds=args.lease_seconds))
 
@@ -964,6 +998,15 @@ def build_parser() -> argparse.ArgumentParser:
     agent_identity = sub.add_parser("agent-identity", help="fetch composed MAC/Hermes agent identity")
     agent_identity.add_argument("agent_id")
     agent_identity.set_defaults(func=_cmd_agent_identity)
+
+    claim_next = sub.add_parser("claim-next", help="claim or dry-run the next eligible MAC task for an agent")
+    claim_next.add_argument("agent_id")
+    claim_next.add_argument("--lease-seconds", type=int, default=900)
+    claim_next.add_argument("--allowed-project", action="append", default=[])
+    claim_next.add_argument("--required-metadata", default="{}")
+    claim_next.add_argument("--require-canary", action="store_true")
+    claim_next.add_argument("--dry-run", action="store_true")
+    claim_next.set_defaults(func=_cmd_claim_next)
 
     claim = sub.add_parser("claim", help="claim a MAC task for an agent")
     claim.add_argument("task_id")

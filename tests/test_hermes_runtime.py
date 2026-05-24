@@ -99,6 +99,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "mac-hermes register-beads-repository <name> <path> --project <project>" in markdown
     assert "Agent View" in markdown
     assert "mac-hermes agents" in markdown
+    assert "mac-hermes claim-next agent_rocky_host --dry-run" in markdown
     assert "hgmac agents claim-next agent_rocky_host --dry-run" in markdown
     assert "mac-hermes claim {task_id} agent_rocky_host" in markdown
     assert "Direct Session Parity" in markdown

@@ -274,6 +274,7 @@ Hermes can then perform lifecycle operations through the adapter or CLI:
 
 ```python
 adapter.claim_task(task_id, agent_id)
+adapter.claim_next_task(agent_id, dry_run=True)
 adapter.start_task(task_id, agent_id)
 adapter.add_evidence(task_id, "test", "artifact://pytest", "tests passed", agent_id)
 adapter.submit_for_review(task_id, agent_id)
@@ -283,6 +284,7 @@ adapter.publish_task(task_id, "git://main", reviewer_agent_id, evidence_id=evide
 
 ```bash
 mac-hermes claim <task_id> <agent_id>
+mac-hermes claim-next <agent_id> --dry-run
 mac-hermes start <task_id> <agent_id>
 mac-hermes evidence <task_id> --kind test --uri artifact://pytest --summary "tests passed" --created-by <agent_id>
 mac-hermes submit-review <task_id> <agent_id>

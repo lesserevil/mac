@@ -196,7 +196,9 @@ def _session_capability_contract(
             "mac-hermes project-items",
             "mac-hermes beads-repositories",
             "mac-hermes agents",
+            "mac-hermes claim-next %s --dry-run" % agent_id,
             "hgmac agents identity %s" % agent_id,
+            "hgmac agents claim-next %s --dry-run" % agent_id,
             "git status --short --branch",
             test_command,
         ],
@@ -223,6 +225,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "/hermes-instances/%s/tasks" % hermes_instance_id,
                     "/tasks/{task_id}",
                     "/tasks/{task_id}/summary",
+                    "/agents/%s/claim-next" % agent_id,
                     "/tasks/{task_id}/transition",
                 ],
                 "mac_cli": ["mac task show {task_id}", "mac task create --title ..."],
@@ -230,6 +233,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac-hermes task %s <title> --summary <summary> --project <project>"
                     % hermes_instance_id,
                     "mac-hermes task-detail {task_id}",
+                    "mac-hermes claim-next %s --dry-run" % agent_id,
                     "mac-hermes claim {task_id} %s" % agent_id,
                     "mac-hermes start {task_id} %s" % agent_id,
                     "mac-hermes transition {task_id} {target_state} --actor %s" % agent_id,
@@ -291,6 +295,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac-hermes agents",
                     "mac-hermes agent-detail %s" % agent_id,
                     "mac-hermes agent-identity %s" % agent_id,
+                    "mac-hermes claim-next %s --dry-run" % agent_id,
                 ],
                 "hgmac_cli": [
                     "hgmac agents list",
@@ -403,6 +408,7 @@ def build_runtime_context(
                 "mac-hermes agents",
                 "mac-hermes agent-detail %s" % resolved_agent_id,
                 "mac-hermes agent-identity %s" % resolved_agent_id,
+                "mac-hermes claim-next %s --dry-run" % resolved_agent_id,
                 "hgmac agents list",
                 "hgmac agents identity %s" % resolved_agent_id,
                 "hgmac agents claim-next %s --dry-run" % resolved_agent_id,
@@ -410,6 +416,7 @@ def build_runtime_context(
             "create_task": [
                 "mac-hermes task %s <title> --summary <summary> --project <project>"
                 % resolved_instance_id,
+                "mac-hermes claim-next %s --dry-run" % resolved_agent_id,
             ],
             "task_lifecycle": [
                 "mac-hermes task-detail {task_id}",

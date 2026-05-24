@@ -682,6 +682,7 @@ class ControlPlane:
             "create_task_from_conversation",
             "get_task",
             "get_task_summary",
+            "claim_next_task",
             "claim_task",
             "start_task",
             "transition_task",
@@ -704,6 +705,7 @@ class ControlPlane:
             "list_agents",
             "get_agent",
             "get_agent_identity",
+            "claim_next_task",
         }
         mac_cli_commands = [str(command) for command in operations.get("mac_cli", [])]
         mac_hermes_commands = [
@@ -722,6 +724,7 @@ class ControlPlane:
             "mac-hermes beads-repositories",
             "mac-hermes register-beads-repository",
             "mac-hermes poll-beads-repositories",
+            "mac-hermes claim-next",
             "mac-hermes task ",
             "mac-hermes task-detail",
             "mac-hermes claim",
@@ -739,6 +742,7 @@ class ControlPlane:
             "mac-hermes agents",
             "mac-hermes agent-detail",
             "mac-hermes agent-identity",
+            "mac-hermes claim-next",
         )
         expected_hgmac_fragments = (
             "hgmac agents list",
@@ -832,6 +836,7 @@ class ControlPlane:
                     (
                         "mac-hermes task ",
                         "mac-hermes task-detail",
+                        "mac-hermes claim-next",
                         "mac-hermes claim",
                         "mac-hermes start",
                         "mac-hermes transition",
@@ -842,6 +847,7 @@ class ControlPlane:
                     (
                         "mac-hermes task ",
                         "mac-hermes task-detail",
+                        "mac-hermes claim-next",
                         "mac-hermes claim",
                         "mac-hermes start",
                         "mac-hermes transition",
@@ -1341,6 +1347,11 @@ class ControlPlane:
                     "path": "/tasks/{task_id}/summary",
                 },
                 {
+                    "name": "claim_next_task",
+                    "method": "POST",
+                    "path": "/agents/{agent_id}/claim-next",
+                },
+                {
                     "name": "claim_task",
                     "method": "POST",
                     "path": "/tasks/{task_id}/claim?agent_id={agent_id}",
@@ -1461,6 +1472,7 @@ class ControlPlane:
                 "mac-hermes agents",
                 "mac-hermes agent-detail {agent_id}",
                 "mac-hermes agent-identity {agent_id}",
+                "mac-hermes claim-next {agent_id} --dry-run",
                 "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
                 "mac-hermes task-detail {task_id}",
                 "mac-hermes summary {task_id}",
