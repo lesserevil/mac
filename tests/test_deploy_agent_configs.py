@@ -283,6 +283,8 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
     assert "install_or_validate_web_search_service()" in script
     assert "write_hermes_web_search_config()" in script
     assert "install_hermes_web_deps()" in script
+    assert "initialize_hermes_home()" in script
+    assert "from hermes_cli.config import ensure_hermes_home" in script
     assert "firecrawl-py==4.17.0" in script
     assert "FIRECRAWL_API_URL" in script
     assert 'web["search_backend"] = "firecrawl"' in script

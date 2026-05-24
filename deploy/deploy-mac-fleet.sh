@@ -2493,6 +2493,16 @@ if configured and (patch.get("error") or not report.get("gateway_runtime_shim_pr
 PY
 }
 
+initialize_hermes_home() {
+  log "initializing Hermes home with upstream Hermes defaults"
+  "$HERMES_DIR/.venv/bin/python" - <<'PY'
+from hermes_cli.config import ensure_hermes_home
+
+ensure_hermes_home()
+print("Hermes home initialized")
+PY
+}
+
 install_hermes_messaging_deps() {
   log "preinstalling configured Hermes messaging dependencies"
   "$HERMES_DIR/.venv/bin/python" - "$HERMES_DIR" "$HOME/.hermes" "$LOG_DIR/hermes-messaging-deps.json" <<'PY'
@@ -3320,6 +3330,7 @@ done
 "$HERMES_PY" -m venv "$HERMES_DIR/.venv"
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$HERMES_DIR/.venv/bin/python" -m pip install --ignore-requires-python -e "$HERMES_DIR" >/dev/null
+initialize_hermes_home
 apply_hermes_gateway_runtime_shim
 install_hermes_web_deps
 install_hermes_messaging_deps

@@ -134,6 +134,22 @@ def test_startup_report_inventories_hermes_state_without_contents(monkeypatch, t
     assert "secret-slack-token" not in rendered
 
 
+def test_startup_report_treats_unwritten_hermes_memory_as_pending_not_warning(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_REQUIRE_QDRANT_MEMORY", "0")
+    monkeypatch.setenv("MAC_REQUIRE_TOKENHUB", "0")
+
+    report = build_hermes_startup_report()
+
+    assert report["checks"]["long_term_memory_present"] is False
+    assert "Hermes MEMORY.md is missing" not in " ".join(report["warnings"])
+
+
 def test_slack_accounts_file_shim_satisfies_account_file_only_startup(monkeypatch, tmp_path):
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"

@@ -1717,8 +1717,6 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         warnings.append("Hermes config.yaml is missing")
     if not _ref_exists(hermes_refs, "soul"):
         warnings.append("Hermes SOUL.md is missing")
-    if not (_ref_exists(hermes_refs, "long_term_memory") or _ref_exists(hermes_refs, "memory_long_term")):
-        warnings.append("Hermes MEMORY.md is missing")
     if not _ref_exists(hermes_refs, "conversation_state"):
         warnings.append("Hermes state.db is missing")
     if slack["warning"]:
