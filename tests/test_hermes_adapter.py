@@ -154,10 +154,21 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         "register_beads_repository",
         "list_beads_repositories",
         "poll_beads_repositories",
+        "list_agents",
+        "get_agent",
+        "get_agent_identity",
     } <= operation_names
     assert any(
         "mac-hermes project-items" in command
         for command in work_context["operations"]["mac_hermes_cli"]
+    )
+    assert any(
+        "mac-hermes agents" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
+    assert any(
+        "hgmac agents create" in command
+        for command in work_context["operations"]["hgmac_cli"]
     )
     assert adapter.work_context_brief(registration["hermes_instance"]["id"]).startswith(
         "MAC work context:"
@@ -192,6 +203,9 @@ def test_hermes_adapter_exposes_project_bridge_operations():
     )
     adapter.list_beads_repositories(enabled=True)
     adapter.poll_beads_repositories(repository="mac", force=True, actor="agent_1")
+    adapter.list_agents()
+    adapter.agent_detail("agent_1")
+    adapter.agent_identity("agent_1")
 
     assert calls == [
         (
@@ -228,6 +242,9 @@ def test_hermes_adapter_exposes_project_bridge_operations():
             "/bridge/beads/poll",
             {"repository": "mac", "force": True, "actor": "agent_1"},
         ),
+        ("GET", "/agents", None),
+        ("GET", "/agents/agent_1", None),
+        ("GET", "/agents/agent_1/identity", None),
     ]
 
 
@@ -551,6 +568,9 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
             "--actor",
             "agent_1",
         ],
+        ["agents"],
+        ["agent-detail", "agent_1"],
+        ["agent-identity", "agent_1"],
     ]
 
     for command in commands:
@@ -593,6 +613,9 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
             "/bridge/beads/poll",
             {"repository": "mac", "force": True, "actor": "agent_1"},
         ),
+        ("GET", "/agents", None),
+        ("GET", "/agents/agent_1", None),
+        ("GET", "/agents/agent_1/identity", None),
     ]
 
 

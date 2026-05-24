@@ -1461,6 +1461,9 @@ function hermesRecord(instance, data) {
     const proofRuntime = (proofEvidence.hermes_runtime || {});
     const proofWork = (proofEvidence.work_context || {});
     const proofApi = (proofEvidence.api || {});
+    const proofObjects = (proofEvidence.first_class_objects || {});
+    const proofObjectEntries = Object.entries(proofObjects);
+    const readyObjectCount = proofObjectEntries.filter(([, value]) => Boolean(value.ready)).length;
     const proofSessionCapabilities = (proofRuntime.session_capability_names || []);
     const proofSessionAvailability = (proofRuntime.session_capability_availability || {});
     const unavailableSessionCapabilities = (proofSessionAvailability.missing || []);
@@ -1511,10 +1514,12 @@ function hermesRecord(instance, data) {
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", (proofRuntime.prompt_bridge || {}).present ? "active" : "not required")}
             ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}
+            ${field("Objects", `${readyObjectCount}/${proofObjectEntries.length || 3}`)}
             ${field("Project ops", String(projectOperationCount))}
             ${field("Project links", `${proofWork.project_bridge_item_count || 0}/${proofWork.beads_repository_count || 0}`)}
             ${field("Bound agents", String((proofWork.bound_agent_ids || []).length))}
           </div>
+          <div class="chip-row">${proofObjectEntries.map(([name, value]) => chip(name, value.ready ? "good" : "bad")).join("") || chip("object proof missing", "warn")}</div>
         </div>
       ` : ""}
     </article>

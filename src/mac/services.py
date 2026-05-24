@@ -678,21 +678,10 @@ class ControlPlane:
             for operation in operations.get("api", [])
             if isinstance(operation, dict)
         }
-        expected_project_api_operations = {
-            "import_project_item",
-            "list_project_items",
-            "register_beads_repository",
-            "list_beads_repositories",
-            "poll_beads_repositories",
-        }
-        mac_hermes_commands = [
-            str(command) for command in operations.get("mac_hermes_cli", [])
-        ]
-        expected_api_operations = {
-            "get_work_context",
-            "get_runtime_proof",
+        expected_task_api_operations = {
             "create_task_from_conversation",
             "get_task",
+            "get_task_summary",
             "claim_task",
             "start_task",
             "transition_task",
@@ -703,7 +692,28 @@ class ControlPlane:
             "submit_review",
             "publish_task",
             "write_completed_task_to_memory",
-        } | expected_project_api_operations
+        }
+        expected_project_api_operations = {
+            "import_project_item",
+            "list_project_items",
+            "register_beads_repository",
+            "list_beads_repositories",
+            "poll_beads_repositories",
+        }
+        expected_agent_api_operations = {
+            "list_agents",
+            "get_agent",
+            "get_agent_identity",
+        }
+        mac_cli_commands = [str(command) for command in operations.get("mac_cli", [])]
+        mac_hermes_commands = [
+            str(command) for command in operations.get("mac_hermes_cli", [])
+        ]
+        hgmac_commands = [str(command) for command in operations.get("hgmac_cli", [])]
+        expected_api_operations = {
+            "get_work_context",
+            "get_runtime_proof",
+        } | expected_task_api_operations | expected_project_api_operations | expected_agent_api_operations
         expected_cli_fragments = (
             "mac-hermes work-context",
             "mac-hermes runtime-proof",
@@ -725,6 +735,22 @@ class ControlPlane:
             "mac-hermes publish",
             "mac-hermes writeback",
         )
+        expected_agent_cli_fragments = (
+            "mac-hermes agents",
+            "mac-hermes agent-detail",
+            "mac-hermes agent-identity",
+        )
+        expected_hgmac_fragments = (
+            "hgmac agents list",
+            "hgmac agents show",
+            "hgmac agents create",
+            "hgmac agents update",
+            "hgmac agents disable",
+            "hgmac agents delete",
+            "hgmac agents heartbeat",
+            "hgmac agents claim-next",
+            "hgmac agents identity",
+        )
         authority = work_context.get("authority", {})
         project_contexts = [
             project
@@ -736,6 +762,11 @@ class ControlPlane:
             for agent in work_context.get("agents", [])
             if agent.get("hermes_instance_id") == hermes_instance_id
         ]
+        relationships = (
+            work_context.get("relationships")
+            if isinstance(work_context.get("relationships"), dict)
+            else {}
+        )
         runtime = (
             hermes_startup.get("task_project_runtime")
             if isinstance(hermes_startup, dict)
@@ -766,6 +797,143 @@ class ControlPlane:
             if isinstance(runtime.get("session_capability_availability"), dict)
             else {}
         )
+
+        def matching(commands: Iterable[str], fragments: Iterable[str]) -> List[str]:
+            return [
+                command
+                for command in commands
+                if any(fragment in command for fragment in fragments)
+            ]
+
+        def has_all(commands: Iterable[str], fragments: Iterable[str]) -> bool:
+            command_list = list(commands)
+            return all(any(fragment in command for command in command_list) for fragment in fragments)
+
+        runtime_capabilities_ready = (
+            expected_session_capabilities <= session_capabilities
+            if session_contract_required
+            else True
+        )
+        first_class_objects: JsonDict = {
+            "tasks": {
+                "authority": authority.get("tasks"),
+                "api_operations": sorted(api_operation_names & expected_task_api_operations),
+                "api_ready": expected_task_api_operations <= api_operation_names,
+                "mac_cli_commands": matching(mac_cli_commands, ("mac task ",)),
+                "mac_cli_ready": has_all(mac_cli_commands, ("mac task show", "mac task create")),
+                "mac_hermes_cli_commands": matching(
+                    mac_hermes_commands,
+                    (
+                        "mac-hermes task ",
+                        "mac-hermes task-detail",
+                        "mac-hermes claim",
+                        "mac-hermes start",
+                        "mac-hermes transition",
+                    ),
+                ),
+                "mac_hermes_cli_ready": has_all(
+                    mac_hermes_commands,
+                    (
+                        "mac-hermes task ",
+                        "mac-hermes task-detail",
+                        "mac-hermes claim",
+                        "mac-hermes start",
+                        "mac-hermes transition",
+                    ),
+                ),
+                "dashboard_projection": {
+                    "state_key": "hermes_work_contexts",
+                    "fields": ["tasks", "relationships.task_dependencies", "operations.task_state_transitions"],
+                },
+                "dashboard_ready": (
+                    isinstance(work_context.get("tasks"), list)
+                    and isinstance(relationships.get("task_dependencies"), list)
+                    and isinstance(operations.get("task_state_transitions"), dict)
+                ),
+                "runtime_capabilities": sorted(
+                    session_capabilities & {"mac_api", "mac_cli", "mac_hermes_cli", "quality_gate"}
+                ),
+                "runtime_ready": runtime_capabilities_ready,
+            },
+            "projects": {
+                "authority": authority.get("projects"),
+                "api_operations": sorted(api_operation_names & expected_project_api_operations),
+                "api_ready": expected_project_api_operations <= api_operation_names,
+                "mac_cli_commands": matching(mac_cli_commands, ("mac bridge ",)),
+                "mac_cli_ready": has_all(
+                    mac_cli_commands,
+                    ("mac bridge import", "mac bridge list", "mac bridge beads register"),
+                ),
+                "mac_hermes_cli_commands": matching(
+                    mac_hermes_commands,
+                    (
+                        "mac-hermes import-project-item",
+                        "mac-hermes project-items",
+                        "mac-hermes beads-repositories",
+                        "mac-hermes register-beads-repository",
+                        "mac-hermes poll-beads-repositories",
+                    ),
+                ),
+                "mac_hermes_cli_ready": has_all(
+                    mac_hermes_commands,
+                    (
+                        "mac-hermes import-project-item",
+                        "mac-hermes project-items",
+                        "mac-hermes beads-repositories",
+                        "mac-hermes register-beads-repository",
+                        "mac-hermes poll-beads-repositories",
+                    ),
+                ),
+                "dashboard_projection": {
+                    "state_key": "hermes_work_contexts",
+                    "fields": ["projects", "projects.bridge_item_count", "projects.repository_count"],
+                },
+                "dashboard_ready": isinstance(work_context.get("projects"), list),
+                "runtime_capabilities": sorted(
+                    session_capabilities & {"mac_api", "mac_cli", "mac_hermes_cli", "beads_issue_tracker"}
+                ),
+                "runtime_ready": runtime_capabilities_ready,
+            },
+            "agents": {
+                "authority": authority.get("agents"),
+                "api_operations": sorted(api_operation_names & expected_agent_api_operations),
+                "api_ready": expected_agent_api_operations <= api_operation_names,
+                "mac_cli_commands": matching(mac_cli_commands, ("mac agent ",)),
+                "mac_cli_ready": has_all(mac_cli_commands, ("mac agent register", "mac agent list", "mac agent heartbeat")),
+                "mac_hermes_cli_commands": matching(mac_hermes_commands, expected_agent_cli_fragments),
+                "mac_hermes_cli_ready": has_all(mac_hermes_commands, expected_agent_cli_fragments),
+                "hgmac_cli_commands": matching(hgmac_commands, expected_hgmac_fragments),
+                "hgmac_cli_ready": has_all(hgmac_commands, expected_hgmac_fragments),
+                "dashboard_projection": {
+                    "state_key": "hermes_work_contexts",
+                    "fields": ["agents", "relationships.agent_assignments", "agents.active_task_ids"],
+                },
+                "dashboard_ready": (
+                    isinstance(work_context.get("agents"), list)
+                    and isinstance(relationships.get("agent_assignments"), list)
+                ),
+                "runtime_capabilities": sorted(
+                    session_capabilities & {"mac_api", "mac_cli", "mac_hermes_cli", "hgmac_agent_ops_cli"}
+                ),
+                "runtime_ready": runtime_capabilities_ready,
+            },
+        }
+        for object_proof in first_class_objects.values():
+            object_proof["ready"] = all(
+                bool(object_proof.get(check))
+                for check in (
+                    "api_ready",
+                    "mac_cli_ready",
+                    "mac_hermes_cli_ready",
+                    "dashboard_ready",
+                    "runtime_ready",
+                )
+            ) and (
+                bool(object_proof.get("hgmac_cli_ready"))
+                if "hgmac_cli_ready" in object_proof
+                else True
+            )
+
         checks: JsonDict = {
             "api_work_context_schema": work_context.get("schema") == "mac.hermes_work_context.v1",
             "mac_authority_declared": (
@@ -779,7 +947,9 @@ class ControlPlane:
             "cli_lifecycle_commands_present": all(
                 any(fragment in command for command in mac_hermes_commands)
                 for fragment in expected_cli_fragments
-            ),
+            )
+            and has_all(mac_hermes_commands, expected_agent_cli_fragments)
+            and has_all(hgmac_commands, expected_hgmac_fragments),
             "agent_bound_to_hermes_instance": bool(bound_agents),
             "runtime_context_ready": (
                 bool(runtime.get("ready"))
@@ -794,17 +964,18 @@ class ControlPlane:
                 if bool(prompt_bridge.get("required")) or runtime_required
                 else True
             ),
-            "runtime_session_capabilities_declared": (
-                expected_session_capabilities <= session_capabilities
-                if session_contract_required
-                else True
-            ),
+            "runtime_session_capabilities_declared": runtime_capabilities_ready,
             "runtime_session_capabilities_available": (
                 bool(session_availability.get("ready"))
                 if session_contract_required
                 else True
             ),
-            "dashboard_projection_available": True,
+            "first_class_object_matrix_ready": all(
+                bool(item.get("ready")) for item in first_class_objects.values()
+            ),
+            "dashboard_projection_available": all(
+                bool(item.get("dashboard_ready")) for item in first_class_objects.values()
+            ),
         }
         missing = [name for name, ok in checks.items() if not ok]
         return {
@@ -819,17 +990,29 @@ class ControlPlane:
                     "work_context_schema": work_context.get("schema"),
                     "work_context_path": "/hermes-instances/%s/work-context" % hermes_instance_id,
                     "operation_names": sorted(api_operation_names),
+                    "task_operation_names": sorted(
+                        api_operation_names & expected_task_api_operations
+                    ),
                     "project_operation_names": sorted(
                         api_operation_names & expected_project_api_operations
+                    ),
+                    "agent_operation_names": sorted(
+                        api_operation_names & expected_agent_api_operations
                     ),
                 },
                 "cli": {
                     "mac_hermes_commands": mac_hermes_commands,
-                    "mac_cli_commands": operations.get("mac_cli", []),
+                    "mac_cli_commands": mac_cli_commands,
+                    "hgmac_cli_commands": hgmac_commands,
                 },
                 "ui": {
+                    "dashboard_state_keys": ["hermes_work_contexts", "hermes_runtime_proofs"],
                     "dashboard_state_key": "hermes_runtime_proofs",
                     "dashboard_record_key": hermes_instance_id,
+                    "first_class_object_projection": {
+                        name: proof.get("dashboard_projection")
+                        for name, proof in first_class_objects.items()
+                    },
                 },
                 "hermes_runtime": {
                     "status": runtime.get("status"),
@@ -862,6 +1045,7 @@ class ControlPlane:
                         for key, value in work_context.get("relationships", {}).items()
                     },
                 },
+                "first_class_objects": first_class_objects,
             },
         }
 
@@ -1186,6 +1370,21 @@ class ControlPlane:
                     "path": "/bridge/beads/poll",
                 },
                 {
+                    "name": "list_agents",
+                    "method": "GET",
+                    "path": "/agents",
+                },
+                {
+                    "name": "get_agent",
+                    "method": "GET",
+                    "path": "/agents/{agent_id}",
+                },
+                {
+                    "name": "get_agent_identity",
+                    "method": "GET",
+                    "path": "/agents/{agent_id}/identity",
+                },
+                {
                     "name": "track_conversation_thread",
                     "method": "POST",
                     "path": "/conversation-threads",
@@ -1201,6 +1400,9 @@ class ControlPlane:
                 "mac bridge beads poll --repository <repository>",
                 "mac task show {task_id}",
                 "mac task create --title ...",
+                "mac agent register <machine_id> <name>",
+                "mac agent list",
+                "mac agent heartbeat {agent_id}",
             ],
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
@@ -1210,6 +1412,9 @@ class ControlPlane:
                 "mac-hermes beads-repositories",
                 "mac-hermes register-beads-repository <name> <path> --project <project>",
                 "mac-hermes poll-beads-repositories --repository <repository>",
+                "mac-hermes agents",
+                "mac-hermes agent-detail {agent_id}",
+                "mac-hermes agent-identity {agent_id}",
                 "mac-hermes task %s <title> --summary ..." % hermes_instance_id,
                 "mac-hermes task-detail {task_id}",
                 "mac-hermes summary {task_id}",
@@ -1223,6 +1428,22 @@ class ControlPlane:
                 "mac-hermes review-decision {review_id} approved {reviewer_agent_id} --evidence-id {evidence_id}",
                 "mac-hermes publish {task_id} {target} {created_by}",
                 "mac-hermes writeback %s {task_id}" % hermes_instance_id,
+            ],
+            "hgmac_cli": [
+                "hgmac agents list",
+                "hgmac agents show {agent_id}",
+                "hgmac agents create --machine-id {machine_id} --name {name}",
+                "hgmac agents update {agent_id} --status {status}",
+                "hgmac agents disable {agent_id}",
+                "hgmac agents delete {agent_id}",
+                "hgmac agents heartbeat {agent_id} --status {status}",
+                "hgmac agents claim-next {agent_id} --dry-run",
+                "hgmac agents identity {agent_id}",
+                "hgmac agents role assign {agent_id} {role}",
+                "hgmac agents role unassign {agent_id}",
+                "hgmac agents mood show {agent_id}",
+                "hgmac agents nap next {agent_id}",
+                "hgmac agents command-audit list --agent-id {agent_id}",
             ],
             "task_state_transitions": {
                 state: sorted(targets)

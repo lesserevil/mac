@@ -340,6 +340,15 @@ class HermesMacAdapter:
             },
         )
 
+    def list_agents(self) -> Any:
+        return self.client.get("/agents")
+
+    def agent_detail(self, agent_id: str) -> JsonDict:
+        return self.client.get("/agents/%s" % _path_part(agent_id))
+
+    def agent_identity(self, agent_id: str) -> JsonDict:
+        return self.client.get("/agents/%s/identity" % _path_part(agent_id))
+
     def claim_task(
         self,
         task_id: str,
@@ -706,6 +715,18 @@ def _cmd_poll_beads_repositories(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_agents(args: argparse.Namespace) -> None:
+    _print(_adapter(args).list_agents())
+
+
+def _cmd_agent_detail(args: argparse.Namespace) -> None:
+    _print(_adapter(args).agent_detail(args.agent_id))
+
+
+def _cmd_agent_identity(args: argparse.Namespace) -> None:
+    _print(_adapter(args).agent_identity(args.agent_id))
+
+
 def _cmd_claim(args: argparse.Namespace) -> None:
     _print(_adapter(args).claim_task(args.task_id, args.agent_id, lease_seconds=args.lease_seconds))
 
@@ -896,6 +917,17 @@ def build_parser() -> argparse.ArgumentParser:
     poll_beads_repositories.add_argument("--force", action="store_true")
     poll_beads_repositories.add_argument("--actor", default="hermes")
     poll_beads_repositories.set_defaults(func=_cmd_poll_beads_repositories)
+
+    agents = sub.add_parser("agents", help="list MAC agents visible to Hermes")
+    agents.set_defaults(func=_cmd_agents)
+
+    agent_detail = sub.add_parser("agent-detail", help="fetch one MAC agent record")
+    agent_detail.add_argument("agent_id")
+    agent_detail.set_defaults(func=_cmd_agent_detail)
+
+    agent_identity = sub.add_parser("agent-identity", help="fetch composed MAC/Hermes agent identity")
+    agent_identity.add_argument("agent_id")
+    agent_identity.set_defaults(func=_cmd_agent_identity)
 
     claim = sub.add_parser("claim", help="claim a MAC task for an agent")
     claim.add_argument("task_id")

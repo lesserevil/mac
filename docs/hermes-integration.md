@@ -176,6 +176,23 @@ mac-hermes register-beads-repository nanolang /Users/jordanh/Src/nanolang --proj
 mac-hermes poll-beads-repositories --repository nanolang --force
 ```
 
+Agent state is also MAC-owned. Hermes can inspect the same agent records and
+composed identity that operators see:
+
+```python
+adapter.list_agents()
+adapter.agent_detail(agent_id)
+adapter.agent_identity(agent_id)
+```
+
+```bash
+mac-hermes agents
+mac-hermes agent-detail <agent_id>
+mac-hermes agent-identity <agent_id>
+hgmac agents list
+hgmac agents identity <agent_id>
+```
+
 Operators and Hermes agents can also request an auditable readiness proof for
 the bridge:
 
@@ -191,7 +208,10 @@ mac-hermes runtime-proof <hermes_instance_id>
 The proof payload is `mac.hermes_runtime_proof.v1`. It checks that the API work
 context, MAC and Hermes CLI affordances, dashboard projection, deployed runtime
 context, prompt bridge, and bound agent identity all agree on the same
-task/project authority model.
+task/project/agent authority model. Its evidence includes a first-class object
+matrix for tasks, projects, and agents across API operations, MAC CLI commands,
+Hermes-facing commands, dashboard projection fields, and runtime session
+capabilities.
 
 Fleet deployment now also writes a Hermes-visible runtime bootstrap contract:
 
