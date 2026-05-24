@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mac.api import create_app
-from mac.hermes_runtime import build_runtime_context
+from mac.hermes_runtime import build_runtime_context, render_runtime_markdown
 from mac.hermes_startup import build_hermes_startup_report
 from mac.models import ValidationError
 from mac.services import ControlPlane
@@ -590,7 +590,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
         workspace_path=workspace,
     )
     _write(context_path, json.dumps(context))
-    _write(markdown_path, "private runtime command notes")
+    _write(markdown_path, render_runtime_markdown(context))
     _write(
         agent_dir / "agent" / "prompt_builder.py",
         "_load_mac_runtime_context\nMAC_HERMES_RUNTIME_CONTEXT_MARKDOWN\nmac-runtime-context.md\n",
@@ -622,6 +622,8 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["first_class_objects"]["projects"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["hgmac_cli"]
+    assert report["task_project_runtime"]["markdown_contract"]["ready"] is True
+    assert report["task_project_runtime"]["markdown_contract"]["missing_snippets"] == []
     assert "hgmac_agent_ops_cli" in report["task_project_runtime"]["session_capability_names"]
     assert "shell_execution" in report["task_project_runtime"]["session_capability_names"]
     assert "workspace_file_access" in report["task_project_runtime"]["session_capability_names"]
@@ -645,6 +647,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
         "web_search",
     }
     assert report["checks"]["task_project_runtime_context_available"] is True
+    assert report["checks"]["task_project_runtime_markdown_contract_present"] is True
     assert report["checks"]["task_project_runtime_prompt_bridge_active"] is True
     assert report["checks"]["mac_task_project_authority_declared"] is True
     assert report["checks"]["mac_first_class_object_model_declared"] is True
@@ -685,22 +688,18 @@ def test_required_task_project_runtime_context_blocks_when_session_tools_missing
             ]
         ),
     )
-    _write(
-        context_path,
-        json.dumps(
-            build_runtime_context(
-                agent_name="rocky",
-                fleet_name="classic",
-                mac_url="http://hub.example.internal:8789",
-                hermes_home=hermes_home,
-                mac_home=tmp_path / ".mac",
-                hermes_instance_id="hermes_rocky",
-                agent_id="agent_rocky",
-                workspace_path=workspace,
-            )
-        ),
+    context = build_runtime_context(
+        agent_name="rocky",
+        fleet_name="classic",
+        mac_url="http://hub.example.internal:8789",
+        hermes_home=hermes_home,
+        mac_home=tmp_path / ".mac",
+        hermes_instance_id="hermes_rocky",
+        agent_id="agent_rocky",
+        workspace_path=workspace,
     )
-    _write(markdown_path, "runtime")
+    _write(context_path, json.dumps(context))
+    _write(markdown_path, render_runtime_markdown(context))
     _write(
         agent_dir / "agent" / "prompt_builder.py",
         "_load_mac_runtime_context\nMAC_HERMES_RUNTIME_CONTEXT_MARKDOWN\nmac-runtime-context.md\n",
@@ -719,6 +718,70 @@ def test_required_task_project_runtime_context_blocks_when_session_tools_missing
     missing = report["task_project_runtime"]["session_capability_availability"]["missing"]
     assert "mac_cli" in missing
     assert "quality_gate" in missing
+
+
+def test_required_task_project_runtime_context_blocks_when_markdown_contract_missing(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    mac_home = tmp_path / ".mac"
+    workspace = tmp_path / "workspace" / "mac"
+    context_path = hermes_home / "mac-runtime-context.json"
+    markdown_path = hermes_home / "mac-runtime-context.md"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        workspace / ".mac" / "project.yaml",
+        "\n".join(
+            [
+                "schema: mac.repository_contract.v1",
+                "project: repo-beads-mac",
+                "toolchain:",
+                "  required_commands:",
+                "    - bd",
+                "test:",
+                "  command: scripts/run-contract-tests.sh",
+                "",
+            ]
+        ),
+    )
+    _prepare_direct_session_tools(monkeypatch, mac_home, workspace)
+    context = build_runtime_context(
+        agent_name="rocky",
+        fleet_name="classic",
+        mac_url="http://hub.example.internal:8789",
+        hermes_home=hermes_home,
+        mac_home=mac_home,
+        hermes_instance_id="hermes_rocky",
+        agent_id="agent_rocky",
+        workspace_path=workspace,
+    )
+    _write(context_path, json.dumps(context))
+    _write(markdown_path, "MAC Task and Project Runtime\n")
+    _write(
+        agent_dir / "agent" / "prompt_builder.py",
+        "_load_mac_runtime_context\nMAC_HERMES_RUNTIME_CONTEXT_MARKDOWN\nmac-runtime-context.md\n",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", str(context_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", str(markdown_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    runtime = report["task_project_runtime"]
+    assert runtime["status"] == "markdown_contract_missing"
+    assert runtime["markdown_contract"]["ready"] is False
+    assert "First-Class Objects" in runtime["markdown_contract"]["missing_snippets"]
+    assert "mac-hermes tasks" in runtime["markdown_contract"]["missing_snippets"]
+    assert report["checks"]["task_project_runtime_markdown_contract_present"] is False
 
 
 def test_required_task_project_runtime_context_blocks_readiness_when_missing(

@@ -277,9 +277,11 @@ Deployment also patches Hermes' prompt builder to load
 `mac-runtime-context.md` as a normal context source. That means gateway, CLI,
 and oneshot Hermes sessions see the MAC task/project contract in their system
 prompt, alongside `SOUL.md`, `AGENTS.md`, and other context files. Startup
-health exposes this as `task_project_runtime.prompt_bridge` and reports
-degraded readiness when fleet deploy requires the contract but the files are
-missing, invalid, or not wired into the Hermes prompt builder.
+health exposes this as `task_project_runtime.prompt_bridge` and
+`task_project_runtime.markdown_contract`. It reports degraded readiness when
+fleet deploy requires the contract but the files are missing, invalid, missing
+the first-class task/project/agent prompt snippets, or not wired into the
+Hermes prompt builder.
 
 Hermes can then perform lifecycle operations through the adapter or CLI:
 

@@ -886,6 +886,11 @@ class ControlPlane:
         )
         runtime = runtime if isinstance(runtime, dict) else {}
         prompt_bridge = runtime.get("prompt_bridge") if isinstance(runtime.get("prompt_bridge"), dict) else {}
+        markdown_contract = (
+            runtime.get("markdown_contract")
+            if isinstance(runtime.get("markdown_contract"), dict)
+            else {}
+        )
         runtime_required = bool(runtime.get("required"))
         runtime_instance_id = runtime.get("hermes_instance_id")
         session_capabilities = {
@@ -1132,6 +1137,11 @@ class ControlPlane:
                 if bool(prompt_bridge.get("required")) or runtime_required
                 else True
             ),
+            "runtime_markdown_contract_present": (
+                bool(markdown_contract.get("ready"))
+                if runtime_required
+                else True
+            ),
             "runtime_session_capabilities_declared": runtime_capabilities_ready,
             "runtime_first_class_object_model_declared": (
                 expected_first_class_objects <= runtime_first_class_objects
@@ -1194,6 +1204,7 @@ class ControlPlane:
                     "hermes_instance_id": runtime_instance_id,
                     "context_file": runtime.get("context_file"),
                     "markdown_file": runtime.get("markdown_file"),
+                    "markdown_contract": markdown_contract,
                     "prompt_bridge": prompt_bridge,
                     "workspace": runtime.get("workspace"),
                     "first_class_object_names": sorted(runtime_first_class_objects),

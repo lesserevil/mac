@@ -201,6 +201,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert runtime_proof["checks"]["api_work_context_schema"] is True
     assert runtime_proof["checks"]["agent_bound_to_hermes_instance"] is True
     assert runtime_proof["checks"]["live_object_alignment_consistent"] is True
+    assert runtime_proof["checks"]["runtime_markdown_contract_present"] is True
     assert runtime_proof["checks"]["runtime_session_capabilities_available"] is True
     assert runtime_proof["checks"]["first_class_object_matrix_ready"] is True
     assert runtime_proof["checks"]["dashboard_projection_available"] is True
@@ -228,6 +229,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                 "ready": True,
                 "hermes_instance_id": hermes["id"],
                 "prompt_bridge": {"required": True, "present": True},
+                "markdown_contract": {"ready": True, "missing_snippets": []},
                 "first_class_object_names": ["tasks", "projects", "agents"],
                 "session_capability_names": [
                     "mac_api",
@@ -263,6 +265,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                     "ready": True,
                     "hermes_instance_id": hermes["id"],
                     "prompt_bridge": {"required": True, "present": True},
+                    "markdown_contract": {"ready": True, "missing_snippets": []},
                     "first_class_object_names": ["tasks", "projects", "agents"],
                     "session_capability_names": [
                         "mac_api",

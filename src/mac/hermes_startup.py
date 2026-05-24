@@ -42,6 +42,24 @@ ACC_STATE_REF_CANDIDATES = (
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
 
+RUNTIME_MARKDOWN_REQUIRED_SNIPPETS = (
+    "MAC Task and Project Runtime",
+    "First-Class Objects",
+    "`tasks`: authority `mac`",
+    "`projects`: authority `mac`",
+    "`agents`: authority `mac`",
+    "mac-hermes tasks",
+    "mac-hermes projects",
+    "mac-hermes agents",
+    "Project Bridge",
+    "Agent View",
+    "Direct Session Parity",
+    "`shell_execution`",
+    "`workspace_file_access`",
+    "bd prime",
+    "git push",
+)
+
 
 def _env_enabled(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -156,6 +174,23 @@ def _runtime_context_markdown_path(hermes_home: Path) -> Path:
     if configured and configured.strip():
         return Path(configured).expanduser()
     return hermes_home / "mac-runtime-context.md"
+
+
+def _runtime_markdown_contract(markdown_path: Path) -> Dict[str, Any]:
+    file_ref = _file_ref(markdown_path, "task_project_runtime_markdown", False)
+    text = _read_small_text(markdown_path, limit=1_000_000)
+    missing = [
+        snippet
+        for snippet in RUNTIME_MARKDOWN_REQUIRED_SNIPPETS
+        if snippet not in text
+    ]
+    return {
+        "schema": "mac.hermes.runtime_markdown_contract.v1",
+        "file": file_ref,
+        "ready": bool(file_ref["exists"]) and not missing,
+        "required_snippets": list(RUNTIME_MARKDOWN_REQUIRED_SNIPPETS),
+        "missing_snippets": missing,
+    }
 
 
 def _runtime_prompt_bridge_report(
@@ -444,6 +479,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         "session_capability_names": [],
         "session_capabilities": [],
         "session_capability_availability": {"ready": True, "missing": []},
+        "markdown_contract": _runtime_markdown_contract(markdown_path),
         "warning": "",
         "error": "",
     }
@@ -619,6 +655,8 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         "mac_api",
         "mac_cli",
         "mac_hermes_cli",
+        "shell_execution",
+        "workspace_file_access",
         "hgmac_agent_ops_cli",
         "beads_issue_tracker",
         "git_source_control",
@@ -631,6 +669,17 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         summary["ready"] = not required
         summary["status"] = "session_capability_contract_missing"
         summary["error"] = "runtime context is missing session capabilities: %s" % ", ".join(missing)
+        if required:
+            summary["warning"] = summary["error"]
+        return summary
+    markdown_contract = summary["markdown_contract"]
+    if not markdown_contract.get("ready"):
+        summary["ready"] = not required
+        summary["status"] = "markdown_contract_missing"
+        summary["error"] = (
+            "runtime markdown is missing first-class prompt contract snippets: %s"
+            % ", ".join(markdown_contract.get("missing_snippets") or [])
+        )
         if required:
             summary["warning"] = summary["error"]
         return summary
@@ -1580,6 +1629,10 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             task_project_runtime["prompt_bridge"]["present"]
         )
         or not task_project_runtime["prompt_bridge"]["required"],
+        "task_project_runtime_markdown_contract_present": bool(
+            task_project_runtime.get("markdown_contract", {}).get("ready")
+        )
+        or not task_project_runtime["required"],
         "mac_task_project_authority_declared": (
             not task_project_runtime["required"]
             or (

@@ -1405,10 +1405,15 @@ required = [
     "Agent View",
     "Direct Session Parity",
     "mac-hermes work-context",
+    "mac-hermes tasks",
+    "mac-hermes projects",
     "mac-hermes project-items",
     "mac-hermes agents",
+    "shell_execution",
+    "workspace_file_access",
     "hgmac agents list",
     "bd prime",
+    "git push",
 ]
 runtime_context = prompt_builder._load_mac_runtime_context()
 missing = [item for item in required if item not in runtime_context]
