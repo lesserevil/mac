@@ -200,6 +200,9 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     firecrawl_installer = (ROOT / "deploy" / "install-firecrawl-gateway.sh").read_text(
         encoding="utf-8"
     )
+    tokenhub_installer = (ROOT / "deploy" / "install-tokenhub-service.sh").read_text(
+        encoding="utf-8"
+    )
     env_example = parse_env(ROOT / "deploy" / "systemd" / "mac.env.example")
     cfg = load_sample_fleet_config()
 
@@ -218,6 +221,7 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert 'common+=(--hermes-instance-id "${MAC_WORKER_HERMES_INSTANCE_ID:-${MAC_HERMES_INSTANCE_ID:-}}")' in script
     assert 'export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"' in script
     assert "install_or_validate_shared_services" in script
+    assert "install_or_validate_tokenhub_service" in script
     assert "mac.hermes.memory_topology.v1" in script
     assert "QDRANT_FLEET_URL" in script
     assert 'if ! truthy "$required"; then' in script
@@ -249,6 +253,18 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "Firecrawl-compatible web search gateway" in firecrawl_installer
     assert env_example["MAC_REQUIRE_FIRECRAWL"] == "1"
     assert env_example["FIRECRAWL_API_URL"] == "http://hub.example.internal:3002"
+    assert cfg["defaults"]["tokenhub"]["install"] == "auto"
+    assert cfg["defaults"]["tokenhub"]["required"] is True
+    assert cfg["defaults"]["tokenhub"]["port"] == 8090
+    assert "provider_secret_keys" in script
+    assert "values.pop(key, None)" in script
+    assert "install-tokenhub-service.sh" in script
+    assert "Before=${FLEET_NAME}.service" in tokenhub_installer
+    assert 'TOKENHUB_VAULT_ENABLED="${TOKENHUB_VAULT_ENABLED:-true}"' in tokenhub_installer
+    assert "OPENAI_API_KEY" in tokenhub_installer
+    assert env_example["MAC_REQUIRE_TOKENHUB"] == "1"
+    assert env_example["TOKENHUB_URL"] == "http://hub.example.internal:8090"
+    assert env_example["OPENAI_BASE_URL"] == "http://hub.example.internal:8090/v1"
 
 
 def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
@@ -262,6 +278,34 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
     assert "FIRECRAWL_API_URL" in script
     assert 'web["search_backend"] = "firecrawl"' in script
     assert '"role": "shared_web_search"' in script
+
+
+def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    startup = (ROOT / "src" / "mac" / "hermes_startup.py").read_text(encoding="utf-8")
+    gateway_wrapper = script.split("install_hermes_gateway_wrapper() {", 1)[1].split(
+        "install_mac_agent_wrapper() {", 1
+    )[0]
+    executor_wrapper = script.split('cat > "$executor" <<', 1)[1].split(
+        'cat > "$executor_py" <<', 1
+    )[0]
+
+    assert (
+        '. "$ENV_FILE"\n'
+        "set +a\n"
+        "install_or_validate_tokenhub_service\n"
+        "set -a\n"
+        '. "$ENV_FILE"\n'
+        "set +a\n"
+        '[ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories'
+    ) in script
+    assert "provider_secret_keys" in script
+    assert 'values["TOKENHUB_URL"] = derived_tokenhub_url' in script
+    assert 'values["OPENAI_API_KEY"] = configured_tokenhub_api_key' in script
+    assert '[ -f "$HOME/.acc/.env" ]' not in gateway_wrapper
+    assert '[ -f "$HOME/.acc/.env" ]' not in executor_wrapper
+    assert 'or os.environ.get("NVIDIA_API_KEY")' not in startup
+    assert 'or os.environ.get("NVIDIA_API_BASE")' not in startup
 
 
 def test_fleet_deploy_uses_home_scoped_registry_not_legacy_site_config():
@@ -361,6 +405,8 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
     assert cfg["defaults"]["qdrant"]["url"] == "http://hub.example.internal:6333"
     assert cfg["defaults"]["firecrawl"]["required"] is True
     assert cfg["defaults"]["firecrawl"]["url"] == "http://hub.example.internal:3002"
+    assert cfg["defaults"]["tokenhub"]["required"] is True
+    assert cfg["defaults"]["tokenhub"]["url"] == "http://hub.example.internal:8090"
     assert cfg["defaults"]["network"]["provider"] == "tailscale"
     assert cfg["defaults"]["network"]["install"] == "auto"
     assert cfg["defaults"]["network"]["headscale"]["manage"] is False

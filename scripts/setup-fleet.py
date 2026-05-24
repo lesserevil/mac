@@ -297,6 +297,7 @@ def main(argv: List[str]) -> int:
         hub_url = args.hub_url.strip() or "http://%s:%d" % (host, args.control_port)
         qdrant_port = 6333
         firecrawl_port = 3002
+        tokenhub_port = 8090
         headscale_login_server = args.headscale_login_server.strip()
         if args.network_provider == "headscale" and not headscale_login_server:
             print("--network-provider headscale requires --headscale-login-server", file=sys.stderr)
@@ -348,6 +349,15 @@ def main(argv: List[str]) -> int:
                     "url": qdrant_url_from_hub(hub_url, firecrawl_port),
                     "bind_addr": "",
                     "port": firecrawl_port,
+                },
+                "tokenhub": {
+                    "install": "auto",
+                    "required": True,
+                    "url": qdrant_url_from_hub(hub_url, tokenhub_port),
+                    "bind_addr": "",
+                    "port": tokenhub_port,
+                    "repo_url": "https://github.com/jordanhubbard/tokenhub.git",
+                    "ref": "",
                 },
                 "network": {
                     "provider": args.network_provider,
@@ -428,6 +438,8 @@ def main(argv: List[str]) -> int:
     qdrant_data_dir = prompt("Qdrant data directory override (blank for default /var/lib/<fleet>/qdrant)", default="")
     firecrawl_port = 3002
     firecrawl_url = qdrant_url_from_hub(hub_url, firecrawl_port)
+    tokenhub_port = 8090
+    tokenhub_url = qdrant_url_from_hub(hub_url, tokenhub_port)
 
     print("")
     print("Fleet mesh networking connects agents across networks without manual VPN config.")
@@ -461,6 +473,7 @@ def main(argv: List[str]) -> int:
             ):
                 hub_url = "http://%s:%d" % (ts_hub_name, control_port)
                 firecrawl_url = "http://%s:%d" % (ts_hub_name, firecrawl_port)
+                tokenhub_url = "http://%s:%d" % (ts_hub_name, tokenhub_port)
                 if prompt_bool(
                     "Set Qdrant URL to http://%s:%d?" % (ts_hub_name, qdrant_port),
                     default=True,
@@ -512,6 +525,7 @@ def main(argv: List[str]) -> int:
         ):
             hub_url = "http://%s.mac.internal:%d" % (hs_host, control_port)
             firecrawl_url = "http://%s.mac.internal:%d" % (hs_host, firecrawl_port)
+            tokenhub_url = "http://%s.mac.internal:%d" % (hs_host, tokenhub_port)
             if prompt_bool(
                 "Set Qdrant URL to http://%s.mac.internal:%d?" % (hs_host, qdrant_port),
                 default=False,
@@ -596,6 +610,15 @@ def main(argv: List[str]) -> int:
                 "url": firecrawl_url,
                 "bind_addr": "",
                 "port": firecrawl_port,
+            },
+            "tokenhub": {
+                "install": "auto",
+                "required": True,
+                "url": tokenhub_url,
+                "bind_addr": "",
+                "port": tokenhub_port,
+                "repo_url": "https://github.com/jordanhubbard/tokenhub.git",
+                "ref": "",
             },
             "network": {
                 "provider": network_provider,

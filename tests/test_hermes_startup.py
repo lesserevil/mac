@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from mac.api import create_app
 from mac.hermes_runtime import build_runtime_context, render_runtime_markdown
+import mac.hermes_startup as hermes_startup
 from mac.hermes_startup import build_hermes_startup_report
 from mac.models import ValidationError
 from mac.services import ControlPlane
@@ -45,8 +46,12 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_QDRANT_MEMORY_ROLE",
         "MAC_REQUIRE_HERMES_STARTUP_READY",
         "MAC_REQUIRE_QDRANT_MEMORY",
+        "MAC_REQUIRE_TOKENHUB",
         "MAC_SHARED_SERVICES_MANAGER_AGENT",
         "MAC_PROJECT_CONTRACT_FILE",
+        "MAC_TOKENHUB_ALLOW_DEGRADED",
+        "MAC_TOKENHUB_CHECK_TIMEOUT_SECONDS",
+        "MAC_TOKENHUB_URL",
         "MAC_URL",
         "MAC_WORKER_HERMES_INSTANCE_ID",
         "ACC_HERMES_GATEWAY_BASE_URL",
@@ -244,6 +249,7 @@ class GatewayRunner:
     monkeypatch.setenv("MAC_HERMES_GATEWAY_PROVIDER", "custom")
     monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.invalid:8090")
     monkeypatch.setenv("TOKENHUB_API_KEY", "secret-tokenhub-key")
+    monkeypatch.setenv("MAC_TOKENHUB_ALLOW_DEGRADED", "1")
 
     report = build_hermes_startup_report()
     patched = run_py.read_text(encoding="utf-8")
@@ -258,6 +264,46 @@ class GatewayRunner:
     assert "MAC_HERMES_GATEWAY_MODEL" in patched
     assert "TOKENHUB_URL" in patched
     assert "resolve_runtime_provider" in patched
+    assert "secret-tokenhub-key" not in str(report)
+
+
+def test_startup_reports_tokenhub_readiness_without_leaking_key(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    agent_dir = tmp_path / "hermes-agent"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    _write(
+        agent_dir / "gateway" / "run.py",
+        "MAC_HERMES_GATEWAY_MODEL = True\nMAC_HERMES_GATEWAY_PROVIDER = True\nresolve_runtime_provider = True\n",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.internal:8090")
+    monkeypatch.setenv("TOKENHUB_API_KEY", "secret-tokenhub-key")
+    monkeypatch.setenv("MAC_REQUIRE_TOKENHUB", "1")
+
+    def fake_fetch(endpoint, path, api_key, timeout_seconds):
+        assert endpoint == "http://tokenhub.internal:8090"
+        if path == "/healthz":
+            assert api_key is None
+            return {"status": "ok", "adapters": 2}
+        assert path == "/v1/models"
+        assert api_key == "secret-tokenhub-key"
+        return {"data": [{"id": "model-a"}, {"id": "model-b"}]}
+
+    monkeypatch.setattr(hermes_startup, "_fetch_tokenhub_json", fake_fetch)
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["tokenhub"]["status"] == "ready"
+    assert report["tokenhub"]["model_count"] == 2
+    assert report["tokenhub"]["adapter_count"] == 2
+    assert report["checks"]["tokenhub_ready"] is True
+    assert report["operator_health"]["tokenhub_model_count"] == 2
     assert "secret-tokenhub-key" not in str(report)
 
 

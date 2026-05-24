@@ -812,6 +812,112 @@ def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
     return report
 
 
+def _tokenhub_endpoint_from_env() -> Tuple[Optional[str], Optional[str]]:
+    for name in ("TOKENHUB_URL", "MAC_TOKENHUB_URL"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip().rstrip("/"), name
+    custom = os.environ.get("CUSTOM_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+    if custom and custom.strip():
+        value = custom.strip().rstrip("/")
+        if value.endswith("/v1"):
+            return value[:-3].rstrip("/"), "CUSTOM_BASE_URL" if os.environ.get("CUSTOM_BASE_URL") else "OPENAI_BASE_URL"
+    return None, None
+
+
+def _fetch_tokenhub_json(endpoint: str, path: str, api_key: Optional[str], timeout_seconds: float) -> Dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer %s" % api_key
+    request = urllib.request.Request(endpoint.rstrip("/") + path, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = response.read(1_048_576)
+    if not payload:
+        return {}
+    return json.loads(payload.decode("utf-8"))
+
+
+def _tokenhub_report() -> Dict[str, Any]:
+    endpoint, endpoint_source = _tokenhub_endpoint_from_env()
+    explicitly_required = _env_enabled("MAC_REQUIRE_TOKENHUB", False)
+    required = explicitly_required or bool(endpoint)
+    degraded_allowed = _env_enabled("MAC_TOKENHUB_ALLOW_DEGRADED", False)
+    api_key = (
+        os.environ.get("TOKENHUB_API_KEY")
+        or os.environ.get("TOKENHUB_AGENT_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    report: Dict[str, Any] = {
+        "status": "disabled",
+        "ready": True,
+        "required": required,
+        "degraded_allowed": degraded_allowed,
+        "endpoint": _redact_url(endpoint),
+        "endpoint_source": endpoint_source,
+        "api_key_present": bool(api_key),
+        "model_count": None,
+        "adapter_count": None,
+        "warning": "",
+        "degradation_reason": "",
+    }
+    if not endpoint:
+        if not required:
+            return report
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "missing_endpoint"
+        report["degradation_reason"] = "required TokenHub endpoint is not configured"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    parsed = urllib.parse.urlsplit(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "invalid_endpoint"
+        report["degradation_reason"] = "TokenHub endpoint is invalid"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    timeout_seconds = float(os.environ.get("MAC_TOKENHUB_CHECK_TIMEOUT_SECONDS", "2"))
+    try:
+        health = _fetch_tokenhub_json(endpoint, "/healthz", None, timeout_seconds)
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "unreachable"
+        report["degradation_reason"] = "TokenHub health endpoint is unreachable: %s" % exc
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+    if isinstance(health, dict):
+        adapters = health.get("adapters")
+        if isinstance(adapters, int):
+            report["adapter_count"] = adapters
+
+    if required and not api_key:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "missing_client_key"
+        report["degradation_reason"] = "TokenHub client key is missing"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    try:
+        models = _fetch_tokenhub_json(endpoint, "/v1/models", api_key, timeout_seconds)
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "models_unreachable"
+        report["degradation_reason"] = "TokenHub model endpoint is unreachable: %s" % exc
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+    rows = models.get("data") if isinstance(models, dict) else None
+    report["model_count"] = len(rows) if isinstance(rows, list) else None
+    report["status"] = "ready"
+    report["ready"] = True
+    return report
+
+
 def _config_explicitly_enables_slack(config_path: Path) -> bool:
     text = _read_small_text(config_path)
     if not text:
@@ -1024,7 +1130,6 @@ def _configured_gateway_base_url_present() -> bool:
             or os.environ.get("ACC_HERMES_GATEWAY_BASE_URL")
             or os.environ.get("TOKENHUB_URL")
             or os.environ.get("OPENAI_BASE_URL")
-            or os.environ.get("NVIDIA_API_BASE")
             or ""
         ).strip()
     )
@@ -1080,7 +1185,6 @@ def _apply_gateway_runtime_shim(agent_dir: Path) -> Dict[str, Any]:
             or os.environ.get("ACC_HERMES_GATEWAY_BASE_URL")
             or ((os.environ.get("TOKENHUB_URL") or "").rstrip("/") + "/v1" if os.environ.get("TOKENHUB_URL") else "")
             or os.environ.get("OPENAI_BASE_URL")
-            or os.environ.get("NVIDIA_API_BASE")
             or ""
         ).strip()
         mac_gateway_api_key = (
@@ -1089,7 +1193,6 @@ def _apply_gateway_runtime_shim(agent_dir: Path) -> Dict[str, Any]:
             or os.environ.get("TOKENHUB_API_KEY")
             or os.environ.get("TOKENHUB_AGENT_KEY")
             or os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("NVIDIA_API_KEY")
             or ""
         ).strip()
         if mac_gateway_model or mac_gateway_provider or mac_gateway_base_url:
@@ -1573,6 +1676,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "ready": True,
                 "required": False,
             },
+            "tokenhub": {
+                "status": "startup_check_disabled",
+                "ready": True,
+                "required": False,
+            },
             "task_project_runtime": {
                 "status": "startup_check_disabled",
                 "ready": True,
@@ -1592,6 +1700,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     secret_redaction = _secret_redaction_report(hermes_home, acc_dir)
     logs = _log_classification_report()
     qdrant = _qdrant_memory_report(hermes_home)
+    tokenhub = _tokenhub_report()
     task_project_runtime = _runtime_context_summary(hermes_home)
     agent_dir, _explicit_agent_dir = _hermes_agent_dir_info()
     task_project_runtime["prompt_bridge"] = _runtime_prompt_bridge_report(
@@ -1619,6 +1728,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     warnings.extend(logs["warnings"])
     if qdrant["warning"]:
         warnings.append(qdrant["warning"])
+    if tokenhub["warning"]:
+        warnings.append(tokenhub["warning"])
     if task_project_runtime["warning"]:
         warnings.append(task_project_runtime["warning"])
     if task_project_runtime["prompt_bridge"]["warning"]:
@@ -1638,6 +1749,10 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         and not secret_redaction["drift_detected"],
         "logs_have_no_actionable_classes": not bool(logs["actionable_count"]),
         "shared_qdrant_memory_ready": bool(qdrant["ready"]),
+        "tokenhub_ready": bool(tokenhub["ready"]),
+        "tokenhub_client_key_present": (
+            bool(tokenhub["api_key_present"]) or not tokenhub["required"]
+        ),
         "memory_topology_available": (
             not qdrant["required"] or bool(qdrant["topology"]["file"]["exists"])
         ),
@@ -1710,6 +1825,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "security": {"secret_redaction": secret_redaction},
         "logs": logs,
         "qdrant_level2": qdrant,
+        "tokenhub": tokenhub,
         "task_project_runtime": task_project_runtime,
         "operator_health": {
             "status": operator_status,
@@ -1721,6 +1837,9 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "log_actionable_count": logs["actionable_count"],
             "qdrant_level2_status": qdrant["status"],
             "qdrant_level2_ready": qdrant["ready"],
+            "tokenhub_status": tokenhub["status"],
+            "tokenhub_ready": tokenhub["ready"],
+            "tokenhub_model_count": tokenhub["model_count"],
             "memory_topology_present": qdrant["topology"]["file"]["exists"],
             "task_project_runtime_status": task_project_runtime["status"],
             "task_project_runtime_ready": task_project_runtime["ready"]

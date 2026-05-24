@@ -399,6 +399,7 @@ for name in selected:
     worker = merge_dicts(defaults.get("worker", {}) if isinstance(defaults.get("worker"), dict) else {}, agent.get("worker", {}) if isinstance(agent.get("worker"), dict) else {})
     qdrant = merge_dicts(defaults.get("qdrant", {}) if isinstance(defaults.get("qdrant"), dict) else {}, agent.get("qdrant", {}) if isinstance(agent.get("qdrant"), dict) else {})
     firecrawl = merge_dicts(defaults.get("firecrawl", {}) if isinstance(defaults.get("firecrawl"), dict) else {}, agent.get("firecrawl", {}) if isinstance(agent.get("firecrawl"), dict) else {})
+    tokenhub = merge_dicts(defaults.get("tokenhub", {}) if isinstance(defaults.get("tokenhub"), dict) else {}, agent.get("tokenhub", {}) if isinstance(agent.get("tokenhub"), dict) else {})
     network = merge_dicts(defaults.get("network", {}) if isinstance(defaults.get("network"), dict) else {}, agent.get("network", {}) if isinstance(agent.get("network"), dict) else {})
     network_provider = text_field(network.get("provider"))
     if not network_provider:
@@ -453,6 +454,13 @@ for name in selected:
         bool_field(firecrawl.get("required"), True),
         text_field(firecrawl.get("bind_addr")),
         text_field(firecrawl.get("port") or "3002"),
+        text_field(tokenhub.get("url")),
+        text_field(tokenhub.get("install") or "auto"),
+        bool_field(tokenhub.get("required"), True),
+        text_field(tokenhub.get("bind_addr")),
+        text_field(tokenhub.get("port") or "8090"),
+        text_field(tokenhub.get("repo_url") or "https://github.com/jordanhubbard/tokenhub.git"),
+        text_field(tokenhub.get("ref")),
         network_provider,
         text_field(network.get("install") or "auto"),
         text_field(network.get("hostname_prefix")),
@@ -594,8 +602,8 @@ REMOTE
 }
 
 deploy_host() {
-  local spec="$1" hub_token="${2:-}" hub_tunnel_pubkey="${3:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit fleet_name control_port qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_fleet_url headscale_preauth_key_source headscale_preauth_key_env headscale_port headscale_public_addr headscale_dns headscale_ip_prefix remote_archive ssh_args scp_args ssh_target scp_target
-  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit fleet_name control_port qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_fleet_url headscale_preauth_key_source headscale_preauth_key_env headscale_port headscale_public_addr headscale_dns headscale_ip_prefix <<<"$spec"
+  local spec="$1" hub_token="${2:-}" hub_tunnel_pubkey="${3:-}" tokenhub_api_key="${4:-}" agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit fleet_name control_port qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port tokenhub_url tokenhub_install tokenhub_required tokenhub_bind_addr tokenhub_port tokenhub_repo_url tokenhub_ref network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_fleet_url headscale_preauth_key_source headscale_preauth_key_env headscale_port headscale_public_addr headscale_dns headscale_ip_prefix remote_archive ssh_args scp_args ssh_target scp_target
+  IFS='|' read -r agent target os home_channel gateway_model gateway_provider gateway_base_url hub_url bind_host worker_mode worker_capabilities worker_allowed_projects worker_required_metadata worker_require_canary supervisor shared_services_manager qdrant_url qdrant_install qdrant_required qdrant_bind_addr qdrant_port qdrant_image qdrant_memory_limit fleet_name control_port qdrant_data_dir firecrawl_url firecrawl_install firecrawl_required firecrawl_bind_addr firecrawl_port tokenhub_url tokenhub_install tokenhub_required tokenhub_bind_addr tokenhub_port tokenhub_repo_url tokenhub_ref network_provider network_install network_hostname_prefix tailscale_auth_key_env headscale_manage headscale_login_server headscale_health_url headscale_fleet_url headscale_preauth_key_source headscale_preauth_key_env headscale_port headscale_public_addr headscale_dns headscale_ip_prefix <<<"$spec"
   remote_archive="/tmp/mac-${agent}-${TS}.tar.gz"
   local ssh_parts=() scp_parts=() last_index
   while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
@@ -612,7 +620,7 @@ deploy_host() {
 
   echo "==> ${agent}: running one-time deploy"
   if ! ssh -A -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 "${ssh_args[@]}" "$ssh_target" \
-    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_FIRECRAWL_URL=$(shell_quote "$firecrawl_url") MAC_DEPLOY_FIRECRAWL_INSTALL=$(shell_quote "$firecrawl_install") MAC_DEPLOY_REQUIRE_FIRECRAWL=$(shell_quote "$firecrawl_required") MAC_DEPLOY_FIRECRAWL_BIND_ADDR=$(shell_quote "$firecrawl_bind_addr") MAC_DEPLOY_FIRECRAWL_PORT=$(shell_quote "$firecrawl_port") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") MAC_DEPLOY_HUB_TUNNEL_PUBKEY=$(shell_quote "$hub_tunnel_pubkey") bash -s" <<'REMOTE'
+    "MAC_DEPLOY_AGENT=$(shell_quote "$agent") MAC_DEPLOY_OS=$(shell_quote "$os") MAC_DEPLOY_ARCHIVE=$(shell_quote "$remote_archive") MAC_DEPLOY_TS=$(shell_quote "$TS") MAC_DEPLOY_GIT_REV=$(shell_quote "$GIT_REV") MAC_DEPLOY_GIT_URL=$(shell_quote "$GIT_URL") MAC_DEPLOY_GIT_BRANCH=$(shell_quote "$GIT_BRANCH") MAC_DEPLOY_HERMES_SLACK_HOME_CHANNEL_NAME=$(shell_quote "$home_channel") MAC_DEPLOY_HERMES_GATEWAY_MODEL=$(shell_quote "$gateway_model") MAC_DEPLOY_HERMES_GATEWAY_PROVIDER=$(shell_quote "$gateway_provider") MAC_DEPLOY_HERMES_GATEWAY_BASE_URL=$(shell_quote "$gateway_base_url") MAC_DEPLOY_HUB_URL=$(shell_quote "$hub_url") MAC_DEPLOY_HUB_TOKEN=$(shell_quote "$hub_token") MAC_DEPLOY_CONTROL_BIND_HOST=$(shell_quote "$bind_host") MAC_DEPLOY_WORKER_MODE=$(shell_quote "$worker_mode") MAC_DEPLOY_WORKER_CAPABILITIES=$(shell_quote "$worker_capabilities") MAC_DEPLOY_WORKER_ALLOWED_PROJECTS=$(shell_quote "$worker_allowed_projects") MAC_DEPLOY_WORKER_REQUIRED_METADATA=$(shell_quote "$worker_required_metadata") MAC_DEPLOY_WORKER_REQUIRE_CANARY=$(shell_quote "$worker_require_canary") MAC_DEPLOY_SUPERVISOR=$(shell_quote "$supervisor") MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT=$(shell_quote "$shared_services_manager") MAC_DEPLOY_QDRANT_URL=$(shell_quote "$qdrant_url") MAC_DEPLOY_QDRANT_INSTALL=$(shell_quote "$qdrant_install") MAC_DEPLOY_REQUIRE_QDRANT_MEMORY=$(shell_quote "$qdrant_required") MAC_DEPLOY_QDRANT_BIND_ADDR=$(shell_quote "$qdrant_bind_addr") MAC_DEPLOY_QDRANT_PORT=$(shell_quote "$qdrant_port") MAC_DEPLOY_QDRANT_IMAGE=$(shell_quote "$qdrant_image") MAC_DEPLOY_QDRANT_MEMORY_LIMIT=$(shell_quote "$qdrant_memory_limit") MAC_DEPLOY_TARGET=$(shell_quote "$target") MAC_DEPLOY_FLEET_NAME=$(shell_quote "$fleet_name") MAC_DEPLOY_CONTROL_PORT=$(shell_quote "$control_port") MAC_DEPLOY_QDRANT_DATA_DIR=$(shell_quote "$qdrant_data_dir") MAC_DEPLOY_FIRECRAWL_URL=$(shell_quote "$firecrawl_url") MAC_DEPLOY_FIRECRAWL_INSTALL=$(shell_quote "$firecrawl_install") MAC_DEPLOY_REQUIRE_FIRECRAWL=$(shell_quote "$firecrawl_required") MAC_DEPLOY_FIRECRAWL_BIND_ADDR=$(shell_quote "$firecrawl_bind_addr") MAC_DEPLOY_FIRECRAWL_PORT=$(shell_quote "$firecrawl_port") MAC_DEPLOY_TOKENHUB_URL=$(shell_quote "$tokenhub_url") MAC_DEPLOY_TOKENHUB_INSTALL=$(shell_quote "$tokenhub_install") MAC_DEPLOY_REQUIRE_TOKENHUB=$(shell_quote "$tokenhub_required") MAC_DEPLOY_TOKENHUB_BIND_ADDR=$(shell_quote "$tokenhub_bind_addr") MAC_DEPLOY_TOKENHUB_PORT=$(shell_quote "$tokenhub_port") MAC_DEPLOY_TOKENHUB_REPO_URL=$(shell_quote "$tokenhub_repo_url") MAC_DEPLOY_TOKENHUB_REF=$(shell_quote "$tokenhub_ref") MAC_DEPLOY_TOKENHUB_API_KEY=$(shell_quote "$tokenhub_api_key") MAC_DEPLOY_NETWORK_PROVIDER=$(shell_quote "$network_provider") MAC_DEPLOY_NETWORK_INSTALL=$(shell_quote "$network_install") MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX=$(shell_quote "$network_hostname_prefix") MAC_DEPLOY_TAILSCALE_AUTH_KEY_ENV=$(shell_quote "$tailscale_auth_key_env") MAC_DEPLOY_HEADSCALE_MANAGE=$(shell_quote "$headscale_manage") MAC_DEPLOY_HEADSCALE_LOGIN_SERVER=$(shell_quote "$headscale_login_server") MAC_DEPLOY_HEADSCALE_HEALTH_URL=$(shell_quote "$headscale_health_url") MAC_DEPLOY_HEADSCALE_FLEET_URL=$(shell_quote "$headscale_fleet_url") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_SOURCE=$(shell_quote "$headscale_preauth_key_source") MAC_DEPLOY_HEADSCALE_PREAUTH_KEY_ENV=$(shell_quote "$headscale_preauth_key_env") MAC_DEPLOY_HEADSCALE_PORT=$(shell_quote "$headscale_port") MAC_DEPLOY_HEADSCALE_PUBLIC_ADDR=$(shell_quote "$headscale_public_addr") MAC_DEPLOY_HEADSCALE_DNS=$(shell_quote "$headscale_dns") MAC_DEPLOY_HEADSCALE_IP_PREFIX=$(shell_quote "$headscale_ip_prefix") MAC_DEPLOY_DRAIN_MODE=$(shell_quote "${MAC_DEPLOY_DRAIN_MODE:-}") MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_TIMEOUT_SECONDS:-}") MAC_DEPLOY_DRAIN_POLL_SECONDS=$(shell_quote "${MAC_DEPLOY_DRAIN_POLL_SECONDS:-}") MAC_DEPLOY_HUB_TUNNEL_PUBKEY=$(shell_quote "$hub_tunnel_pubkey") bash -s" <<'REMOTE'
 set -euo pipefail
 
 AGENT="${MAC_DEPLOY_AGENT:?}"
@@ -649,6 +657,14 @@ FIRECRAWL_INSTALL="${MAC_DEPLOY_FIRECRAWL_INSTALL:-auto}"
 FIRECRAWL_REQUIRE="${MAC_DEPLOY_REQUIRE_FIRECRAWL:-1}"
 FIRECRAWL_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_BIND_ADDR:-}"
 FIRECRAWL_PORT_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_PORT:-3002}"
+TOKENHUB_URL_CONFIGURED="${MAC_DEPLOY_TOKENHUB_URL:-}"
+TOKENHUB_INSTALL="${MAC_DEPLOY_TOKENHUB_INSTALL:-auto}"
+TOKENHUB_REQUIRE="${MAC_DEPLOY_REQUIRE_TOKENHUB:-1}"
+TOKENHUB_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_TOKENHUB_BIND_ADDR:-}"
+TOKENHUB_PORT_CONFIGURED="${MAC_DEPLOY_TOKENHUB_PORT:-8090}"
+TOKENHUB_REPO_URL_CONFIGURED="${MAC_DEPLOY_TOKENHUB_REPO_URL:-https://github.com/jordanhubbard/tokenhub.git}"
+TOKENHUB_REF_CONFIGURED="${MAC_DEPLOY_TOKENHUB_REF:-}"
+TOKENHUB_API_KEY_CONFIGURED="${MAC_DEPLOY_TOKENHUB_API_KEY:-}"
 NETWORK_PROVIDER="${MAC_DEPLOY_NETWORK_PROVIDER:-tailscale}"
 NETWORK_INSTALL="${MAC_DEPLOY_NETWORK_INSTALL:-auto}"
 NETWORK_HOSTNAME_PREFIX="${MAC_DEPLOY_NETWORK_HOSTNAME_PREFIX:-}"
@@ -1050,6 +1066,18 @@ firecrawl_install_enabled() {
   esac
 }
 
+tokenhub_install_enabled() {
+  case "${TOKENHUB_INSTALL:-auto}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    0|false|FALSE|no|NO|off|OFF|none|disabled) return 1 ;;
+    auto|"") [ "$AGENT" = "$SHARED_SERVICES_MANAGER_AGENT" ]; return ;;
+    *)
+      log "ERROR: unsupported MAC_DEPLOY_TOKENHUB_INSTALL value: $TOKENHUB_INSTALL"
+      exit 1
+      ;;
+  esac
+}
+
 ensure_hub_tunnel_key() {
   local key_file="$HOME/.ssh/mac_tunnel_id"
   if [ ! -f "$key_file" ]; then
@@ -1145,6 +1173,84 @@ validate_firecrawl_endpoint() {
   fi
   log "ERROR: Firecrawl web search is unreachable at ${firecrawl_url%/}/health"
   exit 1
+}
+
+validate_tokenhub_endpoint() {
+  local tokenhub_url tokenhub_api_key required allow_degraded
+  tokenhub_url="${TOKENHUB_URL:-${TOKENHUB_URL_CONFIGURED:-}}"
+  tokenhub_api_key="${TOKENHUB_API_KEY:-${TOKENHUB_AGENT_KEY:-${OPENAI_API_KEY:-}}}"
+  required="${MAC_REQUIRE_TOKENHUB:-${TOKENHUB_REQUIRE:-1}}"
+  allow_degraded="${MAC_TOKENHUB_ALLOW_DEGRADED:-0}"
+  if ! truthy "$required"; then
+    if [ -z "$tokenhub_url" ]; then
+      log "TokenHub is optional and no endpoint is configured"
+      return
+    fi
+    if curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/healthz" >/dev/null; then
+      log "Optional TokenHub reachable at configured health endpoint"
+    else
+      log "WARNING: optional TokenHub is unreachable at ${tokenhub_url%/}/healthz"
+    fi
+    return
+  fi
+  if [ -z "$tokenhub_url" ]; then
+    if truthy "$allow_degraded"; then
+      log "WARNING: TokenHub is required but no endpoint is configured; degraded override is active"
+      return
+    fi
+    log "ERROR: TokenHub is required but no endpoint is configured"
+    exit 1
+  fi
+  if ! curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/healthz" >/dev/null; then
+    if truthy "$allow_degraded"; then
+      log "WARNING: TokenHub health endpoint is unreachable; degraded override is active"
+      return
+    fi
+    log "ERROR: TokenHub is unreachable at ${tokenhub_url%/}/healthz"
+    exit 1
+  fi
+  if [ -z "$tokenhub_api_key" ]; then
+    if truthy "$allow_degraded"; then
+      log "WARNING: TokenHub is reachable but no client key is configured; degraded override is active"
+      return
+    fi
+    log "ERROR: TokenHub client key is required before Hermes/AI paths start"
+    exit 1
+  fi
+  if curl -fsS --connect-timeout 2 --max-time 8 -H "Authorization: Bearer $tokenhub_api_key" "${tokenhub_url%/}/v1/models" >/dev/null; then
+    log "TokenHub model routing reachable at configured OpenAI-compatible endpoint"
+    return
+  fi
+  if truthy "$allow_degraded"; then
+    log "WARNING: TokenHub /v1/models is unreachable with configured client key; degraded override is active"
+    return
+  fi
+  log "ERROR: TokenHub /v1/models is unreachable with configured client key"
+  exit 1
+}
+
+install_or_validate_tokenhub_service() {
+  if tokenhub_install_enabled; then
+    log "installing hub-managed TokenHub secret/model routing service"
+    if [ -n "$TOKENHUB_BIND_ADDR_CONFIGURED" ]; then
+      export TOKENHUB_BIND_ADDR="$TOKENHUB_BIND_ADDR_CONFIGURED"
+    else
+      unset TOKENHUB_BIND_ADDR
+    fi
+    export TOKENHUB_PORT="$TOKENHUB_PORT_CONFIGURED"
+    export TOKENHUB_REPO_URL="$TOKENHUB_REPO_URL_CONFIGURED"
+    export TOKENHUB_REF="$TOKENHUB_REF_CONFIGURED"
+    export FLEET_NAME="$FLEET_NAME"
+    export TOKENHUB_SUPERVISOR="$SUPERVISOR_KIND"
+    MAC_HOME="$MAC_HOME" HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}" WORKSPACE="$SRC_DIR" \
+      bash "$SRC_DIR/deploy/install-tokenhub-service.sh"
+    set -a
+    . "$ENV_FILE"
+    set +a
+  else
+    log "using hub-managed TokenHub from $SHARED_SERVICES_MANAGER_AGENT"
+  fi
+  validate_tokenhub_endpoint
 }
 
 install_or_validate_shared_services() {
@@ -2282,7 +2388,7 @@ EOF
 }
 
 normalize_hermes_redaction_env() {
-  "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" "$HOME/.acc/.env" <<'PY'
+  "$PY" - "$LOG_DIR/hermes-redaction-normalization.json" "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" <<'PY'
 import json
 import re
 import sys
@@ -2872,7 +2978,7 @@ install_beads_cli || true
 install_github_cli || true
 
 log "creating/updating mac environment file"
-"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" "$FIRECRAWL_URL_CONFIGURED" "$FIRECRAWL_REQUIRE" "$FIRECRAWL_PORT_CONFIGURED" <<'PY'
+"$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" "$FIRECRAWL_URL_CONFIGURED" "$FIRECRAWL_REQUIRE" "$FIRECRAWL_PORT_CONFIGURED" "$TOKENHUB_URL_CONFIGURED" "$TOKENHUB_REQUIRE" "$TOKENHUB_PORT_CONFIGURED" "$TOKENHUB_API_KEY_CONFIGURED" <<'PY'
 from pathlib import Path
 import os
 import re
@@ -2905,6 +3011,10 @@ configured_qdrant_port = sys.argv[22].strip() or "6333"
 configured_firecrawl_url = sys.argv[23].strip()
 configured_firecrawl_required = sys.argv[24].strip() or "1"
 configured_firecrawl_port = sys.argv[25].strip() or "3002"
+configured_tokenhub_url = sys.argv[26].strip()
+configured_tokenhub_required = sys.argv[27].strip() or "1"
+configured_tokenhub_port = sys.argv[28].strip() or "8090"
+configured_tokenhub_api_key = sys.argv[29].strip()
 network_provider = (
     os.environ.get("MAC_DEPLOY_NETWORK_PROVIDER")
     or os.environ.get("NETWORK_PROVIDER")
@@ -3056,6 +3166,70 @@ elif not truthy(configured_firecrawl_required):
         "HERMES_WEB_EXTRACT_BACKEND",
     ):
         values.pop(key, None)
+
+provider_secret_keys = (
+    "NVIDIA_API_KEY",
+    "NVIDIA_API_BASE",
+    "NVIDIA_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "PERPLEXITY_API_KEY",
+    "PERPLEXITY_BASE_URL",
+    "PERPLEXITY_API_BASE",
+    "LLM_KEY",
+    "LLM_URL",
+)
+for key in provider_secret_keys:
+    values.pop(key, None)
+
+def tokenhub_url():
+    if configured_tokenhub_url:
+        return configured_tokenhub_url.rstrip("/")
+    raw_hub = configured_hub_url or values.get("MAC_HUB_URL") or "http://127.0.0.1:8789"
+    parsed = urllib.parse.urlsplit(raw_hub)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
+    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, configured_tokenhub_port), "", "", ""))
+
+derived_tokenhub_url = tokenhub_url()
+if derived_tokenhub_url:
+    tokenhub_v1 = derived_tokenhub_url.rstrip("/") + "/v1"
+    values["TOKENHUB_URL"] = derived_tokenhub_url
+    values["MAC_REQUIRE_TOKENHUB"] = configured_tokenhub_required
+    values["MAC_TOKENHUB_PORT"] = configured_tokenhub_port
+    values["OPENAI_BASE_URL"] = tokenhub_v1
+    values["CUSTOM_BASE_URL"] = tokenhub_v1
+    values["MAC_HERMES_GATEWAY_BASE_URL"] = tokenhub_v1
+    values["ACC_HERMES_GATEWAY_BASE_URL"] = tokenhub_v1
+    values["MAC_HERMES_GATEWAY_PROVIDER"] = "custom"
+    values["ACC_HERMES_GATEWAY_PROVIDER"] = "custom"
+    values["HERMES_INFERENCE_PROVIDER"] = "custom"
+    tokenhub_model = configured_gateway_model or "*"
+    values["MAC_HERMES_GATEWAY_MODEL"] = tokenhub_model
+    values["ACC_HERMES_GATEWAY_MODEL"] = tokenhub_model
+    values["HERMES_INFERENCE_MODEL"] = tokenhub_model
+    values["ACC_LLM_MODEL"] = tokenhub_model
+    if configured_tokenhub_api_key:
+        values["TOKENHUB_API_KEY"] = configured_tokenhub_api_key
+        values["OPENAI_API_KEY"] = configured_tokenhub_api_key
+    else:
+        values.pop("OPENAI_API_KEY", None)
+elif not truthy(configured_tokenhub_required):
+    for key in (
+        "TOKENHUB_URL",
+        "TOKENHUB_API_KEY",
+        "TOKENHUB_AGENT_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CUSTOM_BASE_URL",
+        "MAC_HERMES_GATEWAY_BASE_URL",
+        "ACC_HERMES_GATEWAY_BASE_URL",
+        "MAC_REQUIRE_TOKENHUB",
+    ):
+        values.pop(key, None)
 values.setdefault("MAC_WORKER_WORKSPACE", str(mac_home / "agent-workspaces"))
 values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
 values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
@@ -3101,6 +3275,10 @@ PY
 
 normalize_hermes_redaction_env
 
+set -a
+. "$ENV_FILE"
+set +a
+install_or_validate_tokenhub_service
 set -a
 . "$ENV_FILE"
 set +a
@@ -3311,7 +3489,6 @@ install_hermes_gateway_wrapper() {
 set -euo pipefail
 set -a
 set +u
-[ -f "$HOME/.acc/.env" ] && . "$HOME/.acc/.env"
 [ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
 [ -f "$HOME/.mac/mac.env" ] && . "$HOME/.mac/mac.env"
 set -u
@@ -3451,7 +3628,6 @@ EOF
 set -euo pipefail
 set -a
 set +u
-[ -f "$HOME/.acc/.env" ] && . "$HOME/.acc/.env"
 [ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
 . "$HOME/.mac/mac.env"
 set -u
@@ -4244,6 +4420,17 @@ read_hub_token() {
     'set -euo pipefail; set -a; . "$HOME/.mac/mac.env"; set +a; printf "%s" "${MAC_API_TOKEN:?}"'
 }
 
+read_hub_tokenhub_api_key() {
+  local target ssh_parts=() ssh_args=() ssh_target item last_index
+  target="$(hub_target)"
+  while IFS= read -r -d '' item; do ssh_parts+=("$item"); done < <(ssh_target_args "$target")
+  last_index=$((${#ssh_parts[@]} - 1))
+  ssh_target="${ssh_parts[$last_index]}"
+  ssh_args=("${ssh_parts[@]:0:$last_index}")
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${ssh_args[@]}" "$ssh_target" \
+    'set -euo pipefail; if [ -f "$HOME/.tokenhub/env" ]; then set -a; . "$HOME/.tokenhub/env"; set +a; fi; if [ -z "${TOKENHUB_API_KEY:-}" ] && [ -f "$HOME/.tokenhub/.host-api-key" ]; then TOKENHUB_API_KEY="$(tr -d "\r\n" < "$HOME/.tokenhub/.host-api-key")"; fi; printf "%s" "${TOKENHUB_API_KEY:?}"'
+}
+
 read_hub_tunnel_pubkey() {
   local target ssh_parts=() ssh_args=() ssh_target item last_index
   target="$(hub_target)"
@@ -4314,11 +4501,12 @@ uses_direct_mesh_hub() {
 
 main() {
   make_archive
-  local spec agent hub_agent hub_token hub_target_str hub_tunnel_pubkey local_target fleet_name_field network_provider_field hub_url_field
+  local spec agent hub_agent hub_token hub_target_str hub_tunnel_pubkey tokenhub_api_key local_target fleet_name_field network_provider_field hub_url_field
   hub_agent="$(fleet_hub_agent)"
   hub_target_str="$(fleet_hub_target)"
   hub_token="${MAC_DEPLOY_HUB_TOKEN:-}"
   hub_tunnel_pubkey="${MAC_DEPLOY_HUB_TUNNEL_PUBKEY:-}"
+  tokenhub_api_key="${MAC_DEPLOY_TOKENHUB_API_KEY:-}"
   if [ -z "$hub_tunnel_pubkey" ]; then
     hub_tunnel_pubkey="$(read_hub_tunnel_pubkey 2>/dev/null || true)"
   fi
@@ -4328,17 +4516,25 @@ main() {
     local_target="${spec_fields[1]}"
     hub_url_field="${spec_fields[7]:-}"
     fleet_name_field="${spec_fields[23]:-mac}"
-    network_provider_field="${spec_fields[31]:-none}"
+    network_provider_field="${spec_fields[38]:-none}"
     if [ "$agent" != "$hub_agent" ] && [ -z "$hub_token" ]; then
       hub_token="$(read_hub_token)"
       upsert_local_env "MAC_DEPLOY_HUB_TOKEN" "$hub_token"
     fi
-    deploy_host "$spec" "$hub_token" "$hub_tunnel_pubkey"
+    if [ "$agent" != "$hub_agent" ] && [ -z "$tokenhub_api_key" ]; then
+      tokenhub_api_key="$(read_hub_tokenhub_api_key)"
+      upsert_local_env "MAC_DEPLOY_TOKENHUB_API_KEY" "$tokenhub_api_key"
+    fi
+    deploy_host "$spec" "$hub_token" "$hub_tunnel_pubkey" "$tokenhub_api_key"
     if [ "$agent" = "$hub_agent" ]; then
       if [ -z "$hub_token" ]; then
         hub_token="$(read_hub_token)"
       fi
       upsert_local_env "MAC_DEPLOY_HUB_TOKEN" "$hub_token"
+      if [ -z "$tokenhub_api_key" ]; then
+        tokenhub_api_key="$(read_hub_tokenhub_api_key)"
+      fi
+      upsert_local_env "MAC_DEPLOY_TOKENHUB_API_KEY" "$tokenhub_api_key"
       echo "==> ${agent}: hub UI access:"
       echo "    ssh -L 8789:127.0.0.1:8789 ${hub_target_str}  # then open http://localhost:8789/ui"
       echo "    token stored in \${MAC_DEPLOY_ENV_FILE:-\$HOME/.mac/.env} as MAC_DEPLOY_HUB_TOKEN"
