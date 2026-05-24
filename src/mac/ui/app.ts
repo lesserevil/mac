@@ -1874,6 +1874,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const proofRuntime = (proofEvidence.hermes_runtime || {}) as JsonObject;
   const proofWork = (proofEvidence.work_context || {}) as JsonObject;
   const proofApi = (proofEvidence.api || {}) as JsonObject;
+  const liveAlignment = (proofEvidence.live_alignment || {}) as JsonObject;
   const proofObjects = (proofEvidence.first_class_objects || {}) as Record<string, JsonObject>;
   const proofObjectEntries = Object.entries(proofObjects);
   const readyObjectCount = proofObjectEntries.filter(([, value]) => Boolean(value.ready)).length;
@@ -1937,6 +1938,7 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
           </div>
           <div class="row-grid">
             ${field("Schema", proof.schema)}
+            ${field("Live alignment", liveAlignment.ready ? "aligned" : "not proven")}
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", ((proofRuntime.prompt_bridge || {}) as JsonObject).present ? "active" : "not required")}
             ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}

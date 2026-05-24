@@ -1462,6 +1462,7 @@ function hermesRecord(instance, data) {
     const proofRuntime = (proofEvidence.hermes_runtime || {});
     const proofWork = (proofEvidence.work_context || {});
     const proofApi = (proofEvidence.api || {});
+    const liveAlignment = (proofEvidence.live_alignment || {});
     const proofObjects = (proofEvidence.first_class_objects || {});
     const proofObjectEntries = Object.entries(proofObjects);
     const readyObjectCount = proofObjectEntries.filter(([, value]) => Boolean(value.ready)).length;
@@ -1525,6 +1526,7 @@ function hermesRecord(instance, data) {
           </div>
           <div class="row-grid">
             ${field("Schema", proof.schema)}
+            ${field("Live alignment", liveAlignment.ready ? "aligned" : "not proven")}
             ${field("Runtime", proofRuntime.status || "not required")}
             ${field("Prompt bridge", (proofRuntime.prompt_bridge || {}).present ? "active" : "not required")}
             ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}

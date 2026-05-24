@@ -200,10 +200,18 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert runtime_proof["ready"] is True
     assert runtime_proof["checks"]["api_work_context_schema"] is True
     assert runtime_proof["checks"]["agent_bound_to_hermes_instance"] is True
+    assert runtime_proof["checks"]["live_object_alignment_consistent"] is True
     assert runtime_proof["checks"]["runtime_session_capabilities_available"] is True
     assert runtime_proof["checks"]["first_class_object_matrix_ready"] is True
     assert runtime_proof["checks"]["dashboard_projection_available"] is True
     assert runtime_proof["evidence"]["work_context"]["bound_agent_ids"] == [agent["id"]]
+    live_alignment = runtime_proof["evidence"]["live_alignment"]
+    assert live_alignment["schema"] == "mac.hermes.live_object_alignment.v1"
+    assert live_alignment["ready"] is True
+    assert live_alignment["tasks"]["live_count"] == 2
+    assert set(live_alignment["tasks"]["work_context_ids"]) == {dependency["id"], task["id"]}
+    assert live_alignment["projects"]["work_context_names"] == ["nanolang"]
+    assert live_alignment["agents"]["ready"] is True
     assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
     assert "list_tasks" in runtime_proof["evidence"]["api"]["task_operation_names"]
     assert "list_projects" in runtime_proof["evidence"]["api"]["project_operation_names"]
@@ -1174,6 +1182,8 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "workflowGraph" in app_js
     assert "hermes_runtime_proofs" in app_js
     assert "Runtime Proof" in app_js
+    assert "Live alignment" in app_js
+    assert "live_alignment" in app_js
     assert "Session caps" in app_js
     assert "Session Capabilities" in app_js
     assert "Bridge Commands" in app_js

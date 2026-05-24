@@ -776,6 +776,99 @@ class ControlPlane:
             for project in work_context.get("projects", [])
             if isinstance(project, dict)
         ]
+        tenant_id = instance.get("tenant_id") if isinstance(instance, dict) else None
+        live_tenant_tasks = self.list_tasks(tenant_id=tenant_id)
+        live_visible_tasks = [
+            task for task in live_tenant_tasks if task.state not in TERMINAL_TASK_STATES
+        ]
+        live_task_contexts = [
+            self._hermes_task_context(task)
+            for task in live_visible_tasks[: int(work_context.get("task_limit") or 0)]
+        ]
+        context_tasks = [
+            task for task in work_context.get("tasks", []) if isinstance(task, dict)
+        ]
+        live_task_by_id = {str(task.get("id")): task for task in live_task_contexts}
+        context_task_by_id = {str(task.get("id")): task for task in context_tasks}
+        task_ids_ready = (
+            set(context_task_by_id) <= set(live_task_by_id)
+            if bool(work_context.get("task_truncated"))
+            else set(context_task_by_id) == set(live_task_by_id)
+        )
+        task_fields_ready = all(
+            context_task_by_id[task_id] == live_task_by_id.get(task_id)
+            for task_id in context_task_by_id
+        )
+        live_agents = self.list_agents()
+        live_agent_contexts = [
+            self._hermes_agent_context(agent, live_tenant_tasks)
+            for agent in live_agents
+        ]
+        context_agents = [
+            agent for agent in work_context.get("agents", []) if isinstance(agent, dict)
+        ]
+        live_agent_by_id = {str(agent.get("id")): agent for agent in live_agent_contexts}
+        context_agent_by_id = {str(agent.get("id")): agent for agent in context_agents}
+        agent_fields = (
+            "id",
+            "name",
+            "status",
+            "health_status",
+            "current_task_id",
+            "active_task_ids",
+            "active_projects",
+            "hermes_instance_id",
+        )
+        agent_fields_ready = all(
+            {
+                field: context_agent_by_id[agent_id].get(field)
+                for field in agent_fields
+            }
+            == {
+                field: live_agent_by_id.get(agent_id, {}).get(field)
+                for field in agent_fields
+            }
+            for agent_id in context_agent_by_id
+        )
+        live_project_contexts = self._hermes_project_contexts(
+            live_tenant_tasks,
+            live_agents,
+            [item.to_dict() for item in self.list_project_items()],
+            [repository.to_dict() for repository in self.list_beads_repositories()],
+        )
+        live_alignment = {
+            "schema": "mac.hermes.live_object_alignment.v1",
+            "ready": (
+                int(work_context.get("task_count") or 0) == len(live_visible_tasks)
+                and task_ids_ready
+                and task_fields_ready
+                and live_project_contexts == project_contexts
+                and set(context_agent_by_id) == set(live_agent_by_id)
+                and agent_fields_ready
+            ),
+            "tasks": {
+                "live_count": len(live_visible_tasks),
+                "work_context_count": int(work_context.get("task_count") or 0),
+                "work_context_visible_count": len(context_tasks),
+                "truncated": bool(work_context.get("task_truncated")),
+                "ids_ready": task_ids_ready,
+                "fields_ready": task_fields_ready,
+                "live_ids": [task.id for task in live_visible_tasks[:20]],
+                "work_context_ids": list(context_task_by_id)[:20],
+            },
+            "projects": {
+                "ready": live_project_contexts == project_contexts,
+                "live_names": [str(project.get("project")) for project in live_project_contexts],
+                "work_context_names": [str(project.get("project")) for project in project_contexts],
+            },
+            "agents": {
+                "ready": set(context_agent_by_id) == set(live_agent_by_id) and agent_fields_ready,
+                "ids_ready": set(context_agent_by_id) == set(live_agent_by_id),
+                "fields_ready": agent_fields_ready,
+                "live_ids": list(live_agent_by_id)[:20],
+                "work_context_ids": list(context_agent_by_id)[:20],
+            },
+        }
         bound_agents = [
             agent
             for agent in work_context.get("agents", [])
@@ -1018,6 +1111,7 @@ class ControlPlane:
                 and authority.get("user_memory") == "hermes"
             ),
             "api_lifecycle_operations_present": expected_api_operations <= api_operation_names,
+            "live_object_alignment_consistent": bool(live_alignment.get("ready")),
             "cli_lifecycle_commands_present": all(
                 any(fragment in command for command in mac_hermes_commands)
                 for fragment in expected_cli_fragments
@@ -1126,6 +1220,7 @@ class ControlPlane:
                         for key, value in work_context.get("relationships", {}).items()
                     },
                 },
+                "live_alignment": live_alignment,
                 "first_class_objects": first_class_objects,
             },
         }

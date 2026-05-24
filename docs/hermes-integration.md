@@ -228,7 +228,9 @@ context, prompt bridge, and bound agent identity all agree on the same
 task/project/agent authority model. Its evidence includes a first-class object
 matrix for tasks, projects, and agents across API operations, MAC CLI commands,
 Hermes-facing commands, dashboard projection fields, and runtime session
-capabilities.
+capabilities. It also includes a live alignment section that compares current
+MAC task, project, and agent records against the Hermes work-context projection
+so a ready proof means Hermes is seeing the same operational objects MAC sees.
 
 When `mac-hermes runtime-proof` runs inside a Hermes agent, it sends that
 agent's local `build_hermes_startup_report()` to the hub proof endpoint. That
