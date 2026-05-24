@@ -1202,12 +1202,20 @@ validate_tokenhub_endpoint() {
     exit 1
   fi
   if ! curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/healthz" >/dev/null; then
-    if truthy "$allow_degraded"; then
+    # The configured URL may be an external DNS name not reachable from inside this host
+    # (e.g. a K8s service FQDN when the service doesn't expose the tokenhub port).
+    # Fall back to loopback — valid when tokenhub is installed locally on this node.
+    local loopback_port="${MAC_TOKENHUB_PORT:-${TOKENHUB_PORT_CONFIGURED:-8090}}"
+    if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${loopback_port}/healthz" >/dev/null 2>&1; then
+      log "TokenHub health confirmed on loopback; configured URL ${tokenhub_url%/} is not reachable from this host"
+      tokenhub_url="http://127.0.0.1:${loopback_port}"
+    elif truthy "$allow_degraded"; then
       log "WARNING: TokenHub health endpoint is unreachable; degraded override is active"
       return
+    else
+      log "ERROR: TokenHub is unreachable at ${tokenhub_url%/}/healthz"
+      exit 1
     fi
-    log "ERROR: TokenHub is unreachable at ${tokenhub_url%/}/healthz"
-    exit 1
   fi
   if [ -z "$tokenhub_api_key" ]; then
     if truthy "$allow_degraded"; then
@@ -2548,9 +2556,13 @@ if tokenhub_url:
 if tokenhub_key:
     updates["TOKENHUB_API_KEY"] = tokenhub_key
     updates["OPENAI_API_KEY"] = tokenhub_key
+    updates["MAC_HERMES_GATEWAY_API_KEY"] = tokenhub_key
+    updates["ACC_HERMES_GATEWAY_API_KEY"] = tokenhub_key
 else:
     updates["TOKENHUB_API_KEY"] = None
     updates["OPENAI_API_KEY"] = None
+    updates["MAC_HERMES_GATEWAY_API_KEY"] = None
+    updates["ACC_HERMES_GATEWAY_API_KEY"] = None
 
 model = (
     source.get("MAC_HERMES_GATEWAY_MODEL")
@@ -3298,14 +3310,26 @@ for key in provider_secret_keys:
 def tokenhub_url():
     if configured_tokenhub_url:
         return configured_tokenhub_url.rstrip("/")
-    raw_hub = configured_hub_url or values.get("MAC_HUB_URL") or "http://127.0.0.1:8789"
-    parsed = urllib.parse.urlsplit(raw_hub)
+    # Use the derived MAC_HUB_URL (not the raw spec hub URL) to detect whether
+    # this agent accesses the hub via a reverse SSH tunnel. MAC_HUB_URL is set
+    # to 127.0.0.1:18789 for tunnel-connected workers and 127.0.0.1:<port> for
+    # the hub itself — the raw configured_hub_url is always the native port.
+    mac_hub_url = values.get("MAC_HUB_URL") or configured_hub_url or "http://127.0.0.1:8789"
+    parsed = urllib.parse.urlsplit(mac_hub_url)
     if not parsed.scheme or not parsed.hostname:
         return ""
     host = parsed.hostname
     if ":" in host and not host.startswith("["):
         host = "[%s]" % host
-    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, configured_tokenhub_port), "", "", ""))
+    th_port = int(configured_tokenhub_port or "8090")
+    native_hub_port = int(port or "8789")
+    hub_port = parsed.port or native_hub_port
+    # Workers access the hub via a reverse SSH tunnel where the local port is
+    # native_port + 10000 (e.g. 8789 -> 18789). Apply the same offset to tokenhub
+    # so workers use the tunnel-forwarded tokenhub port (e.g. 8090 -> 18090).
+    if hub_port == native_hub_port + 10000:
+        th_port += 10000
+    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, th_port), "", "", ""))
 
 derived_tokenhub_url = tokenhub_url()
 if derived_tokenhub_url:
@@ -3328,14 +3352,20 @@ if derived_tokenhub_url:
     if configured_tokenhub_api_key:
         values["TOKENHUB_API_KEY"] = configured_tokenhub_api_key
         values["OPENAI_API_KEY"] = configured_tokenhub_api_key
+        values["MAC_HERMES_GATEWAY_API_KEY"] = configured_tokenhub_api_key
+        values["ACC_HERMES_GATEWAY_API_KEY"] = configured_tokenhub_api_key
     else:
         values.pop("OPENAI_API_KEY", None)
+        values.pop("MAC_HERMES_GATEWAY_API_KEY", None)
+        values.pop("ACC_HERMES_GATEWAY_API_KEY", None)
 elif not truthy(configured_tokenhub_required):
     for key in (
         "TOKENHUB_URL",
         "TOKENHUB_API_KEY",
         "TOKENHUB_AGENT_KEY",
         "OPENAI_API_KEY",
+        "MAC_HERMES_GATEWAY_API_KEY",
+        "ACC_HERMES_GATEWAY_API_KEY",
         "OPENAI_BASE_URL",
         "CUSTOM_BASE_URL",
         "MAC_HERMES_GATEWAY_BASE_URL",
@@ -3626,6 +3656,16 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
     export OPENAI_API_KEY="$TOKENHUB_AGENT_KEY"
   fi
 fi
+if [ -z "${MAC_HERMES_GATEWAY_API_KEY:-}" ]; then
+  if [ -n "${TOKENHUB_API_KEY:-}" ]; then
+    export MAC_HERMES_GATEWAY_API_KEY="$TOKENHUB_API_KEY"
+  elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
+    export MAC_HERMES_GATEWAY_API_KEY="$TOKENHUB_AGENT_KEY"
+  fi
+fi
+if [ -z "${ACC_HERMES_GATEWAY_API_KEY:-}" ] && [ -n "${MAC_HERMES_GATEWAY_API_KEY:-}" ]; then
+  export ACC_HERMES_GATEWAY_API_KEY="$MAC_HERMES_GATEWAY_API_KEY"
+fi
 exec "$HOME/.mac/hermes-agent/.venv/bin/python" "$HOME/.mac/hermes-agent/hermes" gateway run --replace
 EOF
   chmod 700 "$wrapper"
@@ -3763,6 +3803,16 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
   elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
     export OPENAI_API_KEY="$TOKENHUB_AGENT_KEY"
   fi
+fi
+if [ -z "${MAC_HERMES_GATEWAY_API_KEY:-}" ]; then
+  if [ -n "${TOKENHUB_API_KEY:-}" ]; then
+    export MAC_HERMES_GATEWAY_API_KEY="$TOKENHUB_API_KEY"
+  elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
+    export MAC_HERMES_GATEWAY_API_KEY="$TOKENHUB_AGENT_KEY"
+  fi
+fi
+if [ -z "${ACC_HERMES_GATEWAY_API_KEY:-}" ] && [ -n "${MAC_HERMES_GATEWAY_API_KEY:-}" ]; then
+  export ACC_HERMES_GATEWAY_API_KEY="$MAC_HERMES_GATEWAY_API_KEY"
 fi
 exec "$HOME/.mac/venv/bin/python" "$HOME/.mac/bin/mac-hermes-task-executor.py"
 EOF
@@ -4582,7 +4632,7 @@ fleet_name="${TUNNEL_FLEET_NAME:-mac}"
 conf_dir="$(ls -d /etc/supervisor/conf.d 2>/dev/null || ls -d /etc/supervisord.d 2>/dev/null || echo '/etc/supervisor/conf.d')"
 sudo tee "$conf_dir/${fleet_name}-tunnel-${worker_agent}.conf" > /dev/null <<EOF
 [program:${fleet_name}-tunnel-${worker_agent}]
-command=ssh -N -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i $HOME/.ssh/mac_tunnel_id -R 127.0.0.1:18789:127.0.0.1:8789 horde@${tunnel_host}
+command=ssh -N -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i $HOME/.ssh/mac_tunnel_id -R 127.0.0.1:18789:127.0.0.1:8789 -R 127.0.0.1:18090:127.0.0.1:8090 horde@${tunnel_host}
 directory=$HOME
 user=$(whoami)
 autostart=true
