@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mac.api import create_app
+from mac.hermes_runtime import build_runtime_context
 from mac.hermes_startup import build_hermes_startup_report
 from mac.models import ValidationError
 from mac.services import ControlPlane
@@ -28,6 +29,10 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_HERMES_GATEWAY_MODEL",
         "MAC_HERMES_GATEWAY_PROVIDER",
         "MAC_HERMES_LOG_SUMMARY",
+        "MAC_HERMES_RUNTIME_CONTEXT_FILE",
+        "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN",
+        "MAC_HERMES_RUNTIME_CONTEXT_REQUIRED",
+        "MAC_HERMES_INSTANCE_ID",
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
         "MAC_HERMES_SLACK_HOME_CHANNEL_NAME",
@@ -39,6 +44,8 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_REQUIRE_HERMES_STARTUP_READY",
         "MAC_REQUIRE_QDRANT_MEMORY",
         "MAC_SHARED_SERVICES_MANAGER_AGENT",
+        "MAC_URL",
+        "MAC_WORKER_HERMES_INSTANCE_ID",
         "ACC_HERMES_GATEWAY_BASE_URL",
         "ACC_HERMES_GATEWAY_MODEL",
         "ACC_HERMES_GATEWAY_PROVIDER",
@@ -512,6 +519,69 @@ def test_required_qdrant_endpoint_uses_redacted_topology(monkeypatch, tmp_path):
     rendered = str(report)
     assert "secret-qdrant-key" not in rendered
     assert "token=hidden" not in rendered
+
+
+def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    context_path = hermes_home / "mac-runtime-context.json"
+    markdown_path = hermes_home / "mac-runtime-context.md"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    context = build_runtime_context(
+        agent_name="rocky",
+        fleet_name="classic",
+        mac_url="http://secret@hub.example.internal:8789?token=hidden",
+        hermes_home=hermes_home,
+        mac_home=tmp_path / ".mac",
+        hermes_instance_id="hermes_rocky",
+        agent_id="agent_rocky",
+    )
+    _write(context_path, json.dumps(context))
+    _write(markdown_path, "private runtime command notes")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_FILE", str(context_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN", str(markdown_path))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["task_project_runtime"]["status"] == "ready"
+    assert report["task_project_runtime"]["schema"] == "mac.hermes.runtime_context.v1"
+    assert report["task_project_runtime"]["authority"]["tasks"] == "mac"
+    assert report["task_project_runtime"]["authority"]["projects"] == "mac"
+    assert report["task_project_runtime"]["hermes_instance_id"] == "hermes_rocky"
+    assert report["task_project_runtime"]["agent_id"] == "agent_rocky"
+    assert report["task_project_runtime"]["mac_url"] == "http://hub.example.internal:8789"
+    assert report["checks"]["task_project_runtime_context_available"] is True
+    assert report["checks"]["mac_task_project_authority_declared"] is True
+    rendered = str(report)
+    assert "token=hidden" not in rendered
+    assert "private runtime command notes" not in rendered
+
+
+def test_required_task_project_runtime_context_blocks_readiness_when_missing(
+    monkeypatch,
+    tmp_path,
+):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["task_project_runtime"]["status"] == "missing_context"
+    assert report["checks"]["task_project_runtime_context_available"] is False
+    assert "runtime context file is missing" in " ".join(report["warnings"])
 
 
 def test_qdrant_degraded_override_allows_startup(monkeypatch, tmp_path):

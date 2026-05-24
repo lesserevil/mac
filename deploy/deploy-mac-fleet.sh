@@ -1359,6 +1359,71 @@ print(
 PY
 }
 
+write_hermes_runtime_context() {
+  log "writing Hermes task/project runtime context"
+  "$VENV/bin/python" -m mac.hermes_runtime \
+    "$HOME/.hermes/mac-runtime-context.json" \
+    "$HOME/.hermes/mac-runtime-context.md" \
+    "$HOME/.hermes/.env" \
+    --agent-name "$AGENT" \
+    --fleet-name "$FLEET_NAME" \
+    --mac-url "${MAC_HUB_URL:-${HUB_URL:-}}" \
+    --hermes-home "${HERMES_HOME:-$HOME/.hermes}" \
+    --mac-home "$MAC_HOME" \
+    --tenant-id "${MAC_FLEET_TENANT_ID:-}" \
+    --persona-id "${MAC_HERMES_PERSONA_ID:-}" \
+    --hermes-instance-id "${MAC_HERMES_INSTANCE_ID:-}" \
+    --agent-id "${MAC_AGENT_ID:-}"
+  set -a
+  set +u
+  . "$HOME/.hermes/.env"
+  set -u
+  set +a
+}
+
+register_hermes_runtime_identity() {
+  log "registering Hermes runtime identity in mac"
+  "$VENV/bin/python" - <<'PY'
+from __future__ import annotations
+
+import os
+
+from mac.hermes_runtime import stable_id
+from mac.services import ControlPlane
+
+agent = os.environ["AGENT"]
+fleet = os.environ.get("FLEET_NAME") or "mac"
+home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+tenant_id = os.environ.get("MAC_FLEET_TENANT_ID") or stable_id("tenant", fleet)
+agent_id = os.environ.get("MAC_AGENT_ID") or stable_id("agent", agent)
+persona_id = os.environ.get("MAC_HERMES_PERSONA_ID") or stable_id("persona", agent)
+instance_id = os.environ.get("MAC_HERMES_INSTANCE_ID") or stable_id("hermes", agent)
+cp = ControlPlane()
+cp.register_tenant(
+    fleet,
+    tenant_id=tenant_id,
+    metadata={"source": "mac-deploy", "fleet": fleet},
+)
+cp.register_persona(
+    tenant_id,
+    agent,
+    os.path.join(home, "SOUL.md"),
+    home,
+    persona_id=persona_id,
+    metadata={"source": "mac-deploy", "agent_id": agent_id},
+)
+cp.register_hermes_instance(
+    tenant_id,
+    agent,
+    persona_id=persona_id,
+    home_ref=home,
+    instance_id=instance_id,
+    metadata={"source": "mac-deploy", "agent_id": agent_id, "fleet": fleet},
+)
+print("Hermes runtime identity: tenant=%s persona=%s instance=%s agent=%s" % (tenant_id, persona_id, instance_id, agent_id))
+PY
+}
+
 write_deploy_manifest() {
   local stage="$1" path="$2"
   SRC_BACKUP="$SRC_BACKUP" VENV_BACKUP="$VENV_BACKUP" HERMES_BACKUP="$HERMES_BACKUP" \
@@ -1599,6 +1664,8 @@ manifest = {
         "beads_source": str(Path(os.environ["BEADS_DIR"])),
         "beads_cli": str(mac_home / "bin" / "bd"),
         "env_file": str(Path(os.environ["ENV_FILE"])),
+        "hermes_runtime_context": os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_FILE") or str(Path.home() / ".hermes" / "mac-runtime-context.json"),
+        "hermes_runtime_markdown": os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN") or str(Path.home() / ".hermes" / "mac-runtime-context.md"),
     },
     "python": {
         "selected": os.environ["PY"],
@@ -1612,6 +1679,8 @@ manifest = {
         "hermes_agent": file_ref(hermes_dir),
         "beads_cli": file_ref(mac_home / "bin" / "bd"),
         "hermes_state": file_ref(Path.home() / ".hermes"),
+        "hermes_runtime_context": file_ref(os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_FILE") or (Path.home() / ".hermes" / "mac-runtime-context.json")),
+        "hermes_runtime_markdown": file_ref(os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN") or (Path.home() / ".hermes" / "mac-runtime-context.md")),
         "acc_state": file_ref(Path.home() / ".acc"),
         "disk_before_cleanup": file_ref(Path(os.environ["LOG_DIR"]) / ("disk-before-cleanup-%s.json" % os.environ["DEPLOY_TS"])),
         "disk_after_cleanup": file_ref(Path(os.environ["LOG_DIR"]) / ("disk-after-cleanup-%s.json" % os.environ["DEPLOY_TS"])),
@@ -1635,6 +1704,7 @@ manifest = {
             and "MAC_HERMES_GATEWAY_PROVIDER" in hermes_run_text
             and "resolve_runtime_provider" in hermes_run_text
         ),
+        "task_project_runtime_context": file_ref(os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_FILE") or (Path.home() / ".hermes" / "mac-runtime-context.json")),
         "messaging_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-messaging-deps.json"),
         "web_deps_report": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-web-deps.json"),
         "log_summary": file_ref(Path(os.environ["LOG_DIR"]) / "hermes-log-summary.json"),
@@ -2746,6 +2816,7 @@ log "creating/updating mac environment file"
 "$PY" - "$ENV_FILE" "$MAC_HOME" "$HOME" "$MAC_PORT" "$HERMES_SLACK_HOME_CHANNEL_NAME" "$HERMES_GATEWAY_MODEL" "$HERMES_GATEWAY_PROVIDER" "$HERMES_GATEWAY_BASE_URL" "$HUB_URL" "$HUB_TOKEN" "$CONTROL_BIND_HOST" "$WORKER_MODE" "$WORKER_CAPABILITIES" "$WORKER_ALLOWED_PROJECTS" "$WORKER_REQUIRED_METADATA" "$WORKER_REQUIRE_CANARY" "$AGENT" "$SUPERVISOR_KIND" "$SHARED_SERVICES_MANAGER_AGENT" "$QDRANT_URL_CONFIGURED" "$QDRANT_REQUIRE" "$QDRANT_PORT_CONFIGURED" "$FIRECRAWL_URL_CONFIGURED" "$FIRECRAWL_REQUIRE" "$FIRECRAWL_PORT_CONFIGURED" <<'PY'
 from pathlib import Path
 import os
+import re
 import secrets
 import sys
 import urllib.parse
@@ -2780,6 +2851,13 @@ network_provider = (
     or os.environ.get("NETWORK_PROVIDER")
     or "tailscale"
 ).strip().lower()
+
+
+def stable_id(prefix, value):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.lower()).strip("_")
+    return "%s_%s" % (prefix, safe or "default")
+
+
 values = {}
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -2812,6 +2890,15 @@ values["MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM"] = "1"
 values["MAC_HERMES_APPLY_GATEWAY_RUNTIME_SHIM"] = "1"
 values["MAC_HERMES_STARTUP_CHECK"] = "1"
 values.setdefault("MAC_REQUIRE_HERMES_STARTUP_READY", "0")
+values["MAC_URL"] = values["MAC_HUB_URL"]
+values["MAC_FLEET_TENANT_ID"] = stable_id("tenant", os.environ.get("FLEET_NAME") or "mac")
+values["MAC_AGENT_ID"] = stable_id("agent", agent_name)
+values["MAC_HERMES_PERSONA_ID"] = stable_id("persona", agent_name)
+values["MAC_HERMES_INSTANCE_ID"] = stable_id("hermes", agent_name)
+values["MAC_WORKER_HERMES_INSTANCE_ID"] = values["MAC_HERMES_INSTANCE_ID"]
+values["MAC_HERMES_RUNTIME_CONTEXT_FILE"] = str(home / ".hermes" / "mac-runtime-context.json")
+values["MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN"] = str(home / ".hermes" / "mac-runtime-context.md")
+values["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] = "1"
 values["MAC_SELF_UPDATE_REPO"] = str(mac_home / "src" / "mac")
 values["MAC_BEADS_CLI"] = str(mac_home / "bin" / "bd")
 values.setdefault("MAC_BEADS_BRIDGE_ROOT", str(mac_home / "beads-checkouts"))
@@ -3001,6 +3088,8 @@ log "installed Hermes agent from upstream plus mac-managed patches"
 
 log "initializing mac database"
 "$VENV/bin/mac" --db "$MAC_DB" init >/dev/null
+register_hermes_runtime_identity
+write_hermes_runtime_context
 
 ACC_DB=""
 for candidate in "$HOME/.acc/data/fleet.db" "$HOME/.acc/data/acc.db"; do
@@ -3234,6 +3323,7 @@ common=(
   --url "$MAC_HUB_URL"
   --token "$MAC_WORKER_TOKEN"
   --register
+  --agent-id "${MAC_AGENT_ID:-$(stable_agent_id)}"
   --agent-name "$agent_name"
   --hostname "$host_name"
   --capabilities "$capabilities"
@@ -3246,6 +3336,9 @@ common=(
 )
 if [ -n "${MAC_WORKER_RESOURCES:-}" ]; then
   common+=(--resources "$MAC_WORKER_RESOURCES")
+fi
+if [ -n "${MAC_WORKER_HERMES_INSTANCE_ID:-${MAC_HERMES_INSTANCE_ID:-}}" ]; then
+  common+=(--hermes-instance-id "${MAC_WORKER_HERMES_INSTANCE_ID:-${MAC_HERMES_INSTANCE_ID:-}}")
 fi
 if [ -n "${MAC_WORKER_ALLOWED_PROJECTS:-}" ]; then
   common+=(--allowed-projects "$MAC_WORKER_ALLOWED_PROJECTS")
@@ -4009,6 +4102,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
     data = json.load(handle)
 slack = data.get("slack") or {}
 qdrant = data.get("qdrant_level2") or {}
+runtime = data.get("task_project_runtime") or {}
 refs = data.get("state_refs") or []
 existing = sum(1 for ref in refs if ref.get("exists"))
 patch = slack.get("account_file_activation_shim_patch") or {}
@@ -4016,6 +4110,7 @@ print(
     "startup: ready=%s warnings=%d state_refs_existing=%d "
     "slack_activation=%s shim_present=%s redaction=%s operator_status=%s "
     "qdrant_status=%s qdrant_ready=%s topology=%s "
+    "runtime_status=%s runtime_ready=%s runtime_context=%s hermes_instance=%s "
     "patch_attempted=%s patch_applied=%s patch_error=%s"
     % (
         data.get("ready"),
@@ -4028,6 +4123,10 @@ print(
         qdrant.get("status"),
         qdrant.get("ready"),
         ((qdrant.get("topology") or {}).get("file") or {}).get("exists"),
+        runtime.get("status"),
+        runtime.get("ready"),
+        (runtime.get("context_file") or {}).get("exists"),
+        runtime.get("hermes_instance_id"),
         patch.get("attempted"),
         patch.get("applied"),
         bool(patch.get("error")),

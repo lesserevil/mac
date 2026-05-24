@@ -674,8 +674,16 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mac-hermes",
         description="Hermes-side adapter for the mac control plane",
     )
-    parser.add_argument("--url", default=os.environ.get("MAC_URL", "http://127.0.0.1:8000"))
-    parser.add_argument("--token", default=os.environ.get("MAC_TOKEN"))
+    parser.add_argument(
+        "--url",
+        default=os.environ.get("MAC_URL") or os.environ.get("MAC_HUB_URL") or "http://127.0.0.1:8000",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("MAC_TOKEN")
+        or os.environ.get("MAC_WORKER_TOKEN")
+        or os.environ.get("MAC_API_TOKEN"),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     register = sub.add_parser("register", help="register tenant, persona, Hermes instance, and optional platform bindings")

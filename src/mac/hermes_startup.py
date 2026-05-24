@@ -10,6 +10,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from mac.hermes_runtime import RUNTIME_CONTEXT_SCHEMA
+
 
 STATE_REF_CANDIDATES = (
     ("hermes_config", "config.yaml", True),
@@ -138,6 +140,20 @@ def _memory_topology_path(hermes_home: Path) -> Path:
     return hermes_home / "mac-memory-topology.json"
 
 
+def _runtime_context_path(hermes_home: Path) -> Path:
+    configured = os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_FILE")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return hermes_home / "mac-runtime-context.json"
+
+
+def _runtime_context_markdown_path(hermes_home: Path) -> Path:
+    configured = os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return hermes_home / "mac-runtime-context.md"
+
+
 def _topology_summary(path: Path) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "file": _file_ref(path, "memory_topology", False),
@@ -170,6 +186,104 @@ def _topology_summary(path: Path) -> Dict[str, Any]:
             "qdrant_url": _redact_url(qdrant.get("url")) if isinstance(qdrant.get("url"), str) else None,
         }
     )
+    return summary
+
+
+def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
+    context_path = _runtime_context_path(hermes_home)
+    markdown_path = _runtime_context_markdown_path(hermes_home)
+    required = _env_enabled("MAC_HERMES_RUNTIME_CONTEXT_REQUIRED", False)
+    summary: Dict[str, Any] = {
+        "status": "disabled",
+        "ready": True,
+        "required": required,
+        "context_file": _file_ref(context_path, "task_project_runtime_context", False),
+        "markdown_file": _file_ref(markdown_path, "task_project_runtime_markdown", False),
+        "schema": None,
+        "fleet": None,
+        "agent_id": None,
+        "agent_name": None,
+        "hermes_instance_id": os.environ.get("MAC_HERMES_INSTANCE_ID")
+        or os.environ.get("MAC_WORKER_HERMES_INSTANCE_ID")
+        or None,
+        "mac_url": _redact_url(os.environ.get("MAC_URL") or os.environ.get("MAC_HUB_URL")),
+        "authority": {},
+        "operation_groups": [],
+        "warning": "",
+        "error": "",
+    }
+    if not context_path.exists() or not context_path.is_file():
+        if required:
+            summary["ready"] = False
+            summary["status"] = "missing_context"
+            summary["warning"] = "Hermes MAC task/project runtime context file is missing: %s" % context_path
+        return summary
+
+    try:
+        data = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        summary["ready"] = not required
+        summary["status"] = "invalid_context"
+        summary["error"] = str(exc)
+        if required:
+            summary["warning"] = "Hermes MAC task/project runtime context file is invalid: %s" % exc
+        return summary
+    if not isinstance(data, dict):
+        summary["ready"] = not required
+        summary["status"] = "invalid_context"
+        summary["error"] = "runtime context root is not an object"
+        if required:
+            summary["warning"] = "Hermes MAC task/project runtime context file is invalid"
+        return summary
+
+    agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+    identity = data.get("identity") if isinstance(data.get("identity"), dict) else {}
+    authority = data.get("authority") if isinstance(data.get("authority"), dict) else {}
+    endpoints = data.get("endpoints") if isinstance(data.get("endpoints"), dict) else {}
+    operations = data.get("operations") if isinstance(data.get("operations"), dict) else {}
+    summary.update(
+        {
+            "schema": data.get("schema"),
+            "fleet": data.get("fleet"),
+            "agent_id": agent.get("agent_id"),
+            "agent_name": agent.get("name"),
+            "hermes_instance_id": identity.get("hermes_instance_id")
+            or agent.get("hermes_instance_id")
+            or summary["hermes_instance_id"],
+            "mac_url": _redact_url(endpoints.get("mac_api"))
+            if isinstance(endpoints.get("mac_api"), str)
+            else summary["mac_url"],
+            "authority": {
+                "tasks": authority.get("tasks"),
+                "projects": authority.get("projects"),
+                "agents": authority.get("agents"),
+                "personality": authority.get("personality"),
+                "user_memory": authority.get("user_memory"),
+            },
+            "operation_groups": sorted(str(key) for key in operations.keys()),
+        }
+    )
+    if data.get("schema") != RUNTIME_CONTEXT_SCHEMA:
+        summary["ready"] = not required
+        summary["status"] = "invalid_schema"
+        summary["error"] = "unexpected runtime context schema: %s" % data.get("schema")
+        if required:
+            summary["warning"] = "Hermes MAC task/project runtime context schema is invalid"
+        return summary
+    if required and not markdown_path.exists():
+        summary["ready"] = False
+        summary["status"] = "missing_markdown"
+        summary["warning"] = "Hermes MAC task/project runtime markdown is missing: %s" % markdown_path
+        return summary
+    for key in ("tasks", "projects", "agents"):
+        if authority.get(key) != "mac":
+            summary["ready"] = not required
+            summary["status"] = "authority_mismatch"
+            summary["error"] = "runtime context does not declare MAC authority for %s" % key
+            if required:
+                summary["warning"] = summary["error"]
+            return summary
+    summary["status"] = "ready"
     return summary
 
 
@@ -1028,6 +1142,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "ready": True,
                 "required": False,
             },
+            "task_project_runtime": {
+                "status": "startup_check_disabled",
+                "ready": True,
+                "required": False,
+            },
             "operator_health": {"status": "healthy"},
         }
 
@@ -1041,6 +1160,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     secret_redaction = _secret_redaction_report(hermes_home, acc_dir)
     logs = _log_classification_report()
     qdrant = _qdrant_memory_report(hermes_home)
+    task_project_runtime = _runtime_context_summary(hermes_home)
 
     warnings: List[str] = []
     if not hermes_home.exists():
@@ -1060,6 +1180,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     warnings.extend(logs["warnings"])
     if qdrant["warning"]:
         warnings.append(qdrant["warning"])
+    if task_project_runtime["warning"]:
+        warnings.append(task_project_runtime["warning"])
 
     checks = {
         "hermes_home_exists": hermes_home.exists(),
@@ -1077,6 +1199,15 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "shared_qdrant_memory_ready": bool(qdrant["ready"]),
         "memory_topology_available": (
             not qdrant["required"] or bool(qdrant["topology"]["file"]["exists"])
+        ),
+        "task_project_runtime_context_available": bool(task_project_runtime["ready"]),
+        "mac_task_project_authority_declared": (
+            not task_project_runtime["required"]
+            or (
+                task_project_runtime["authority"].get("tasks") == "mac"
+                and task_project_runtime["authority"].get("projects") == "mac"
+                and task_project_runtime["authority"].get("agents") == "mac"
+            )
         ),
         "gateway_runtime_override_active": (
             not (
@@ -1103,6 +1234,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "security": {"secret_redaction": secret_redaction},
         "logs": logs,
         "qdrant_level2": qdrant,
+        "task_project_runtime": task_project_runtime,
         "operator_health": {
             "status": operator_status,
             "state_refs_existing": state_refs_existing,
@@ -1114,5 +1246,9 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "qdrant_level2_status": qdrant["status"],
             "qdrant_level2_ready": qdrant["ready"],
             "memory_topology_present": qdrant["topology"]["file"]["exists"],
+            "task_project_runtime_status": task_project_runtime["status"],
+            "task_project_runtime_ready": task_project_runtime["ready"],
+            "task_project_runtime_present": task_project_runtime["context_file"]["exists"],
+            "task_project_runtime_hermes_instance_id": task_project_runtime["hermes_instance_id"],
         },
     }

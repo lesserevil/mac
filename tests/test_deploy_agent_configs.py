@@ -192,6 +192,14 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "systemd|launchd|supervisord" in script
     assert "install_supervisord_service()" in script
     assert "write_hermes_memory_topology()" in script
+    assert "write_hermes_runtime_context()" in script
+    assert "register_hermes_runtime_identity()" in script
+    assert "mac.hermes.runtime_context.v1" in (ROOT / "src" / "mac" / "hermes_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'values["MAC_HERMES_INSTANCE_ID"] = stable_id("hermes", agent_name)' in script
+    assert 'values["MAC_WORKER_HERMES_INSTANCE_ID"] = values["MAC_HERMES_INSTANCE_ID"]' in script
+    assert 'common+=(--hermes-instance-id "${MAC_WORKER_HERMES_INSTANCE_ID:-${MAC_HERMES_INSTANCE_ID:-}}")' in script
     assert "install_or_validate_shared_services" in script
     assert "mac.hermes.memory_topology.v1" in script
     assert "QDRANT_FLEET_URL" in script
@@ -210,6 +218,8 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert cfg["defaults"]["qdrant"]["required"] is True
     assert env_example["MAC_REQUIRE_QDRANT_MEMORY"] == "1"
     assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
+    assert env_example["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"
+    assert env_example["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_example"
     assert cfg["defaults"]["firecrawl"]["install"] == "auto"
     assert cfg["defaults"]["firecrawl"]["required"] is True
     assert cfg["defaults"]["firecrawl"]["port"] == 3002

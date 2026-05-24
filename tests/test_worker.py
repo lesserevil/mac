@@ -21,7 +21,7 @@ from mac.api import create_app
 from mac.hermes_adapter import MacApiClient, MacApiError
 from mac.models import ReviewStatus, TaskState
 from mac.services import ControlPlane, sign_verification_manifest
-from mac.worker import MacWorker, SubprocessExecutor, WorkerExecution, register_worker
+from mac.worker import MacWorker, SubprocessExecutor, WorkerExecution, build_parser, register_worker
 
 
 def api_transport(client: TestClient):
@@ -42,6 +42,20 @@ def register_worker_fixture(cp: ControlPlane):
     machine = cp.register_machine("worker-host")
     agent = cp.register_agent(machine.id, "worker", capabilities=["python"])
     return agent
+
+
+def test_mac_worker_cli_defaults_to_deployed_hub_env(monkeypatch):
+    monkeypatch.delenv("MAC_URL", raising=False)
+    monkeypatch.delenv("MAC_TOKEN", raising=False)
+    monkeypatch.setenv("MAC_HUB_URL", "http://hub.example.internal:8789")
+    monkeypatch.setenv("MAC_WORKER_TOKEN", "worker-token")
+    monkeypatch.setenv("MAC_HERMES_INSTANCE_ID", "hermes_rocky")
+
+    args = build_parser().parse_args(["--register", "--heartbeat-only"])
+
+    assert args.url == "http://hub.example.internal:8789"
+    assert args.token == "worker-token"
+    assert args.hermes_instance_id == "hermes_rocky"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1360,6 +1374,25 @@ def test_register_worker_creates_identity_then_worker_claims_tasks(tmp_path: Pat
     assert cp.get_agent(registered["id"]).name == "rocky"
     assert cp.get_agent(registered["id"]).capabilities == ["python"]
     assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
+def test_register_worker_binds_agent_to_hermes_instance():
+    cp = ControlPlane.in_memory()
+    tenant = cp.register_tenant("fleet")
+    hermes = cp.register_hermes_instance(tenant.id, "rocky")
+    client = TestClient(create_app(control_plane=cp))
+    api = MacApiClient("http://mac.test", transport=api_transport(client))
+
+    registered = register_worker(
+        api,
+        hostname="rocky.local",
+        agent_name="rocky",
+        capabilities=["python"],
+        hermes_instance_id=hermes.id,
+    )
+
+    assert registered["hermes_instance_id"] == hermes.id
+    assert cp.get_agent(registered["id"]).hermes_instance_id == hermes.id
 
 
 def test_worker_detects_stale_local_attestation_key():

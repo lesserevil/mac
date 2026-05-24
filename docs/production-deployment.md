@@ -39,6 +39,13 @@ deploying more than one writer.
 | `MAC_REQUIRE_HERMES_STARTUP_READY` | no | Set `1` to fail `mac` startup when Hermes soul/memory/state references or Slack activation are not ready. |
 | `MAC_HERMES_SLACK_HOME_CHANNEL_NAME` | no | Slack home-channel name, without `#`, used to write `~/.hermes/slack_home_channels.json` from `slack_accounts.json`. Empty skips discovery. |
 | `MAC_HERMES_SYNC_SLACK_HOME_CHANNELS` | no | Set `0` to preserve existing Slack home-channel files without discovery. Default enabled. |
+| `MAC_URL` / `MAC_HUB_URL` | no | MAC API endpoint used by Hermes-side `mac-hermes` operations. Fleet deploy points this at the hub. |
+| `MAC_HERMES_INSTANCE_ID` | no | Hermes instance id for this runtime. Fleet deploy uses a deterministic `hermes_<agent>` id and registers it in MAC. |
+| `MAC_WORKER_HERMES_INSTANCE_ID` | no | Worker agent binding to the Hermes instance id. This keeps MAC agent rows linked to their Hermes soul/runtime. |
+| `MAC_AGENT_ID` | no | Deterministic MAC agent id for this runtime. Fleet deploy uses `agent_<agent>`. |
+| `MAC_HERMES_RUNTIME_CONTEXT_FILE` | no | Hermes-visible task/project runtime contract JSON. Default `~/.hermes/mac-runtime-context.json`. |
+| `MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN` | no | Human/agent-readable runtime contract summary. Default `~/.hermes/mac-runtime-context.md`. |
+| `MAC_HERMES_RUNTIME_CONTEXT_REQUIRED` | no | Set `1` to make startup readiness fail if the MAC task/project runtime contract is missing or invalid. Fleet deploy enables this. |
 | `MAC_SUPERVISOR_KIND` | no | Runtime supervisor selected by fleet deploy: `systemd`, `launchd`, or `supervisord`. |
 | `MAC_MEMORY_TOPOLOGY_FILE` | no | Hermes-visible memory topology JSON. Default `~/.hermes/mac-memory-topology.json`. |
 | `MAC_SHARED_SERVICES_MANAGER_AGENT` | no | Agent that owns hub-managed shared services. Defaults to the configured fleet hub. |

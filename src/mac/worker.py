@@ -189,6 +189,7 @@ def register_worker(
     resources: Optional[JsonDict] = None,
     machine_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    hermes_instance_id: Optional[str] = None,
 ) -> JsonDict:
     """Register or refresh the machine and agent rows for this worker process."""
     host = (hostname or socket.gethostname()).strip()
@@ -217,6 +218,7 @@ def register_worker(
             "agent_id": resolved_agent_id,
             "capabilities": capabilities or [],
             "resources": resources or {},
+            "hermes_instance_id": hermes_instance_id,
         },
     )
 
@@ -2362,9 +2364,23 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mac worker harness")
-    parser.add_argument("--url", default=os.environ.get("MAC_URL", "http://127.0.0.1:8000"))
-    parser.add_argument("--token", default=os.environ.get("MAC_TOKEN"))
+    parser.add_argument(
+        "--url",
+        default=os.environ.get("MAC_URL") or os.environ.get("MAC_HUB_URL") or "http://127.0.0.1:8000",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("MAC_TOKEN")
+        or os.environ.get("MAC_WORKER_TOKEN")
+        or os.environ.get("MAC_API_TOKEN"),
+    )
     parser.add_argument("--agent-id", default=os.environ.get("MAC_AGENT_ID"))
+    parser.add_argument(
+        "--hermes-instance-id",
+        default=os.environ.get("MAC_WORKER_HERMES_INSTANCE_ID")
+        or os.environ.get("MAC_HERMES_INSTANCE_ID"),
+        help="MAC Hermes instance id to bind this worker agent to",
+    )
     parser.add_argument(
         "--register",
         action="store_true",
@@ -2487,6 +2503,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 resources=_json_arg(args.resources),
                 machine_id=args.machine_id,
                 agent_id=args.agent_id,
+                hermes_instance_id=args.hermes_instance_id,
             )
             agent_id = registered["id"]
             if registered.get("attestation_key"):

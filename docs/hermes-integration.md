@@ -158,6 +158,22 @@ mac hermes work-context <hermes_instance_id>
 mac-hermes work-context <hermes_instance_id>
 ```
 
+Fleet deployment now also writes a Hermes-visible runtime bootstrap contract:
+
+- `~/.hermes/mac-runtime-context.json` (`mac.hermes.runtime_context.v1`)
+- `~/.hermes/mac-runtime-context.md`
+- `MAC_HERMES_INSTANCE_ID`, `MAC_WORKER_HERMES_INSTANCE_ID`, `MAC_AGENT_ID`,
+  and `MAC_URL` in the Hermes environment
+
+That contract is the runtime reminder that MAC owns tasks, projects,
+dependencies, agent assignments, reviews, and publications while Hermes owns
+soul, personality, private memory, and conversation state. Deployed workers are
+registered against the same deterministic Hermes instance id, so
+`mac-hermes work-context $MAC_HERMES_INSTANCE_ID` gives the agent the same
+task/project graph the MAC API, CLI, and dashboard show. Startup health exposes
+this as `task_project_runtime` and reports degraded readiness when fleet deploy
+requires the contract but the files are missing or invalid.
+
 Hermes can then perform lifecycle operations through the adapter or CLI:
 
 ```python

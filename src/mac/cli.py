@@ -215,6 +215,7 @@ def cmd_agent_register(args: argparse.Namespace) -> None:
             capabilities=_csv(args.capabilities),
             resources=_json_arg(args.resources, {}),
             agent_id=args.agent_id,
+            hermes_instance_id=args.hermes_instance_id,
         )
     )
 
@@ -1026,6 +1027,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_register.add_argument("--capabilities")
     agent_register.add_argument("--resources")
     agent_register.add_argument("--agent-id")
+    agent_register.add_argument("--hermes-instance-id")
     _set(cmd_agent_register, agent_register)
 
     agent_list = agent.add_parser("list")

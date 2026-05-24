@@ -10,6 +10,7 @@ from mac.hermes_adapter import (
     MacApiClient,
     MacApiError,
     PlatformBindingSpec,
+    build_parser,
     main as mac_hermes_main,
 )
 from mac.models import ReviewStatus, TaskState
@@ -35,6 +36,18 @@ def api_transport(client):
 def register_agent(cp, name, capabilities):
     machine = cp.register_machine("%s-host" % name)
     return cp.register_agent(machine.id, name, capabilities=capabilities)
+
+
+def test_mac_hermes_cli_defaults_to_deployed_hub_env(monkeypatch):
+    monkeypatch.delenv("MAC_URL", raising=False)
+    monkeypatch.delenv("MAC_TOKEN", raising=False)
+    monkeypatch.setenv("MAC_HUB_URL", "http://hub.example.internal:8789")
+    monkeypatch.setenv("MAC_WORKER_TOKEN", "worker-token")
+
+    args = build_parser().parse_args(["work-brief", "hermes_rocky"])
+
+    assert args.url == "http://hub.example.internal:8789"
+    assert args.token == "worker-token"
 
 
 def finish_task(cp, task_id):

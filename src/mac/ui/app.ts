@@ -169,10 +169,15 @@ interface HermesStartup {
     slack_activation_source?: string;
     secret_redaction_effective?: boolean;
     log_actionable_count?: number;
+    task_project_runtime_status?: string;
+    task_project_runtime_ready?: boolean;
+    task_project_runtime_present?: boolean;
+    task_project_runtime_hermes_instance_id?: string;
   };
   security?: JsonObject;
   slack?: JsonObject;
   logs?: JsonObject;
+  task_project_runtime?: JsonObject;
 }
 
 interface ObservabilityEvent extends ApiRecord {
@@ -993,6 +998,8 @@ function hermesStartupPanel(startup?: HermesStartup | null): string {
   const security = (startup.security?.secret_redaction || {}) as JsonObject;
   const slack = startup.slack || {};
   const logs = startup.logs || {};
+  const runtime = startup.task_project_runtime || {};
+  const runtimeAuthority = (runtime.authority || {}) as JsonObject;
   const warnings = startup.warnings || [];
   return `
     <section class="surface">
@@ -1001,12 +1008,15 @@ function hermesStartupPanel(startup?: HermesStartup | null): string {
         ${chip(String(operator.status || (startup.ready ? "healthy" : "degraded")), startup.ready ? "good" : "bad")}
         ${chip(`redaction ${security.effective === false ? "off" : "on"}`, security.effective === false ? "bad" : "good")}
         ${chip(`logs ${Number(logs.actionable_count || 0)}`, Number(logs.actionable_count || 0) ? "bad" : "good")}
+        ${chip(`runtime ${String(runtime.status || operator.task_project_runtime_status || "unknown")}`, runtime.ready === false ? "bad" : "good")}
       </div>
       <div class="row-grid">
         ${field("State refs", operator.state_refs_existing ?? 0)}
         ${field("Slack activation", slack.activation_source || operator.slack_activation_source || "unknown")}
         ${field("Redaction source", security.source || "unknown")}
         ${field("Log classes", (logs.classes as unknown[] | undefined)?.length ?? 0)}
+        ${field("Hermes instance", runtime.hermes_instance_id || operator.task_project_runtime_hermes_instance_id || "unbound")}
+        ${field("MAC authority", `tasks ${runtimeAuthority.tasks || "?"}, projects ${runtimeAuthority.projects || "?"}`)}
       </div>
       ${warnings.length ? `<div class="timeline">${warnings.map((warning) => timelineItem("warning", warning, "")).join("")}</div>` : ""}
     </section>
