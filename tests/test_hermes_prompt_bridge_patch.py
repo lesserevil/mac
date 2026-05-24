@@ -107,6 +107,18 @@ def test_mac_runtime_context_patch_makes_hermes_prompt_load_runtime_markdown(
             [
                 "# MAC Task and Project Runtime",
                 "",
+                "## First-Class Objects",
+                "- `tasks`: authority `mac`; source `mac task records and task history`",
+                "- `projects`: authority `mac`; source `MAC project summaries`",
+                "- `agents`: authority `mac`; source `MAC agent registry`",
+                "",
+                "## Project Bridge",
+                "- `mac-hermes project-items`",
+                "",
+                "## Agent View",
+                "- `mac-hermes agents`",
+                "- `mac-hermes agent-identity agent_rocky`",
+                "",
                 "## Direct Session Parity",
                 "- `bd prime`",
                 "- `mac-hermes work-context hermes_rocky --active-only`",
@@ -130,6 +142,14 @@ def test_mac_runtime_context_patch_makes_hermes_prompt_load_runtime_markdown(
 
     for rendered in (runtime_context, prompt):
         assert "MAC Task and Project Runtime" in rendered
+        assert "First-Class Objects" in rendered
+        assert "`tasks`: authority `mac`" in rendered
+        assert "`projects`: authority `mac`" in rendered
+        assert "`agents`: authority `mac`" in rendered
+        assert "Project Bridge" in rendered
+        assert "mac-hermes project-items" in rendered
+        assert "Agent View" in rendered
+        assert "mac-hermes agents" in rendered
         assert "Direct Session Parity" in rendered
         assert "bd prime" in rendered
         assert "mac-hermes work-context hermes_rocky --active-only" in rendered

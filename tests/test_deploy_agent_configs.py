@@ -175,6 +175,9 @@ def test_fleet_deploy_applies_hermes_patch_set():
     assert "upstream plus mac-managed patches" in script
     assert "verify_hermes_prompt_bridge()" in script
     assert "prompt_builder.build_context_files_prompt" in script
+    assert "First-Class Objects" in script
+    assert "Project Bridge" in script
+    assert "Agent View" in script
     assert "_load_mac_runtime_context" in runtime_patch.read_text(encoding="utf-8")
     assert "MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN" in runtime_patch.read_text(encoding="utf-8")
     assert "Shutdown chat notifications disabled by MAC deployment policy." in quench_patch.read_text(

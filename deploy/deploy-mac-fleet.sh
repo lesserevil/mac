@@ -1397,8 +1397,16 @@ from agent import prompt_builder
 workspace = sys.argv[1]
 required = [
     "MAC Task and Project Runtime",
+    "First-Class Objects",
+    "`tasks`: authority `mac`",
+    "`projects`: authority `mac`",
+    "`agents`: authority `mac`",
+    "Project Bridge",
+    "Agent View",
     "Direct Session Parity",
     "mac-hermes work-context",
+    "mac-hermes project-items",
+    "mac-hermes agents",
     "hgmac agents list",
     "bd prime",
 ]
