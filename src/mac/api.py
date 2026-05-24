@@ -1318,12 +1318,7 @@ def _dashboard_state(
     ]
     task_details = [_dashboard_task(cp, task.id) for task in tasks]
     rollout_statuses = [_dashboard_rollout_status(cp, rollout.id) for rollout in rollouts]
-    project_summaries = _dashboard_project_summaries(
-        tasks,
-        agents,
-        bridge_items,
-        beads_repositories,
-    )
+    project_summaries = cp.list_projects()
     hermes_work_contexts = {
         instance["id"]: cp.hermes_work_context(instance["id"], task_limit=40)
         for instance in hermes_instances
@@ -1740,6 +1735,14 @@ def create_app(
     @app.get("/tasks/{task_id}/summary")
     def task_summary(task_id: str) -> Dict[str, Any]:
         return cp.task_summary(task_id)
+
+    @app.get("/projects")
+    def list_projects() -> List[Dict[str, Any]]:
+        return cp.list_projects()
+
+    @app.get("/projects/{project}")
+    def get_project(project: str) -> Dict[str, Any]:
+        return cp.get_project(project)
 
     @app.post("/tasks/{task_id}/transition")
     def transition_task(

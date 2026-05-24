@@ -163,6 +163,8 @@ Beads-backed project registration, issue import, and repository polling as MAC
 state instead of hidden local Hermes state:
 
 ```python
+adapter.list_projects()
+adapter.project_detail("repo-beads-nanolang")
 adapter.list_project_items()
 adapter.import_project_item(
     "repo-beads-nanolang",
@@ -178,6 +180,10 @@ adapter.poll_beads_repositories(repository="nanolang", force=True)
 ```
 
 ```bash
+mac project list
+mac project show repo-beads-nanolang
+mac-hermes projects
+mac-hermes project-detail repo-beads-nanolang
 mac-hermes project-items
 mac-hermes import-project-item repo-beads-nanolang nanolang-42 "Update parser dependency" --project repo-beads-nanolang --priority 10 --dependencies task_parent
 mac-hermes beads-repositories

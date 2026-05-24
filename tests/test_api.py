@@ -159,6 +159,8 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     )
     operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
     assert {
+        "list_projects",
+        "get_project",
         "list_project_items",
         "register_beads_repository",
         "list_beads_repositories",
@@ -170,8 +172,17 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
         "get_agent",
         "get_agent_identity",
     } <= operation_names
+    projects = client.get("/projects").json()
+    assert projects[0]["project"] == "nanolang"
+    assert projects[0]["task_count"] == 2
+    project_detail = client.get("/projects/nanolang").json()
+    assert project_detail["project"] == "nanolang"
+    assert project_detail["summary"]["blocked_count"] == 1
+    assert {item["id"] for item in project_detail["tasks"]} == {dependency["id"], task["id"]}
+    assert any("mac project list" in command for command in work_context["operations"]["mac_cli"])
     assert any("mac-hermes work-context" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes runtime-proof" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("mac-hermes projects" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes project-items" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes claim-next" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes command-audit" in command for command in work_context["operations"]["mac_hermes_cli"])
@@ -189,6 +200,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert runtime_proof["checks"]["dashboard_projection_available"] is True
     assert runtime_proof["evidence"]["work_context"]["bound_agent_ids"] == [agent["id"]]
     assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
+    assert "list_projects" in runtime_proof["evidence"]["api"]["project_operation_names"]
     assert "list_project_items" in runtime_proof["evidence"]["api"]["project_operation_names"]
     assert "list_agents" in runtime_proof["evidence"]["api"]["agent_operation_names"]
     assert runtime_proof["evidence"]["first_class_objects"]["tasks"]["ready"] is True

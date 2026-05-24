@@ -327,6 +327,12 @@ class HermesMacAdapter:
     def list_project_items(self) -> Any:
         return self.client.get("/bridge/items")
 
+    def list_projects(self) -> Any:
+        return self.client.get("/projects")
+
+    def project_detail(self, project: str) -> JsonDict:
+        return self.client.get("/projects/%s" % _path_part(project))
+
     def register_beads_repository(
         self,
         name: str,
@@ -896,6 +902,14 @@ def _cmd_project_items(args: argparse.Namespace) -> None:
     _print(_adapter(args).list_project_items())
 
 
+def _cmd_projects(args: argparse.Namespace) -> None:
+    _print(_adapter(args).list_projects())
+
+
+def _cmd_project_detail(args: argparse.Namespace) -> None:
+    _print(_adapter(args).project_detail(args.project))
+
+
 def _cmd_register_beads_repository(args: argparse.Namespace) -> None:
     _print(
         _adapter(args).register_beads_repository(
@@ -1190,6 +1204,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     project_items = sub.add_parser("project-items", help="list MAC bridge project items")
     project_items.set_defaults(func=_cmd_project_items)
+
+    projects = sub.add_parser("projects", help="list MAC project summaries")
+    projects.set_defaults(func=_cmd_projects)
+
+    project_detail = sub.add_parser("project-detail", help="fetch one MAC project summary and records")
+    project_detail.add_argument("project")
+    project_detail.set_defaults(func=_cmd_project_detail)
 
     beads_repositories = sub.add_parser("beads-repositories", help="list registered Beads repositories")
     beads_repositories.add_argument("--enabled", action="store_true", default=None)

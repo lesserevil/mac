@@ -182,6 +182,14 @@ def cmd_task_show(args: argparse.Namespace) -> None:
     _print(_plane(args).task_detail(args.task_id))
 
 
+def cmd_project_list(args: argparse.Namespace) -> None:
+    _print(_plane(args).list_projects())
+
+
+def cmd_project_show(args: argparse.Namespace) -> None:
+    _print(_plane(args).get_project(args.project))
+
+
 def cmd_task_start(args: argparse.Namespace) -> None:
     _print(_plane(args).start_task(args.task_id, args.agent_id))
 
@@ -1028,6 +1036,13 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--checksum")
     evidence.add_argument("--metadata")
     _set(cmd_task_evidence, evidence)
+
+    project = sub.add_parser("project", help="project summary commands").add_subparsers(dest="project_command", required=True)
+    project_list = project.add_parser("list")
+    _set(cmd_project_list, project_list)
+    project_show = project.add_parser("show")
+    project_show.add_argument("project")
+    _set(cmd_project_show, project_show)
 
     machine = sub.add_parser("machine", help="machine registry commands").add_subparsers(dest="machine_command", required=True)
     machine_register = machine.add_parser("register")

@@ -697,6 +697,8 @@ class ControlPlane:
             "write_completed_task_to_memory",
         }
         expected_project_api_operations = {
+            "list_projects",
+            "get_project",
             "import_project_item",
             "list_project_items",
             "register_beads_repository",
@@ -723,6 +725,8 @@ class ControlPlane:
         expected_cli_fragments = (
             "mac-hermes work-context",
             "mac-hermes runtime-proof",
+            "mac-hermes projects",
+            "mac-hermes project-detail",
             "mac-hermes import-project-item",
             "mac-hermes project-items",
             "mac-hermes beads-repositories",
@@ -883,14 +887,22 @@ class ControlPlane:
                 "authority": authority.get("projects"),
                 "api_operations": sorted(api_operation_names & expected_project_api_operations),
                 "api_ready": expected_project_api_operations <= api_operation_names,
-                "mac_cli_commands": matching(mac_cli_commands, ("mac bridge ",)),
+                "mac_cli_commands": matching(mac_cli_commands, ("mac project ", "mac bridge ")),
                 "mac_cli_ready": has_all(
                     mac_cli_commands,
-                    ("mac bridge import", "mac bridge list", "mac bridge beads register"),
+                    (
+                        "mac project list",
+                        "mac project show",
+                        "mac bridge import",
+                        "mac bridge list",
+                        "mac bridge beads register",
+                    ),
                 ),
                 "mac_hermes_cli_commands": matching(
                     mac_hermes_commands,
                     (
+                        "mac-hermes projects",
+                        "mac-hermes project-detail",
                         "mac-hermes import-project-item",
                         "mac-hermes project-items",
                         "mac-hermes beads-repositories",
@@ -901,6 +913,8 @@ class ControlPlane:
                 "mac_hermes_cli_ready": has_all(
                     mac_hermes_commands,
                     (
+                        "mac-hermes projects",
+                        "mac-hermes project-detail",
                         "mac-hermes import-project-item",
                         "mac-hermes project-items",
                         "mac-hermes beads-repositories",
@@ -1178,6 +1192,7 @@ class ControlPlane:
                     "frontier_tasks": [],
                     "waiting_tasks": [],
                     "active_tasks": [],
+                    "cross_project_edges": [],
                     "bridge_item_count": 0,
                     "repository_count": 0,
                 }
@@ -1210,6 +1225,16 @@ class ControlPlane:
                     waiting_on.append(dependency_id)
                 if dependency is not None and self._hermes_task_project_key(dependency) != project:
                     item["cross_project_dependency_count"] += 1
+                    if len(item["cross_project_edges"]) < 8:
+                        item["cross_project_edges"].append(
+                            {
+                                "from_project": self._hermes_task_project_key(dependency),
+                                "from_task_id": dependency.id,
+                                "from_task_title": dependency.title,
+                                "to_task_id": task.id,
+                                "to_task_title": task.title,
+                            }
+                        )
             compact = self._hermes_task_context(task)
             if task.state == TaskState.OPEN.value and not waiting_on:
                 item["ready_count"] += 1
@@ -1233,7 +1258,7 @@ class ControlPlane:
                 "bridge_item_count"
             ] += 1
         for repository in repositories:
-            bucket(str(repository.get("project") or repository.get("name") or "unassigned"))[
+            bucket(str(repository.get("project") or repository.get("name") or repository.get("source") or "unassigned"))[
                 "repository_count"
             ] += 1
 
@@ -1424,6 +1449,16 @@ class ControlPlane:
                     "path": "/memory",
                 },
                 {
+                    "name": "list_projects",
+                    "method": "GET",
+                    "path": "/projects",
+                },
+                {
+                    "name": "get_project",
+                    "method": "GET",
+                    "path": "/projects/{project}",
+                },
+                {
                     "name": "import_project_item",
                     "method": "POST",
                     "path": "/bridge/items",
@@ -1472,6 +1507,8 @@ class ControlPlane:
             "mac_cli": [
                 "mac hermes work-context %s" % hermes_instance_id,
                 "mac hermes runtime-proof %s" % hermes_instance_id,
+                "mac project list",
+                "mac project show <project>",
                 "mac bridge import <source> <external_id> <title> --project <project>",
                 "mac bridge list",
                 "mac bridge beads register <name> <path> --project <project>",
@@ -1486,6 +1523,8 @@ class ControlPlane:
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
                 "mac-hermes runtime-proof %s" % hermes_instance_id,
+                "mac-hermes projects",
+                "mac-hermes project-detail <project>",
                 "mac-hermes import-project-item <source> <external_id> <title> --project <project>",
                 "mac-hermes project-items",
                 "mac-hermes beads-repositories",
@@ -1964,6 +2003,61 @@ class ControlPlane:
         if tenant_id is not None:
             tasks = [task for task in tasks if self._task_tenant_id(task) == tenant_id]
         return tasks
+
+    @staticmethod
+    def _project_item_project_key(item: JsonDict) -> str:
+        return str(item.get("project") or item.get("source") or "unassigned")
+
+    @staticmethod
+    def _beads_repository_project_key(repository: JsonDict) -> str:
+        return str(
+            repository.get("project")
+            or repository.get("name")
+            or repository.get("source")
+            or "unassigned"
+        )
+
+    def list_projects(self) -> List[JsonDict]:
+        return self._hermes_project_contexts(
+            self.list_tasks(),
+            self.list_agents(),
+            [item.to_dict() for item in self.list_project_items()],
+            [repository.to_dict() for repository in self.list_beads_repositories()],
+        )
+
+    def get_project(self, project: str) -> JsonDict:
+        project_key = str(project or "unassigned").strip() or "unassigned"
+        summaries = {
+            str(summary.get("project")): summary
+            for summary in self.list_projects()
+            if isinstance(summary, dict)
+        }
+        summary = summaries.get(project_key)
+        if summary is None:
+            raise NotFoundError("project not found: %s" % project_key)
+
+        tasks = [
+            task.to_dict()
+            for task in self.list_tasks()
+            if self._hermes_task_project_key(task) == project_key
+        ]
+        bridge_items = [
+            item.to_dict()
+            for item in self.list_project_items()
+            if self._project_item_project_key(item.to_dict()) == project_key
+        ]
+        beads_repositories = [
+            repository.to_dict()
+            for repository in self.list_beads_repositories()
+            if self._beads_repository_project_key(repository.to_dict()) == project_key
+        ]
+        return {
+            "project": project_key,
+            "summary": summary,
+            "tasks": tasks,
+            "bridge_items": bridge_items,
+            "beads_repositories": beads_repositories,
+        }
 
     def task_detail(self, task_id: str) -> JsonDict:
         task = self.get_task(task_id)

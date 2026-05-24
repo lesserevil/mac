@@ -150,6 +150,8 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     )
     operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
     assert {
+        "list_projects",
+        "get_project",
         "list_project_items",
         "register_beads_repository",
         "list_beads_repositories",
@@ -161,6 +163,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         "get_agent",
         "get_agent_identity",
     } <= operation_names
+    assert any(
+        "mac-hermes projects" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
     assert any(
         "mac-hermes project-items" in command
         for command in work_context["operations"]["mac_hermes_cli"]
@@ -212,6 +218,8 @@ def test_hermes_adapter_exposes_project_bridge_operations():
         metadata={"team": "core", "api_token": "drop"},
     )
     adapter.list_project_items()
+    adapter.list_projects()
+    adapter.project_detail("repo-beads-mac")
     adapter.register_beads_repository(
         "mac",
         "/repo/mac",
@@ -246,6 +254,8 @@ def test_hermes_adapter_exposes_project_bridge_operations():
             },
         ),
         ("GET", "/bridge/items", None),
+        ("GET", "/projects", None),
+        ("GET", "/projects/repo-beads-mac", None),
         (
             "POST",
             "/bridge/beads/repositories",
@@ -525,6 +535,17 @@ def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
     assert payload["projects"][0]["project"] == "mac"
     assert payload["operations"]["mac_cli"][0].startswith("mac hermes work-context")
 
+    rc = mac_cli_main(["--db", str(db), "project", "list"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["project"] == "mac"
+
+    rc = mac_cli_main(["--db", str(db), "project", "show", "mac"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"] == "mac"
+    assert payload["summary"]["task_count"] == 1
+
     rc = mac_cli_main(
         [
             "--db",
@@ -709,6 +730,8 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
     monkeypatch.setattr(MacApiClient, "request", request)
     commands = [
         ["project-items"],
+        ["projects"],
+        ["project-detail", "repo-beads-mac"],
         [
             "import-project-item",
             "repo-beads-mac",
@@ -769,6 +792,8 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
 
     assert calls == [
         ("GET", "/bridge/items", None),
+        ("GET", "/projects", None),
+        ("GET", "/projects/repo-beads-mac", None),
         (
             "POST",
             "/bridge/items",
