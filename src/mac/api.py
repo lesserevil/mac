@@ -215,6 +215,10 @@ class InteractionTaskCreate(TaskCreate):
     actor: str = "hermes"
 
 
+class HermesRuntimeProofCreate(BaseModel):
+    hermes_startup: Dict[str, Any] = Field(default_factory=dict)
+
+
 class TransitionRequest(BaseModel):
     target_state: str
     actor: str
@@ -1636,6 +1640,16 @@ def create_app(
         return cp.hermes_runtime_proof(
             instance_id,
             hermes_startup=app.state.hermes_startup,
+        )
+
+    @app.post("/hermes-instances/{instance_id}/runtime-proof")
+    def hermes_runtime_proof_with_startup(
+        instance_id: str,
+        body: HermesRuntimeProofCreate,
+    ) -> Dict[str, Any]:
+        return cp.hermes_runtime_proof(
+            instance_id,
+            hermes_startup=body.hermes_startup,
         )
 
     @app.post("/hermes-instances/{instance_id}/tasks")

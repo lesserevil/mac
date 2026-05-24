@@ -213,6 +213,14 @@ matrix for tasks, projects, and agents across API operations, MAC CLI commands,
 Hermes-facing commands, dashboard projection fields, and runtime session
 capabilities.
 
+When `mac-hermes runtime-proof` runs inside a Hermes agent, it sends that
+agent's local `build_hermes_startup_report()` to the hub proof endpoint. That
+lets MAC validate the caller's actual runtime context, first-class object
+model, prompt bridge, and direct-session capabilities instead of relying only
+on the hub process environment. Use `mac-hermes runtime-proof
+<hermes_instance_id> --skip-local-startup` only when a hub-only proof is
+intended.
+
 Fleet deployment now also writes a Hermes-visible runtime bootstrap contract:
 
 - `~/.hermes/mac-runtime-context.json` (`mac.hermes.runtime_context.v1`)

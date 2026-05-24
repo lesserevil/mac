@@ -259,10 +259,16 @@ class HermesMacAdapter:
             )
         )
 
-    def runtime_proof(self, hermes_instance_id: str) -> JsonDict:
-        return self.client.get(
-            "/hermes-instances/%s/runtime-proof" % _path_part(hermes_instance_id)
-        )
+    def runtime_proof(
+        self,
+        hermes_instance_id: str,
+        *,
+        hermes_startup: Optional[JsonDict] = None,
+    ) -> JsonDict:
+        path = "/hermes-instances/%s/runtime-proof" % _path_part(hermes_instance_id)
+        if hermes_startup is None:
+            return self.client.get(path)
+        return self.client.post(path, {"hermes_startup": _sanitize_json_object(hermes_startup)})
 
     def import_project_item(
         self,
@@ -665,7 +671,12 @@ def _cmd_work_brief(args: argparse.Namespace) -> None:
 
 
 def _cmd_runtime_proof(args: argparse.Namespace) -> None:
-    _print(_adapter(args).runtime_proof(args.hermes_instance_id))
+    startup = None
+    if not args.skip_local_startup:
+        from mac.hermes_startup import build_hermes_startup_report
+
+        startup = build_hermes_startup_report()
+    _print(_adapter(args).runtime_proof(args.hermes_instance_id, hermes_startup=startup))
 
 
 def _cmd_import_project_item(args: argparse.Namespace) -> None:
@@ -882,6 +893,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     runtime_proof = sub.add_parser("runtime-proof", help="prove MAC/Hermes task-project bridge readiness")
     runtime_proof.add_argument("hermes_instance_id")
+    runtime_proof.add_argument(
+        "--skip-local-startup",
+        action="store_true",
+        help="fetch hub-only proof without sending this Hermes runtime's local startup report",
+    )
     runtime_proof.set_defaults(func=_cmd_runtime_proof)
 
     import_project_item = sub.add_parser("import-project-item", help="import an external project item into MAC")

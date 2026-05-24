@@ -490,7 +490,44 @@ def test_mac_hermes_cli_fetches_work_context(monkeypatch, capsys):
     ]
 
 
-def test_mac_hermes_cli_fetches_runtime_proof(monkeypatch, capsys):
+def test_mac_hermes_cli_submits_local_startup_for_runtime_proof(monkeypatch, capsys):
+    calls = []
+
+    def request(self, method, path, payload):
+        calls.append((self.base_url, method, path, payload))
+        return {"schema": "mac.hermes_runtime_proof.v1", "ready": True}
+
+    startup = {
+        "task_project_runtime": {
+            "ready": True,
+            "first_class_object_names": ["tasks", "projects", "agents"],
+        }
+    }
+    monkeypatch.setattr(MacApiClient, "request", request)
+    monkeypatch.setattr("mac.hermes_startup.build_hermes_startup_report", lambda: startup)
+
+    rc = mac_hermes_main(
+        [
+            "--url",
+            "http://hub:8789",
+            "runtime-proof",
+            "hermes_1",
+        ]
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["schema"] == "mac.hermes_runtime_proof.v1"
+    assert calls == [
+        (
+            "http://hub:8789",
+            "POST",
+            "/hermes-instances/hermes_1/runtime-proof",
+            {"hermes_startup": startup},
+        )
+    ]
+
+
+def test_mac_hermes_cli_can_fetch_hub_only_runtime_proof(monkeypatch, capsys):
     calls = []
 
     def request(self, method, path, payload):
@@ -505,6 +542,7 @@ def test_mac_hermes_cli_fetches_runtime_proof(monkeypatch, capsys):
             "http://hub:8789",
             "runtime-proof",
             "hermes_1",
+            "--skip-local-startup",
         ]
     )
 
