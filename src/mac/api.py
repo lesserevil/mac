@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import os
 import sqlite3
 import time
+import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -1268,6 +1270,232 @@ def _dashboard_rollout_status(cp: ControlPlane, rollout_id: str) -> Dict[str, An
     }
 
 
+TOKENHUB_SESSION_TICKET_PURPOSE = "tokenhub-admin-session-v1"
+
+
+def _service_env_files() -> List[Path]:
+    home = Path.home()
+    mac_home = Path(os.environ.get("MAC_HOME") or home / ".mac").expanduser()
+    hermes_home = Path(os.environ.get("HERMES_HOME") or home / ".hermes").expanduser()
+    tokenhub_state = Path(os.environ.get("TOKENHUB_STATE_DIR") or home / ".tokenhub").expanduser()
+    fleet_name = os.environ.get("FLEET_NAME") or os.environ.get("MAC_FLEET_NAME") or "mac"
+    return [
+        mac_home / "mac.env",
+        hermes_home / ".env",
+        tokenhub_state / "env",
+        tokenhub_state / "service.env",
+        Path("/etc") / fleet_name / "qdrant.env",
+        Path("/etc") / fleet_name / "firecrawl-gateway.env",
+    ]
+
+
+def _strip_shell_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _read_env_file_value(path: Path, names: Iterable[str]) -> Optional[str]:
+    wanted = set(names)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        if key in wanted:
+            return _strip_shell_quotes(value)
+    return None
+
+
+def _lookup_config_value(
+    names: Iterable[str],
+    env_files: Optional[Iterable[Path]] = None,
+) -> Dict[str, Any]:
+    name_list = [str(name) for name in names]
+    for name in name_list:
+        value = os.environ.get(name)
+        if value:
+            return {"name": name, "value": value, "source": "env:%s" % name}
+    files = list(env_files or _service_env_files())
+    for path in files:
+        for name in name_list:
+            value = _read_env_file_value(path, [name])
+            if value:
+                return {
+                    "name": name,
+                    "value": value,
+                    "source": "file:%s:%s" % (path, name),
+                }
+    return {"name": name_list[0] if name_list else "", "value": "", "source": "not_configured"}
+
+
+def _redacted_secret_ref(value: str) -> str:
+    if not value:
+        return ""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return "<redacted:%s:chars=%d>" % (digest, len(value))
+
+
+def _credential_ref(names: Iterable[str], env_files: Optional[Iterable[Path]] = None) -> Dict[str, Any]:
+    found = _lookup_config_value(names, env_files)
+    value = str(found.get("value") or "")
+    return {
+        "name": found.get("name") or "",
+        "source": found.get("source") or "not_configured",
+        "present": bool(value),
+        "redacted_value": _redacted_secret_ref(value),
+    }
+
+
+def _redact_service_url(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return "<invalid-url>"
+    if not parsed.netloc:
+        return raw
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = "redacted@%s" % netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
+def _join_service_url(base_url: str, suffix: str) -> str:
+    if not base_url:
+        return ""
+    return base_url.rstrip("/") + suffix
+
+
+def _service_status(
+    hermes_startup: Optional[Dict[str, Any]],
+    key: str,
+    fallback_url: str,
+) -> str:
+    if isinstance(hermes_startup, dict):
+        report = hermes_startup.get(key)
+        if isinstance(report, dict):
+            return str(report.get("status") or ("ready" if report.get("ready") else "unknown"))
+    return "configured" if fallback_url else "not_configured"
+
+
+def _dashboard_service_links(
+    hermes_startup: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    env_files = _service_env_files()
+    tokenhub_url = str(
+        _lookup_config_value(("TOKENHUB_URL", "MAC_TOKENHUB_URL"), env_files).get("value")
+        or ""
+    ).rstrip("/")
+    qdrant_url = str(
+        _lookup_config_value(("QDRANT_URL", "QDRANT_ADDRESS", "QDRANT_FLEET_URL"), env_files).get("value")
+        or ""
+    ).rstrip("/")
+    firecrawl_url = str(
+        _lookup_config_value(("FIRECRAWL_API_URL", "FIRECRAWL_GATEWAY_URL"), env_files).get("value")
+        or ""
+    ).rstrip("/")
+    tokenhub_admin = _credential_ref(("TOKENHUB_ADMIN_TOKEN",), env_files)
+    tokenhub_client = _credential_ref(
+        ("TOKENHUB_API_KEY", "TOKENHUB_AGENT_KEY", "OPENAI_API_KEY"),
+        env_files,
+    )
+    tokenhub_sso_available = bool(tokenhub_url and tokenhub_admin["present"])
+    return [
+        {
+            "id": "tokenhub",
+            "name": "TokenHub",
+            "kind": "owned_ui",
+            "role": "LLM token vault and wildcard model router",
+            "status": _service_status(hermes_startup, "tokenhub", tokenhub_url),
+            "url": _redact_service_url(tokenhub_url),
+            "ui_url": _redact_service_url(tokenhub_url),
+            "health_url": _redact_service_url(_join_service_url(tokenhub_url, "/healthz")),
+            "auth": {
+                "type": "admin_session_cookie",
+                "credential_pass_through": tokenhub_sso_available,
+                "pass_through_url": (
+                    "/dashboard/service-links/tokenhub/sso" if tokenhub_sso_available else ""
+                ),
+                "notes": (
+                    "MAC creates a short-lived TokenHub session ticket"
+                    if tokenhub_sso_available
+                    else "TOKENHUB_ADMIN_TOKEN is required for pass-through"
+                ),
+            },
+            "credentials": [tokenhub_admin, tokenhub_client],
+        },
+        {
+            "id": "qdrant",
+            "name": "Qdrant",
+            "kind": "external_ui",
+            "role": "shared vector memory",
+            "status": _service_status(hermes_startup, "qdrant_level2", qdrant_url),
+            "url": _redact_service_url(qdrant_url),
+            "ui_url": _redact_service_url(_join_service_url(qdrant_url, "/dashboard")),
+            "health_url": _redact_service_url(_join_service_url(qdrant_url, "/healthz")),
+            "auth": {
+                "type": "api_key_or_none",
+                "credential_pass_through": False,
+                "pass_through_url": "",
+                "notes": "Qdrant owns its browser authentication surface",
+            },
+            "credentials": [_credential_ref(("QDRANT_API_KEY", "QDRANT_FLEET_KEY"), env_files)],
+        },
+        {
+            "id": "firecrawl",
+            "name": "Firecrawl Gateway",
+            "kind": "owned_api",
+            "role": "Firecrawl-compatible web search API",
+            "status": "configured" if firecrawl_url else "not_configured",
+            "url": _redact_service_url(firecrawl_url),
+            "ui_url": _redact_service_url(firecrawl_url),
+            "health_url": _redact_service_url(_join_service_url(firecrawl_url, "/health")),
+            "auth": {
+                "type": "api_key_or_none",
+                "credential_pass_through": False,
+                "pass_through_url": "",
+                "notes": "The MAC Firecrawl gateway exposes an API health page, not a separate admin UI",
+            },
+            "credentials": [_credential_ref(("FIRECRAWL_API_KEY",), env_files)],
+        },
+    ]
+
+
+def _tokenhub_session_ticket_url() -> str:
+    env_files = _service_env_files()
+    tokenhub_url = str(
+        _lookup_config_value(("TOKENHUB_URL", "MAC_TOKENHUB_URL"), env_files).get("value")
+        or ""
+    ).rstrip("/")
+    admin = _lookup_config_value(("TOKENHUB_ADMIN_TOKEN",), env_files)
+    admin_token = str(admin.get("value") or "")
+    if not tokenhub_url:
+        raise ValidationError("TokenHub URL is not configured")
+    if not admin_token:
+        raise ValidationError("TokenHub admin token is not configured")
+    expires = int(time.time()) + 60
+    body = "%s:%d" % (TOKENHUB_SESSION_TICKET_PURPOSE, expires)
+    signature = hmac.new(
+        admin_token.encode("utf-8"),
+        body.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    query = urllib.parse.urlencode(
+        {"expires": str(expires), "signature": signature, "redirect": "/"}
+    )
+    return "%s/admin/v1/session/claim?%s" % (tokenhub_url, query)
+
+
 def _dashboard_state(
     cp: ControlPlane,
     hermes_startup: Optional[Dict[str, Any]] = None,
@@ -1408,6 +1636,7 @@ def _dashboard_state(
         "nap_runs": nap_runs,
         "integration_findings": integration_findings,
         "integration_observations": integration_observations,
+        "service_links": _dashboard_service_links(hermes_startup),
         "command_audit": [
             record.to_dict() for record in cp.list_command_audit(limit=120)
         ],
@@ -1550,6 +1779,14 @@ def create_app(
     def dashboard_state() -> Dict[str, Any]:
         app.state.hermes_startup = build_hermes_startup_report()
         return _dashboard_state(cp, app.state.hermes_startup)
+
+    @app.get("/dashboard/service-links/tokenhub/sso", include_in_schema=False)
+    def tokenhub_sso(
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> RedirectResponse:
+        if not principal.is_admin:
+            raise AuthorizationError("TokenHub pass-through requires an admin MAC token")
+        return RedirectResponse(_tokenhub_session_ticket_url(), status_code=303)
 
     @app.get("/dashboard/agents/{agent_id}")
     def dashboard_agent(agent_id: str) -> Dict[str, Any]:

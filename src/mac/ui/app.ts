@@ -291,6 +291,30 @@ interface IntegrationObservation extends ApiRecord {
   observed_at: string;
 }
 
+interface ServiceCredentialRef {
+  name: string;
+  source: string;
+  present: boolean;
+  redacted_value?: string;
+}
+
+interface ServiceLinkRecord extends ApiRecord {
+  name: string;
+  kind: string;
+  role: string;
+  status: string;
+  url?: string;
+  ui_url?: string;
+  health_url?: string;
+  auth?: {
+    type?: string;
+    credential_pass_through?: boolean;
+    pass_through_url?: string;
+    notes?: string;
+  };
+  credentials?: ServiceCredentialRef[];
+}
+
 interface DashboardData {
   overview: {
     counts: Record<string, number>;
@@ -328,6 +352,7 @@ interface DashboardData {
   nap_runs: ApiRecord[];
   integration_findings: IntegrationFinding[];
   integration_observations: IntegrationObservation[];
+  service_links: ServiceLinkRecord[];
   command_audit: CommandAuditRecord[];
   secrets: ApiRecord[];
   secret_audits: ApiRecord[];
@@ -1098,8 +1123,13 @@ function renderIntegrations(): string {
     <section class="metric-grid">
       ${metric("Beads Repos", data.beads_repositories.length, "registered issue sources")}
       ${metric("Bridge Items", data.bridge_items.length, "imported project items")}
+      ${metric("Service UIs", data.service_links.length, "linked control surfaces")}
       ${metric("Artifacts", data.artifacts.length, "registered outputs")}
       ${metric("Eval Runs", data.eval_runs.length, `${failingEvalRuns.length} failing`)}
+    </section>
+    <section class="surface">
+      <h2>Service UIs</h2>
+      ${serviceLinksTable(data.service_links)}
     </section>
     <section class="split">
       <div class="surface">
@@ -1273,6 +1303,50 @@ function integrationFindingRecord(item: IntegrationFinding): string {
       </div>
     </article>
   `;
+}
+
+function serviceLinksTable(services: ServiceLinkRecord[]): string {
+  if (!services.length) {
+    return `<div class="empty-state">No service UI links are configured</div>`;
+  }
+  return `
+    <div class="table-wrap">
+      <table class="data-table compact-table">
+        <thead><tr><th>Service</th><th>Open</th><th>Status</th><th>Auth</th><th>Credentials</th></tr></thead>
+        <tbody>
+          ${services.map(serviceLinkRow).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function serviceLinkRow(service: ServiceLinkRecord): string {
+  const auth = service.auth || {};
+  const openUrl = String(auth.credential_pass_through && auth.pass_through_url ? auth.pass_through_url : service.ui_url || service.url || "");
+  const healthUrl = String(service.health_url || "");
+  const openLabel = auth.credential_pass_through ? "Open SSO" : "Open";
+  const credentials = service.credentials || [];
+  return `
+    <tr>
+      <td><strong>${escapeHtml(service.name)}</strong><br><span class="muted small">${escapeHtml(service.role)}</span></td>
+      <td>
+        <div class="chip-row">
+          ${openUrl ? `<a class="pill tone-info" href="${escapeHtml(openUrl)}" target="_blank" rel="noreferrer">${escapeHtml(openLabel)}</a>` : chip("no ui", "warn")}
+          ${healthUrl ? `<a class="pill" href="${escapeHtml(healthUrl)}" target="_blank" rel="noreferrer">Health</a>` : ""}
+        </div>
+      </td>
+      <td>${chip(service.status || "unknown", healthTone(service.status))}<br><span class="muted small">${escapeHtml(service.kind)}</span></td>
+      <td><span class="mono small">${escapeHtml(auth.type || "none")}</span><br><span class="muted small">${escapeHtml(auth.notes || "")}</span></td>
+      <td>${credentials.length ? credentials.map(serviceCredentialLine).join("<br>") : `<span class="muted small">none</span>`}</td>
+    </tr>
+  `;
+}
+
+function serviceCredentialLine(ref: ServiceCredentialRef): string {
+  const tone = ref.present ? "good" : "warn";
+  const redacted = ref.redacted_value ? ` ${ref.redacted_value}` : "";
+  return `${chip(ref.name || "credential", tone)} <span class="muted small mono">${escapeHtml(ref.source || "not_configured")}${escapeHtml(redacted)}</span>`;
 }
 
 function notificationRecord(item: OperatorNotification): string {
@@ -2793,8 +2867,8 @@ function statusTone(status: string): Tone {
 }
 
 function healthTone(status: string): Tone {
-  if (status === "healthy") return "good";
-  if (status === "degraded") return "warn";
+  if (["healthy", "ready", "configured"].includes(status)) return "good";
+  if (["degraded", "degraded_allowed", "unknown"].includes(status)) return "warn";
   return "bad";
 }
 

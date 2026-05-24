@@ -733,6 +733,37 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert agent_detail["availability"]["eligible"] is True
 
 
+def test_dashboard_exposes_service_links_with_redacted_credentials(monkeypatch):
+    monkeypatch.setenv("MAC_HERMES_STARTUP_CHECK", "0")
+    monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.internal:8090")
+    monkeypatch.setenv("TOKENHUB_ADMIN_TOKEN", "secret-admin-token")
+    monkeypatch.setenv("TOKENHUB_API_KEY", "secret-client-token")
+    monkeypatch.setenv("QDRANT_URL", "http://qdrant.internal:6333")
+    monkeypatch.setenv("QDRANT_API_KEY", "secret-qdrant-token")
+    monkeypatch.setenv("FIRECRAWL_API_URL", "http://firecrawl.internal:3002")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "secret-firecrawl-token")
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+
+    state = client.get("/dashboard/state").json()
+    services = {item["id"]: item for item in state["service_links"]}
+
+    assert services["tokenhub"]["auth"]["credential_pass_through"] is True
+    assert services["tokenhub"]["auth"]["pass_through_url"] == "/dashboard/service-links/tokenhub/sso"
+    assert services["qdrant"]["ui_url"] == "http://qdrant.internal:6333/dashboard"
+    assert services["firecrawl"]["health_url"] == "http://firecrawl.internal:3002/health"
+    rendered = str(state)
+    assert "secret-admin-token" not in rendered
+    assert "secret-client-token" not in rendered
+    assert "secret-qdrant-token" not in rendered
+    assert "secret-firecrawl-token" not in rendered
+
+    response = client.get("/dashboard/service-links/tokenhub/sso", follow_redirects=False)
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith("http://tokenhub.internal:8090/admin/v1/session/claim?")
+    assert "secret-admin-token" not in location
+
+
 def test_dashboard_models_large_swarm_by_project_and_limits_dispatch_candidates():
     client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
     machine = client.post("/machines", json={"hostname": "swarm-host"}).json()
