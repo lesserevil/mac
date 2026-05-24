@@ -1153,8 +1153,15 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "hermes_runtime_proofs" in app_js
     assert "Runtime Proof" in app_js
     assert "Session caps" in app_js
+    assert "Session Capabilities" in app_js
+    assert "Bridge Commands" in app_js
+    assert "First-Class Objects" in app_js
+    assert "web research" in app_js
+    assert "command audit" in app_js
     assert "Objects" in app_js
+    assert "Task ops" in app_js
     assert "Project ops" in app_js
+    assert "Agent ops" in app_js
     assert 'data-view="work"' in index_html
     assert 'data-view="map"' in index_html
     assert 'data-view="workflows"' in index_html

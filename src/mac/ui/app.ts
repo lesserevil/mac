@@ -139,6 +139,7 @@ interface HermesWorkContext {
     api?: JsonObject[];
     mac_cli?: string[];
     mac_hermes_cli?: string[];
+    hgmac_cli?: string[];
     task_state_transitions?: Record<string, string[]>;
   };
 }
@@ -1867,7 +1868,8 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const proof = data.hermes_runtime_proofs?.[String(instance.id)];
   const contextProjects = context?.projects || [];
   const contextAgents = context?.agents || [];
-  const operationCount = (context?.operations.api || []).length + (context?.operations.mac_hermes_cli || []).length;
+  const hermesBridgeCommands = context?.operations.mac_hermes_cli || [];
+  const operationCount = (context?.operations.api || []).length + hermesBridgeCommands.length;
   const proofEvidence = (proof?.evidence || {}) as JsonObject;
   const proofRuntime = (proofEvidence.hermes_runtime || {}) as JsonObject;
   const proofWork = (proofEvidence.work_context || {}) as JsonObject;
@@ -1878,8 +1880,11 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
   const proofSessionCapabilities = (proofRuntime.session_capability_names || []) as unknown[];
   const proofSessionAvailability = (proofRuntime.session_capability_availability || {}) as JsonObject;
   const unavailableSessionCapabilities = (proofSessionAvailability.missing || []) as unknown[];
+  const unavailableSessionCapabilityNames = new Set(unavailableSessionCapabilities.map((item) => String(item)));
   const availableSessionCapabilityCount = Math.max(0, proofSessionCapabilities.length - unavailableSessionCapabilities.length);
+  const taskOperationCount = ((proofApi.task_operation_names || []) as unknown[]).length;
   const projectOperationCount = ((proofApi.project_operation_names || []) as unknown[]).length;
+  const agentOperationCount = ((proofApi.agent_operation_names || []) as unknown[]).length;
   const proofMissing = proof?.missing || [];
   return `
     <article class="record">
@@ -1907,7 +1912,17 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Operations", operationCount)}
           </div>
           <div class="chip-row">${contextProjects.slice(0, 8).map((project) => chip(`${project.project}:${project.active_count}/${project.task_count}`, project.active_count ? "info" : "good")).join("") || chip("no projects", "warn")}</div>
-          <p class="muted small mono">${escapeHtml((context.operations.mac_hermes_cli || []).slice(0, 3).join(" | "))}</p>
+          <h4>Bridge Commands</h4>
+          <div class="chip-row">
+            ${hermesBridgeCommands.some((command) => command.includes("project")) ? chip("project bridge", "good") : chip("project bridge missing", "bad")}
+            ${hermesBridgeCommands.some((command) => command.includes("claim") || command.includes("task")) ? chip("task lifecycle", "good") : chip("task lifecycle missing", "bad")}
+            ${hermesBridgeCommands.some((command) => command.includes("agents") || command.includes("agent-")) ? chip("agent view", "good") : chip("agent view missing", "bad")}
+            ${hermesBridgeCommands.some((command) => command.includes("command-audit")) ? chip("command audit", "good") : chip("command audit missing", "bad")}
+            ${hermesBridgeCommands.some((command) => command.includes("web-search")) ? chip("web research", "good") : chip("web research missing", "bad")}
+          </div>
+          <div class="timeline">
+            ${hermesBridgeCommands.slice(0, 12).map((command) => timelineItem("mac-hermes", command, "bridge command")).join("")}
+          </div>
           <div class="timeline">
             ${(context.tasks || []).slice(0, 4).map((task) => timelineItem(task.state, task.title, `${task.project || taskProject(task)} / ${task.id}`)).join("") || timelineItem("idle", "No visible tasks", "")}
           </div>
@@ -1926,11 +1941,21 @@ function hermesRecord(instance: ApiRecord, data: DashboardData): string {
             ${field("Prompt bridge", ((proofRuntime.prompt_bridge || {}) as JsonObject).present ? "active" : "not required")}
             ${field("Session caps", `${availableSessionCapabilityCount}/${proofSessionCapabilities.length}`)}
             ${field("Objects", `${readyObjectCount}/${proofObjectEntries.length || 3}`)}
+            ${field("Task ops", String(taskOperationCount))}
             ${field("Project ops", String(projectOperationCount))}
+            ${field("Agent ops", String(agentOperationCount))}
             ${field("Project links", `${proofWork.project_bridge_item_count || 0}/${proofWork.beads_repository_count || 0}`)}
             ${field("Bound agents", String(((proofWork.bound_agent_ids || []) as unknown[]).length))}
           </div>
-          <div class="chip-row">${proofObjectEntries.map(([name, value]) => chip(name, value.ready ? "good" : "bad")).join("") || chip("object proof missing", "warn")}</div>
+          <h4>First-Class Objects</h4>
+          <div class="chip-row">${proofObjectEntries.map(([name, value]) => chip(`${name}:${value.authority || "?"}`, value.ready ? "good" : "bad")).join("") || chip("object proof missing", "warn")}</div>
+          <h4>Session Capabilities</h4>
+          <div class="chip-row">
+            ${proofSessionCapabilities.map((name) => {
+              const label = String(name);
+              return chip(label, unavailableSessionCapabilityNames.has(label) ? "bad" : "good");
+            }).join("") || chip("session capability proof missing", "warn")}
+          </div>
         </div>
       ` : ""}
     </article>
