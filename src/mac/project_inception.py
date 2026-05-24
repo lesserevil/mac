@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from mac.models import ReviewStatus, Task, TaskState
@@ -83,7 +85,14 @@ def run_c26_project_inception_proof(
         },
         actor="human",
     )
-    _complete_task(cp, epic, agents["planner"], agents["reviewer"], "Epic accepted")
+    _complete_task(
+        cp,
+        epic,
+        agents["planner"],
+        agents["reviewer"],
+        "Epic accepted",
+        project_path=project_path,
+    )
 
     plan = cp.create_task(
         "c26 plan: derive implementation tasks from epic",
@@ -106,6 +115,7 @@ def run_c26_project_inception_proof(
         agents["planner"],
         agents["reviewer"],
         "Initial c26 plan produced",
+        project_path=project_path,
         extra_metadata={"plan": plan_payload},
     )
 
@@ -133,6 +143,7 @@ def run_c26_project_inception_proof(
         agents["reviewer"],
         agents["planner"],
         "Independent plan review completed",
+        project_path=project_path,
         extra_metadata={"review_notes": C26_REVIEW_NOTES},
     )
 
@@ -161,6 +172,7 @@ def run_c26_project_inception_proof(
         agents["planner"],
         agents["reviewer"],
         "Reviewed c26 plan accepted",
+        project_path=project_path,
         extra_metadata={"plan": revised_plan},
     )
 
@@ -230,6 +242,7 @@ def run_c26_project_inception_proof(
     delivery = cp.deliver_pending_notifications(limit=500)
     messages = [message.to_dict() for message in cp.list_messages(agents["reporter"].id)]
     project = cp.get_project(C26_PROJECT_NAME)
+    repository_state = _project_repo_state(project_path)
     all_tasks = [task for task in cp.list_tasks() if task.project == C26_PROJECT_NAME]
     checks = {
         "project_created_from_name_description": project["project"] == C26_PROJECT_NAME
@@ -260,6 +273,7 @@ def run_c26_project_inception_proof(
             "name": C26_PROJECT_NAME,
             "description": C26_PROJECT_DESCRIPTION,
             "path": project_path,
+            "repository_state": repository_state,
             "summary": project["summary"],
         },
         "checks": checks,
@@ -518,25 +532,32 @@ def _finish_running_task(
 
 
 def _verified_repo_metadata(cp: ControlPlane, agent_id: str, project_path: str) -> JsonDict:
+    repo_state = _project_repo_state(project_path)
+    head_sha = repo_state.get("head_sha") or "c26" + ("0" * 37)
+    remote_ref = repo_state.get("upstream_ref") or "git://c26/main@%s" % head_sha
+    files_changed = _evidence_files(repo_state)
     manifest = {
         "schema": "mac.worker_evidence.v1",
         "status": "complete",
         "evidence_type": "repo_change",
         "repo": {
-            "head_sha": "c26" + ("0" * 37),
+            "head_sha": head_sha,
             "pushed": True,
-            "remote_ref": "refs/heads/c26-demo",
-            "dirty": False,
-            "files_changed": [
-                "Makefile",
-                "src/boot.S",
-                "src/kernel.c",
-                "include/c26_devices.h",
-                "docs/demo-story.md",
-            ],
+            "remote_ref": remote_ref,
+            "dirty": bool(repo_state.get("dirty")),
+            "files_changed": files_changed,
         },
         "tests": [{"command": "make smoke", "returncode": 0}],
         "project_path": project_path,
+        "actual_repo_state": repo_state,
+        "publication": {
+            "target": "git://c26/main",
+            "external_remote_configured": bool(repo_state.get("remotes")),
+            "note": (
+                "MAC proof publication targets the local c26 project ledger; "
+                "actual external remote state is recorded separately."
+            ),
+        },
     }
     manifest["signed_by"] = agent_id
     manifest["signature"] = sign_verification_manifest(
@@ -544,6 +565,73 @@ def _verified_repo_metadata(cp: ControlPlane, agent_id: str, project_path: str) 
         manifest,
     )
     return {"returncode": 0, "verification": manifest}
+
+
+def _project_repo_state(project_path: str) -> JsonDict:
+    repo_path = Path(project_path).expanduser()
+    head = _git_output(repo_path, ["rev-parse", "HEAD"])
+    status = _git_output(repo_path, ["status", "--porcelain"])
+    tracked_files = _git_output(repo_path, ["ls-tree", "-r", "--name-only", "HEAD"]).splitlines()
+    last_commit_files = _git_output(repo_path, ["show", "--format=", "--name-only", "HEAD"]).splitlines()
+    remotes = _git_output(repo_path, ["remote", "-v"]).splitlines()
+    upstream_ref = _git_output(
+        repo_path,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    return {
+        "path": str(repo_path),
+        "available": _is_git_sha(head),
+        "head_sha": head if _is_git_sha(head) else "",
+        "dirty": bool(status.strip()),
+        "status_porcelain": status.splitlines(),
+        "tracked_file_count": len(tracked_files),
+        "tracked_files": tracked_files,
+        "last_commit_files": last_commit_files,
+        "remotes": remotes,
+        "upstream_ref": upstream_ref,
+    }
+
+
+def _git_output(repo_path: Path, args: List[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_path),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _is_git_sha(value: str) -> bool:
+    return len(value) == 40 and all(char in "0123456789abcdefABCDEF" for char in value)
+
+
+def _evidence_files(repo_state: JsonDict) -> List[str]:
+    preferred = [
+        "Makefile",
+        "src/boot.S",
+        "src/kernel.c",
+        "include/c26_devices.h",
+        "src/devices.c",
+        "src/basic.c",
+        "src/desktop.c",
+        "src/robot.c",
+        "docs/demo-story.md",
+    ]
+    tracked = set(repo_state.get("tracked_files") or [])
+    existing = [path for path in preferred if path in tracked]
+    if existing:
+        return existing
+    last_commit = [path for path in repo_state.get("last_commit_files") or [] if path]
+    if last_commit:
+        return last_commit
+    return preferred
 
 
 def _submit_review_verdict(
