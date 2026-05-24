@@ -708,6 +708,8 @@ write_client_env() {
     set_env_key "$env_file" TOKENHUB_URL "$TOKENHUB_URL"
     set_env_key "$env_file" TOKENHUB_API_KEY "$api_key"
     set_env_key "$env_file" OPENAI_API_KEY "$api_key"
+    set_env_key "$env_file" MAC_HERMES_GATEWAY_API_KEY "$api_key"
+    set_env_key "$env_file" ACC_HERMES_GATEWAY_API_KEY "$api_key"
     set_env_key "$env_file" OPENAI_BASE_URL "$tokenhub_v1"
     set_env_key "$env_file" CUSTOM_BASE_URL "$tokenhub_v1"
     set_env_key "$env_file" MAC_HERMES_GATEWAY_BASE_URL "$tokenhub_v1"

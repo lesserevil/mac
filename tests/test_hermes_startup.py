@@ -280,7 +280,58 @@ class GatewayRunner:
     assert "MAC_HERMES_GATEWAY_MODEL" in patched
     assert "TOKENHUB_URL" in patched
     assert "resolve_runtime_provider" in patched
+    assert 'runtime_kwargs["api_key"] = mac_gateway_api_key' in patched
+    assert 'runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")' in patched
     assert "secret-tokenhub-key" not in str(report)
+
+
+def test_gateway_runtime_shim_upgrades_existing_tokenhub_override(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    agent_dir = tmp_path / "hermes-agent"
+    run_py = agent_dir / "gateway" / "run.py"
+    _write(
+        run_py,
+        '''
+def _resolve_runtime_agent_kwargs():
+    return {}
+
+
+class GatewayRunner:
+    def _resolve_session_agent_runtime(self, user_config=None):
+        model = "old"
+        mac_gateway_model = (
+            "MAC_HERMES_GATEWAY_MODEL"
+        )
+        mac_gateway_provider = (
+            os.environ.get("MAC_HERMES_GATEWAY_PROVIDER")
+            or os.environ.get("ACC_HERMES_GATEWAY_PROVIDER")
+            or os.environ.get("HERMES_INFERENCE_PROVIDER")
+            or ""
+        ).strip()
+        mac_gateway_base_url = "http://tokenhub.invalid:8090/v1"
+        mac_gateway_api_key = "stale-or-explicit"
+        if mac_gateway_model or mac_gateway_provider or mac_gateway_base_url:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime_kwargs = resolve_runtime_provider(
+                requested=mac_gateway_provider or "custom",
+                explicit_base_url=mac_gateway_base_url or None,
+                explicit_api_key=mac_gateway_api_key or None,
+                target_model=model or None,
+            )
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        return model, runtime_kwargs
+''',
+    )
+    monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+
+    report = hermes_startup.apply_hermes_gateway_runtime_shim_report()
+    patched = run_py.read_text(encoding="utf-8")
+
+    assert report["gateway_runtime_shim_patch"]["applied"] is True
+    assert 'runtime_kwargs["api_key"] = mac_gateway_api_key' in patched
+    assert 'runtime_kwargs["source"] = "mac-gateway-explicit"' in patched
+    assert 'runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")' in patched
 
 
 def test_startup_reports_tokenhub_readiness_without_leaking_key(monkeypatch, tmp_path):

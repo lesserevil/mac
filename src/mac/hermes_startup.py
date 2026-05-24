@@ -1152,27 +1152,6 @@ def _apply_gateway_runtime_shim(agent_dir: Path) -> Dict[str, Any]:
         result["error"] = "cannot read Hermes gateway/run.py: %s" % exc
         return result
 
-    if "MAC_HERMES_GATEWAY_MODEL" in text:
-        return result
-
-    model_needle = "        model = _resolve_gateway_model(user_config)\n"
-    model_patch = '''        model = _resolve_gateway_model(user_config)
-        mac_gateway_model = (
-            os.environ.get("MAC_HERMES_GATEWAY_MODEL")
-            or os.environ.get("ACC_HERMES_GATEWAY_MODEL")
-            or os.environ.get("HERMES_INFERENCE_MODEL")
-            or os.environ.get("ACC_LLM_MODEL")
-            or ""
-        ).strip()
-        if mac_gateway_model:
-            logger.info("mac gateway model override active: %s", mac_gateway_model)
-            model = mac_gateway_model
-'''
-    if model_needle not in text:
-        result["error"] = "cannot patch Hermes gateway model override; upstream gateway/run.py changed"
-        return result
-    text = text.replace(model_needle, model_patch, 1)
-
     runtime_needle = "        runtime_kwargs = _resolve_runtime_agent_kwargs()\n"
     runtime_patch = '''        mac_gateway_provider = (
             os.environ.get("MAC_HERMES_GATEWAY_PROVIDER")
@@ -1203,14 +1182,75 @@ def _apply_gateway_runtime_shim(agent_dir: Path) -> Dict[str, Any]:
                 explicit_api_key=mac_gateway_api_key or None,
                 target_model=model or None,
             )
-            logger.info(
+            if mac_gateway_api_key:
+                runtime_kwargs["api_key"] = mac_gateway_api_key
+                runtime_kwargs["source"] = "mac-gateway-explicit"
+            if mac_gateway_base_url:
+                runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+'''
+
+    if "MAC_HERMES_GATEWAY_MODEL" in text:
+        if (
+            "mac-gateway-explicit" in text
+            and 'runtime_kwargs["api_key"] = mac_gateway_api_key' in text
+        ):
+            return result
+        old_runtime_needle = '''            runtime_kwargs = resolve_runtime_provider(
+                requested=mac_gateway_provider or "custom",
+                explicit_base_url=mac_gateway_base_url or None,
+                explicit_api_key=mac_gateway_api_key or None,
+                target_model=model or None,
+            )
+'''
+        old_runtime_patch = old_runtime_needle + '''            if mac_gateway_api_key:
+                runtime_kwargs["api_key"] = mac_gateway_api_key
+                runtime_kwargs["source"] = "mac-gateway-explicit"
+            if mac_gateway_base_url:
+                runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")
+'''
+        if old_runtime_needle not in text:
+            result["error"] = "cannot upgrade Hermes gateway runtime override; upstream gateway/run.py changed"
+            return result
+        text = text.replace(old_runtime_needle, old_runtime_patch, 1)
+        try:
+            run_py.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            result["error"] = "cannot write Hermes gateway/run.py: %s" % exc
+            return result
+        result["applied"] = True
+        return result
+
+    model_needle = "        model = _resolve_gateway_model(user_config)\n"
+    model_patch = '''        model = _resolve_gateway_model(user_config)
+        mac_gateway_model = (
+            os.environ.get("MAC_HERMES_GATEWAY_MODEL")
+            or os.environ.get("ACC_HERMES_GATEWAY_MODEL")
+            or os.environ.get("HERMES_INFERENCE_MODEL")
+            or os.environ.get("ACC_LLM_MODEL")
+            or ""
+        ).strip()
+        if mac_gateway_model:
+            logger.info("mac gateway model override active: %s", mac_gateway_model)
+            model = mac_gateway_model
+'''
+    if model_needle not in text:
+        result["error"] = "cannot patch Hermes gateway model override; upstream gateway/run.py changed"
+        return result
+    text = text.replace(model_needle, model_patch, 1)
+
+    runtime_patch = runtime_patch.replace(
+        "        else:\n            runtime_kwargs = _resolve_runtime_agent_kwargs()\n",
+        '''            logger.info(
                 "mac gateway runtime override active: provider=%s base_url=%s",
                 runtime_kwargs.get("provider"),
                 runtime_kwargs.get("base_url"),
             )
         else:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
-'''
+''',
+    )
     if runtime_needle not in text:
         result["error"] = "cannot patch Hermes gateway runtime override; upstream gateway/run.py changed"
         return result
@@ -1500,7 +1540,7 @@ def _maybe_apply_gateway_runtime_shim(
         "path": str(agent_dir / "gateway" / "run.py") if agent_dir is not None else None,
         "error": "",
     }
-    if not result["enabled"] or agent_dir is None or shim_present:
+    if not result["enabled"] or agent_dir is None:
         return result
     return {
         "enabled": True,

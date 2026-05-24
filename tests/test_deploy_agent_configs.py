@@ -262,8 +262,10 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "Before=${FLEET_NAME}.service" in tokenhub_installer
     assert 'TOKENHUB_VAULT_ENABLED="${TOKENHUB_VAULT_ENABLED:-true}"' in tokenhub_installer
     assert "OPENAI_API_KEY" in tokenhub_installer
+    assert "MAC_HERMES_GATEWAY_API_KEY" in tokenhub_installer
     assert env_example["MAC_REQUIRE_TOKENHUB"] == "1"
     assert env_example["TOKENHUB_URL"] == "http://hub.example.internal:8090"
+    assert env_example["MAC_HERMES_GATEWAY_API_KEY"] == "tokenhub_REPLACE_ME"
     assert env_example["OPENAI_BASE_URL"] == "http://hub.example.internal:8090/v1"
 
 
@@ -326,8 +328,12 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
     assert "provider_secret_keys" in script
     assert 'values["TOKENHUB_URL"] = derived_tokenhub_url' in script
     assert 'values["OPENAI_API_KEY"] = configured_tokenhub_api_key' in script
+    assert 'values["MAC_HERMES_GATEWAY_API_KEY"] = configured_tokenhub_api_key' in script
     assert 'updates["TOKENHUB_API_KEY"] = tokenhub_key' in script
+    assert 'updates["MAC_HERMES_GATEWAY_API_KEY"] = tokenhub_key' in script
     assert 'write_env(target_path, updates)' in script
+    assert 'runtime_kwargs["api_key"] = mac_gateway_api_key' in startup
+    assert 'runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")' in startup
     assert '[ -f "$HOME/.acc/.env" ]' not in gateway_wrapper
     assert '[ -f "$HOME/.acc/.env" ]' not in executor_wrapper
     assert 'or os.environ.get("NVIDIA_API_KEY")' not in startup
