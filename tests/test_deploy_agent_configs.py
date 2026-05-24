@@ -271,6 +271,15 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 
     assert "firecrawl = merge_dicts" in script
+    assert 'os.environ.get("MAC_DEPLOY_FIRECRAWL_URL") or text_field(firecrawl.get("url"))' in script
+    assert (
+        'os.environ.get("MAC_DEPLOY_FIRECRAWL_INSTALL") '
+        'or text_field(firecrawl.get("install") or "auto")'
+    ) in script
+    assert (
+        'os.environ.get("MAC_DEPLOY_REQUIRE_FIRECRAWL") '
+        'or bool_field(firecrawl.get("required"), True)'
+    ) in script
     assert "install_or_validate_web_search_service()" in script
     assert "write_hermes_web_search_config()" in script
     assert "install_hermes_web_deps()" in script
@@ -278,6 +287,18 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
     assert "FIRECRAWL_API_URL" in script
     assert 'web["search_backend"] = "firecrawl"' in script
     assert '"role": "shared_web_search"' in script
+
+
+def test_fleet_deploy_linux_control_plane_uses_service_wrapper():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    linux_service = script.split("install_linux_service() {", 1)[1].split(
+        "install_supervisord_service() {", 1
+    )[0]
+
+    assert "install_mac_control_wrapper" in linux_service
+    assert 'export PATH="$HOME/.mac/bin:$HOME/.mac/venv/bin:$PATH"' in script
+    assert "ExecStart=$MAC_HOME/bin/mac-service" in linux_service
+    assert "ExecStart=$VENV/bin/uvicorn" not in linux_service
 
 
 def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():

@@ -449,11 +449,11 @@ for name in selected:
         fleet_name,
         control_port,
         qdrant_data_dir,
-        text_field(firecrawl.get("url")),
-        text_field(firecrawl.get("install") or "auto"),
-        bool_field(firecrawl.get("required"), True),
-        text_field(firecrawl.get("bind_addr")),
-        text_field(firecrawl.get("port") or "3002"),
+        os.environ.get("MAC_DEPLOY_FIRECRAWL_URL") or text_field(firecrawl.get("url")),
+        os.environ.get("MAC_DEPLOY_FIRECRAWL_INSTALL") or text_field(firecrawl.get("install") or "auto"),
+        os.environ.get("MAC_DEPLOY_REQUIRE_FIRECRAWL") or bool_field(firecrawl.get("required"), True),
+        os.environ.get("MAC_DEPLOY_FIRECRAWL_BIND_ADDR") or text_field(firecrawl.get("bind_addr")),
+        os.environ.get("MAC_DEPLOY_FIRECRAWL_PORT") or text_field(firecrawl.get("port") or "3002"),
         os.environ.get("MAC_DEPLOY_TOKENHUB_URL") or text_field(tokenhub.get("url")),
         os.environ.get("MAC_DEPLOY_TOKENHUB_INSTALL") or text_field(tokenhub.get("install") or "auto"),
         os.environ.get("MAC_DEPLOY_REQUIRE_TOKENHUB") or bool_field(tokenhub.get("required"), True),
@@ -3443,6 +3443,7 @@ EOF
 install_linux_service() {
   local unit="/etc/systemd/system/${MAC_SERVICE_NAME}" restart_since
   log "installing systemd service $unit"
+  install_mac_control_wrapper
   install_hermes_gateway_wrapper
   install_mac_agent_wrapper
   if sudo test -f "$unit"; then
@@ -3462,7 +3463,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$MAC_HOME
 EnvironmentFile=$ENV_FILE
-ExecStart=$VENV/bin/uvicorn mac.api:create_app --factory --host $MAC_BIND_HOST --port $MAC_PORT --workers 1 --log-level info
+ExecStart=$MAC_HOME/bin/mac-service
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
