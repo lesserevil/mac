@@ -427,7 +427,12 @@ def test_review_nudge_prepares_review_worktree_and_git_main_publication(tmp_path
             "verdict": "approved",
             "review_id": context["review_id"],
             "reviewed_evidence_id": context["executor_evidence_id"],
-            "repo": dict(executor_manifest["repo"]),
+            "repo": {
+                "head_sha": reviewed_head,
+                "pushed": True,
+                "dirty": False,
+                "files_changed": ["README.md"],
+            },
             "checks": [
                 {
                     "name": "reviewer checkout head",
@@ -456,6 +461,8 @@ def test_review_nudge_prepares_review_worktree_and_git_main_publication(tmp_path
     result = worker.run_once()
 
     assert result.status == "review_verdict_recorded"
+    verdict_manifest = cp.list_evidence(task.id)[-1].metadata["verification"]
+    assert verdict_manifest["repo"]["remote_ref"] == "refs/heads/%s" % branch
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
     assert cp.list_publications(task.id)[0].target == "git://main"
     assert _git(repo, "rev-parse", "HEAD") == reviewed_head

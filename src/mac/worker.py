@@ -2143,6 +2143,27 @@ def _enrich_verification_manifest_from_repository_context(
     repo_value = manifest.get("repo")
     repo = dict(repo_value) if isinstance(repo_value, dict) else {}
     if context.get("checkout_policy") == "review_git_worktree" and repo:
+        reviewed_ref = str(context.get("repository_reviewed_remote_ref") or "").strip()
+        branch = str(context.get("repository_branch") or "").strip()
+        remote_ref = reviewed_ref or branch
+        if remote_ref and not remote_ref.startswith("refs/"):
+            remote_ref = "refs/heads/%s" % remote_ref
+        defaults = {
+            "path": context.get("repository_worktree"),
+            "remote_url": context.get("repository_origin_remote"),
+            "branch": reviewed_ref or branch,
+            "base_sha": context.get("repository_base_sha"),
+            "remote_ref": remote_ref,
+            "head_sha": context.get("repository_reviewed_head_sha")
+            or context.get("repository_base_sha"),
+        }
+        for key, value in defaults.items():
+            if value not in {None, ""} and repo.get(key) in {None, ""}:
+                repo[key] = value
+        worktree_raw = str(context.get("repository_worktree") or "").strip()
+        worktree = Path(worktree_raw).expanduser() if worktree_raw else None
+        if "pushed" not in repo and worktree is not None and worktree.exists():
+            repo["pushed"] = _repository_context_head_is_pushed(worktree, repo)
         enriched["repo"] = repo
         return enriched
     worktree_raw = str(context.get("repository_worktree") or "").strip()
