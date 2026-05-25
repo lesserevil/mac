@@ -3975,6 +3975,11 @@ host_name="${MAC_WORKER_HOSTNAME:-$agent_name}"
 workspace="${MAC_WORKER_WORKSPACE:-$HOME/.mac/agent-workspaces}"
 mode="${MAC_WORKER_MODE:-heartbeat}"
 capabilities="${MAC_WORKER_CAPABILITIES:-ops,python,hermes,review,web_search,web_extract,web_crawl,firecrawl}"
+# Hardware capability probes: append gpu/cuda if nvidia-smi sees GPUs; always append cpu.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q "^GPU"; then
+  capabilities="$capabilities,gpu,cuda"
+fi
+capabilities="$capabilities,cpu"
 mkdir -p "$workspace"
 
 stable_agent_id() {

@@ -125,6 +125,102 @@ The checked-in `deploy/fleet/config.yaml` is a generic sample only. It is
 marked `sample: true`, and `deploy/deploy-mac-fleet.sh` refuses to deploy from
 it unless `MAC_DEPLOY_ALLOW_SAMPLE_CONFIG=1` is set explicitly for tests.
 
+## Reaching the Hub Node
+
+The hub control plane binds to `hub_url` as declared in `~/.mac/fleets.yaml`.
+How you reach it from a client machine depends on the network topology.
+
+### Direct access (same network or VPN)
+
+Hub is directly routable — no tunnel needed:
+
+```bash
+# Confirm health
+curl http://<hub-host>:8789/health
+
+# Deploy
+bash deploy/deploy-mac-fleet.sh --hub <hub-node>
+```
+
+### SSH port forward (K8s, bastion, or private subnets)
+
+Hub lives behind a bastion or inside a K8s cluster. Add a `Host` entry in
+`~/.ssh/config` with `ProxyJump` (or `ProxyCommand`), then forward the control
+port:
+
+```
+# ~/.ssh/config
+Host my-hub
+    HostName my-hub.cluster.local
+    User horde
+    ProxyJump horde@bastion.example.com:2222
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ForwardAgent yes
+```
+
+```bash
+# Forward hub control port to localhost and open the UI
+ssh -L 8789:127.0.0.1:8789 my-hub
+# then: curl http://localhost:8789/health
+# or:   open http://localhost:8789/ui
+```
+
+Set `hub_url: http://127.0.0.1:8789` in the fleet registry when using this
+pattern — the deploy script reaches the hub through the forwarded port.
+
+### Tailscale mesh (`provider: tailscale`)
+
+Hub and spokes join the same Tailscale network. The hub is reachable at its
+Tailscale IP or MagicDNS name without any SSH tunnel:
+
+```yaml
+# ~/.mac/fleets.yaml
+defaults:
+  network:
+    provider: tailscale
+    tailscale:
+      auth_key_env: MAC_DEPLOY_TAILSCALE_AUTH_KEY
+```
+
+```bash
+# Hub is reachable at its Tailscale IP, e.g. 100.x.x.x:8789
+curl http://100.x.x.x:8789/health
+bash deploy/deploy-mac-fleet.sh --hub <hub-node>
+```
+
+`MAC_DEPLOY_TAILSCALE_AUTH_KEY` must be set in `~/.mac/.env` before deploy.
+
+### Headscale (self-hosted control plane, `provider: headscale`)
+
+Headscale manages the WireGuard mesh. The fleet registry must declare the login
+server, DNS assumption, health URL, and pre-auth key source:
+
+```yaml
+# ~/.mac/fleets.yaml
+defaults:
+  network:
+    provider: headscale
+    headscale:
+      manage: false          # true if mac should install/manage the headscale binary on the hub
+      login_server: https://headscale.example.com
+      health_url: https://headscale.example.com/health
+      preauth_key_source: env
+      preauth_key_env: MAC_DEPLOY_HEADSCALE_PREAUTHKEY
+      dns: magicdns
+      ip_prefix: "100.64.0.0/10"
+```
+
+```bash
+# Hub reachable at its headscale-assigned IP or MagicDNS name
+curl http://hub.headscale.example.com:8789/health
+bash deploy/deploy-mac-fleet.sh --hub <hub-node>
+```
+
+`MAC_DEPLOY_HEADSCALE_PREAUTHKEY` must be set in `~/.mac/.env`. With
+`headscale.manage: true` the deploy script installs and configures the
+headscale server on the hub node itself.
+
 ## One-Time ACC Replacement Deploy
 
 For a configured fleet, use the fleet deploy script:
