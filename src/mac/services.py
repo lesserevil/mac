@@ -6156,6 +6156,26 @@ class ControlPlane:
             )
             return result
 
+        def run_git_step(name: str, args: List[str], timeout: int = 60) -> JsonDict:
+            argv = ["git", *args]
+            completed = subprocess.run(
+                argv,
+                cwd=str(poll_path),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            step = {
+                "name": name,
+                "argv": argv,
+                "returncode": int(completed.returncode),
+                "stdout": (completed.stdout or "")[:1000],
+                "stderr": (completed.stderr or "")[:1000],
+            }
+            steps.append(step)
+            return step
+
         embedded_dolt = poll_path / ".beads" / "embeddeddolt"
         if embedded_dolt.exists() and any(embedded_dolt.iterdir()):
             steps.append(
@@ -6186,6 +6206,81 @@ class ControlPlane:
         export = run_step("export", ["export", "-o", str(export_path)], timeout=60)
         if export.returncode != 0:
             return fail("authority_export_error", export.output or "bd export failed")
+        try:
+            exported_ready = self._ready_beads_issues_from_jsonl(export_path)
+        except Exception as exc:  # noqa: BLE001 - rewrite from canonical ready output below.
+            exported_ready = []
+            steps.append(
+                {
+                    "name": "verify_export",
+                    "argv": [],
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": str(exc)[:1000],
+                }
+            )
+        canonical_ids = self._beads_issue_ids(data)
+        exported_ids = self._beads_issue_ids(exported_ready)
+        if canonical_ids != exported_ids:
+            payload = "".join("%s\n" % json_dumps(issue) for issue in data)
+            export_path.write_text(payload, encoding="utf-8")
+            steps.append(
+                {
+                    "name": "canonical_ready_export",
+                    "argv": [],
+                    "returncode": 0,
+                    "stdout": "rewrote tracked export from canonical bd ready output",
+                    "stderr": "",
+                    "canonical_ready_count": len(canonical_ids),
+                    "exported_ready_count": len(exported_ids),
+                }
+            )
+        if (poll_path / ".git").exists():
+            status = run_git_step(
+                "git_status_export",
+                ["status", "--porcelain", "--", ".beads/issues.jsonl"],
+                timeout=20,
+            )
+            if status["returncode"] != 0:
+                return fail("git_status_failed", status["stderr"] or status["stdout"] or "git status failed")
+            if str(status.get("stdout") or "").strip():
+                add = run_git_step("git_add_export", ["add", ".beads/issues.jsonl"], timeout=20)
+                if add["returncode"] != 0:
+                    return fail("git_add_failed", add["stderr"] or add["stdout"] or "git add failed")
+                commit = run_git_step(
+                    "git_commit_export",
+                    [
+                        "-c",
+                        "user.name=MAC Beads Bridge",
+                        "-c",
+                        "user.email=mac-beads-bridge@localhost",
+                        "commit",
+                        "-m",
+                        "Repair Beads tracked export",
+                    ],
+                    timeout=60,
+                )
+                if commit["returncode"] != 0:
+                    return fail("git_commit_failed", commit["stderr"] or commit["stdout"] or "git commit failed")
+                branch = str(source_state.get("branch") or "").strip()
+                if branch:
+                    push_args = ["push", "origin", "HEAD:%s" % branch]
+                else:
+                    push_args = ["push"]
+                push = run_git_step("git_push_export", push_args, timeout=120)
+                if push["returncode"] != 0:
+                    return fail("git_push_failed", push["stderr"] or push["stdout"] or "git push failed")
+            else:
+                steps.append(
+                    {
+                        "name": "git_persist_export",
+                        "argv": ["git", "status", "--porcelain", "--", ".beads/issues.jsonl"],
+                        "returncode": 0,
+                        "stdout": "skipped: tracked export already matches git HEAD",
+                        "stderr": "",
+                        "skipped": True,
+                    }
+                )
         poll_report = (
             self.poll_beads_repositories(repo.id, force=True, actor=actor)
             if poll_after
@@ -7054,6 +7149,9 @@ class ControlPlane:
                 "bd dolt pull",
                 "bd ready --json",
                 "bd export -o .beads/issues.jsonl",
+                "git add .beads/issues.jsonl",
+                "git commit -m 'Repair Beads tracked export'",
+                "git push",
             ],
         }
 

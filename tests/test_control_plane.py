@@ -2461,7 +2461,8 @@ def test_beads_bridge_records_authority_drift_when_jsonl_export_disagrees_with_d
     assert len(findings) == 1
     assert findings[0].detail["jsonl_only_ready_ids"] == ["mac-jsonl-only"]
     assert findings[0].detail["jsonl_only_untracked_ids"] == ["mac-jsonl-only"]
-    assert findings[0].detail["repair_action"]["commands"][-1] == "bd export -o .beads/issues.jsonl"
+    assert "bd export -o .beads/issues.jsonl" in findings[0].detail["repair_action"]["commands"]
+    assert findings[0].detail["repair_action"]["commands"][-1] == "git push"
     observations = cp.list_integration_observations(source_id=repo_record.id)
     assert observations[0].authority == "beads_db"
     assert observations[0].status == "drift"
@@ -2665,6 +2666,33 @@ def test_beads_bridge_repair_skips_bootstrap_when_embedded_db_already_exists(cp,
     assert repaired["poll_report"]["repositories"][0]["status"] == "ok"
     assert cp.get_beads_repository(repo_record.id).metadata["health"]["status"] == "healthy"
     assert cp.list_integration_findings(status="open") == []
+
+
+def test_beads_bridge_repair_persists_export_to_dedicated_checkout(cp, tmp_path, monkeypatch):
+    origin, _seed, clone = _seed_bare_beads_repo(tmp_path, "mac-stale-export")
+    ready_path = tmp_path / "ready.json"
+    ready_path.write_text("[]", encoding="utf-8")
+    fake_bd = tmp_path / "bd"
+    _write_fake_bd_cli(fake_bd, ready_path)
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    monkeypatch.setenv("MAC_BEADS_BRIDGE_ROOT", str(tmp_path / "bridge-checkouts"))
+    repo_record = cp.register_beads_repository("mac", str(clone), source="repo-beads-mac")
+    drift = cp.poll_beads_repositories(repo_record.id, force=True)
+    assert drift["repositories"][0]["status"] == "authority_drift"
+
+    repaired = cp.repair_beads_repository(repo_record.id, actor="operator")
+
+    assert repaired["status"] == "ok"
+    step_names = [step["name"] for step in repaired["steps"]]
+    assert "git_add_export" in step_names
+    assert "git_commit_export" in step_names
+    assert "git_push_export" in step_names
+    assert repaired["poll_report"]["repositories"][0]["status"] == "ok"
+    bridge_path = Path(repaired["poll_report"]["repositories"][0]["source_state"]["poll_path"])
+    assert _git(["status", "--porcelain", "--", ".beads/issues.jsonl"], cwd=bridge_path).stdout.strip() == ""
+    assert _git(["--git-dir", str(origin), "show", "main:.beads/issues.jsonl"]).stdout == ""
+    repoll = cp.poll_beads_repositories(repo_record.id, force=True)
+    assert repoll["repositories"][0]["status"] == "ok"
 
 
 def test_direct_task_for_registered_project_gets_repository_execution_contract(cp, tmp_path):
