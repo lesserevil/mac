@@ -1245,6 +1245,11 @@ install_or_validate_tokenhub_service() {
     else
       unset TOKENHUB_BIND_ADDR
     fi
+    if [ -n "$TOKENHUB_URL_CONFIGURED" ]; then
+      export TOKENHUB_URL="$TOKENHUB_URL_CONFIGURED"
+    else
+      unset TOKENHUB_URL
+    fi
     export TOKENHUB_PORT="$TOKENHUB_PORT_CONFIGURED"
     export TOKENHUB_REPO_URL="$TOKENHUB_REPO_URL_CONFIGURED"
     export TOKENHUB_REF="$TOKENHUB_REF_CONFIGURED"

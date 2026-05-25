@@ -268,6 +268,7 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "install-tokenhub-service.sh" in script
     assert "Before=${FLEET_NAME}.service" in tokenhub_installer
     assert 'TOKENHUB_VAULT_ENABLED="${TOKENHUB_VAULT_ENABLED:-true}"' in tokenhub_installer
+    assert 'health_urls+=("http://${TOKENHUB_BIND_ADDR}:${TOKENHUB_PORT}/healthz")' in tokenhub_installer
     assert "OPENAI_API_KEY" in tokenhub_installer
     assert "MAC_HERMES_GATEWAY_API_KEY" in tokenhub_installer
     assert env_example["MAC_REQUIRE_TOKENHUB"] == "1"
@@ -333,6 +334,7 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
         "sync_hermes_slack_identity_env\n"
         '[ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories'
     ) in script
+    assert 'unset TOKENHUB_URL' in script
     assert "provider_secret_keys" in script
     assert 'values["TOKENHUB_URL"] = derived_tokenhub_url' in script
     assert 'values["OPENAI_API_KEY"] = configured_tokenhub_api_key' in script

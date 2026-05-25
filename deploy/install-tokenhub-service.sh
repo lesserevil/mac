@@ -569,8 +569,12 @@ EOF
 }
 
 wait_for_tokenhub() {
-  local health_urls=("http://127.0.0.1:${TOKENHUB_PORT}/healthz" "${TOKENHUB_URL%/}/healthz")
+  local health_urls=("http://127.0.0.1:${TOKENHUB_PORT}/healthz")
   local health_url
+  if [ -n "${TOKENHUB_BIND_ADDR:-}" ]; then
+    health_urls+=("http://${TOKENHUB_BIND_ADDR}:${TOKENHUB_PORT}/healthz")
+  fi
+  health_urls+=("${TOKENHUB_URL%/}/healthz")
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     for health_url in "${health_urls[@]}"; do
       if curl -fsS --connect-timeout 2 --max-time 5 "$health_url" >/dev/null 2>&1; then
