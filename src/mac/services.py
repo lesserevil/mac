@@ -6156,9 +6156,22 @@ class ControlPlane:
             )
             return result
 
-        bootstrap = run_step("bootstrap", ["bootstrap", "--yes"], timeout=120)
-        if bootstrap.returncode != 0:
-            return fail("bootstrap_failed", bootstrap.output or "bd bootstrap failed")
+        embedded_dolt = poll_path / ".beads" / "embeddeddolt"
+        if embedded_dolt.exists() and any(embedded_dolt.iterdir()):
+            steps.append(
+                {
+                    "name": "bootstrap",
+                    "argv": [self.beads_bridge.cli_path(), "--actor", actor, "bootstrap", "--yes"],
+                    "returncode": 0,
+                    "stdout": "skipped: embedded Beads database already exists",
+                    "stderr": "",
+                    "skipped": True,
+                }
+            )
+        else:
+            bootstrap = run_step("bootstrap", ["bootstrap", "--yes"], timeout=120)
+            if bootstrap.returncode != 0:
+                return fail("bootstrap_failed", bootstrap.output or "bd bootstrap failed")
         dolt_pull = run_step("dolt_pull", ["dolt", "pull"], timeout=120)
         if dolt_pull.returncode != 0:
             return fail("dolt_pull_failed", dolt_pull.output or "bd dolt pull failed")

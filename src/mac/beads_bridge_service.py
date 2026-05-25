@@ -42,6 +42,9 @@ class BeadsBridgeService:
         self._cli_path = cli_path
         self._runner = runner
 
+    def cli_path(self) -> str:
+        return self._cli_path()
+
     def run(
         self,
         args: Sequence[str],
@@ -50,7 +53,7 @@ class BeadsBridgeService:
         actor: Optional[str] = None,
         timeout: int = 20,
     ) -> BeadsCommandResult:
-        argv = [self._cli_path()]
+        argv = [self.cli_path()]
         if actor:
             argv.extend(["--actor", actor])
         argv.extend(str(item) for item in args)

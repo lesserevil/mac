@@ -2232,7 +2232,7 @@ def _write_repository_contract(repo_path, project="repo-beads-mac", include_test
     )
 
 
-def _write_fake_bd_cli(path, ready_path):
+def _write_fake_bd_cli(path, ready_path, *, bootstrap_returncode=0, bootstrap_stderr=""):
     path.write_text(
         "\n".join(
             [
@@ -2247,7 +2247,8 @@ def _write_fake_bd_cli(path, ready_path):
                 "    sys.stdout.write(pathlib.Path(%r).read_text(encoding='utf-8'))" % str(ready_path),
                 "    sys.exit(0)",
                 "if args[:1] == ['bootstrap']:",
-                "    sys.exit(0)",
+                "    sys.stderr.write(%r)" % bootstrap_stderr,
+                "    sys.exit(%d)" % bootstrap_returncode,
                 "if args == ['dolt', 'pull'] or args == ['dolt', 'push']:",
                 "    sys.exit(0)",
                 "if args[:1] == ['export']:",
@@ -2615,6 +2616,51 @@ def test_beads_bridge_repair_reconciles_tracked_export_from_canonical_db(cp, tmp
         "ready",
         "export",
     ]
+    assert (repo / ".beads" / "issues.jsonl").read_text(encoding="utf-8") == ""
+    assert repaired["poll_report"]["repositories"][0]["status"] == "ok"
+    assert cp.get_beads_repository(repo_record.id).metadata["health"]["status"] == "healthy"
+    assert cp.list_integration_findings(status="open") == []
+
+
+def test_beads_bridge_repair_skips_bootstrap_when_embedded_db_already_exists(cp, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue = {
+        "_type": "issue",
+        "id": "mac-stale-export",
+        "title": "Stale export",
+        "description": "JSONL says ready but canonical DB does not",
+        "status": "open",
+        "priority": 0,
+        "created_at": "2026-05-20T00:00:00Z",
+        "dependency_count": 0,
+    }
+    _write_beads(repo, [issue])
+    (repo / ".beads" / "embeddeddolt" / "repo").mkdir(parents=True)
+    ready_path = tmp_path / "ready.json"
+    ready_path.write_text("[]", encoding="utf-8")
+    fake_bd = tmp_path / "bd"
+    _write_fake_bd_cli(
+        fake_bd,
+        ready_path,
+        bootstrap_returncode=1,
+        bootstrap_stderr="Error 1007: can't create database repo; database exists\n",
+    )
+    monkeypatch.setenv("MAC_BEADS_CLI", str(fake_bd))
+    repo_record = cp.register_beads_repository("mac", str(repo), source="repo-beads-mac")
+    drift = cp.poll_beads_repositories(repo_record.id, force=True)
+    assert drift["repositories"][0]["status"] == "authority_drift"
+
+    repaired = cp.repair_beads_repository(repo_record.id, actor="operator")
+
+    assert repaired["status"] == "ok"
+    assert [step["name"] for step in repaired["steps"]] == [
+        "bootstrap",
+        "dolt_pull",
+        "ready",
+        "export",
+    ]
+    assert repaired["steps"][0]["skipped"] is True
     assert (repo / ".beads" / "issues.jsonl").read_text(encoding="utf-8") == ""
     assert repaired["poll_report"]["repositories"][0]["status"] == "ok"
     assert cp.get_beads_repository(repo_record.id).metadata["health"]["status"] == "healthy"
