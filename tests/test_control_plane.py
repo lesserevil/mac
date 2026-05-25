@@ -4096,6 +4096,51 @@ def test_rejected_review_verdict_fails_exhausted_task(cp):
     assert exhausted.lease_id is None
 
 
+def test_default_review_does_not_reuse_stale_verdict_for_new_review(cp):
+    from tests.conftest import submit_review_verdict
+
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "stale verdict reuse",
+        required_capabilities=["python"],
+        max_attempts=2,
+        metadata={"publication_target": "test://publish"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://attempt",
+        "attempt complete",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    first = cp.advance_default_review_workflow(task.id)
+    submit_review_verdict(cp, task.id, reviewer.id, evidence.id, verdict="rejected")
+    rejected = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    assert rejected["status"] == "review_not_approved"
+    assert cp.get_task(task.id).state == TaskState.OPEN.value
+
+    cp.store.execute(
+        "UPDATE tasks SET state = ? WHERE id = ?",
+        (TaskState.NEEDS_REVIEW.value, task.id),
+    )
+    second = cp.advance_default_review_workflow(task.id)
+
+    assert second["status"] == "waiting_for_reviewer_verdict"
+    assert second["reviewer_agent_id"] == reviewer.id
+    assert any("predates review request" in problem for problem in second["problems"])
+    reviews = cp.list_reviews(task.id)
+    assert [review.status for review in reviews] == [
+        ReviewStatus.REJECTED.value,
+        ReviewStatus.PENDING.value,
+    ]
+
+
 def test_publication_requires_verifiable_review_verdict_not_plain_approval(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])

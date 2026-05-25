@@ -5239,6 +5239,7 @@ class ControlPlane:
                 review.reviewer_agent_id,
                 executor_evidence_id=executor_evidence.id,
                 verdict_evidence_id=review.evidence_id,
+                not_before=review.created_at,
             )
             if verdict_evidence is not None and verdict_evidence.id == review.evidence_id:
                 if self._verdict_value(verdict_evidence) == "approved":
@@ -5266,6 +5267,7 @@ class ControlPlane:
                 review.reviewer_agent_id,
                 executor_evidence_id=executor_evidence_id,
                 verdict_evidence_id=review.evidence_id,
+                not_before=review.created_at,
             )
             if verdict_evidence is not None and verdict_evidence.id == review.evidence_id:
                 if self._verdict_value(verdict_evidence) == "approved":
@@ -5454,7 +5456,10 @@ class ControlPlane:
             # waits for the verdict, and a follow-up review-executor
             # worker will produce it automatically.
             verdict_evidence, verdict_problems = self._find_review_verdict_evidence(
-                task_id, review.reviewer_agent_id, executor_evidence_id=evidence.id
+                task_id,
+                review.reviewer_agent_id,
+                executor_evidence_id=evidence.id,
+                not_before=review.created_at,
             )
             if verdict_evidence is None:
                 self._record_default_review_observation(
@@ -9289,6 +9294,7 @@ class ControlPlane:
         *,
         executor_evidence_id: str,
         verdict_evidence_id: Optional[str] = None,
+        not_before: Optional[str] = None,
     ) -> Tuple[Optional[Evidence], List[str]]:
         """Locate the reviewer's signed verdict evidence row, or return
         ``(None, problems)`` if it doesn't exist yet (mac-jqb v1).
@@ -9316,6 +9322,16 @@ class ControlPlane:
                 continue
             if evidence.created_by != reviewer_agent_id:
                 continue
+            if not_before is not None:
+                try:
+                    if parse_time(evidence.created_at) < parse_time(not_before):
+                        problems.append(
+                            "verdict %s predates review request" % evidence.id
+                        )
+                        continue
+                except ValueError:
+                    problems.append("verdict %s has invalid created_at" % evidence.id)
+                    continue
             if self._evidence_returncode(evidence) != 0:
                 problems.append("verdict evidence %s has nonzero returncode" % evidence.id)
                 continue
