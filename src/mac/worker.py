@@ -1503,6 +1503,8 @@ class MacWorker:
     ) -> JsonDict:
         (task_dir / "stdout.txt").write_text(execution.stdout, encoding="utf-8")
         (task_dir / "stderr.txt").write_text(execution.stderr, encoding="utf-8")
+        if execution.succeeded:
+            self._auto_publish_repository_worktree(task_id, task_dir)
         result_path = task_dir / "worker-result.json"
         result_path.write_text(
             json.dumps(
@@ -1530,6 +1532,81 @@ class MacWorker:
                     "stderr": (task_dir / "stderr.txt").resolve().as_uri(),
                     **metadata,
                 },
+            },
+        )
+
+    def _auto_publish_repository_worktree(self, task_id: str, task_dir: Path) -> None:
+        task = _task_payload_from_workspace(task_dir)
+        metadata = ensure_json_object(task.get("metadata"))
+        if not (
+            metadata.get("repository_auto_publish") is True
+            or metadata.get("auto_commit_repository") is True
+            or os.environ.get("MAC_WORKER_REPOSITORY_AUTO_PUBLISH", "").lower()
+            in {"1", "true", "yes"}
+        ):
+            return
+        context = _load_repository_context(task_dir)
+        if not context:
+            return
+        worktree = Path(str(context.get("repository_worktree") or "")).expanduser()
+        if not worktree.exists():
+            raise RuntimeError("repository auto-publish worktree missing: %s" % worktree)
+        branch = str(context.get("repository_branch") or "").strip()
+        if not branch:
+            raise RuntimeError("repository auto-publish missing repository_branch")
+
+        status = _run_git(worktree, ["status", "--porcelain"])
+        if status.returncode != 0:
+            raise RuntimeError(
+                "repository auto-publish status failed: %s"
+                % ((status.stderr or status.stdout or "").strip() or worktree)
+            )
+        if status.stdout.strip():
+            add = _run_git(worktree, ["add", "-A"])
+            if add.returncode != 0:
+                raise RuntimeError(
+                    "repository auto-publish add failed: %s"
+                    % ((add.stderr or add.stdout or "").strip() or worktree)
+                )
+            staged = _run_git(worktree, ["diff", "--cached", "--quiet"])
+            if staged.returncode == 1:
+                title = str(task.get("title") or task_id).strip() or task_id
+                commit = _run_git(
+                    worktree,
+                    ["commit", "-m", "MAC task %s: %s" % (task_id, title[:120])],
+                )
+                if commit.returncode != 0:
+                    raise RuntimeError(
+                        "repository auto-publish commit failed: %s"
+                        % ((commit.stderr or commit.stdout or "").strip() or worktree)
+                    )
+            elif staged.returncode != 0:
+                raise RuntimeError(
+                    "repository auto-publish staged diff failed: %s"
+                    % ((staged.stderr or staged.stdout or "").strip() or worktree)
+                )
+
+        push = _run_git(worktree, ["push", "origin", "HEAD:refs/heads/%s" % branch])
+        if push.returncode != 0:
+            raise RuntimeError(
+                "repository auto-publish push failed: %s"
+                % ((push.stderr or push.stdout or "").strip() or branch)
+            )
+        head = _run_git(worktree, ["rev-parse", "HEAD"])
+        remote = _run_git(worktree, ["ls-remote", "origin", "refs/heads/%s" % branch])
+        remote_sha = (remote.stdout.split() or [""])[0] if remote.returncode == 0 else ""
+        if head.returncode != 0 or not head.stdout.strip() or remote_sha != head.stdout.strip():
+            raise RuntimeError("repository auto-publish remote verification failed for %s" % branch)
+
+        self._observe_log(
+            "worker.repository.auto_published",
+            subject_type="task",
+            subject_id=task_id,
+            detail={
+                "repository_worktree": str(worktree),
+                "repository_branch": branch,
+                "head_sha": head.stdout.strip(),
+                "remote_ref": "refs/heads/%s" % branch,
             },
         )
 
