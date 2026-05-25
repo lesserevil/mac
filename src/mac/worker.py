@@ -2065,21 +2065,19 @@ def _enrich_verification_manifest_from_repository_context(
     enriched = dict(manifest)
     repo_value = manifest.get("repo")
     repo = dict(repo_value) if isinstance(repo_value, dict) else {}
+    if context.get("checkout_policy") == "review_git_worktree" and repo:
+        enriched["repo"] = repo
+        return enriched
     worktree_raw = str(context.get("repository_worktree") or "").strip()
     worktree = Path(worktree_raw).expanduser() if worktree_raw else None
     if worktree is not None and worktree.exists():
-        if not repo.get("head_sha"):
-            head = _run_git(worktree, ["rev-parse", "HEAD"])
-            if head.returncode == 0 and head.stdout.strip():
-                repo["head_sha"] = head.stdout.strip()
-        if "dirty" not in repo:
-            status = _run_git(worktree, ["status", "--porcelain"])
-            if status.returncode == 0:
-                repo["dirty"] = bool(status.stdout.strip())
-        if not repo.get("files_changed"):
-            files_changed = _repository_context_changed_files(worktree, context)
-            if files_changed:
-                repo["files_changed"] = files_changed
+        head = _run_git(worktree, ["rev-parse", "HEAD"])
+        if head.returncode == 0 and head.stdout.strip():
+            repo["head_sha"] = head.stdout.strip()
+        status = _run_git(worktree, ["status", "--porcelain"])
+        if status.returncode == 0:
+            repo["dirty"] = bool(status.stdout.strip())
+        repo["files_changed"] = _repository_context_changed_files(worktree, context)
 
     defaults = {
         "path": context.get("repository_worktree"),
@@ -2087,12 +2085,12 @@ def _enrich_verification_manifest_from_repository_context(
         "branch": context.get("repository_branch"),
         "base_sha": context.get("repository_base_sha"),
     }
-    if context.get("repository_branch") and not repo.get("remote_ref"):
+    if context.get("repository_branch"):
         defaults["remote_ref"] = "refs/heads/%s" % context.get("repository_branch")
     for key, value in defaults.items():
-        if value not in {None, ""} and not repo.get(key):
+        if value not in {None, ""}:
             repo[key] = value
-    if "pushed" not in repo and worktree is not None and worktree.exists():
+    if worktree is not None and worktree.exists():
         repo["pushed"] = _repository_context_head_is_pushed(worktree, repo)
     enriched["repo"] = repo
     return enriched

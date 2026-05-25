@@ -827,6 +827,7 @@ def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
         assert _git(repo, "status", "--porcelain") == ""
         assert (task_dir / "repository-worktree.json").exists()
         _write_repo_worker_manifest(task_dir, worktree)
+        _git(worktree, "push", "origin", "HEAD:refs/heads/%s" % runtime["repository_branch"])
         return WorkerExecution(0, "repo worktree prepared", stdout="ok\n")
 
     worker = MacWorker(
@@ -876,6 +877,13 @@ def test_mac_worker_derives_repo_anchor_for_documentation_evidence(tmp_path: Pat
                     "status": "complete",
                     "evidence_type": "documentation",
                     "summary": "docs updated",
+                    "repo": {
+                        "head_sha": "badbadbadbadbadbadbadbadbadbadbadbadbadb",
+                        "pushed": False,
+                        "remote_ref": "refs/heads/not-the-task-branch",
+                        "dirty": True,
+                        "files_changed": ["wrong.md"],
+                    },
                 },
                 indent=2,
                 sort_keys=True,
@@ -962,6 +970,7 @@ def test_mac_worker_resolves_hub_repository_path_to_local_self_update_repo(tmp_p
         worktree = Path(runtime["repository_worktree"])
         assert worktree.is_dir()
         _write_repo_worker_manifest(_task_dir, worktree)
+        _git(worktree, "push", "origin", "HEAD:refs/heads/%s" % runtime["repository_branch"])
         return WorkerExecution(0, "repo worktree prepared", stdout="ok\n")
 
     worker = MacWorker(
@@ -1017,6 +1026,7 @@ def test_subprocess_executor_exports_repository_worktree_env(tmp_path: Path):
                 "  'checks': [{'name': 'pytest', 'returncode': 0}],",
                 "}",
                 "(workspace / 'mac-evidence.json').write_text(json.dumps(manifest), encoding='utf-8')",
+                "subprocess.check_call(['git', '-C', worktree, 'push', 'origin', 'HEAD:refs/heads/%s' % os.environ.get('MAC_TASK_REPO_BRANCH')])",
             ]
         ),
         encoding="utf-8",
