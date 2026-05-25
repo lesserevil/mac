@@ -135,10 +135,16 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert env["MAC_HERMES_RUNTIME_CONTEXT_FILE"] == str(context_path)
     assert env["MAC_HERMES_RUNTIME_CONTEXT_MARKDOWN"] == str(markdown_path)
     assert env["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"
+    assert env["MAC_FLEET_TENANT_ID"] == "tenant_classic-fleet"
+    assert env["MAC_HERMES_PERSONA_ID"] == "persona_rocky_host"
     assert env["MAC_HERMES_INSTANCE_ID"] == "hermes_rocky_host"
     assert env["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_rocky_host"
     assert env["MAC_AGENT_ID"] == "agent_rocky_host"
+    assert env["MAC_WORKER_AGENT_NAME"] == "Rocky Host"
+    assert env["MAC_WORKER_HOSTNAME"] == "Rocky Host"
     assert env["MAC_URL"] == "http://hub.example.internal:8789/path"
+    assert env["MAC_HUB_URL"] == "http://hub.example.internal:8789/path"
+    assert env["HERMES_HOME"] == str(hermes_home)
     assert env["MAC_HERMES_WORKSPACE"] == str(workspace)
     assert env["MAC_PROJECT_CONTRACT_FILE"] == str(workspace / ".mac" / "project.yaml")
     assert "token=hidden" not in str(stored)

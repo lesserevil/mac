@@ -342,6 +342,9 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
     assert 'updates["TOKENHUB_API_KEY"] = tokenhub_key' in script
     assert 'updates["MAC_HERMES_GATEWAY_API_KEY"] = tokenhub_key' in script
     assert 'write_env(target_path, updates)' in script
+    assert "sync_tokenhub_credential_pool" in script
+    assert 'pool["custom:tokenhub"] = entries' in script
+    assert '"source": "mac-tokenhub-sync"' in script
     assert "sync_hermes_tokenhub_runtime_config()" in script
     assert 'model_config["provider"] = "tokenhub"' in script
     assert 'model_config.pop("api_key", None)' in script

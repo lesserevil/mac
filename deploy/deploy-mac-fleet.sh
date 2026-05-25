@@ -2486,8 +2486,10 @@ PY
 sync_hermes_tokenhub_client_env() {
   log "syncing Hermes TokenHub client environment"
   "$PY" - "$ENV_FILE" "$HOME/.hermes/.env" <<'PY'
+import json
 from pathlib import Path
 import sys
+from datetime import datetime, timezone
 
 source_path = Path(sys.argv[1])
 target_path = Path(sys.argv[2])
@@ -2526,6 +2528,59 @@ def write_env(path: Path, updates: dict[str, str | None]) -> None:
             output.append(f"{key}={updates[key]}")
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
     path.chmod(0o600)
+
+
+def sync_tokenhub_credential_pool(hermes_home: Path, tokenhub_url: str, tokenhub_key: str) -> bool:
+    if not tokenhub_url or not tokenhub_key:
+        return False
+    auth_path = hermes_home / "auth.json"
+    try:
+        auth_store = json.loads(auth_path.read_text(encoding="utf-8")) if auth_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        auth_store = {}
+    if not isinstance(auth_store, dict):
+        auth_store = {}
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+        auth_store["credential_pool"] = pool
+    entries = pool.get("custom:tokenhub")
+    if not isinstance(entries, list) or not entries:
+        entries = [
+            {
+                "id": "mac-tokenhub",
+                "label": "tokenhub",
+                "auth_type": "api_key",
+                "priority": 0,
+                "source": "mac-tokenhub-sync",
+            }
+        ]
+    now = datetime.now(timezone.utc).isoformat()
+    entry = entries[0] if isinstance(entries[0], dict) else {}
+    entry.update(
+        {
+            "label": entry.get("label") or "tokenhub",
+            "auth_type": "api_key",
+            "priority": int(entry.get("priority") or 0),
+            "source": "mac-tokenhub-sync",
+            "access_token": tokenhub_key,
+            "base_url": tokenhub_url.rstrip("/") + "/v1",
+            "last_status": "ok",
+            "last_status_at": now,
+            "last_error_code": None,
+            "last_error_reason": None,
+            "last_error_message": None,
+            "last_error_reset_at": None,
+        }
+    )
+    if not str(entry.get("id") or "").strip():
+        entry["id"] = "mac-tokenhub"
+    entries[0] = entry
+    pool["custom:tokenhub"] = entries
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(json.dumps(auth_store, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    auth_path.chmod(0o600)
+    return True
 
 
 source = read_env(source_path)
@@ -2586,7 +2641,8 @@ updates["HERMES_INFERENCE_MODEL"] = model
 updates["ACC_LLM_MODEL"] = model
 
 write_env(target_path, updates)
-print("TokenHub client env: synced to %s" % target_path)
+pool_synced = sync_tokenhub_credential_pool(target_path.parent, tokenhub_url, tokenhub_key)
+print("TokenHub client env: synced to %s credential_pool=%s" % (target_path, "synced" if pool_synced else "skipped"))
 PY
 }
 
