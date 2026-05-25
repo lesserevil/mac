@@ -5388,6 +5388,7 @@ class ControlPlane:
             reviewer_issue = self._default_reviewer_unavailable_reason_for_id(
                 task,
                 review.reviewer_agent_id,
+                executor_agent_id=evidence.created_by,
             )
             if reviewer_issue is not None:
                 self._retract_default_review(
@@ -5408,7 +5409,10 @@ class ControlPlane:
                 )
                 review = None
         if review is None:
-            reviewer = self._select_default_reviewer(task)
+            reviewer = self._select_default_reviewer(
+                task,
+                executor_agent_id=evidence.created_by,
+            )
             if reviewer is None:
                 self._record_default_review_observation(
                     task_id,
@@ -9426,7 +9430,12 @@ class ControlPlane:
             },
         )
 
-    def _select_default_reviewer(self, task: Task) -> Optional[Agent]:
+    def _select_default_reviewer(
+        self,
+        task: Task,
+        *,
+        executor_agent_id: Optional[str] = None,
+    ) -> Optional[Agent]:
         """Pick a default reviewer for ``task``.
 
         Trust boundaries enforced here (autonomous-review context where
@@ -9442,8 +9451,10 @@ class ControlPlane:
           Two code-reviewer-souled agents cannot approve each other's
           work — the second-eyes role only matters if it's a different
           eye.
-        * Not the executor (existing): agent_has_owned_task continues
-          to exclude prior owners.
+        * Not the executor (existing): the latest evidence author cannot
+          review their own work. Prior owners from earlier rejected
+          attempts may review a newer agent's evidence so small fleets do
+          not deadlock after retries.
         """
         task_tenant = self._task_tenant_id(task)
         executor_persona_slug = self._task_executor_persona_slug(task)
@@ -9455,6 +9466,7 @@ class ControlPlane:
                 agent,
                 task_tenant=task_tenant,
                 executor_persona_slug=executor_persona_slug,
+                executor_agent_id=executor_agent_id,
             ) is not None:
                 continue
             candidates.append(agent)
@@ -9473,12 +9485,18 @@ class ControlPlane:
         self,
         task: Task,
         reviewer_agent_id: str,
+        *,
+        executor_agent_id: Optional[str] = None,
     ) -> Optional[str]:
         try:
             agent = self.get_agent(reviewer_agent_id)
         except NotFoundError:
             return "reviewer_missing"
-        return self._default_reviewer_unavailable_reason(task, agent)
+        return self._default_reviewer_unavailable_reason(
+            task,
+            agent,
+            executor_agent_id=executor_agent_id,
+        )
 
     def _default_reviewer_unavailable_reason(
         self,
@@ -9487,6 +9505,7 @@ class ControlPlane:
         *,
         task_tenant: Optional[str] = None,
         executor_persona_slug: Optional[str] = None,
+        executor_agent_id: Optional[str] = None,
     ) -> Optional[str]:
         if agent.health_status != HealthStatus.HEALTHY.value:
             return "reviewer_unhealthy"
@@ -9494,8 +9513,10 @@ class ControlPlane:
             return "reviewer_not_available"
         if not self._agent_seen_recently(agent, self._default_reviewer_stale_after_seconds()):
             return "reviewer_stale"
-        if self.reviews.agent_has_owned_task(task.id, agent.id):
+        if task.owner_agent_id == agent.id:
             return "reviewer_owned_task"
+        if executor_agent_id is not None and agent.id == executor_agent_id:
+            return "reviewer_created_executor_evidence"
         if "review" not in set(agent.capabilities):
             return "reviewer_missing_capability"
         if task_tenant is None:

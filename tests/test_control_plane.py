@@ -841,6 +841,81 @@ def test_default_review_workflow_reuses_pending_verdict_nudge(cp):
     assert len(nudges) == 1
 
 
+def test_default_review_allows_prior_owner_to_review_newer_retry_evidence(cp):
+    from tests.conftest import submit_review_verdict
+
+    alpha = register_agent(cp, "alpha", ["python", "review"])
+    beta = register_agent(cp, "beta", ["python", "review"])
+    task = cp.create_task(
+        "retry with small fleet",
+        required_capabilities=["python"],
+        max_attempts=2,
+        metadata={"publication_target": "test://retry"},
+    )
+    cp.claim_task(task.id, alpha.id)
+    cp.start_task(task.id, alpha.id)
+    first_evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://attempt-1",
+        "attempt 1",
+        alpha.id,
+        metadata=verified_repo_metadata(cp, alpha.id),
+    )
+    cp.submit_for_review(task.id, alpha.id)
+
+    first_review = cp.advance_default_review_workflow(task.id)
+    assert first_review["reviewer_agent_id"] == beta.id
+    submit_review_verdict(cp, task.id, beta.id, first_evidence.id, verdict="rejected")
+    rejected = cp.advance_default_review_workflow(task.id)
+    assert rejected["status"] == "review_not_approved"
+    assert cp.get_task(task.id).state == TaskState.OPEN.value
+
+    cp.claim_task(task.id, beta.id)
+    cp.start_task(task.id, beta.id)
+    retry_evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://attempt-2",
+        "attempt 2",
+        beta.id,
+        metadata=verified_repo_metadata(
+            cp,
+            beta.id,
+            head_sha="fedcba9876543210fedcba9876543210fedcba98",
+        ),
+    )
+    cp.submit_for_review(task.id, beta.id)
+
+    retry_review = cp.advance_default_review_workflow(task.id)
+    assert retry_review["status"] == "waiting_for_reviewer_verdict"
+    assert retry_review["reviewer_agent_id"] == alpha.id
+    submit_review_verdict(cp, task.id, alpha.id, retry_evidence.id)
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "published"
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+
+
+def test_request_review_refuses_latest_evidence_author(cp):
+    worker = register_agent(cp, "worker", ["python", "review"])
+    task = cp.create_task("self-review", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    with pytest.raises(AuthorizationError):
+        cp.request_review(task.id, worker.id)
+
+
 def test_default_review_workflow_waits_without_non_owner_reviewer(cp):
     worker = register_agent(cp, "worker", ["python", "review"])
     task = cp.create_task("Implement thing", required_capabilities=["python"])
@@ -3983,6 +4058,42 @@ def test_rejected_review_verdict_completes_without_clean_pushed_repo(cp):
     assert requeued.owner_agent_id is None
     assert requeued.lease_id is None
     assert cp.list_publications(task.id) == []
+
+
+def test_rejected_review_verdict_fails_exhausted_task(cp):
+    from tests.conftest import submit_review_verdict
+
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "last attempt",
+        required_capabilities=["python"],
+        max_attempts=1,
+        metadata={"publication_target": "test://publish"},
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://attempt",
+        "attempt complete",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    submit_review_verdict(cp, task.id, reviewer.id, evidence.id, verdict="rejected")
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "review_not_approved"
+    assert result["review_status"] == ReviewStatus.REJECTED.value
+    exhausted = cp.get_task(task.id)
+    assert exhausted.state == TaskState.FAILED.value
+    assert exhausted.owner_agent_id is None
+    assert exhausted.lease_id is None
 
 
 def test_publication_requires_verifiable_review_verdict_not_plain_approval(cp):

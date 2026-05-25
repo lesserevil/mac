@@ -14,6 +14,7 @@ emits the matching observability events, and idles the owning agent.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, List, Optional
 
 from mac.models import (
@@ -70,9 +71,9 @@ class ReviewService:
     ) -> Review:
         task = self._get_task(task_id)
         self._get_agent(reviewer_agent_id)
-        if self.agent_has_owned_task(task_id, reviewer_agent_id):
+        if self.agent_is_current_owner_or_latest_evidence_author(task_id, reviewer_agent_id):
             raise AuthorizationError(
-                "reviewer cannot be a prior or current owner of the reviewed task"
+                "reviewer cannot review its own active task or latest evidence"
             )
         if task.state == TaskState.NEEDS_REVIEW.value:
             self._transition_task(
@@ -173,11 +174,23 @@ class ReviewService:
             ReviewStatus.CHANGES_REQUESTED.value,
             ReviewStatus.REJECTED.value,
         }:
+            task = self._get_task(review.task_id)
+            target = (
+                TaskState.FAILED.value
+                if task.attempt_count >= task.max_attempts
+                else TaskState.OPEN.value
+            )
             self._transition_task(
                 review.task_id,
-                TaskState.OPEN.value,
+                target,
                 reviewer_agent_id,
-                {"review_id": review_id},
+                {
+                    "review_id": review_id,
+                    "review_status": status_value,
+                    "reason": "review rejected after max attempts"
+                    if target == TaskState.FAILED.value
+                    else "review rejected",
+                },
             )
         return self.get_review(review_id)
 
@@ -324,6 +337,36 @@ class ReviewService:
             (task_id, agent_id),
         )
         return prior is not None
+
+    def agent_is_current_owner_or_latest_evidence_author(
+        self, task_id: str, agent_id: str
+    ) -> bool:
+        task = self._get_task(task_id)
+        if task.owner_agent_id == agent_id:
+            return True
+        return self.latest_executor_evidence_author(task_id) == agent_id
+
+    def latest_executor_evidence_author(self, task_id: str) -> Optional[str]:
+        rows = self.store.query_all(
+            """
+            SELECT created_by, metadata FROM evidence
+            WHERE task_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (task_id,),
+        )
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"])
+            except (TypeError, ValueError):
+                metadata = {}
+            verification = metadata.get("verification") if isinstance(metadata, dict) else {}
+            if isinstance(verification, dict):
+                evidence_type = str(verification.get("evidence_type") or "").strip().lower()
+                if evidence_type == "review_verdict":
+                    continue
+            return str(row["created_by"])
+        return None
 
     def task_requires_publication_evidence(self, task: Task) -> bool:
         policy = task.metadata.get("policy") or {}
