@@ -753,6 +753,55 @@ def test_default_review_workflow_approves_repo_less_operator_result(cp):
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
 
 
+def test_publication_uses_linked_review_verdict_when_newer_duplicates_exist(cp):
+    from tests.conftest import submit_review_verdict
+
+    worker = register_agent(cp, "worker", ["ops"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("Plan project", required_capabilities=["ops"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    manifest = _sign(
+        cp,
+        worker.id,
+        {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "operator_result",
+            "summary": "Implementation plan produced",
+        },
+    )
+    evidence = cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://operator-result",
+        "Implementation plan produced",
+        worker.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
+
+    cp.submit_for_review(task.id, worker.id)
+    first = cp.advance_default_review_workflow(task.id)
+    assert first["status"] == "waiting_for_reviewer_verdict"
+    linked_verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
+    approved = cp.advance_default_review_workflow(task.id)
+    assert approved["status"] == "waiting_for_publication_target"
+    submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
+
+    publication = cp.publish_task(
+        task.id,
+        "test://publish",
+        "operator",
+        evidence_id=evidence.id,
+    )
+
+    assert publication.status == PublicationStatus.PUBLISHED.value
+    review = cp.list_reviews(task.id)[0]
+    assert review.status == ReviewStatus.APPROVED.value
+    assert review.evidence_id == linked_verdict_id
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+
+
 def test_default_review_workflow_reuses_pending_verdict_nudge(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])

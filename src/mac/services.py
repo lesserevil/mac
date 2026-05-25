@@ -5238,6 +5238,7 @@ class ControlPlane:
                 task_id,
                 review.reviewer_agent_id,
                 executor_evidence_id=executor_evidence.id,
+                verdict_evidence_id=review.evidence_id,
             )
             if verdict_evidence is not None and verdict_evidence.id == review.evidence_id:
                 if self._verdict_value(verdict_evidence) == "approved":
@@ -5264,6 +5265,7 @@ class ControlPlane:
                 task_id,
                 review.reviewer_agent_id,
                 executor_evidence_id=executor_evidence_id,
+                verdict_evidence_id=review.evidence_id,
             )
             if verdict_evidence is not None and verdict_evidence.id == review.evidence_id:
                 if self._verdict_value(verdict_evidence) == "approved":
@@ -9282,6 +9284,7 @@ class ControlPlane:
         reviewer_agent_id: str,
         *,
         executor_evidence_id: str,
+        verdict_evidence_id: Optional[str] = None,
     ) -> Tuple[Optional[Evidence], List[str]]:
         """Locate the reviewer's signed verdict evidence row, or return
         ``(None, problems)`` if it doesn't exist yet (mac-jqb v1).
@@ -9305,6 +9308,8 @@ class ControlPlane:
         """
         problems: List[str] = []
         for evidence in reversed(self.list_evidence(task_id)):
+            if verdict_evidence_id is not None and evidence.id != verdict_evidence_id:
+                continue
             if evidence.created_by != reviewer_agent_id:
                 continue
             if self._evidence_returncode(evidence) != 0:
