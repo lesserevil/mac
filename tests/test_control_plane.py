@@ -4008,6 +4008,111 @@ def test_completion_requires_evidence_linked_from_approved_review(cp):
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
 
 
+def test_git_publication_merges_non_fast_forward_task_branch(cp, tmp_path):
+    from tests.conftest import submit_review_verdict
+
+    def git(repo, *args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(remote), str(source)], check=True, capture_output=True)
+    git(source, "config", "user.email", "mac-test@example.com")
+    git(source, "config", "user.name", "MAC Test")
+    (source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(source, "add", "base.txt")
+    git(source, "commit", "-m", "base")
+    git(source, "branch", "-M", "main")
+    git(source, "push", "-u", "origin", "main")
+
+    git(source, "checkout", "-b", "task/feature")
+    (source / "feature.txt").write_text("feature\n", encoding="utf-8")
+    git(source, "add", "feature.txt")
+    git(source, "commit", "-m", "feature branch")
+    task_head = git(source, "rev-parse", "HEAD")
+    git(source, "push", "origin", "task/feature")
+
+    git(source, "checkout", "main")
+    (source / "mainline.txt").write_text("mainline\n", encoding="utf-8")
+    git(source, "add", "mainline.txt")
+    git(source, "commit", "-m", "main moved independently")
+    main_head = git(source, "rev-parse", "HEAD")
+    git(source, "push", "origin", "main")
+
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "publish parallel branch",
+        required_capabilities=["python"],
+        metadata={
+            "origin": {
+                "type": "direct_task",
+                "repository_path": str(source),
+                "repository_contract": {"schema": "mac.repository_contract.v1"},
+            },
+            "publication_target": "git://main",
+        },
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    manifest = _sign(
+        cp,
+        worker.id,
+        {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "repo_change",
+            "repo": {
+                "head_sha": task_head,
+                "pushed": True,
+                "remote_ref": "refs/heads/task/feature",
+                "dirty": False,
+                "files_changed": ["feature.txt"],
+            },
+            "tests": [{"command": "make smoke", "returncode": 0}],
+        },
+    )
+    evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://feature",
+        "feature branch tested",
+        worker.id,
+        metadata={"returncode": 0, "verification": manifest},
+    )
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
+
+    publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+
+    assert publication.status == "published"
+    assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+    final_head = git(source, "rev-parse", "HEAD")
+    assert final_head != task_head
+    assert len(git(source, "rev-list", "--parents", "-n", "1", final_head).split()) == 3
+    git(source, "merge-base", "--is-ancestor", task_head, final_head)
+    git(source, "merge-base", "--is-ancestor", main_head, final_head)
+    assert git(source, "ls-remote", "origin", "refs/heads/main").split()[0] == final_head
+    published = [
+        event
+        for event in cp.list_observability(limit=50)
+        if event.name == "task.git_published" and event.subject_id == task.id
+    ]
+    assert published
+    assert published[0].detail["publication_mode"] == "merge_commit"
+    assert published[0].detail["head_sha"] == task_head
+    assert published[0].detail["final_sha"] == final_head
+
+
 def test_review_verdict_requires_same_repo_head_as_executor_evidence(cp):
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])

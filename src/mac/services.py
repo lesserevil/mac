@@ -5126,15 +5126,23 @@ class ControlPlane:
 
         commands: List[JsonDict] = []
 
-        def run_step(name: str, args: List[str], timeout: int = 120) -> JsonDict:
+        def git_step(
+            name: str,
+            args: List[str],
+            timeout: int = 120,
+            *,
+            check: bool = True,
+        ) -> JsonDict:
             result = self._git_output(root, args, timeout=timeout)
             commands.append({"name": name, "args": args, **result})
-            if result["returncode"] != 0:
+            if check and result["returncode"] != 0:
                 raise ValidationError(
                     "git publication %s failed: %s"
                     % (name, result.get("stderr") or result.get("stdout") or args)
                 )
             return result
+
+        run_step = git_step
 
         run_step("fetch_main", ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"])
         run_step(
@@ -5151,13 +5159,42 @@ class ControlPlane:
             run_step("create_main", ["checkout", "-B", "main", "origin/main"])
         run_step("pull_main", ["pull", "--ff-only", "origin", "main"])
         run_step("verify_commit", ["cat-file", "-e", "%s^{commit}" % head_sha])
-        run_step("merge_source", ["merge", "--ff-only", head_sha])
+        publication_mode = "fast_forward"
+        ff_merge = git_step("merge_source_ff", ["merge", "--ff-only", head_sha], check=False)
+        if ff_merge["returncode"] != 0:
+            already_merged = git_step(
+                "source_already_merged",
+                ["merge-base", "--is-ancestor", head_sha, "HEAD"],
+                check=False,
+            )
+            if already_merged["returncode"] == 0:
+                publication_mode = "already_integrated"
+            else:
+                publication_mode = "merge_commit"
+                merge = git_step(
+                    "merge_source",
+                    ["merge", "--no-ff", "--no-edit", head_sha],
+                    timeout=180,
+                    check=False,
+                )
+                if merge["returncode"] != 0:
+                    git_step("merge_abort", ["merge", "--abort"], check=False)
+                    raise ValidationError(
+                        "git publication merge_source failed: %s"
+                        % (merge.get("stderr") or merge.get("stdout") or head_sha)
+                    )
         run_step("push_main", ["push", "origin", "main"], timeout=180)
         final_head = run_step("final_head", ["rev-parse", "HEAD"])
         final_sha = str(final_head.get("stdout") or "").strip()
-        if final_sha != head_sha:
+        contains_source = git_step(
+            "verify_source_ancestor",
+            ["merge-base", "--is-ancestor", head_sha, final_sha],
+            check=False,
+        )
+        if contains_source["returncode"] != 0:
             raise ValidationError(
-                "git publication finished at %s, expected %s" % (final_sha, head_sha)
+                "git publication final main %s does not contain reviewed commit %s"
+                % (final_sha, head_sha)
             )
         return {
             "status": "published",
@@ -5166,6 +5203,8 @@ class ControlPlane:
             "source_branch": source_branch,
             "remote_ref": remote_ref,
             "head_sha": head_sha,
+            "final_sha": final_sha,
+            "publication_mode": publication_mode,
             "commands": commands,
         }
 
