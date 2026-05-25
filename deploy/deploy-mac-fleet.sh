@@ -2154,14 +2154,47 @@ clear_mac_agent_drain_after_deploy() {
 }
 
 install_beads_cli() {
-  local target="$MAC_HOME/bin/bd" existing
+  local target="$MAC_HOME/bin/bd" existing upgrade source_first missing_required required
   mkdir -p "$MAC_HOME/bin" "$(dirname "$BEADS_DIR")"
+  upgrade="${MAC_DEPLOY_BEADS_UPGRADE:-1}"
+  source_first="${MAC_DEPLOY_BEADS_SOURCE_FIRST:-1}"
   if [ -x "$target" ]; then
     log "bd CLI already installed at $target"
     "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
-    return 0
+    if ! truthy "$upgrade"; then
+      return 0
+    fi
+    log "upgrading bd CLI from $BEADS_REPO_URL@$BEADS_REF"
+    existing="$target"
   fi
-  existing="$(command -v bd 2>/dev/null || true)"
+
+  if truthy "$source_first"; then
+    missing_required=""
+    for required in git make go; do
+      if ! command -v "$required" >/dev/null 2>&1; then
+        missing_required="${missing_required}${missing_required:+, }$required"
+      fi
+    done
+    if [ -z "$missing_required" ]; then
+      log "building bd CLI from $BEADS_REPO_URL@$BEADS_REF"
+      if [ -d "$BEADS_DIR/.git" ]; then
+        git -C "$BEADS_DIR" fetch --quiet origin "$BEADS_REF"
+      else
+        git clone --quiet "$BEADS_REPO_URL" "$BEADS_DIR"
+        git -C "$BEADS_DIR" fetch --quiet origin "$BEADS_REF"
+      fi
+      git -C "$BEADS_DIR" checkout --quiet FETCH_HEAD
+      make -C "$BEADS_DIR" build
+      install -m 0755 "$BEADS_DIR/bd" "$target"
+      "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
+      return 0
+    fi
+    log "WARNING: cannot build bd CLI from source (missing: $missing_required); falling back to an existing binary or release download"
+  fi
+
+  if [ -z "${existing:-}" ]; then
+    existing="$(command -v bd 2>/dev/null || true)"
+  fi
   if [ -z "$existing" ]; then
     for candidate in "$HOME/.local/bin/bd" "$HOME/bin/bd" /opt/homebrew/bin/bd /usr/local/bin/bd; do
       if [ -x "$candidate" ]; then
@@ -2173,7 +2206,7 @@ install_beads_cli() {
   if [ -n "$existing" ] && [ -x "$existing" ]; then
     log "copying existing bd CLI from $existing to managed mac bin"
     if [ "$existing" != "$target" ]; then
-      cp "$existing" "$target"
+      cp -f "$existing" "$target"
       chmod 0755 "$target"
     fi
     "$target" version > "$LOG_DIR/beads-version.txt" 2>&1 || true
