@@ -1472,6 +1472,66 @@ def test_default_reviewer_requires_review_capability(cp):
     assert result["status"] == "published"
 
 
+def test_default_reviewer_honors_target_agent_name(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "bullwinkle", ["review"])
+    natasha = register_agent(cp, "natasha", ["review"])
+    task = cp.create_task(
+        "needs-specific-reviewer",
+        required_capabilities=["python"],
+        metadata={
+            "publication_target": "test://r",
+            "default_review": {"target_agent_name": "natasha"},
+        },
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "x",
+        "y",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["reviewer_agent_id"] == natasha.id
+
+
+def test_default_reviewer_honors_review_required_capabilities(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "bullwinkle", ["review"])
+    natasha = register_agent(cp, "natasha", ["qemu", "review"])
+    task = cp.create_task(
+        "needs-qemu-reviewer",
+        required_capabilities=["python"],
+        metadata={
+            "publication_target": "test://r",
+            "default_review": {"required_capabilities": ["qemu"]},
+        },
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "x",
+        "y",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_reviewer_verdict"
+    assert result["reviewer_agent_id"] == natasha.id
+
+
 def test_default_review_reassigns_stale_pending_reviewer(cp):
     worker = register_agent(cp, "worker", ["python"])
     stale_reviewer = register_agent(cp, "operator-reviewer", ["review"])

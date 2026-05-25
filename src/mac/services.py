@@ -146,6 +146,15 @@ def _manifest_list(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
 
 
+def _metadata_string_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if not isinstance(value, Iterable):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 def _truthy_env(name: str, default: str = "") -> bool:
     value = os.environ.get(name, default).strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -8915,10 +8924,30 @@ class ControlPlane:
         required = set(task.required_capabilities) | role_required_caps
         return required.issubset(capabilities)
 
+    def _default_review_policy(self, task: Task) -> JsonDict:
+        metadata = ensure_json_object(task.metadata)
+        for key in ("review", "default_review"):
+            value = metadata.get(key)
+            if isinstance(value, dict):
+                return ensure_json_object(value)
+        return {}
+
+    def _default_review_required_capabilities(
+        self,
+        task: Task,
+        policy: Optional[JsonDict] = None,
+    ) -> List[str]:
+        policy = ensure_json_object(policy or self._default_review_policy(task))
+        required = set(_metadata_string_list(policy.get("required_capabilities")))
+        if (
+            policy.get("inherit_task_capabilities") is True
+            or policy.get("inherit_required_capabilities") is True
+        ):
+            required.update(str(capability) for capability in task.required_capabilities)
+        return sorted(required)
+
     def _default_review_disabled(self, task: Task) -> bool:
-        policy = task.metadata.get("review") or task.metadata.get("default_review") or {}
-        if not isinstance(policy, dict):
-            return False
+        policy = self._default_review_policy(task)
         mode = str(policy.get("mode") or policy.get("workflow") or "").strip().lower()
         return (
             mode == "manual"
@@ -9474,6 +9503,11 @@ class ControlPlane:
         """
         task_tenant = self._task_tenant_id(task)
         executor_persona_slug = self._task_executor_persona_slug(task)
+        review_policy = self._default_review_policy(task)
+        review_required_capabilities = self._default_review_required_capabilities(
+            task,
+            review_policy,
+        )
 
         candidates: List[Agent] = []
         for agent in self.list_agents():
@@ -9483,6 +9517,8 @@ class ControlPlane:
                 task_tenant=task_tenant,
                 executor_persona_slug=executor_persona_slug,
                 executor_agent_id=executor_agent_id,
+                review_policy=review_policy,
+                review_required_capabilities=review_required_capabilities,
             ) is not None:
                 continue
             candidates.append(agent)
@@ -9512,6 +9548,7 @@ class ControlPlane:
             task,
             agent,
             executor_agent_id=executor_agent_id,
+            review_policy=self._default_review_policy(task),
         )
 
     def _default_reviewer_unavailable_reason(
@@ -9522,6 +9559,8 @@ class ControlPlane:
         task_tenant: Optional[str] = None,
         executor_persona_slug: Optional[str] = None,
         executor_agent_id: Optional[str] = None,
+        review_policy: Optional[JsonDict] = None,
+        review_required_capabilities: Optional[Iterable[str]] = None,
     ) -> Optional[str]:
         if agent.health_status != HealthStatus.HEALTHY.value:
             return "reviewer_unhealthy"
@@ -9535,6 +9574,29 @@ class ControlPlane:
             return "reviewer_created_executor_evidence"
         if "review" not in set(agent.capabilities):
             return "reviewer_missing_capability"
+        policy = review_policy if review_policy is not None else self._default_review_policy(task)
+        target_agent_id = str(
+            policy.get("target_agent_id")
+            or policy.get("reviewer_agent_id")
+            or ""
+        ).strip()
+        if target_agent_id and agent.id != target_agent_id:
+            return "reviewer_not_target_agent"
+        target_agent_name = str(
+            policy.get("target_agent_name")
+            or policy.get("reviewer_agent_name")
+            or ""
+        ).strip()
+        if target_agent_name and agent.name != target_agent_name:
+            return "reviewer_not_target_agent"
+        required = set(
+            review_required_capabilities
+            if review_required_capabilities is not None
+            else self._default_review_required_capabilities(task, policy)
+        )
+        missing = sorted(required - set(agent.capabilities))
+        if missing:
+            return "reviewer_missing_capabilities:%s" % ",".join(missing)
         if task_tenant is None:
             task_tenant = self._task_tenant_id(task)
         if executor_persona_slug is None:
