@@ -3652,6 +3652,8 @@ values.setdefault("MAC_WORKER_HEARTBEAT_INTERVAL", "30")
 values.setdefault("MAC_WORKER_POLL_INTERVAL", "2")
 values.setdefault("MAC_WORKER_LEASE_SECONDS", "900")
 values.setdefault("MAC_WORKER_EXECUTOR", str(mac_home / "bin" / "mac-hermes-task-executor"))
+values.setdefault("MAC_AGENT_STARTUP_SELF_TEST", "1")
+values.setdefault("MAC_AGENT_STARTUP_SELF_TEST_TIMEOUT", "120")
 values.setdefault("MAC_BEADS_BRIDGE_HUB_AGENT", shared_services_manager)
 values.setdefault("MAC_REVIEW_TICK_HUB_AGENT", shared_services_manager)
 values.setdefault("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")
@@ -3953,6 +3955,7 @@ EOF
 
 install_mac_agent_wrapper() {
   local wrapper="$MAC_HOME/bin/mac-agent-service"
+  local selftest="$MAC_HOME/bin/mac-agent-startup-self-test"
   local executor="$MAC_HOME/bin/mac-hermes-task-executor"
   local executor_py="$MAC_HOME/bin/mac-hermes-task-executor.py"
   mkdir -p "$MAC_HOME/bin"
@@ -3993,6 +3996,10 @@ mark_worker_offline() {
     "$MAC_HUB_URL/agents/$agent_id/heartbeat" >/dev/null || true
 }
 trap mark_worker_offline TERM INT
+
+if [ "${MAC_AGENT_STARTUP_SELF_TEST:-1}" != "0" ]; then
+  "$HOME/.mac/bin/mac-agent-startup-self-test"
+fi
 
 common=(
   "$HOME/.mac/venv/bin/mac-agent"
@@ -4058,6 +4065,275 @@ case "$mode" in
 esac
 EOF
   chmod 700 "$wrapper"
+
+  cat > "$selftest" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+set +u
+[ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
+. "$HOME/.mac/mac.env"
+set -u
+set +a
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+export HERMES_DISABLE_LAZY_INSTALLS=1
+export HERMES_REDACT_SECRETS=true
+if [ -z "${CUSTOM_BASE_URL:-}" ] && [ -n "${TOKENHUB_URL:-}" ]; then
+  export CUSTOM_BASE_URL="${TOKENHUB_URL%/}/v1"
+fi
+if [ -z "${OPENAI_BASE_URL:-}" ] && [ -n "${CUSTOM_BASE_URL:-}" ]; then
+  export OPENAI_BASE_URL="$CUSTOM_BASE_URL"
+fi
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  if [ -n "${TOKENHUB_API_KEY:-}" ]; then
+    export OPENAI_API_KEY="$TOKENHUB_API_KEY"
+  elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
+    export OPENAI_API_KEY="$TOKENHUB_AGENT_KEY"
+  fi
+fi
+if [ -z "${MAC_HERMES_GATEWAY_API_KEY:-}" ]; then
+  if [ -n "${TOKENHUB_API_KEY:-}" ]; then
+    export MAC_HERMES_GATEWAY_API_KEY="$TOKENHUB_API_KEY"
+  elif [ -n "${TOKENHUB_AGENT_KEY:-}" ]; then
+    export MAC_HERMES_GATEWAY_API_KEY="$TOKENHUB_AGENT_KEY"
+  fi
+fi
+if [ -z "${ACC_HERMES_GATEWAY_API_KEY:-}" ] && [ -n "${MAC_HERMES_GATEWAY_API_KEY:-}" ]; then
+  export ACC_HERMES_GATEWAY_API_KEY="$MAC_HERMES_GATEWAY_API_KEY"
+fi
+selftest_python="$HOME/.mac/hermes-agent/.venv/bin/python"
+if [ ! -x "$selftest_python" ]; then
+  selftest_python="$HOME/.mac/venv/bin/python"
+fi
+exec "$selftest_python" - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def truthy(raw: str | None) -> bool:
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def stable_agent_id(name: str) -> str:
+    import re
+
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.lower()).strip("_") or "default"
+    return f"agent_{safe}"
+
+
+def tail(text: str, limit: int = 1200) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def safe_error(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+home = Path.home()
+mac_home = home / ".mac"
+hermes_home = Path(os.environ.get("HERMES_HOME") or home / ".hermes")
+report_path = Path(
+    os.environ.get("MAC_AGENT_STARTUP_SELF_TEST_REPORT")
+    or mac_home / "logs" / "mac-agent-startup-self-test.json"
+)
+report_path.parent.mkdir(parents=True, exist_ok=True)
+
+agent_name = os.environ.get("MAC_WORKER_AGENT_NAME") or os.environ.get("MAC_WORKER_HOSTNAME") or ""
+agent_id = os.environ.get("MAC_AGENT_ID") or os.environ.get("MAC_WORKER_AGENT_ID") or ""
+if not agent_id and agent_name:
+    agent_id = stable_agent_id(agent_name)
+hermes_instance = (
+    os.environ.get("MAC_WORKER_HERMES_INSTANCE_ID")
+    or os.environ.get("MAC_HERMES_INSTANCE_ID")
+    or ""
+)
+persona_id = os.environ.get("MAC_HERMES_PERSONA_ID") or ""
+tenant_id = os.environ.get("MAC_FLEET_TENANT_ID") or ""
+context_path = Path(
+    os.environ.get("MAC_HERMES_RUNTIME_CONTEXT_FILE")
+    or hermes_home / "mac-runtime-context.json"
+)
+tokenhub_url = str(os.environ.get("TOKENHUB_URL") or "").rstrip("/")
+tokenhub_key = os.environ.get("TOKENHUB_API_KEY") or os.environ.get("TOKENHUB_AGENT_KEY") or ""
+tokenhub_required = truthy(os.environ.get("MAC_REQUIRE_TOKENHUB") or "1")
+timeout = int(os.environ.get("MAC_AGENT_STARTUP_SELF_TEST_TIMEOUT") or "120")
+python_bin = str(mac_home / "hermes-agent" / ".venv" / "bin" / "python")
+hermes_script = str(mac_home / "hermes-agent" / "hermes")
+
+problems: list[str] = []
+checks: dict[str, object] = {
+    "identity_env": False,
+    "runtime_context": False,
+    "tokenhub_runtime": False,
+    "hermes_chat": False,
+}
+runtime_provider: dict[str, object] = {}
+chat_output = ""
+chat_returncode: int | None = None
+
+for key, value in {
+    "MAC_WORKER_AGENT_NAME": agent_name,
+    "MAC_AGENT_ID": agent_id,
+    "MAC_HERMES_INSTANCE_ID": hermes_instance,
+    "MAC_HERMES_PERSONA_ID": persona_id,
+    "MAC_FLEET_TENANT_ID": tenant_id,
+    "HERMES_HOME": str(hermes_home),
+}.items():
+    if not value:
+        problems.append(f"missing required identity env {key}")
+checks["identity_env"] = not any(problem.startswith("missing required identity env") for problem in problems)
+
+try:
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    context = {}
+    problems.append(f"runtime context unreadable at {context_path}: {safe_error(exc)}")
+
+if context:
+    expected_context = {
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "hermes_instance_id": hermes_instance,
+        "persona_id": persona_id,
+        "tenant_id": tenant_id,
+    }
+    for key, expected in expected_context.items():
+        actual = str(context.get(key) or "")
+        if expected and actual != expected:
+            problems.append(f"runtime context mismatch {key}: expected {expected!r}, got {actual!r}")
+    checks["runtime_context"] = not any("runtime context" in problem for problem in problems)
+
+if tokenhub_required and not tokenhub_url:
+    problems.append("TOKENHUB_URL is required but not configured")
+if tokenhub_required and not tokenhub_key:
+    problems.append("TOKENHUB_API_KEY is required but not configured")
+
+try:
+    sys.path.insert(0, str(mac_home / "hermes-agent"))
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime_provider = resolve_runtime_provider(
+        target_model=os.environ.get("HERMES_INFERENCE_MODEL") or "*"
+    )
+    runtime_key = str(runtime_provider.get("api_key") or "")
+    runtime_base_url = str(runtime_provider.get("base_url") or "").rstrip("/")
+    expected_base_url = f"{tokenhub_url}/v1" if tokenhub_url else ""
+    key_matches_env = bool(tokenhub_key and runtime_key == tokenhub_key)
+    base_url_matches_env = bool(
+        not expected_base_url or runtime_base_url == expected_base_url.rstrip("/")
+    )
+    runtime_provider = {
+        "provider": runtime_provider.get("provider"),
+        "source": runtime_provider.get("source"),
+        "model": runtime_provider.get("model"),
+        "base_url_matches_env": base_url_matches_env,
+        "key_matches_env": key_matches_env,
+    }
+    if tokenhub_key and not key_matches_env:
+        problems.append("Hermes runtime provider key does not match TOKENHUB_API_KEY")
+    if expected_base_url and not base_url_matches_env:
+        problems.append("Hermes runtime provider base_url does not match TOKENHUB_URL")
+    checks["tokenhub_runtime"] = not any(
+        problem.startswith("Hermes runtime provider") or problem.startswith("TOKENHUB_")
+        for problem in problems
+    )
+except Exception as exc:
+    runtime_provider = {"error": safe_error(exc)}
+    problems.append(f"Hermes runtime provider resolution failed: {safe_error(exc)}")
+
+prompt = (
+    "From your MAC runtime context only, answer exactly: "
+    f"name={agent_name}; agent_id={agent_id}; hermes_instance={hermes_instance}. "
+    "Do not infer or proxy."
+)
+try:
+    completed = subprocess.run(
+        [python_bin, hermes_script, "chat", "--query", prompt, "--quiet"],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    chat_returncode = completed.returncode
+    chat_output = tail((completed.stdout or "") + "\n" + (completed.stderr or ""))
+    normalized = chat_output.lower()
+    if completed.returncode != 0:
+        problems.append(f"Hermes chat self-test exited {completed.returncode}")
+    for fragment in (
+        f"name={agent_name}",
+        f"agent_id={agent_id}",
+        f"hermes_instance={hermes_instance}",
+    ):
+        if fragment and fragment.lower() not in normalized:
+            problems.append(f"Hermes chat self-test did not report {fragment}")
+    checks["hermes_chat"] = not any("Hermes chat self-test" in problem for problem in problems)
+except subprocess.TimeoutExpired as exc:
+    chat_returncode = None
+    chat_output = tail((exc.stdout or "") + "\n" + (exc.stderr or ""))
+    problems.append(f"Hermes chat self-test timed out after {timeout}s")
+except Exception as exc:
+    chat_returncode = None
+    problems.append(f"Hermes chat self-test failed to execute: {safe_error(exc)}")
+
+report = {
+    "schema": "mac.agent_startup_self_test.v1",
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "status": "failed" if problems else "passed",
+    "agent_name": agent_name,
+    "agent_id": agent_id,
+    "hermes_instance_id": hermes_instance,
+    "persona_id": persona_id,
+    "tenant_id": tenant_id,
+    "checks": checks,
+    "runtime_provider": runtime_provider,
+    "chat_returncode": chat_returncode,
+    "chat_output_tail": chat_output,
+    "problems": problems,
+}
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+if problems:
+    hub_url = str(os.environ.get("MAC_HUB_URL") or "").rstrip("/")
+    token = os.environ.get("MAC_WORKER_TOKEN") or ""
+    if hub_url and token and agent_id:
+        payload = {
+            "status": "offline",
+            "health_status": "degraded",
+            "resources": {"startup_self_test": report},
+        }
+        req = urllib.request.Request(
+            f"{hub_url}/agents/{agent_id}/heartbeat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10).read()
+        except (OSError, urllib.error.URLError) as exc:
+            print(f"agent startup self-test: failed to report degraded heartbeat: {safe_error(exc)}", file=sys.stderr)
+    print(f"agent startup self-test: failed; report={report_path}", file=sys.stderr)
+    for problem in problems:
+        print(f"agent startup self-test: {problem}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"agent startup self-test: passed; report={report_path}")
+PY
+EOF
+  chmod 700 "$selftest"
 
   cat > "$executor" <<'EOF'
 #!/usr/bin/env bash

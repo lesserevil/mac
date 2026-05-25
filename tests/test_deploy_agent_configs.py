@@ -636,6 +636,24 @@ def test_launchd_worker_wrapper_marks_agent_offline_on_controlled_shutdown():
     assert '{"status":"offline","health_status":"degraded"}' in wrapper
 
 
+def test_worker_wrapper_runs_agent_side_startup_self_test():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    wrapper = script.split("install_mac_agent_wrapper() {", 1)[1].split(
+        'cat > "$executor" <<', 1
+    )[0]
+    selftest = script.split('cat > "$selftest" <<', 1)[1].split(
+        'cat > "$executor" <<', 1
+    )[0]
+
+    assert 'values.setdefault("MAC_AGENT_STARTUP_SELF_TEST", "1")' in script
+    assert '"$HOME/.mac/bin/mac-agent-startup-self-test"' in wrapper
+    assert 'resolve_runtime_provider(' in selftest
+    assert '"key_matches_env": key_matches_env' in selftest
+    assert '[python_bin, hermes_script, "chat", "--query", prompt, "--quiet"]' in selftest
+    assert '"resources": {"startup_self_test": report}' in selftest
+    assert '"health_status": "degraded"' in selftest
+
+
 def test_executor_prompt_includes_repository_runtime_contract():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
 
