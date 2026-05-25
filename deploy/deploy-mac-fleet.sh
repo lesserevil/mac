@@ -4145,6 +4145,34 @@ def safe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def first_context_value(context: dict[str, object], paths: list[tuple[str, ...]]) -> str:
+    for path in paths:
+        current: object = context
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if current is not None:
+            return str(current)
+    return ""
+
+
+def output_contains_identity(output: str, field: str, value: str) -> bool:
+    if not value:
+        return False
+    normalized = output.lower().replace("_", " ")
+    field_text = field.lower().replace("_", " ")
+    value_text = value.lower().replace("_", " ")
+    candidates = (
+        f"{field.lower()}={value.lower()}",
+        f"{field_text}={value_text}",
+        f"{field_text}: {value_text}",
+        f"{field_text} = {value_text}",
+    )
+    return any(candidate in normalized for candidate in candidates)
+
+
 home = Path.home()
 mac_home = home / ".mac"
 hermes_home = Path(os.environ.get("HERMES_HOME") or home / ".hermes")
@@ -4207,14 +4235,34 @@ except Exception as exc:
 
 if context:
     expected_context = {
-        "agent_id": agent_id,
-        "agent_name": agent_name,
-        "hermes_instance_id": hermes_instance,
-        "persona_id": persona_id,
-        "tenant_id": tenant_id,
+        "agent_id": (
+            agent_id,
+            [("agent_id",), ("agent", "agent_id"), ("environment", "MAC_AGENT_ID")],
+        ),
+        "agent_name": (
+            agent_name,
+            [("agent_name",), ("agent", "name"), ("environment", "MAC_WORKER_AGENT_NAME")],
+        ),
+        "hermes_instance_id": (
+            hermes_instance,
+            [
+                ("hermes_instance_id",),
+                ("agent", "hermes_instance_id"),
+                ("identity", "hermes_instance_id"),
+                ("environment", "MAC_HERMES_INSTANCE_ID"),
+            ],
+        ),
+        "persona_id": (
+            persona_id,
+            [("persona_id",), ("identity", "persona_id"), ("environment", "MAC_HERMES_PERSONA_ID")],
+        ),
+        "tenant_id": (
+            tenant_id,
+            [("tenant_id",), ("identity", "tenant_id"), ("environment", "MAC_FLEET_TENANT_ID")],
+        ),
     }
-    for key, expected in expected_context.items():
-        actual = str(context.get(key) or "")
+    for key, (expected, paths) in expected_context.items():
+        actual = first_context_value(context, paths)
         if expected and actual != expected:
             problems.append(f"runtime context mismatch {key}: expected {expected!r}, got {actual!r}")
     checks["runtime_context"] = not any("runtime context" in problem for problem in problems)
@@ -4275,13 +4323,14 @@ try:
     normalized = chat_output.lower()
     if completed.returncode != 0:
         problems.append(f"Hermes chat self-test exited {completed.returncode}")
-    for fragment in (
-        f"name={agent_name}",
-        f"agent_id={agent_id}",
-        f"hermes_instance={hermes_instance}",
-    ):
-        if fragment and fragment.lower() not in normalized:
-            problems.append(f"Hermes chat self-test did not report {fragment}")
+    expected_fragments = {
+        "name": agent_name,
+        "agent_id": agent_id,
+        "hermes_instance": hermes_instance,
+    }
+    for field, expected in expected_fragments.items():
+        if expected and not output_contains_identity(normalized, field, expected):
+            problems.append(f"Hermes chat self-test did not report {field}={expected}")
     checks["hermes_chat"] = not any("Hermes chat self-test" in problem for problem in problems)
 except subprocess.TimeoutExpired as exc:
     chat_returncode = None
