@@ -233,7 +233,9 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert 'configured_qdrant_required = "1"' in script
     assert 'values["MAC_REQUIRE_QDRANT_MEMORY"] = "1"' in script
     assert '"MAC_REQUIRE_QDRANT_MEMORY": "1",' in script
+    assert '"mandatory": True,' in script
     assert 'updates["QDRANT_URL"] = None' not in script
+    assert "Optional Qdrant shared memory" not in script
     assert "127.0.0.1:16333:127.0.0.1:6333" in script
     assert "qd_port += 10000" in script
     assert '"qdrant_shared_memory": False' in script
@@ -250,6 +252,7 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert cfg["defaults"]["qdrant"]["required"] is True
     assert env_example["MAC_REQUIRE_QDRANT_MEMORY"] == "1"
     assert env_example["MAC_QDRANT_MEMORY_ROLE"] == "shared_level2"
+    assert "MAC_QDRANT_MEMORY_ALLOW_DEGRADED" not in env_example
     assert env_example["MAC_HERMES_RUNTIME_CONTEXT_REQUIRED"] == "1"
     assert env_example["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_example"
     assert env_example["MAC_WORKER_EXECUTOR"] == "/home/mac/.mac/bin/mac-hermes-task-executor"
@@ -266,6 +269,7 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "Firecrawl-compatible web search gateway" in firecrawl_installer
     assert env_example["MAC_REQUIRE_FIRECRAWL"] == "1"
     assert env_example["FIRECRAWL_API_URL"] == "http://hub.example.internal:3002"
+    assert "MAC_FIRECRAWL_ALLOW_DEGRADED" not in env_example
     assert cfg["defaults"]["tokenhub"]["install"] == "auto"
     assert cfg["defaults"]["tokenhub"]["required"] is True
     assert cfg["defaults"]["tokenhub"]["port"] == 8090
@@ -296,6 +300,7 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
     assert 'configured_firecrawl_required = "1"' in script
     assert 'values["MAC_REQUIRE_FIRECRAWL"] = "1"' in script
     assert '"MAC_REQUIRE_FIRECRAWL": "1",' in script
+    assert "Optional Firecrawl web search" not in script
     assert "install_or_validate_web_search_service()" in script
     assert "write_hermes_web_search_config()" in script
     assert "install_hermes_web_deps()" in script
@@ -422,7 +427,6 @@ def test_setup_fleet_wizard_writes_fleet_registry_and_env(tmp_path):
             "provider/family/hub-model",
             "",
             "n",
-            "y",
             "",
             "",
             "",
@@ -495,7 +499,6 @@ def test_setup_fleet_wizard_can_write_explicit_headscale_provider(tmp_path):
             "",
             "",
             "n",
-            "y",
             "",
             "",
             "",
@@ -656,6 +659,9 @@ def test_worker_wrapper_runs_agent_side_startup_self_test():
     assert 'values.setdefault("MAC_AGENT_STARTUP_SELF_TEST", "1")' in script
     assert '"$HOME/.mac/bin/mac-agent-startup-self-test"' in wrapper
     assert 'resolve_runtime_provider(' in selftest
+    assert "MAC_REQUIRE_QDRANT_MEMORY must be true" in selftest
+    assert "MAC_REQUIRE_FIRECRAWL must be true" in selftest
+    assert '"mandatory_services": {' in selftest
     assert '"key_matches_env": key_matches_env' in selftest
     assert '[python_bin, hermes_script, "chat", "--query", prompt, "--quiet"]' in selftest
     assert '"resources": {"startup_self_test": report}' in selftest

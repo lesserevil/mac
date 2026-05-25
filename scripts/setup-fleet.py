@@ -427,12 +427,14 @@ def main(argv: List[str]) -> int:
     hub_model = prompt("Hub Hermes model selector (blank to configure later)", default="")
     hub_worker_mode = prompt("Hub worker mode", default="loop", choices=["heartbeat", "dry-run", "loop"])
     hub_require_canary = prompt_bool("Require canary metadata on hub tasks?", default=False)
-    qdrant_required = prompt_bool("Require shared Qdrant memory readiness?", default=True)
+    qdrant_required = True
+    print("Shared Qdrant memory readiness is mandatory.")
     qdrant_port_str = prompt("Qdrant port", default="6333")
     qdrant_port = int(qdrant_port_str) if qdrant_port_str.isdigit() else 6333
     qdrant_url = prompt(
         "Shared Qdrant URL",
-        default=qdrant_url_from_hub(hub_url, qdrant_port) if qdrant_required else "",
+        default=qdrant_url_from_hub(hub_url, qdrant_port),
+        required=True,
     )
     qdrant_bind_addr = prompt("Hub Qdrant bind address override (blank for Tailscale/loopback auto)", default="")
     qdrant_data_dir = prompt("Qdrant data directory override (blank for default /var/lib/<fleet>/qdrant)", default="")

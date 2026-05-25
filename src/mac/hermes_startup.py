@@ -754,22 +754,16 @@ def _fetch_firecrawl_health(endpoint: str, api_key: Optional[str], timeout_secon
 def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
     endpoint, endpoint_source = _qdrant_endpoint_from_env()
     memory_disabled = not _any_env_enabled(("MAC_QDRANT_MEMORY", "ACC_QDRANT_MEMORY"), True)
-    explicitly_required = _any_env_enabled(
-        ("MAC_REQUIRE_QDRANT_MEMORY", "ACC_REQUIRE_QDRANT_MEMORY"),
-        False,
-    )
-    required = not memory_disabled and (explicitly_required or bool(endpoint))
-    degraded_allowed = _any_env_enabled(
-        ("MAC_QDRANT_MEMORY_ALLOW_DEGRADED", "ACC_QDRANT_MEMORY_ALLOW_DEGRADED"),
-        False,
-    )
+    required = True
+    degraded_allowed = False
     topology = _topology_summary(_memory_topology_path(hermes_home))
     api_key = os.environ.get("QDRANT_API_KEY") or os.environ.get("QDRANT_FLEET_KEY")
     report: Dict[str, Any] = {
         "status": "disabled",
-        "ready": True,
+        "ready": False,
         "required": required,
         "degraded_allowed": degraded_allowed,
+        "mandatory": True,
         "endpoint": _redact_url(endpoint),
         "endpoint_source": endpoint_source,
         "api_key_present": bool(api_key),
@@ -784,24 +778,22 @@ def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
     }
     if memory_disabled:
         report["status"] = "disabled_by_env"
+        report["degradation_reason"] = "Qdrant shared memory is mandatory and cannot be disabled"
+        report["warning"] = report["degradation_reason"]
         return report
     if not endpoint:
-        if not required:
-            return report
-        report["ready"] = bool(degraded_allowed)
-        report["status"] = "degraded_allowed" if degraded_allowed else "missing_endpoint"
+        report["ready"] = False
+        report["status"] = "missing_endpoint"
         report["degradation_reason"] = "required Qdrant shared memory endpoint is not configured"
-        if not degraded_allowed:
-            report["warning"] = report["degradation_reason"]
+        report["warning"] = report["degradation_reason"]
         return report
 
     parsed = urllib.parse.urlsplit(endpoint)
     if not parsed.scheme or not parsed.netloc:
-        report["ready"] = bool(degraded_allowed)
-        report["status"] = "degraded_allowed" if degraded_allowed else "invalid_endpoint"
+        report["ready"] = False
+        report["status"] = "invalid_endpoint"
         report["degradation_reason"] = "Qdrant shared memory endpoint is invalid"
-        if not degraded_allowed:
-            report["warning"] = report["degradation_reason"]
+        report["warning"] = report["degradation_reason"]
         return report
 
     if required and not topology["file"]["exists"]:
@@ -819,11 +811,10 @@ def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
     try:
         collections = _fetch_qdrant_collections(endpoint, api_key, timeout_seconds)
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
-        report["ready"] = bool(degraded_allowed)
-        report["status"] = "degraded_allowed" if degraded_allowed else "unreachable"
+        report["ready"] = False
+        report["status"] = "unreachable"
         report["degradation_reason"] = "Qdrant collections endpoint is unreachable: %s" % exc
-        if not degraded_allowed:
-            report["warning"] = report["degradation_reason"]
+        report["warning"] = report["degradation_reason"]
         return report
     result = collections.get("result") if isinstance(collections, dict) else {}
     collection_rows = result.get("collections") if isinstance(result, dict) else None
@@ -835,15 +826,15 @@ def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
 
 def _firecrawl_web_search_report() -> Dict[str, Any]:
     endpoint, endpoint_source = _firecrawl_endpoint_from_env()
-    explicitly_required = _env_enabled("MAC_REQUIRE_FIRECRAWL", False)
-    required = explicitly_required or bool(endpoint)
-    degraded_allowed = _env_enabled("MAC_FIRECRAWL_ALLOW_DEGRADED", False)
+    required = True
+    degraded_allowed = False
     api_key = os.environ.get("FIRECRAWL_API_KEY")
     report: Dict[str, Any] = {
         "status": "disabled",
-        "ready": True,
+        "ready": False,
         "required": required,
         "degraded_allowed": degraded_allowed,
+        "mandatory": True,
         "endpoint": _redact_url(endpoint),
         "endpoint_source": endpoint_source,
         "api_key_present": bool(api_key),
@@ -851,33 +842,28 @@ def _firecrawl_web_search_report() -> Dict[str, Any]:
         "degradation_reason": "",
     }
     if not endpoint:
-        if not required:
-            return report
-        report["ready"] = bool(degraded_allowed)
-        report["status"] = "degraded_allowed" if degraded_allowed else "missing_endpoint"
+        report["ready"] = False
+        report["status"] = "missing_endpoint"
         report["degradation_reason"] = "required Firecrawl web search endpoint is not configured"
-        if not degraded_allowed:
-            report["warning"] = report["degradation_reason"]
+        report["warning"] = report["degradation_reason"]
         return report
 
     parsed = urllib.parse.urlsplit(endpoint)
     if not parsed.scheme or not parsed.netloc:
-        report["ready"] = bool(degraded_allowed)
-        report["status"] = "degraded_allowed" if degraded_allowed else "invalid_endpoint"
+        report["ready"] = False
+        report["status"] = "invalid_endpoint"
         report["degradation_reason"] = "Firecrawl web search endpoint is invalid"
-        if not degraded_allowed:
-            report["warning"] = report["degradation_reason"]
+        report["warning"] = report["degradation_reason"]
         return report
 
     timeout_seconds = float(os.environ.get("MAC_FIRECRAWL_CHECK_TIMEOUT_SECONDS", "2"))
     try:
         _fetch_firecrawl_health(endpoint, api_key, timeout_seconds)
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
-        report["ready"] = bool(degraded_allowed)
-        report["status"] = "degraded_allowed" if degraded_allowed else "unreachable"
+        report["ready"] = False
+        report["status"] = "unreachable"
         report["degradation_reason"] = "Firecrawl web search health endpoint is unreachable: %s" % exc
-        if not degraded_allowed:
-            report["warning"] = report["degradation_reason"]
+        report["warning"] = report["degradation_reason"]
         return report
     report["status"] = "ready"
     report["ready"] = True

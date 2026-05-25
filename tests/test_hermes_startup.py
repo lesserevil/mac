@@ -115,6 +115,45 @@ def _prepare_direct_session_tools(monkeypatch, mac_home, workspace) -> None:
     )
 
 
+def _configure_mandatory_shared_services(monkeypatch, hermes_home) -> None:
+    topology = hermes_home / "mac-memory-topology.json"
+    _write(
+        topology,
+        json.dumps(
+            {
+                "schema": "mac.hermes.memory_topology.v1",
+                "agent": "hub",
+                "hub": {"agent": "hub", "url": "http://hub.example.internal:8789"},
+                "shared_services": {
+                    "qdrant": {
+                        "url": "http://hub.example.internal:6333",
+                        "role": "shared_level2_memory",
+                    },
+                    "firecrawl": {
+                        "url": "http://hub.example.internal:3002",
+                        "role": "shared_web_search",
+                    },
+                },
+            }
+        ),
+    )
+    monkeypatch.setenv("MAC_MEMORY_TOPOLOGY_FILE", str(topology))
+    monkeypatch.setenv("MAC_REQUIRE_QDRANT_MEMORY", "1")
+    monkeypatch.setenv("QDRANT_URL", "http://hub.example.internal:6333")
+    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
+    monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "http://hub.example.internal:3002")
+    monkeypatch.setattr(
+        hermes_startup,
+        "_fetch_qdrant_collections",
+        lambda endpoint, api_key, timeout_seconds: {"result": {"collections": []}},
+    )
+    monkeypatch.setattr(
+        hermes_startup,
+        "_fetch_firecrawl_health",
+        lambda endpoint, api_key, timeout_seconds: {"ok": True},
+    )
+
+
 def test_startup_report_inventories_hermes_state_without_contents(monkeypatch, tmp_path):
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
@@ -174,6 +213,7 @@ def test_slack_accounts_file_shim_satisfies_account_file_only_startup(monkeypatc
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
 
     report = build_hermes_startup_report()
 
@@ -275,6 +315,7 @@ class GatewayRunner:
     monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.invalid:8090")
     monkeypatch.setenv("TOKENHUB_API_KEY", "secret-tokenhub-key")
     monkeypatch.setenv("MAC_TOKENHUB_ALLOW_DEGRADED", "1")
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
 
     report = build_hermes_startup_report()
     patched = run_py.read_text(encoding="utf-8")
@@ -360,6 +401,7 @@ def test_startup_reports_tokenhub_readiness_without_leaking_key(monkeypatch, tmp
     monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.internal:8090")
     monkeypatch.setenv("TOKENHUB_API_KEY", "secret-tokenhub-key")
     monkeypatch.setenv("MAC_REQUIRE_TOKENHUB", "1")
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
 
     def fake_fetch(endpoint, path, api_key, timeout_seconds):
         assert endpoint == "http://tokenhub.internal:8090"
@@ -444,6 +486,7 @@ def apply_env_overrides(config):
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
 
     report = build_hermes_startup_report()
     patched = config_py.read_text(encoding="utf-8")
@@ -516,6 +559,7 @@ def apply_env_overrides(config):
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("MAC_HERMES_AGENT_DIR", str(agent_dir))
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
 
     report = build_hermes_startup_report()
 
@@ -535,6 +579,7 @@ def test_slack_bot_token_satisfies_upstream_slack_activation(monkeypatch, tmp_pa
     _write(hermes_home / "slack_accounts.json", '{"workspace":"T123"}')
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-not-returned")
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
 
     report = build_hermes_startup_report()
 
@@ -586,7 +631,7 @@ def test_startup_detects_inherited_env_file_redaction_drift(monkeypatch, tmp_pat
     assert "not-returned" not in str(report)
 
 
-def test_qdrant_shared_memory_disabled_without_endpoint(monkeypatch, tmp_path):
+def test_qdrant_shared_memory_missing_endpoint_blocks_readiness(monkeypatch, tmp_path):
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
     _write(hermes_home / "config.yaml", "model: local\n")
@@ -597,9 +642,11 @@ def test_qdrant_shared_memory_disabled_without_endpoint(monkeypatch, tmp_path):
 
     report = build_hermes_startup_report()
 
-    assert report["ready"] is True
-    assert report["qdrant_level2"]["status"] == "disabled"
-    assert report["checks"]["shared_qdrant_memory_ready"] is True
+    assert report["ready"] is False
+    assert report["qdrant_level2"]["required"] is True
+    assert report["qdrant_level2"]["mandatory"] is True
+    assert report["qdrant_level2"]["status"] == "missing_endpoint"
+    assert report["checks"]["shared_qdrant_memory_ready"] is False
 
 
 def test_required_qdrant_without_endpoint_blocks_readiness(monkeypatch, tmp_path):
@@ -649,6 +696,13 @@ def test_required_qdrant_endpoint_uses_redacted_topology(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("QDRANT_URL", "http://secret@hub.example.internal:6333?token=hidden")
     monkeypatch.setenv("QDRANT_API_KEY", "secret-qdrant-key")
+    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
+    monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "http://hub.example.internal:3002")
+    monkeypatch.setattr(
+        hermes_startup,
+        "_fetch_firecrawl_health",
+        lambda endpoint, api_key, timeout_seconds: {"ok": True},
+    )
 
     def fake_fetch(endpoint, api_key, timeout_seconds):
         assert endpoint == "http://secret@hub.example.internal:6333?token=hidden"
@@ -680,11 +734,13 @@ def test_required_firecrawl_without_endpoint_blocks_readiness(monkeypatch, tmp_p
     _write(hermes_home / "MEMORY.md", "memory")
     _write(hermes_home / "state.db", "state")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
+    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "0")
 
     report = build_hermes_startup_report()
 
     assert report["ready"] is False
+    assert report["firecrawl_web_search"]["required"] is True
+    assert report["firecrawl_web_search"]["mandatory"] is True
     assert report["firecrawl_web_search"]["status"] == "missing_endpoint"
     assert report["checks"]["firecrawl_web_search_ready"] is False
     assert "required Firecrawl web search endpoint is not configured" in " ".join(
@@ -726,6 +782,7 @@ def test_required_firecrawl_endpoint_ready(monkeypatch, tmp_path):
     _write(hermes_home / "MEMORY.md", "memory")
     _write(hermes_home / "state.db", "state")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
     monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
     monkeypatch.setenv("FIRECRAWL_API_URL", "http://secret@hub.example.internal:3002?token=hidden")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "secret-firecrawl-key")
@@ -742,6 +799,7 @@ def test_required_firecrawl_endpoint_ready(monkeypatch, tmp_path):
 
     assert report["ready"] is True
     assert report["firecrawl_web_search"]["status"] == "ready"
+    assert report["firecrawl_web_search"]["mandatory"] is True
     assert report["firecrawl_web_search"]["endpoint"] == "http://redacted@hub.example.internal:3002"
     assert report["checks"]["firecrawl_web_search_ready"] is True
     rendered = str(report)
@@ -779,6 +837,7 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
         ),
     )
     _prepare_direct_session_tools(monkeypatch, mac_home, workspace)
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
     context = build_runtime_context(
         agent_name="rocky",
         fleet_name="classic",
@@ -1096,7 +1155,7 @@ def test_required_task_project_runtime_context_blocks_when_prompt_bridge_missing
     assert "runtime prompt bridge is missing" in " ".join(report["warnings"])
 
 
-def test_qdrant_degraded_override_allows_startup(monkeypatch, tmp_path):
+def test_qdrant_degraded_override_does_not_allow_startup(monkeypatch, tmp_path):
     _clear_startup_env(monkeypatch)
     hermes_home = tmp_path / ".hermes"
     _write(hermes_home / "config.yaml", "model: local\n")
@@ -1109,10 +1168,34 @@ def test_qdrant_degraded_override_allows_startup(monkeypatch, tmp_path):
 
     report = build_hermes_startup_report()
 
-    assert report["ready"] is True
-    assert report["qdrant_level2"]["status"] == "degraded_allowed"
+    assert report["ready"] is False
+    assert report["qdrant_level2"]["status"] == "missing_endpoint"
+    assert report["qdrant_level2"]["degraded_allowed"] is False
     assert report["qdrant_level2"]["degradation_reason"]
-    assert report["warnings"] == []
+    assert "required Qdrant shared memory endpoint is not configured" in " ".join(
+        report["warnings"]
+    )
+
+
+def test_qdrant_disable_flag_does_not_allow_startup(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _configure_mandatory_shared_services(monkeypatch, hermes_home)
+    monkeypatch.setenv("MAC_QDRANT_MEMORY", "0")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["qdrant_level2"]["status"] == "disabled_by_env"
+    assert report["qdrant_level2"]["mandatory"] is True
+    assert "Qdrant shared memory is mandatory and cannot be disabled" in " ".join(
+        report["warnings"]
+    )
 
 
 def test_startup_includes_gateway_log_classification(monkeypatch, tmp_path):

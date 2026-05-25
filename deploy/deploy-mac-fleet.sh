@@ -1102,27 +1102,9 @@ install_hub_tunnel_pubkey() {
 }
 
 validate_qdrant_endpoint() {
-  local qdrant_url required allow_degraded
+  local qdrant_url
   qdrant_url="${QDRANT_URL:-${QDRANT_ADDRESS:-${QDRANT_FLEET_URL:-}}}"
-  required="${MAC_REQUIRE_QDRANT_MEMORY:-${QDRANT_REQUIRE:-1}}"
-  allow_degraded="${MAC_QDRANT_MEMORY_ALLOW_DEGRADED:-${ACC_QDRANT_MEMORY_ALLOW_DEGRADED:-0}}"
-  if ! truthy "$required"; then
-    if [ -z "$qdrant_url" ]; then
-      log "Qdrant shared memory is optional and no endpoint is configured"
-      return
-    fi
-    if curl -fsS --connect-timeout 2 --max-time 5 "${qdrant_url%/}/collections" >/dev/null; then
-      log "Optional Qdrant shared memory reachable at configured collections endpoint"
-    else
-      log "WARNING: optional Qdrant shared memory is unreachable at ${qdrant_url%/}/collections"
-    fi
-    return
-  fi
   if [ -z "$qdrant_url" ]; then
-    if truthy "$allow_degraded"; then
-      log "WARNING: Qdrant shared memory is required but no endpoint is configured; degraded override is active"
-      return
-    fi
     log "ERROR: Qdrant shared memory is required but no endpoint is configured"
     exit 1
   fi
@@ -1130,45 +1112,19 @@ validate_qdrant_endpoint() {
     log "Qdrant shared memory reachable at configured collections endpoint"
     return
   fi
-  if truthy "$allow_degraded"; then
-    log "WARNING: Qdrant shared memory is unreachable; degraded override is active"
-    return
-  fi
   log "ERROR: Qdrant shared memory is unreachable at ${qdrant_url%/}/collections"
   exit 1
 }
 
 validate_firecrawl_endpoint() {
-  local firecrawl_url required allow_degraded
+  local firecrawl_url
   firecrawl_url="${FIRECRAWL_API_URL:-${FIRECRAWL_GATEWAY_URL:-${FIRECRAWL_URL_CONFIGURED:-}}}"
-  required="${MAC_REQUIRE_FIRECRAWL:-${FIRECRAWL_REQUIRE:-1}}"
-  allow_degraded="${MAC_FIRECRAWL_ALLOW_DEGRADED:-${MAC_DEPLOY_ALLOW_DEGRADED_SERVICES:-0}}"
-  if ! truthy "$required"; then
-    if [ -z "$firecrawl_url" ]; then
-      log "Firecrawl web search is optional and no endpoint is configured"
-      return
-    fi
-    if curl -fsS --connect-timeout 2 --max-time 5 "${firecrawl_url%/}/health" >/dev/null; then
-      log "Optional Firecrawl web search reachable at configured health endpoint"
-    else
-      log "WARNING: optional Firecrawl web search is unreachable at ${firecrawl_url%/}/health"
-    fi
-    return
-  fi
   if [ -z "$firecrawl_url" ]; then
-    if truthy "$allow_degraded"; then
-      log "WARNING: Firecrawl web search is required but no endpoint is configured; degraded override is active"
-      return
-    fi
     log "ERROR: Firecrawl web search is required but no endpoint is configured"
     exit 1
   fi
   if curl -fsS --connect-timeout 2 --max-time 5 "${firecrawl_url%/}/health" >/dev/null; then
     log "Firecrawl web search reachable at configured health endpoint"
-    return
-  fi
-  if truthy "$allow_degraded"; then
-    log "WARNING: Firecrawl web search is unreachable; degraded override is active"
     return
   fi
   log "ERROR: Firecrawl web search is unreachable at ${firecrawl_url%/}/health"
@@ -1392,12 +1348,9 @@ firecrawl_url = (
 )
 safe_firecrawl_url = connection_url(firecrawl_url) if firecrawl_url else ""
 required = True
-degraded_allowed = truthy(
-    os.environ.get("MAC_QDRANT_MEMORY_ALLOW_DEGRADED")
-    or os.environ.get("ACC_QDRANT_MEMORY_ALLOW_DEGRADED")
-)
+degraded_allowed = False
 firecrawl_required = True
-firecrawl_degraded_allowed = truthy(os.environ.get("MAC_FIRECRAWL_ALLOW_DEGRADED"))
+firecrawl_degraded_allowed = False
 
 topology = {
     "schema": "mac.hermes.memory_topology.v1",
@@ -1433,6 +1386,7 @@ topology = {
             "role": "shared_level2_memory",
             "url": safe_qdrant_url,
             "required": required,
+            "mandatory": True,
             "degraded_allowed": degraded_allowed,
             "api_key_env": "QDRANT_API_KEY" if os.environ.get("QDRANT_API_KEY") else "",
         },
@@ -1442,6 +1396,7 @@ topology = {
             "role": "shared_web_search",
             "url": safe_firecrawl_url,
             "required": firecrawl_required,
+            "mandatory": True,
             "degraded_allowed": firecrawl_degraded_allowed,
             "api_key_env": "FIRECRAWL_API_KEY" if os.environ.get("FIRECRAWL_API_KEY") else "",
         }
@@ -4112,6 +4067,10 @@ def truthy(raw: str | None) -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def falsey(raw: str | None) -> bool:
+    return str(raw or "").strip().lower() in {"0", "false", "no", "off"}
+
+
 def stable_agent_id(name: str) -> str:
     import re
 
@@ -4205,7 +4164,9 @@ qdrant_url = str(
     or ""
 ).rstrip("/")
 qdrant_key = os.environ.get("QDRANT_API_KEY") or os.environ.get("QDRANT_FLEET_KEY") or ""
-qdrant_required = truthy(os.environ.get("MAC_REQUIRE_QDRANT_MEMORY") or "1")
+qdrant_required = True
+qdrant_required_flag = os.environ.get("MAC_REQUIRE_QDRANT_MEMORY")
+qdrant_disable_flag = os.environ.get("MAC_QDRANT_MEMORY") or os.environ.get("ACC_QDRANT_MEMORY")
 firecrawl_url = str(
     os.environ.get("FIRECRAWL_API_URL")
     or os.environ.get("FIRECRAWL_GATEWAY_URL")
@@ -4213,7 +4174,8 @@ firecrawl_url = str(
     or ""
 ).rstrip("/")
 firecrawl_key = os.environ.get("FIRECRAWL_API_KEY") or ""
-firecrawl_required = truthy(os.environ.get("MAC_REQUIRE_FIRECRAWL") or "1")
+firecrawl_required = True
+firecrawl_required_flag = os.environ.get("MAC_REQUIRE_FIRECRAWL")
 timeout = int(os.environ.get("MAC_AGENT_STARTUP_SELF_TEST_TIMEOUT") or "120")
 python_bin = str(mac_home / "hermes-agent" / ".venv" / "bin" / "python")
 hermes_script = str(mac_home / "hermes-agent" / "hermes")
@@ -4288,6 +4250,10 @@ if tokenhub_required and not tokenhub_url:
 if tokenhub_required and not tokenhub_key:
     problems.append("TOKENHUB_API_KEY is required but not configured")
 
+if not truthy(qdrant_required_flag):
+    problems.append("MAC_REQUIRE_QDRANT_MEMORY must be true")
+if falsey(qdrant_disable_flag):
+    problems.append("Qdrant shared memory is mandatory and cannot be disabled")
 qdrant_headers = {"Accept": "application/json"}
 if qdrant_key:
     qdrant_headers["api-key"] = qdrant_key
@@ -4298,9 +4264,9 @@ elif qdrant_url:
     if not ok:
         problems.append(f"Qdrant shared memory endpoint is unreachable: {error}")
     checks["qdrant_shared_memory"] = ok
-elif not qdrant_required:
-    checks["qdrant_shared_memory"] = True
 
+if not truthy(firecrawl_required_flag):
+    problems.append("MAC_REQUIRE_FIRECRAWL must be true")
 firecrawl_headers = {"Accept": "application/json"}
 if firecrawl_key and firecrawl_key.lower() != "none":
     firecrawl_headers["Authorization"] = f"Bearer {firecrawl_key}"
@@ -4311,8 +4277,6 @@ elif firecrawl_url:
     if not ok:
         problems.append(f"Firecrawl web search endpoint is unreachable: {error}")
     checks["firecrawl_web_search"] = ok
-elif not firecrawl_required:
-    checks["firecrawl_web_search"] = True
 
 try:
     sys.path.insert(0, str(mac_home / "hermes-agent"))
@@ -4392,6 +4356,21 @@ report = {
     "persona_id": persona_id,
     "tenant_id": tenant_id,
     "checks": checks,
+    "mandatory_services": {
+        "qdrant_shared_memory": {
+            "required": qdrant_required,
+            "required_flag": "MAC_REQUIRE_QDRANT_MEMORY",
+            "required_flag_true": truthy(qdrant_required_flag),
+            "disabled_by_env": falsey(qdrant_disable_flag),
+            "url_configured": bool(qdrant_url),
+        },
+        "firecrawl_web_search": {
+            "required": firecrawl_required,
+            "required_flag": "MAC_REQUIRE_FIRECRAWL",
+            "required_flag_true": truthy(firecrawl_required_flag),
+            "url_configured": bool(firecrawl_url),
+        },
+    },
     "runtime_provider": runtime_provider,
     "chat_returncode": chat_returncode,
     "chat_output_tail": chat_output,
@@ -5407,13 +5386,13 @@ main() {
     allow_degraded_services=0
     if [ "$agent" != "$hub_agent" ] && ! uses_direct_mesh_hub "$network_provider_field" "$hub_url_field"; then
       # Detect brand-new nodes: if the remote mac API is unreachable before deploy,
-      # the hub tunnel key has not been authorized yet. Allow hub-managed services
-      # (TokenHub, Firecrawl) to be degraded for this first deploy; they will be
-      # re-checked after the tunnel auto-establishes post-deploy.
+      # the hub tunnel key has not been authorized yet. Allow TokenHub to be
+      # degraded for this first deploy; Qdrant and Firecrawl remain mandatory
+      # and are checked after the tunnel is established below.
       if ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$local_target" \
         "curl -fsS --max-time 3 http://127.0.0.1:8789/health >/dev/null 2>&1" 2>/dev/null; then
         allow_degraded_services=1
-        echo "==> ${agent}: first deploy (no existing mac API); hub-managed services degraded override active"
+        echo "==> ${agent}: first deploy (no existing mac API); TokenHub degraded override active"
       fi
       # Update the hub's reverse-tunnel conf and wait for it BEFORE deploying the
       # worker. The worker validates hub-managed TokenHub, Qdrant, and Firecrawl
