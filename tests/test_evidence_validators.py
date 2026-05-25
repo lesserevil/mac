@@ -124,3 +124,21 @@ def test_review_verdict_validator_requires_verdict_anchor_and_digest():
     )
     assert "review_verdict evidence requires reviewed_evidence_id" in problems
     assert "review_verdict evidence requires worktree_digest sha256" in problems
+
+
+def test_review_verdict_validator_allows_repo_less_operator_result_verdict():
+    manifest = {
+        "schema": "mac.worker_evidence.v1",
+        "status": "complete",
+        "evidence_type": "review_verdict",
+        "verdict": "approved",
+        "reviewed_evidence_id": "ev_123",
+        "worktree_digest": "sha256:" + "0" * 64,
+        "checks": [{"name": "reviewer independent verification", "returncode": 0}],
+    }
+
+    assert validate_evidence_type(
+        "review_verdict",
+        manifest,
+        passed_check_count=_passed_check_count,
+    ) == []

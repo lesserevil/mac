@@ -213,7 +213,6 @@ class ReviewVerdictValidator(EvidenceValidator):
         if not WORKTREE_DIGEST_RE.match(digest):
             problems.append("review_verdict evidence requires worktree_digest sha256")
         if verdict == "approved":
-            problems.extend(self.require_pushed_repo_anchor(manifest))
             if self.passed_checks(manifest, context) < 1:
                 problems.append("review_verdict evidence requires at least one independent passing check")
         return problems

@@ -9356,18 +9356,20 @@ class ControlPlane:
                 continue
             if verdict == "rejected":
                 return evidence, []
-            repo_problems = self._require_pushed_repo_anchor(manifest)
-            if repo_problems:
-                problems.extend("verdict %s %s" % (evidence.id, problem) for problem in repo_problems)
-                continue
-            reviewed_sha = str((manifest.get("repo") or {}).get("head_sha") or "").strip()
-            executor_sha = str((executor_manifest.get("repo") or {}).get("head_sha") or "").strip()
-            if reviewed_sha != executor_sha:
-                problems.append(
-                    "verdict %s repo.head_sha does not match executor evidence: %s != %s"
-                    % (evidence.id, reviewed_sha, executor_sha)
-                )
-                continue
+            executor_repo = executor_manifest.get("repo")
+            if isinstance(executor_repo, dict):
+                repo_problems = self._require_pushed_repo_anchor(manifest)
+                if repo_problems:
+                    problems.extend("verdict %s %s" % (evidence.id, problem) for problem in repo_problems)
+                    continue
+                reviewed_sha = str((manifest.get("repo") or {}).get("head_sha") or "").strip()
+                executor_sha = str(executor_repo.get("head_sha") or "").strip()
+                if reviewed_sha != executor_sha:
+                    problems.append(
+                        "verdict %s repo.head_sha does not match executor evidence: %s != %s"
+                        % (evidence.id, reviewed_sha, executor_sha)
+                    )
+                    continue
             if self._passed_verification_check_count(manifest) < 1:
                 problems.append("verdict %s requires at least one independent passing check" % evidence.id)
                 continue
