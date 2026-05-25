@@ -85,7 +85,7 @@ def finish_task(cp, task_id):
     review = cp.request_review(task_id, reviewer.id)
     verdict_id = submit_review_verdict(cp, task_id, reviewer.id, evidence.id)
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
-    cp.publish_task(task_id, "git://main", reviewer.id, evidence_id=evidence.id)
+    cp.publish_task(task_id, "test://publish", reviewer.id, evidence_id=evidence.id)
 
 
 def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
@@ -328,7 +328,7 @@ def test_hermes_adapter_summarizes_result_and_prepares_memory_writeback():
     summary = adapter.task_summary(task["id"])
     assert summary["state"] == "completed"
     assert summary["approved_review_count"] == 1
-    assert adapter.user_reply_for_task(task["id"]) == "Fix build is complete and published to git://main."
+    assert adapter.user_reply_for_task(task["id"]) == "Fix build is complete and published to test://publish."
 
     writes = []
     writeback = adapter.write_completed_task_to_memory(
@@ -337,7 +337,7 @@ def test_hermes_adapter_summarizes_result_and_prepares_memory_writeback():
         sink=writes.append,
     )
     assert writes[0]["memory_scope"] == "hermes://team/natasha/memory"
-    assert writes[0]["content"] == "Fix build is complete and published to git://main."
+    assert writes[0]["content"] == "Fix build is complete and published to test://publish."
     assert writeback["record"]["subject_type"] == "hermes_memory"
     assert cp.search_memory(task_id=task["id"])[0].record_type == "task_result_writeback"
 
@@ -435,7 +435,7 @@ def test_hermes_adapter_performs_task_lifecycle_operations_through_api():
     assert decision["status"] == ReviewStatus.APPROVED.value
     publication = adapter.publish_task(
         task["id"],
-        "git://main",
+        "test://publish",
         reviewer.id,
         evidence_id=evidence["id"],
     )

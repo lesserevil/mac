@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -37,6 +38,11 @@ StatusUpdateSink = Callable[[JsonDict], JsonDict]
 SAFE_GIT_REF_RE = r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$"
 VERIFICATION_SCHEMA = "mac.worker_evidence.v1"
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+REQUIRED_CHANGED_FILE_KEYS = (
+    "required_changed_files",
+    "required_files",
+    "required_repo_files",
+)
 
 
 @dataclass
@@ -1637,6 +1643,7 @@ class MacWorker:
                     ),
                 )
             )
+            problems.extend(_worker_required_changed_file_problems(task_payload, manifest))
 
         repository_context = _load_repository_context(task_dir)
         if repository_context:
@@ -2253,6 +2260,95 @@ def _manifest_list(value: Any) -> List[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def _normalize_repo_relative_path(value: Any) -> str:
+    path = str(value or "").strip().replace("\\", "/")
+    path = re.sub(r"/+", "/", path)
+    while path.startswith("./"):
+        path = path[2:]
+    return path.strip("/")
+
+
+def _metadata_path_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        return []
+    paths: List[str] = []
+    seen = set()
+    for item in values:
+        path = _normalize_repo_relative_path(item)
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _nested_dict(root: JsonDict, *keys: str) -> JsonDict:
+    node: Any = root
+    for key in keys:
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return dict(node) if isinstance(node, dict) else {}
+
+
+def _required_changed_files_from_task(task: JsonDict) -> List[str]:
+    metadata = task.get("metadata") if isinstance(task, dict) else {}
+    if not isinstance(metadata, dict):
+        return []
+    containers = [
+        metadata,
+        _nested_dict(metadata, "acceptance"),
+        _nested_dict(metadata, "execution_contract"),
+        _nested_dict(metadata, "execution_contract", "evidence"),
+        _nested_dict(metadata, "execution_contract", "repository_contract"),
+        _nested_dict(metadata, "execution_contract", "repository_contract", "evidence"),
+        _nested_dict(metadata, "origin", "repository_contract"),
+        _nested_dict(metadata, "origin", "repository_contract", "evidence"),
+        _nested_dict(metadata, "repository_contract"),
+        _nested_dict(metadata, "repository_contract", "evidence"),
+    ]
+    required: List[str] = []
+    seen = set()
+    for container in containers:
+        if not container:
+            continue
+        for key in REQUIRED_CHANGED_FILE_KEYS:
+            for path in _metadata_path_list(container.get(key)):
+                if path not in seen:
+                    seen.add(path)
+                    required.append(path)
+    return required
+
+
+def _repo_path_satisfies_requirement(changed_path: str, required_path: str) -> bool:
+    changed = _normalize_repo_relative_path(changed_path)
+    required = _normalize_repo_relative_path(required_path)
+    if not changed or not required:
+        return False
+    if any(char in required for char in "*?["):
+        return fnmatch.fnmatchcase(changed, required)
+    return changed == required
+
+
+def _worker_required_changed_file_problems(task: JsonDict, manifest: JsonDict) -> List[str]:
+    required = _required_changed_files_from_task(task)
+    if not required:
+        return []
+    repo = manifest.get("repo") if isinstance(manifest.get("repo"), dict) else {}
+    changed = _metadata_path_list(repo.get("files_changed")) if isinstance(repo, dict) else []
+    missing = [
+        path
+        for path in required
+        if not any(_repo_path_satisfies_requirement(item, path) for item in changed)
+    ]
+    if not missing:
+        return []
+    return ["repo evidence missing required changed files: %s" % ", ".join(missing)]
 
 
 def _remote_branch_from_ref(remote_ref: str) -> str:

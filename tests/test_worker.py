@@ -262,7 +262,7 @@ def test_mac_worker_processes_review_nudge_and_records_signed_verdict(tmp_path: 
     task = cp.create_task(
         "Reviewable repo task",
         required_capabilities=["python"],
-        metadata={"publication_target": "git://main"},
+        metadata={"publication_target": "test://publish"},
     )
     cp.claim_task(task.id, executor_agent.id)
     cp.start_task(task.id, executor_agent.id)
@@ -482,7 +482,7 @@ def test_mac_worker_skips_stale_review_nudge_and_processes_next(tmp_path: Path):
         task = cp.create_task(
             title,
             required_capabilities=["python"],
-            metadata={"publication_target": "git://main"},
+            metadata={"publication_target": "test://publish"},
         )
         cp.claim_task(task.id, executor_agent.id)
         cp.start_task(task.id, executor_agent.id)
@@ -980,6 +980,62 @@ def test_mac_worker_auto_publishes_repository_worktree_when_enabled(tmp_path: Pa
     assert _git(repo, "ls-remote", "origin", "refs/heads/%s" % branch).startswith(
         repo_anchor["head_sha"]
     )
+
+
+def test_mac_worker_fails_when_required_changed_files_are_missing(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    _git(repo, "config", "user.email", "mac-tests@example.invalid")
+    _git(repo, "config", "user.name", "mac tests")
+    metadata = _repository_task_metadata(repo)
+    metadata["execution_contract"]["evidence_type"] = "documentation"
+    metadata["execution_contract"]["required_changed_files"] = [
+        "README.md",
+        "docs/demo-story.md",
+    ]
+    metadata["repository_auto_publish"] = True
+    task = cp.create_task(
+        "Repository docs task with required files",
+        required_capabilities=["python"],
+        metadata=metadata,
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        worktree = Path(task_payload["metadata"]["runtime"]["repository_worktree"])
+        docs = worktree / "docs"
+        docs.mkdir()
+        (docs / "demo-story.md").write_text("demo\n", encoding="utf-8")
+        (task_dir / "mac-evidence.json").write_text(
+            json.dumps(
+                {
+                    "schema": "mac.worker_evidence.v1",
+                    "status": "complete",
+                    "evidence_type": "documentation",
+                    "summary": "docs updated",
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return WorkerExecution(0, "docs updated", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert "README.md" in (result.error or "")
+    assert cp.get_task(task.id).state == TaskState.FAILED.value
+    assert cp.list_reviews(task.id) == []
 
 
 def test_mac_worker_fails_dirty_repository_worktree_after_success(tmp_path: Path):

@@ -37,6 +37,10 @@ def test_c26_project_inception_proof_covers_epic_review_parallel_slack_and_demo(
     assert "Slack" in demo_task["description"]
     assert "make smoke" in demo_task["description"]
     assert "feedback" in demo_task["description"]
+    assert demo_task["metadata"]["execution_contract"]["required_changed_files"] == [
+        "README.md",
+        "docs/demo-story.md",
+    ]
 
 
 def test_c26_project_inception_proof_records_actual_repository_state(tmp_path):

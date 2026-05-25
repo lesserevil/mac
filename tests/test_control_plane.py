@@ -142,6 +142,7 @@ def verified_repo_metadata(
     cp=None,
     agent_id=None,
     head_sha="abcdef1234567890abcdef1234567890abcdef12",
+    files_changed=None,
 ):
     manifest = {
         "schema": "mac.worker_evidence.v1",
@@ -152,7 +153,7 @@ def verified_repo_metadata(
             "pushed": True,
             "remote_ref": "refs/heads/task/example",
             "dirty": False,
-            "files_changed": ["src/example.py"],
+            "files_changed": files_changed if files_changed is not None else ["src/example.py"],
         },
         "tests": [{"command": "pytest tests/test_example.py", "returncode": 0}],
     }
@@ -615,7 +616,7 @@ def finish_task(cp, task, worker, reviewer):
     review = cp.request_review(task.id, reviewer.id)
     verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
-    cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+    cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=evidence.id)
     return cp.get_task(task.id)
 
 
@@ -648,7 +649,7 @@ def test_task_lifecycle_requires_evidence_review_and_publication(cp):
 
     verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
-    publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+    publication = cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=evidence.id)
 
     completed = cp.get_task(task.id)
     assert completed.state == TaskState.COMPLETED.value
@@ -1037,6 +1038,105 @@ def test_default_review_workflow_rejects_unpushed_repo_manifest(cp):
     assert result["status"] == "waiting_for_verifiable_evidence"
     assert "repo evidence requires pushed=true" in result["rejected_evidence"][0]["problems"][-1]
     assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
+def test_submit_for_review_requires_declared_required_changed_files(cp):
+    worker = register_agent(cp, "worker", ["python"])
+    register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "Write final demo docs",
+        required_capabilities=["python"],
+        metadata={
+            "execution_contract": {
+                "schema": "mac.task_execution_contract.v1",
+                "type": "repository",
+                "required_changed_files": ["README.md", "docs/demo-story.md"],
+            }
+        },
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    cp.add_evidence(
+        task.id,
+        "log",
+        "artifact://worker-result",
+        "demo story only",
+        worker.id,
+        metadata=verified_repo_metadata(
+            cp,
+            worker.id,
+            files_changed=["docs/demo-story.md"],
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="README.md"):
+        cp.submit_for_review(task.id, worker.id)
+    cp.store.execute(
+        "UPDATE tasks SET state = ? WHERE id = ?",
+        (TaskState.NEEDS_REVIEW.value, task.id),
+    )
+
+    result = cp.advance_default_review_workflow(task.id)
+
+    assert result["status"] == "waiting_for_verifiable_evidence"
+    assert "README.md" in result["rejected_evidence"][0]["problems"][-1]
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+
+
+def test_publication_revalidates_declared_required_changed_files(cp):
+    from tests.conftest import submit_review_verdict
+
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task(
+        "Write final demo docs",
+        required_capabilities=["python"],
+        metadata={
+            "execution_contract": {
+                "schema": "mac.task_execution_contract.v1",
+                "type": "repository",
+                "required_changed_files": ["README.md", "docs/demo-story.md"],
+            }
+        },
+    )
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    reviewed_evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://complete",
+        "complete docs",
+        worker.id,
+        metadata=verified_repo_metadata(
+            cp,
+            worker.id,
+            files_changed=["README.md", "docs/demo-story.md"],
+        ),
+    )
+    incomplete_evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://incomplete",
+        "demo story only",
+        worker.id,
+        metadata=verified_repo_metadata(
+            cp,
+            worker.id,
+            files_changed=["docs/demo-story.md"],
+        ),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    verdict_id = submit_review_verdict(cp, task.id, reviewer.id, reviewed_evidence.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
+
+    with pytest.raises(ValidationError, match="README.md"):
+        cp.publish_task(
+            task.id,
+            "test://publish",
+            reviewer.id,
+            evidence_id=incomplete_evidence.id,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3634,7 +3734,7 @@ def test_beads_bridge_syncs_publication_close_to_beads(cp, tmp_path, monkeypatch
 
     verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
-    cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+    cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=evidence.id)
 
     close_calls = [
         call for call in calls if len(call["command"]) > 3 and call["command"][3] == "close"
@@ -4003,9 +4103,34 @@ def test_completion_requires_evidence_linked_from_approved_review(cp):
 
     verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
-    publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+    publication = cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=evidence.id)
     assert publication.status == "published"
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value
+
+
+def test_git_main_publication_requires_repository_path(cp):
+    from tests.conftest import submit_review_verdict
+
+    worker = register_agent(cp, "worker", ["python"])
+    reviewer = register_agent(cp, "reviewer", ["review"])
+    task = cp.create_task("publish branch", required_capabilities=["python"])
+    cp.claim_task(task.id, worker.id)
+    cp.start_task(task.id, worker.id)
+    evidence = cp.add_evidence(
+        task.id,
+        "test",
+        "artifact://t",
+        "tests passed",
+        worker.id,
+        metadata=verified_repo_metadata(cp, worker.id),
+    )
+    cp.submit_for_review(task.id, worker.id)
+    review = cp.request_review(task.id, reviewer.id)
+    verdict_id = submit_review_verdict(cp, task.id, reviewer.id, evidence.id)
+    cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
+
+    with pytest.raises(ValidationError, match="origin.repository_path"):
+        cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
 
 
 def test_git_publication_merges_non_fast_forward_task_branch(cp, tmp_path):
@@ -4324,7 +4449,7 @@ def test_publication_requires_verifiable_review_verdict_not_plain_approval(cp):
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=evidence.id)
 
     with pytest.raises(ValidationError, match="review_verdict"):
-        cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=evidence.id)
+        cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=evidence.id)
 
 
 def test_publication_policy_requires_publication_evidence_with_hash(cp):
@@ -4353,21 +4478,21 @@ def test_publication_policy_requires_publication_evidence_with_hash(cp):
     cp.submit_review(review.id, ReviewStatus.APPROVED.value, reviewer.id, evidence_id=verdict_id)
 
     with pytest.raises(ValidationError):
-        cp.publish_task(task.id, "git://main", reviewer.id)
+        cp.publish_task(task.id, "test://publish", reviewer.id)
     with pytest.raises(ValidationError):
-        cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=test_evidence.id)
+        cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=test_evidence.id)
     with pytest.raises(ValidationError):
-        cp.add_evidence(task.id, "publication", "git://main", "published", reviewer.id)
+        cp.add_evidence(task.id, "publication", "test://publish", "published", reviewer.id)
 
     pub_evidence = cp.add_evidence(
         task.id,
         "publication",
-        "git://main",
+        "test://publish",
         "published",
         reviewer.id,
         checksum="sha256:abc123",
     )
-    publication = cp.publish_task(task.id, "git://main", reviewer.id, evidence_id=pub_evidence.id)
+    publication = cp.publish_task(task.id, "test://publish", reviewer.id, evidence_id=pub_evidence.id)
 
     assert publication.content_hash == "sha256:abc123"
     assert cp.get_task(task.id).state == TaskState.COMPLETED.value

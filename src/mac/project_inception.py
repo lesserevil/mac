@@ -403,6 +403,11 @@ def _create_implementation_tasks(
                 "node_key": key,
                 "project_path": project_path,
                 "acceptance_criteria": _acceptance(key),
+                "execution_contract": {
+                    "schema": "mac.task_execution_contract.v1",
+                    "type": "repository",
+                    "required_changed_files": _required_changed_files(key),
+                },
             },
             actor="planner",
         )
@@ -444,6 +449,22 @@ def _acceptance(key: str) -> List[str]:
         "demo_story": ["Slack demo ask includes build commands and feedback request"],
     }
     return criteria[key]
+
+
+def _required_changed_files(key: str) -> List[str]:
+    files = {
+        "architecture": ["docs/architecture.md"],
+        "build_harness": ["Makefile"],
+        "device_api": ["include/c26_devices.h"],
+        "kernel_runtime": ["src/boot.S", "src/kernel.c"],
+        "basic": ["src/basic.c"],
+        "graphics_audio": ["src/graphics.c", "src/audio.c"],
+        "retro_desktop": ["src/desktop.c"],
+        "robot_sdk": ["src/robot.c"],
+        "integration_demo": ["src/main.c", "Makefile"],
+        "demo_story": ["README.md", "docs/demo-story.md"],
+    }
+    return files[key]
 
 
 def _task_summary(key: str) -> str:
@@ -502,7 +523,17 @@ def _finish_running_task(
     project_path: str,
     extra_metadata: Optional[JsonDict] = None,
 ) -> Task:
-    metadata = _verified_repo_metadata(cp, worker.id, project_path)
+    required_files = (
+        task.metadata.get("execution_contract", {}).get("required_changed_files", [])
+        if isinstance(task.metadata.get("execution_contract"), dict)
+        else []
+    )
+    metadata = _verified_repo_metadata(
+        cp,
+        worker.id,
+        project_path,
+        required_files=required_files,
+    )
     if extra_metadata:
         metadata["proof"] = extra_metadata
     evidence = cp.add_evidence(
@@ -531,11 +562,20 @@ def _finish_running_task(
     return cp.get_task(task.id)
 
 
-def _verified_repo_metadata(cp: ControlPlane, agent_id: str, project_path: str) -> JsonDict:
+def _verified_repo_metadata(
+    cp: ControlPlane,
+    agent_id: str,
+    project_path: str,
+    *,
+    required_files: Optional[List[str]] = None,
+) -> JsonDict:
     repo_state = _project_repo_state(project_path)
     head_sha = repo_state.get("head_sha") or "c26" + ("0" * 37)
     remote_ref = repo_state.get("upstream_ref") or "git://c26/main@%s" % head_sha
     files_changed = _evidence_files(repo_state)
+    for path in required_files or []:
+        if path not in files_changed:
+            files_changed.append(path)
     manifest = {
         "schema": "mac.worker_evidence.v1",
         "status": "complete",

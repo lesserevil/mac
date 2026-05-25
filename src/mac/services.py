@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
 import os
 import re
@@ -153,6 +154,83 @@ def _metadata_string_list(value: Any) -> List[str]:
     if not isinstance(value, Iterable):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+_REQUIRED_CHANGED_FILE_KEYS = (
+    "required_changed_files",
+    "required_files",
+    "required_repo_files",
+)
+
+
+def _normalize_repo_relative_path(value: Any) -> str:
+    path = str(value or "").strip().replace("\\", "/")
+    path = re.sub(r"/+", "/", path)
+    while path.startswith("./"):
+        path = path[2:]
+    return path.strip("/")
+
+
+def _metadata_path_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, Iterable) and not isinstance(value, dict):
+        values = list(value)
+    else:
+        return []
+    paths: List[str] = []
+    seen = set()
+    for item in values:
+        path = _normalize_repo_relative_path(item)
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _nested_json_object(root: JsonDict, *keys: str) -> JsonDict:
+    node: Any = root
+    for key in keys:
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return ensure_json_object(node) if isinstance(node, dict) else {}
+
+
+def _required_changed_files_from_metadata(metadata: JsonDict) -> List[str]:
+    containers = [
+        ensure_json_object(metadata),
+        _nested_json_object(metadata, "acceptance"),
+        _nested_json_object(metadata, "execution_contract"),
+        _nested_json_object(metadata, "execution_contract", "evidence"),
+        _nested_json_object(metadata, "execution_contract", "repository_contract"),
+        _nested_json_object(metadata, "execution_contract", "repository_contract", "evidence"),
+        _nested_json_object(metadata, "origin", "repository_contract"),
+        _nested_json_object(metadata, "origin", "repository_contract", "evidence"),
+        _nested_json_object(metadata, "repository_contract"),
+        _nested_json_object(metadata, "repository_contract", "evidence"),
+    ]
+    required: List[str] = []
+    seen = set()
+    for container in containers:
+        if not container:
+            continue
+        for key in _REQUIRED_CHANGED_FILE_KEYS:
+            for path in _metadata_path_list(container.get(key)):
+                if path not in seen:
+                    seen.add(path)
+                    required.append(path)
+    return required
+
+
+def _repo_path_satisfies_requirement(changed_path: str, required_path: str) -> bool:
+    changed = _normalize_repo_relative_path(changed_path)
+    required = _normalize_repo_relative_path(required_path)
+    if not changed or not required:
+        return False
+    if any(char in required for char in "*?["):
+        return fnmatch.fnmatchcase(changed, required)
+    return changed == required
 
 
 def _truthy_env(name: str, default: str = "") -> bool:
@@ -5091,7 +5169,7 @@ class ControlPlane:
         origin = ensure_json_object(metadata.get("origin"))
         repo_path_raw = str(origin.get("repository_path") or "").strip()
         if not repo_path_raw:
-            return {"status": "skipped", "reason": "task_has_no_repository_path"}
+            raise ValidationError("git publication requires task origin.repository_path")
         repo_path = Path(repo_path_raw).expanduser()
         if not repo_path.exists():
             raise ValidationError("git publication repository path does not exist: %s" % repo_path)
@@ -5109,11 +5187,9 @@ class ControlPlane:
 
         top = self._git_output(repo_path, ["rev-parse", "--show-toplevel"])
         if top["returncode"] != 0 or not top.get("stdout"):
-            return {
-                "status": "skipped",
-                "reason": "repository_path_not_git_worktree",
-                "repository_path": str(repo_path),
-            }
+            raise ValidationError(
+                "git publication repository path is not a git worktree: %s" % repo_path
+            )
         root = Path(str(top["stdout"])).expanduser()
         dirty = self._git_output(root, ["status", "--porcelain"])
         if dirty["returncode"] != 0:
@@ -9118,12 +9194,31 @@ class ControlPlane:
         manifest: JsonDict,
         evidence_type: str,
     ) -> List[str]:
-        return validate_evidence_type(
+        problems = validate_evidence_type(
             evidence_type,
             manifest,
             passed_check_count=self._passed_verification_check_count,
             allow_empty_repo_change=self._allows_empty_repo_change_evidence(task, evidence_type),
         )
+        problems.extend(self._required_changed_file_problems(task, manifest))
+        return problems
+
+    def _required_changed_file_problems(self, task: Task, manifest: JsonDict) -> List[str]:
+        required = _required_changed_files_from_metadata(ensure_json_object(task.metadata))
+        if not required:
+            return []
+        repo = manifest.get("repo") if isinstance(manifest.get("repo"), dict) else {}
+        changed = _metadata_path_list(repo.get("files_changed")) if isinstance(repo, dict) else []
+        missing = [
+            path
+            for path in required
+            if not any(_repo_path_satisfies_requirement(item, path) for item in changed)
+        ]
+        if not missing:
+            return []
+        return [
+            "repo evidence missing required changed files: %s" % ", ".join(missing)
+        ]
 
     def _allows_empty_repo_change_evidence(self, task: Task, evidence_type: str) -> bool:
         if str(evidence_type or "").strip().lower() != "repo_change":
