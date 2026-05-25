@@ -473,6 +473,7 @@ def build_runtime_context(
                 "mac-hermes tasks --state open",
             ],
             "project_bridge": [
+                "mac-hermes create-project <name> --description <description>",
                 "mac-hermes projects",
                 "mac-hermes project-detail <project>",
                 "mac-hermes import-project-item <source> <external_id> <title> --project <project>",

@@ -301,6 +301,26 @@ class HermesMacAdapter:
             return self.client.get(path)
         return self.client.post(path, {"hermes_startup": _sanitize_json_object(hermes_startup)})
 
+    def create_project(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        metadata: Optional[JsonDict] = None,
+        status: str = "active",
+        actor: str = "hermes",
+    ) -> JsonDict:
+        return self.client.post(
+            "/projects",
+            {
+                "name": name,
+                "description": description,
+                "metadata": _sanitize_json_object(metadata or {}),
+                "status": status,
+                "actor": actor,
+            },
+        )
+
     def import_project_item(
         self,
         source: str,
@@ -915,6 +935,18 @@ def _cmd_project_items(args: argparse.Namespace) -> None:
     _print(_adapter(args).list_project_items())
 
 
+def _cmd_create_project(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).create_project(
+            args.name,
+            args.description or "",
+            metadata=_json_arg(args.metadata, {}),
+            status=args.status,
+            actor=args.actor,
+        )
+    )
+
+
 def _cmd_projects(args: argparse.Namespace) -> None:
     _print(_adapter(args).list_projects())
 
@@ -1222,6 +1254,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     project_items = sub.add_parser("project-items", help="list MAC bridge project items")
     project_items.set_defaults(func=_cmd_project_items)
+
+    create_project = sub.add_parser("create-project", help="create a first-class MAC project")
+    create_project.add_argument("name")
+    create_project.add_argument("--description", default="")
+    create_project.add_argument("--metadata", default="{}")
+    create_project.add_argument("--status", default="active")
+    create_project.add_argument("--actor", default="hermes")
+    create_project.set_defaults(func=_cmd_create_project)
 
     projects = sub.add_parser("projects", help="list MAC project summaries")
     projects.set_defaults(func=_cmd_projects)

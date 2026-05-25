@@ -186,6 +186,19 @@ def cmd_project_list(args: argparse.Namespace) -> None:
     _print(_plane(args).list_projects())
 
 
+def cmd_project_create(args: argparse.Namespace) -> None:
+    _print(
+        _plane(args).create_project(
+            args.name,
+            description=args.description or "",
+            metadata=_json_arg(args.metadata, {}),
+            status=args.status,
+            actor=args.actor,
+            project_id=args.project_id,
+        )
+    )
+
+
 def cmd_project_show(args: argparse.Namespace) -> None:
     _print(_plane(args).get_project(args.project))
 
@@ -1038,6 +1051,14 @@ def build_parser() -> argparse.ArgumentParser:
     _set(cmd_task_evidence, evidence)
 
     project = sub.add_parser("project", help="project summary commands").add_subparsers(dest="project_command", required=True)
+    project_create = project.add_parser("create")
+    project_create.add_argument("name")
+    project_create.add_argument("--description", default="")
+    project_create.add_argument("--metadata", default="{}")
+    project_create.add_argument("--status", default="active")
+    project_create.add_argument("--actor", default="human")
+    project_create.add_argument("--project-id")
+    _set(cmd_project_create, project_create)
     project_list = project.add_parser("list")
     _set(cmd_project_list, project_list)
     project_show = project.add_parser("show")

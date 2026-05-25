@@ -65,6 +65,7 @@ from mac.models import (
     OperatorNotification,
     Persona,
     PlatformBinding,
+    ProjectRecord,
     ProjectItem,
     Publication,
     PublicationStatus,
@@ -646,6 +647,7 @@ class ControlPlane:
                 agents,
                 project_items,
                 repositories,
+                [project.to_dict() for project in self.list_project_records()],
             ),
             "tasks": [self._hermes_task_context(task) for task in limited_tasks],
             "task_count": len(visible_tasks),
@@ -699,6 +701,7 @@ class ControlPlane:
             "write_completed_task_to_memory",
         }
         expected_project_api_operations = {
+            "create_project",
             "list_projects",
             "get_project",
             "import_project_item",
@@ -836,6 +839,7 @@ class ControlPlane:
             live_agents,
             [item.to_dict() for item in self.list_project_items()],
             [repository.to_dict() for repository in self.list_beads_repositories()],
+            [project.to_dict() for project in self.list_project_records()],
         )
         live_alignment = {
             "schema": "mac.hermes.live_object_alignment.v1",
@@ -1483,6 +1487,7 @@ class ControlPlane:
         agents: List[Agent],
         project_items: List[JsonDict],
         repositories: List[JsonDict],
+        project_records: Optional[List[JsonDict]] = None,
     ) -> List[JsonDict]:
         task_by_id = {task.id: task for task in tasks}
         agent_by_id = {agent.id: agent for agent in agents}
@@ -1510,8 +1515,23 @@ class ControlPlane:
                     "cross_project_edges": [],
                     "bridge_item_count": 0,
                     "repository_count": 0,
+                    "description": "",
+                    "status": "derived",
+                    "metadata": {},
+                    "project_id": None,
                 }
             return buckets[project]
+
+        for record in project_records or []:
+            name = str(record.get("name") or record.get("project") or "").strip()
+            if not name:
+                continue
+            item = bucket(name)
+            item["description"] = str(record.get("description") or "")
+            item["status"] = str(record.get("status") or "active")
+            metadata = record.get("metadata")
+            item["metadata"] = metadata if isinstance(metadata, dict) else {}
+            item["project_id"] = record.get("id")
 
         for task in tasks:
             project = self._hermes_task_project_key(task)
@@ -1765,6 +1785,11 @@ class ControlPlane:
                     "path": "/memory",
                 },
                 {
+                    "name": "create_project",
+                    "method": "POST",
+                    "path": "/projects",
+                },
+                {
                     "name": "list_projects",
                     "method": "GET",
                     "path": "/projects",
@@ -1823,6 +1848,7 @@ class ControlPlane:
             "mac_cli": [
                 "mac hermes work-context %s" % hermes_instance_id,
                 "mac hermes runtime-proof %s" % hermes_instance_id,
+                "mac project create <name> --description <description>",
                 "mac project list",
                 "mac project show <project>",
                 "mac bridge import <source> <external_id> <title> --project <project>",
@@ -1840,6 +1866,7 @@ class ControlPlane:
             "mac_hermes_cli": [
                 "mac-hermes work-context %s" % hermes_instance_id,
                 "mac-hermes runtime-proof %s" % hermes_instance_id,
+                "mac-hermes create-project <name> --description <description>",
                 "mac-hermes projects",
                 "mac-hermes project-detail <project>",
                 "mac-hermes import-project-item <source> <external_id> <title> --project <project>",
@@ -2377,7 +2404,71 @@ class ControlPlane:
             self.list_agents(),
             [item.to_dict() for item in self.list_project_items()],
             [repository.to_dict() for repository in self.list_beads_repositories()],
+            [project.to_dict() for project in self.list_project_records()],
         )
+
+    def create_project(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: str = "active",
+        actor: str = "human",
+        project_id: Optional[str] = None,
+    ) -> ProjectRecord:
+        project_name = str(name or "").strip()
+        if not project_name:
+            raise ValidationError("project name is required")
+        existing = self.store.query_one(
+            "SELECT * FROM projects WHERE name = ?",
+            (project_name,),
+        )
+        project_metadata = ensure_json_object(metadata)
+        if actor:
+            project_metadata.setdefault("created_by", actor)
+        if existing is not None:
+            return self._project_record_from_row(existing)
+        now = utcnow()
+        self.store.execute(
+            """
+            INSERT INTO projects (id, name, description, metadata, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id or new_id("project"),
+                project_name,
+                str(description or ""),
+                json_dumps(project_metadata),
+                str(status or "active"),
+                now,
+                now,
+            ),
+        )
+        notification_body = str(description or "Project %s was created." % project_name)
+        self.record_notification(
+            "project.created",
+            "Project created: %s" % project_name,
+            notification_body,
+            subject_type="project",
+            subject_id=project_name,
+            channels=["dashboard", "hermes"],
+            metadata={"project": project_name, "actor": actor},
+        )
+        return self.get_project_record(project_name)
+
+    def get_project_record(self, name_or_id: str) -> ProjectRecord:
+        row = self.store.query_one(
+            "SELECT * FROM projects WHERE name = ? OR id = ?",
+            (name_or_id, name_or_id),
+        )
+        if row is None:
+            raise NotFoundError("project record not found: %s" % name_or_id)
+        return self._project_record_from_row(row)
+
+    def list_project_records(self) -> List[ProjectRecord]:
+        rows = self.store.query_all("SELECT * FROM projects ORDER BY name, id")
+        return [self._project_record_from_row(row) for row in rows]
 
     def get_project(self, project: str) -> JsonDict:
         project_key = str(project or "unassigned").strip() or "unassigned"
@@ -2408,6 +2499,11 @@ class ControlPlane:
         return {
             "project": project_key,
             "summary": summary,
+            "record": (
+                self.get_project_record(project_key).to_dict()
+                if summary.get("project_id")
+                else None
+            ),
             "tasks": tasks,
             "bridge_items": bridge_items,
             "beads_repositories": beads_repositories,
@@ -8465,6 +8561,17 @@ class ControlPlane:
             row["title"],
             json_loads(row["payload"], {}),
             row["task_id"],
+            row["status"],
+            row["created_at"],
+            row["updated_at"],
+        )
+
+    def _project_record_from_row(self, row: Any) -> ProjectRecord:
+        return ProjectRecord(
+            row["id"],
+            row["name"],
+            row["description"],
+            json_loads(row["metadata"], {}),
             row["status"],
             row["created_at"],
             row["updated_at"],

@@ -160,6 +160,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
     assert {
         "list_tasks",
+        "create_project",
         "list_projects",
         "get_project",
         "list_project_items",
@@ -182,12 +183,26 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert project_detail["project"] == "nanolang"
     assert project_detail["summary"]["blocked_count"] == 1
     assert {item["id"] for item in project_detail["tasks"]} == {dependency["id"], task["id"]}
+    created_project = client.post(
+        "/projects",
+        json={
+            "name": "c26",
+            "description": "RISC-V home computer proof",
+            "metadata": {"inception": True},
+        },
+    ).json()
+    assert created_project["name"] == "c26"
+    project_detail = client.get("/projects/c26").json()
+    assert project_detail["record"]["description"] == "RISC-V home computer proof"
+    assert project_detail["summary"]["task_count"] == 0
     assert any("mac task list" in command for command in work_context["operations"]["mac_cli"])
+    assert any("mac project create" in command for command in work_context["operations"]["mac_cli"])
     assert any("mac project list" in command for command in work_context["operations"]["mac_cli"])
     assert any("mac-hermes work-context" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes runtime-proof" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes tasks" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes projects" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("mac-hermes create-project" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes project-items" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes claim-next" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes command-audit" in command for command in work_context["operations"]["mac_hermes_cli"])
@@ -235,7 +250,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert live_alignment["ready"] is True
     assert live_alignment["tasks"]["live_count"] == 2
     assert set(live_alignment["tasks"]["work_context_ids"]) == {dependency["id"], task["id"]}
-    assert live_alignment["projects"]["work_context_names"] == ["nanolang"]
+    assert live_alignment["projects"]["work_context_names"] == ["nanolang", "c26"]
     assert live_alignment["agents"]["ready"] is True
     assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
     assert "list_tasks" in runtime_proof["evidence"]["api"]["task_operation_names"]

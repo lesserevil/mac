@@ -222,6 +222,11 @@ def test_hermes_adapter_exposes_project_bridge_operations():
         dependencies=["task_parent"],
         metadata={"team": "core", "api_token": "drop"},
     )
+    adapter.create_project(
+        "c26",
+        "RISC-V home computer proof",
+        metadata={"team": "retro", "api_token": "drop"},
+    )
     adapter.list_project_items()
     adapter.list_projects()
     adapter.project_detail("repo-beads-mac")
@@ -255,6 +260,17 @@ def test_hermes_adapter_exposes_project_bridge_operations():
                 "required_capabilities": ["ops"],
                 "dependencies": ["task_parent"],
                 "metadata": {"team": "core"},
+                "actor": "hermes",
+            },
+        ),
+        (
+            "POST",
+            "/projects",
+            {
+                "name": "c26",
+                "description": "RISC-V home computer proof",
+                "metadata": {"team": "retro"},
+                "status": "active",
                 "actor": "hermes",
             },
         ),
@@ -548,6 +564,24 @@ def test_mac_cli_prints_hermes_work_context(tmp_path, capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["project"] == "mac"
 
+    rc = mac_cli_main(
+        [
+            "--db",
+            str(db),
+            "project",
+            "create",
+            "c26",
+            "--description",
+            "RISC-V home computer proof",
+            "--metadata",
+            '{"team":"retro"}',
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "c26"
+    assert payload["description"] == "RISC-V home computer proof"
+
     rc = mac_cli_main(["--db", str(db), "project", "show", "mac"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
@@ -738,6 +772,14 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
     monkeypatch.setattr(MacApiClient, "request", request)
     commands = [
         ["project-items"],
+        [
+            "create-project",
+            "c26",
+            "--description",
+            "RISC-V home computer proof",
+            "--metadata",
+            '{"team":"retro","api_token":"drop"}',
+        ],
         ["projects"],
         ["project-detail", "repo-beads-mac"],
         [
@@ -800,6 +842,17 @@ def test_mac_hermes_cli_exposes_project_bridge_operations(monkeypatch, capsys):
 
     assert calls == [
         ("GET", "/bridge/items", None),
+        (
+            "POST",
+            "/projects",
+            {
+                "name": "c26",
+                "description": "RISC-V home computer proof",
+                "metadata": {"team": "retro"},
+                "status": "active",
+                "actor": "hermes",
+            },
+        ),
         ("GET", "/projects", None),
         ("GET", "/projects/repo-beads-mac", None),
         (

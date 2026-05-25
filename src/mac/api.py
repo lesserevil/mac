@@ -166,6 +166,15 @@ class TaskCreate(BaseModel):
     actor: str = "human"
 
 
+class ProjectCreate(BaseModel):
+    name: str
+    description: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    actor: str = "human"
+    project_id: Optional[str] = None
+
+
 class TenantRegister(BaseModel):
     name: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -1976,6 +1985,23 @@ def create_app(
     @app.get("/projects")
     def list_projects() -> List[Dict[str, Any]]:
         return cp.list_projects()
+
+    @app.post("/projects")
+    def create_project(
+        body: ProjectCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        _ensure_payload_bounded(body.metadata, "project.metadata")
+        data = _data(body)
+        actor = data.pop("actor", "human")
+        metadata = dict(data.get("metadata") or {})
+        if principal.tenant_id is not None and not principal.is_admin:
+            origin_value = metadata.get("origin")
+            origin = dict(origin_value) if isinstance(origin_value, dict) else {}
+            origin["tenant_id"] = principal.tenant_id
+            metadata["origin"] = origin
+            data["metadata"] = metadata
+        return cp.create_project(actor=actor, **data).to_dict()
 
     @app.get("/projects/{project}")
     def get_project(project: str) -> Dict[str, Any]:

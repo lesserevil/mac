@@ -1121,6 +1121,20 @@ class ProjectItem:
 
 
 @dataclass
+class ProjectRecord:
+    id: str
+    name: str
+    description: str
+    metadata: JsonDict
+    status: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
 class BeadsRepository:
     id: str
     name: str
