@@ -229,9 +229,15 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert '"long_term_memory": "memories/MEMORY.md"' in script
     assert '"legacy_long_term_memory": "MEMORY.md"' in script
     assert "QDRANT_FLEET_URL" in script
-    assert 'if ! truthy "$required"; then' in script
-    assert 'values.pop(key, None)' in script
-    assert 'updates["QDRANT_URL"] = None' in script
+    assert 'QDRANT_REQUIRE="1"' in script
+    assert 'configured_qdrant_required = "1"' in script
+    assert 'values["MAC_REQUIRE_QDRANT_MEMORY"] = "1"' in script
+    assert '"MAC_REQUIRE_QDRANT_MEMORY": "1",' in script
+    assert 'updates["QDRANT_URL"] = None' not in script
+    assert "127.0.0.1:16333:127.0.0.1:6333" in script
+    assert "qd_port += 10000" in script
+    assert '"qdrant_shared_memory": False' in script
+    assert 'probe_http(qdrant_url, "/collections", qdrant_headers)' in script
     assert 'values.setdefault("MAC_REVIEW_TICK_HUB_AGENT", shared_services_manager)' in script
     assert "mac-qdrant.service" in qdrant_installer
     assert 'ENV_DEST="/etc/${FLEET_NAME}/qdrant.env"' in qdrant_installer
@@ -286,10 +292,10 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
         'os.environ.get("MAC_DEPLOY_FIRECRAWL_INSTALL") '
         'or text_field(firecrawl.get("install") or "auto")'
     ) in script
-    assert (
-        'os.environ.get("MAC_DEPLOY_REQUIRE_FIRECRAWL") '
-        'or bool_field(firecrawl.get("required"), True)'
-    ) in script
+    assert 'FIRECRAWL_REQUIRE="1"' in script
+    assert 'configured_firecrawl_required = "1"' in script
+    assert 'values["MAC_REQUIRE_FIRECRAWL"] = "1"' in script
+    assert '"MAC_REQUIRE_FIRECRAWL": "1",' in script
     assert "install_or_validate_web_search_service()" in script
     assert "write_hermes_web_search_config()" in script
     assert "install_hermes_web_deps()" in script
@@ -299,6 +305,8 @@ def test_fleet_deploy_configures_firecrawl_for_hermes_and_worker_capabilities():
     assert "FIRECRAWL_API_URL" in script
     assert 'web["search_backend"] = "firecrawl"' in script
     assert '"role": "shared_web_search"' in script
+    assert '"firecrawl_web_search": False' in script
+    assert 'probe_http(firecrawl_url, "/health", firecrawl_headers)' in script
 
 
 def test_fleet_deploy_linux_control_plane_uses_service_wrapper():

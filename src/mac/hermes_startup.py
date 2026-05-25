@@ -142,6 +142,14 @@ def _qdrant_endpoint_from_env() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _firecrawl_endpoint_from_env() -> Tuple[Optional[str], Optional[str]]:
+    for name in ("FIRECRAWL_API_URL", "FIRECRAWL_GATEWAY_URL", "MAC_WEB_SEARCH_URL"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip().rstrip("/"), name
+    return None, None
+
+
 def _redact_url(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return raw
@@ -731,6 +739,18 @@ def _fetch_qdrant_collections(endpoint: str, api_key: Optional[str], timeout_sec
     return json.loads(payload.decode("utf-8"))
 
 
+def _fetch_firecrawl_health(endpoint: str, api_key: Optional[str], timeout_seconds: float) -> Dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    if api_key and api_key.lower() != "none":
+        headers["Authorization"] = "Bearer %s" % api_key
+    request = urllib.request.Request(endpoint.rstrip("/") + "/health", headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = response.read(1_048_576)
+    if not payload:
+        return {}
+    return json.loads(payload.decode("utf-8"))
+
+
 def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
     endpoint, endpoint_source = _qdrant_endpoint_from_env()
     memory_disabled = not _any_env_enabled(("MAC_QDRANT_MEMORY", "ACC_QDRANT_MEMORY"), True)
@@ -808,6 +828,57 @@ def _qdrant_memory_report(hermes_home: Path) -> Dict[str, Any]:
     result = collections.get("result") if isinstance(collections, dict) else {}
     collection_rows = result.get("collections") if isinstance(result, dict) else None
     report["collection_count"] = len(collection_rows) if isinstance(collection_rows, list) else None
+    report["status"] = "ready"
+    report["ready"] = True
+    return report
+
+
+def _firecrawl_web_search_report() -> Dict[str, Any]:
+    endpoint, endpoint_source = _firecrawl_endpoint_from_env()
+    explicitly_required = _env_enabled("MAC_REQUIRE_FIRECRAWL", False)
+    required = explicitly_required or bool(endpoint)
+    degraded_allowed = _env_enabled("MAC_FIRECRAWL_ALLOW_DEGRADED", False)
+    api_key = os.environ.get("FIRECRAWL_API_KEY")
+    report: Dict[str, Any] = {
+        "status": "disabled",
+        "ready": True,
+        "required": required,
+        "degraded_allowed": degraded_allowed,
+        "endpoint": _redact_url(endpoint),
+        "endpoint_source": endpoint_source,
+        "api_key_present": bool(api_key),
+        "warning": "",
+        "degradation_reason": "",
+    }
+    if not endpoint:
+        if not required:
+            return report
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "missing_endpoint"
+        report["degradation_reason"] = "required Firecrawl web search endpoint is not configured"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    parsed = urllib.parse.urlsplit(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "invalid_endpoint"
+        report["degradation_reason"] = "Firecrawl web search endpoint is invalid"
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
+
+    timeout_seconds = float(os.environ.get("MAC_FIRECRAWL_CHECK_TIMEOUT_SECONDS", "2"))
+    try:
+        _fetch_firecrawl_health(endpoint, api_key, timeout_seconds)
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+        report["ready"] = bool(degraded_allowed)
+        report["status"] = "degraded_allowed" if degraded_allowed else "unreachable"
+        report["degradation_reason"] = "Firecrawl web search health endpoint is unreachable: %s" % exc
+        if not degraded_allowed:
+            report["warning"] = report["degradation_reason"]
+        return report
     report["status"] = "ready"
     report["ready"] = True
     return report
@@ -1717,6 +1788,11 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 "ready": True,
                 "required": False,
             },
+            "firecrawl_web_search": {
+                "status": "startup_check_disabled",
+                "ready": True,
+                "required": False,
+            },
             "tokenhub": {
                 "status": "startup_check_disabled",
                 "ready": True,
@@ -1741,6 +1817,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     secret_redaction = _secret_redaction_report(hermes_home, acc_dir)
     logs = _log_classification_report()
     qdrant = _qdrant_memory_report(hermes_home)
+    firecrawl = _firecrawl_web_search_report()
     tokenhub = _tokenhub_report()
     task_project_runtime = _runtime_context_summary(hermes_home)
     agent_dir, _explicit_agent_dir = _hermes_agent_dir_info()
@@ -1767,6 +1844,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
     warnings.extend(logs["warnings"])
     if qdrant["warning"]:
         warnings.append(qdrant["warning"])
+    if firecrawl["warning"]:
+        warnings.append(firecrawl["warning"])
     if tokenhub["warning"]:
         warnings.append(tokenhub["warning"])
     if task_project_runtime["warning"]:
@@ -1788,6 +1867,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         and not secret_redaction["drift_detected"],
         "logs_have_no_actionable_classes": not bool(logs["actionable_count"]),
         "shared_qdrant_memory_ready": bool(qdrant["ready"]),
+        "firecrawl_web_search_ready": bool(firecrawl["ready"]),
         "tokenhub_ready": bool(tokenhub["ready"]),
         "tokenhub_client_key_present": (
             bool(tokenhub["api_key_present"]) or not tokenhub["required"]
@@ -1864,6 +1944,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         "security": {"secret_redaction": secret_redaction},
         "logs": logs,
         "qdrant_level2": qdrant,
+        "firecrawl_web_search": firecrawl,
         "tokenhub": tokenhub,
         "task_project_runtime": task_project_runtime,
         "operator_health": {
@@ -1876,6 +1957,8 @@ def build_hermes_startup_report() -> Dict[str, Any]:
             "log_actionable_count": logs["actionable_count"],
             "qdrant_level2_status": qdrant["status"],
             "qdrant_level2_ready": qdrant["ready"],
+            "firecrawl_web_search_status": firecrawl["status"],
+            "firecrawl_web_search_ready": firecrawl["ready"],
             "tokenhub_status": tokenhub["status"],
             "tokenhub_ready": tokenhub["ready"],
             "tokenhub_model_count": tokenhub["model_count"],

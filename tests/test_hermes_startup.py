@@ -39,12 +39,15 @@ def _clear_startup_env(monkeypatch) -> None:
         "MAC_HERMES_APPLY_SLACK_ACCOUNT_SHIM",
         "MAC_HERMES_STARTUP_CHECK",
         "MAC_HERMES_SLACK_HOME_CHANNEL_NAME",
+        "MAC_FIRECRAWL_ALLOW_DEGRADED",
+        "MAC_FIRECRAWL_CHECK_TIMEOUT_SECONDS",
         "MAC_MEMORY_TOPOLOGY_FILE",
         "MAC_QDRANT_CHECK_TIMEOUT_SECONDS",
         "MAC_QDRANT_MEMORY",
         "MAC_QDRANT_MEMORY_ALLOW_DEGRADED",
         "MAC_QDRANT_MEMORY_ROLE",
         "MAC_REQUIRE_HERMES_STARTUP_READY",
+        "MAC_REQUIRE_FIRECRAWL",
         "MAC_REQUIRE_QDRANT_MEMORY",
         "MAC_REQUIRE_TOKENHUB",
         "MAC_SHARED_SERVICES_MANAGER_AGENT",
@@ -68,6 +71,7 @@ def _clear_startup_env(monkeypatch) -> None:
         "HERMES_INFERENCE_MODEL",
         "HERMES_INFERENCE_PROVIDER",
         "MAC_WEB_SEARCH_PROVIDER",
+        "MAC_WEB_SEARCH_URL",
         "OPENAI_BASE_URL",
         "QDRANT_ADDRESS",
         "QDRANT_API_KEY",
@@ -104,6 +108,11 @@ def _prepare_direct_session_tools(monkeypatch, mac_home, workspace) -> None:
         ),
     )
     monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "http://hub.example.internal:3002")
+    monkeypatch.setattr(
+        hermes_startup,
+        "_fetch_firecrawl_health",
+        lambda endpoint, api_key, timeout_seconds: {"ok": True},
+    )
 
 
 def test_startup_report_inventories_hermes_state_without_contents(monkeypatch, tmp_path):
@@ -660,6 +669,83 @@ def test_required_qdrant_endpoint_uses_redacted_topology(monkeypatch, tmp_path):
     assert report["qdrant_level2"]["topology"]["qdrant_url"] == "http://redacted@hub.example.internal:6333"
     rendered = str(report)
     assert "secret-qdrant-key" not in rendered
+    assert "token=hidden" not in rendered
+
+
+def test_required_firecrawl_without_endpoint_blocks_readiness(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["firecrawl_web_search"]["status"] == "missing_endpoint"
+    assert report["checks"]["firecrawl_web_search_ready"] is False
+    assert "required Firecrawl web search endpoint is not configured" in " ".join(
+        report["warnings"]
+    )
+
+
+def test_required_firecrawl_endpoint_blocks_when_unreachable(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
+    monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "http://hub.example.internal:3002")
+
+    def fake_fetch(endpoint, api_key, timeout_seconds):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("mac.hermes_startup._fetch_firecrawl_health", fake_fetch)
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is False
+    assert report["firecrawl_web_search"]["status"] == "unreachable"
+    assert report["checks"]["firecrawl_web_search_ready"] is False
+    assert "Firecrawl web search health endpoint is unreachable" in " ".join(
+        report["warnings"]
+    )
+
+
+def test_required_firecrawl_endpoint_ready(monkeypatch, tmp_path):
+    _clear_startup_env(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    _write(hermes_home / "config.yaml", "model: local\n")
+    _write(hermes_home / "SOUL.md", "soul")
+    _write(hermes_home / "MEMORY.md", "memory")
+    _write(hermes_home / "state.db", "state")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("MAC_REQUIRE_FIRECRAWL", "1")
+    monkeypatch.setenv("FIRECRAWL_API_URL", "http://secret@hub.example.internal:3002?token=hidden")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "secret-firecrawl-key")
+
+    def fake_fetch(endpoint, api_key, timeout_seconds):
+        assert endpoint == "http://secret@hub.example.internal:3002?token=hidden"
+        assert api_key == "secret-firecrawl-key"
+        assert timeout_seconds == 2
+        return {"ok": True}
+
+    monkeypatch.setattr("mac.hermes_startup._fetch_firecrawl_health", fake_fetch)
+
+    report = build_hermes_startup_report()
+
+    assert report["ready"] is True
+    assert report["firecrawl_web_search"]["status"] == "ready"
+    assert report["firecrawl_web_search"]["endpoint"] == "http://redacted@hub.example.internal:3002"
+    assert report["checks"]["firecrawl_web_search_ready"] is True
+    rendered = str(report)
+    assert "secret-firecrawl-key" not in rendered
     assert "token=hidden" not in rendered
 
 

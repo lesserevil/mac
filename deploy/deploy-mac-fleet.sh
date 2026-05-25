@@ -441,7 +441,7 @@ for name in selected:
         shared_services_manager,
         text_field(qdrant.get("url")),
         text_field(qdrant.get("install") or "auto"),
-        bool_field(qdrant.get("required"), True),
+        "true",
         text_field(qdrant.get("bind_addr")),
         text_field(qdrant.get("port") or "6333"),
         text_field(qdrant.get("image") or "docker.io/qdrant/qdrant:latest"),
@@ -451,7 +451,7 @@ for name in selected:
         qdrant_data_dir,
         os.environ.get("MAC_DEPLOY_FIRECRAWL_URL") or text_field(firecrawl.get("url")),
         os.environ.get("MAC_DEPLOY_FIRECRAWL_INSTALL") or text_field(firecrawl.get("install") or "auto"),
-        os.environ.get("MAC_DEPLOY_REQUIRE_FIRECRAWL") or bool_field(firecrawl.get("required"), True),
+        "true",
         os.environ.get("MAC_DEPLOY_FIRECRAWL_BIND_ADDR") or text_field(firecrawl.get("bind_addr")),
         os.environ.get("MAC_DEPLOY_FIRECRAWL_PORT") or text_field(firecrawl.get("port") or "3002"),
         os.environ.get("MAC_DEPLOY_TOKENHUB_URL") or text_field(tokenhub.get("url")),
@@ -647,14 +647,14 @@ SUPERVISOR_REQUESTED="${MAC_DEPLOY_SUPERVISOR:-auto}"
 SHARED_SERVICES_MANAGER_AGENT="${MAC_DEPLOY_SHARED_SERVICES_MANAGER_AGENT:-$AGENT}"
 QDRANT_URL_CONFIGURED="${MAC_DEPLOY_QDRANT_URL:-}"
 QDRANT_INSTALL="${MAC_DEPLOY_QDRANT_INSTALL:-auto}"
-QDRANT_REQUIRE="${MAC_DEPLOY_REQUIRE_QDRANT_MEMORY:-1}"
+QDRANT_REQUIRE="1"
 QDRANT_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_QDRANT_BIND_ADDR:-}"
 QDRANT_PORT_CONFIGURED="${MAC_DEPLOY_QDRANT_PORT:-6333}"
 QDRANT_IMAGE_CONFIGURED="${MAC_DEPLOY_QDRANT_IMAGE:-docker.io/qdrant/qdrant:latest}"
 QDRANT_MEMORY_LIMIT_CONFIGURED="${MAC_DEPLOY_QDRANT_MEMORY_LIMIT:-2g}"
 FIRECRAWL_URL_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_URL:-}"
 FIRECRAWL_INSTALL="${MAC_DEPLOY_FIRECRAWL_INSTALL:-auto}"
-FIRECRAWL_REQUIRE="${MAC_DEPLOY_REQUIRE_FIRECRAWL:-1}"
+FIRECRAWL_REQUIRE="1"
 FIRECRAWL_BIND_ADDR_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_BIND_ADDR:-}"
 FIRECRAWL_PORT_CONFIGURED="${MAC_DEPLOY_FIRECRAWL_PORT:-3002}"
 TOKENHUB_URL_CONFIGURED="${MAC_DEPLOY_TOKENHUB_URL:-}"
@@ -1391,12 +1391,12 @@ firecrawl_url = (
     or ""
 )
 safe_firecrawl_url = connection_url(firecrawl_url) if firecrawl_url else ""
-required = truthy(os.environ.get("MAC_REQUIRE_QDRANT_MEMORY") or os.environ.get("QDRANT_REQUIRE") or "1")
+required = True
 degraded_allowed = truthy(
     os.environ.get("MAC_QDRANT_MEMORY_ALLOW_DEGRADED")
     or os.environ.get("ACC_QDRANT_MEMORY_ALLOW_DEGRADED")
 )
-firecrawl_required = truthy(os.environ.get("MAC_REQUIRE_FIRECRAWL") or os.environ.get("FIRECRAWL_REQUIRE") or "1")
+firecrawl_required = True
 firecrawl_degraded_allowed = truthy(os.environ.get("MAC_FIRECRAWL_ALLOW_DEGRADED"))
 
 topology = {
@@ -1453,28 +1453,21 @@ topology_path.chmod(0o600)
 updates = {
     "MAC_MEMORY_TOPOLOGY_FILE": str(topology_path),
     "MAC_SHARED_SERVICES_MANAGER_AGENT": hub_agent,
-    "MAC_REQUIRE_QDRANT_MEMORY": "1" if required else "0",
+    "MAC_REQUIRE_QDRANT_MEMORY": "1",
     "MAC_QDRANT_MEMORY_ROLE": "shared_level2",
-    "MAC_REQUIRE_FIRECRAWL": "1" if firecrawl_required else "0",
+    "MAC_REQUIRE_FIRECRAWL": "1",
     "MAC_WEB_SEARCH_PROVIDER": "firecrawl" if safe_firecrawl_url else "",
 }
 if safe_qdrant_url:
     updates["QDRANT_URL"] = safe_qdrant_url
     updates["QDRANT_ADDRESS"] = safe_qdrant_url
     updates["QDRANT_FLEET_URL"] = safe_qdrant_url
-elif not required:
-    updates["QDRANT_URL"] = None
-    updates["QDRANT_ADDRESS"] = None
-    updates["QDRANT_FLEET_URL"] = None
 if safe_firecrawl_url:
     updates["FIRECRAWL_API_URL"] = safe_firecrawl_url
     updates["FIRECRAWL_GATEWAY_URL"] = safe_firecrawl_url
     updates["FIRECRAWL_API_KEY"] = os.environ.get("FIRECRAWL_API_KEY") or "none"
     updates["HERMES_WEB_SEARCH_BACKEND"] = "firecrawl"
     updates["HERMES_WEB_EXTRACT_BACKEND"] = "firecrawl"
-elif not firecrawl_required:
-    updates["FIRECRAWL_API_URL"] = None
-    updates["FIRECRAWL_GATEWAY_URL"] = None
 set_env(hermes_env_path, updates)
 print(
     "memory topology: agent=%s hub=%s qdrant=%s required=%s firecrawl=%s firecrawl_required=%s"
@@ -3001,12 +2994,7 @@ firecrawl_url = (
     or os.environ.get("FIRECRAWL_GATEWAY_URL")
     or ""
 ).strip().rstrip("/")
-required = (os.environ.get("MAC_REQUIRE_FIRECRAWL") or os.environ.get("FIRECRAWL_REQUIRE") or "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+required = True
 
 
 def set_env(path: Path, updates: dict[str, str | None]) -> None:
@@ -3034,7 +3022,7 @@ def set_env(path: Path, updates: dict[str, str | None]) -> None:
 
 
 updates: dict[str, str | None] = {
-    "MAC_REQUIRE_FIRECRAWL": "1" if required else "0",
+    "MAC_REQUIRE_FIRECRAWL": "1",
 }
 if firecrawl_url:
     updates.update(
@@ -3405,10 +3393,10 @@ agent_name = sys.argv[17].strip()
 supervisor_kind = sys.argv[18].strip()
 shared_services_manager = sys.argv[19].strip() or agent_name
 configured_qdrant_url = sys.argv[20].strip()
-configured_qdrant_required = sys.argv[21].strip() or "1"
+configured_qdrant_required = "1"
 configured_qdrant_port = sys.argv[22].strip() or "6333"
 configured_firecrawl_url = sys.argv[23].strip()
-configured_firecrawl_required = sys.argv[24].strip() or "1"
+configured_firecrawl_required = "1"
 configured_firecrawl_port = sys.argv[25].strip() or "3002"
 configured_tokenhub_url = sys.argv[26].strip()
 configured_tokenhub_required = sys.argv[27].strip() or "1"
@@ -3501,10 +3489,10 @@ values["MAC_WORKER_REQUIRE_CANARY"] = configured_worker_require_canary
 values["MAC_WORKER_ALLOWED_PROJECTS"] = configured_worker_allowed_projects
 values["MAC_WORKER_REQUIRED_METADATA"] = configured_worker_required_metadata
 values["MAC_SHARED_SERVICES_MANAGER_AGENT"] = shared_services_manager
-values["MAC_REQUIRE_QDRANT_MEMORY"] = configured_qdrant_required
+values["MAC_REQUIRE_QDRANT_MEMORY"] = "1"
 values["MAC_QDRANT_MEMORY_ROLE"] = "shared_level2"
 values["MAC_MEMORY_TOPOLOGY_FILE"] = str(home / ".hermes" / "mac-memory-topology.json")
-values["MAC_REQUIRE_FIRECRAWL"] = configured_firecrawl_required
+values["MAC_REQUIRE_FIRECRAWL"] = "1"
 
 def truthy(raw):
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -3512,25 +3500,25 @@ def truthy(raw):
 def qdrant_url():
     if configured_qdrant_url:
         return configured_qdrant_url.rstrip("/")
-    if not truthy(configured_qdrant_required):
-        return ""
-    raw_hub = configured_hub_url or values.get("MAC_HUB_URL") or "http://127.0.0.1:8789"
+    raw_hub = values.get("MAC_HUB_URL") or configured_hub_url or "http://127.0.0.1:8789"
     parsed = urllib.parse.urlsplit(raw_hub)
     if not parsed.scheme or not parsed.hostname:
         return ""
     host = parsed.hostname
     if ":" in host and not host.startswith("["):
         host = "[%s]" % host
-    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, configured_qdrant_port), "", "", ""))
+    qd_port = int(configured_qdrant_port or "6333")
+    native_hub_port = int(port or "8789")
+    hub_port = parsed.port or native_hub_port
+    if hub_port == native_hub_port + 10000:
+        qd_port += 10000
+    return urllib.parse.urlunsplit((parsed.scheme, "%s:%s" % (host, qd_port), "", "", ""))
 
 derived_qdrant_url = qdrant_url()
 if derived_qdrant_url:
     values["QDRANT_URL"] = derived_qdrant_url
     values["QDRANT_ADDRESS"] = derived_qdrant_url
     values["QDRANT_FLEET_URL"] = derived_qdrant_url
-elif not truthy(configured_qdrant_required):
-    for key in ("QDRANT_URL", "QDRANT_ADDRESS", "QDRANT_FLEET_URL"):
-        values.pop(key, None)
 
 def firecrawl_url():
     if configured_firecrawl_url:
@@ -3562,16 +3550,6 @@ if derived_firecrawl_url:
     values["MAC_WEB_SEARCH_URL"] = derived_firecrawl_url
     values["HERMES_WEB_SEARCH_BACKEND"] = "firecrawl"
     values["HERMES_WEB_EXTRACT_BACKEND"] = "firecrawl"
-elif not truthy(configured_firecrawl_required):
-    for key in (
-        "FIRECRAWL_API_URL",
-        "FIRECRAWL_GATEWAY_URL",
-        "MAC_WEB_SEARCH_PROVIDER",
-        "MAC_WEB_SEARCH_URL",
-        "HERMES_WEB_SEARCH_BACKEND",
-        "HERMES_WEB_EXTRACT_BACKEND",
-    ):
-        values.pop(key, None)
 
 provider_secret_keys = (
     "NVIDIA_API_KEY",
@@ -4152,6 +4130,19 @@ def safe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def probe_http(path_base: str, suffix: str, headers: dict[str, str] | None = None) -> tuple[bool, str]:
+    if not path_base:
+        return False, "endpoint is not configured"
+    url = path_base.rstrip("/") + suffix
+    request = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read(1_048_576)
+        return True, ""
+    except (OSError, urllib.error.URLError) as exc:
+        return False, safe_error(exc)
+
+
 def first_context_value(context: dict[str, object], paths: list[tuple[str, ...]]) -> str:
     for path in paths:
         current: object = context
@@ -4207,6 +4198,22 @@ context_path = Path(
 tokenhub_url = str(os.environ.get("TOKENHUB_URL") or "").rstrip("/")
 tokenhub_key = os.environ.get("TOKENHUB_API_KEY") or os.environ.get("TOKENHUB_AGENT_KEY") or ""
 tokenhub_required = truthy(os.environ.get("MAC_REQUIRE_TOKENHUB") or "1")
+qdrant_url = str(
+    os.environ.get("QDRANT_URL")
+    or os.environ.get("QDRANT_ADDRESS")
+    or os.environ.get("QDRANT_FLEET_URL")
+    or ""
+).rstrip("/")
+qdrant_key = os.environ.get("QDRANT_API_KEY") or os.environ.get("QDRANT_FLEET_KEY") or ""
+qdrant_required = truthy(os.environ.get("MAC_REQUIRE_QDRANT_MEMORY") or "1")
+firecrawl_url = str(
+    os.environ.get("FIRECRAWL_API_URL")
+    or os.environ.get("FIRECRAWL_GATEWAY_URL")
+    or os.environ.get("MAC_WEB_SEARCH_URL")
+    or ""
+).rstrip("/")
+firecrawl_key = os.environ.get("FIRECRAWL_API_KEY") or ""
+firecrawl_required = truthy(os.environ.get("MAC_REQUIRE_FIRECRAWL") or "1")
 timeout = int(os.environ.get("MAC_AGENT_STARTUP_SELF_TEST_TIMEOUT") or "120")
 python_bin = str(mac_home / "hermes-agent" / ".venv" / "bin" / "python")
 hermes_script = str(mac_home / "hermes-agent" / "hermes")
@@ -4215,6 +4222,8 @@ problems: list[str] = []
 checks: dict[str, object] = {
     "identity_env": False,
     "runtime_context": False,
+    "qdrant_shared_memory": False,
+    "firecrawl_web_search": False,
     "tokenhub_runtime": False,
     "hermes_chat": False,
 }
@@ -4278,6 +4287,32 @@ if tokenhub_required and not tokenhub_url:
     problems.append("TOKENHUB_URL is required but not configured")
 if tokenhub_required and not tokenhub_key:
     problems.append("TOKENHUB_API_KEY is required but not configured")
+
+qdrant_headers = {"Accept": "application/json"}
+if qdrant_key:
+    qdrant_headers["api-key"] = qdrant_key
+if qdrant_required and not qdrant_url:
+    problems.append("QDRANT_URL is required but not configured")
+elif qdrant_url:
+    ok, error = probe_http(qdrant_url, "/collections", qdrant_headers)
+    if not ok:
+        problems.append(f"Qdrant shared memory endpoint is unreachable: {error}")
+    checks["qdrant_shared_memory"] = ok
+elif not qdrant_required:
+    checks["qdrant_shared_memory"] = True
+
+firecrawl_headers = {"Accept": "application/json"}
+if firecrawl_key and firecrawl_key.lower() != "none":
+    firecrawl_headers["Authorization"] = f"Bearer {firecrawl_key}"
+if firecrawl_required and not firecrawl_url:
+    problems.append("FIRECRAWL_API_URL is required but not configured")
+elif firecrawl_url:
+    ok, error = probe_http(firecrawl_url, "/health", firecrawl_headers)
+    if not ok:
+        problems.append(f"Firecrawl web search endpoint is unreachable: {error}")
+    checks["firecrawl_web_search"] = ok
+elif not firecrawl_required:
+    checks["firecrawl_web_search"] = True
 
 try:
     sys.path.insert(0, str(mac_home / "hermes-agent"))
@@ -5182,6 +5217,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
     data = json.load(handle)
 slack = data.get("slack") or {}
 qdrant = data.get("qdrant_level2") or {}
+firecrawl = data.get("firecrawl_web_search") or {}
 runtime = data.get("task_project_runtime") or {}
 prompt_bridge = runtime.get("prompt_bridge") or {}
 refs = data.get("state_refs") or []
@@ -5190,7 +5226,7 @@ patch = slack.get("account_file_activation_shim_patch") or {}
 print(
     "startup: ready=%s warnings=%d state_refs_existing=%d "
     "slack_activation=%s shim_present=%s redaction=%s operator_status=%s "
-    "qdrant_status=%s qdrant_ready=%s topology=%s "
+    "qdrant_status=%s qdrant_ready=%s topology=%s firecrawl_status=%s firecrawl_ready=%s "
     "runtime_status=%s runtime_ready=%s runtime_context=%s prompt_bridge=%s hermes_instance=%s "
     "patch_attempted=%s patch_applied=%s patch_error=%s"
     % (
@@ -5204,6 +5240,8 @@ print(
         qdrant.get("status"),
         qdrant.get("ready"),
         ((qdrant.get("topology") or {}).get("file") or {}).get("exists"),
+        firecrawl.get("status"),
+        firecrawl.get("ready"),
         runtime.get("status"),
         runtime.get("ready"),
         (runtime.get("context_file") or {}).get("exists"),
@@ -5307,7 +5345,7 @@ fleet_name="${TUNNEL_FLEET_NAME:-mac}"
 conf_dir="$(ls -d /etc/supervisor/conf.d 2>/dev/null || ls -d /etc/supervisord.d 2>/dev/null || echo '/etc/supervisor/conf.d')"
 sudo tee "$conf_dir/${fleet_name}-tunnel-${worker_agent}.conf" > /dev/null <<EOF
 [program:${fleet_name}-tunnel-${worker_agent}]
-command=ssh -N -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i $HOME/.ssh/mac_tunnel_id -R 127.0.0.1:18789:127.0.0.1:8789 -R 127.0.0.1:18090:127.0.0.1:8090 -R 127.0.0.1:13002:127.0.0.1:3002 horde@${tunnel_host}
+command=ssh -N -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i $HOME/.ssh/mac_tunnel_id -R 127.0.0.1:18789:127.0.0.1:8789 -R 127.0.0.1:18090:127.0.0.1:8090 -R 127.0.0.1:16333:127.0.0.1:6333 -R 127.0.0.1:13002:127.0.0.1:3002 horde@${tunnel_host}
 directory=$HOME
 user=$(whoami)
 autostart=true
@@ -5378,8 +5416,9 @@ main() {
         echo "==> ${agent}: first deploy (no existing mac API); hub-managed services degraded override active"
       fi
       # Update the hub's reverse-tunnel conf and wait for it BEFORE deploying the
-      # worker. The worker validates tokenhub at the tunnel-forwarded port (18090)
-      # during its deploy; the tunnel must be established first.
+      # worker. The worker validates hub-managed TokenHub, Qdrant, and Firecrawl
+      # through tunnel-forwarded ports during deploy; the tunnel must be
+      # established first.
       install_reverse_tunnel_on_hub "$agent" "$local_target" "$hub_target_str" "$fleet_name_field"
       echo "==> ${agent}: waiting for hub reverse tunnel to establish before worker deploy"
       local attempt tunnel_ok=0
