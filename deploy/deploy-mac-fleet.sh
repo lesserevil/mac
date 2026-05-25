@@ -2590,6 +2590,103 @@ print("TokenHub client env: synced to %s" % target_path)
 PY
 }
 
+sync_hermes_tokenhub_runtime_config() {
+  log "syncing Hermes TokenHub runtime config"
+  "$HERMES_DIR/.venv/bin/python" - "$HOME/.hermes/config.yaml" "$HOME/.hermes/.env" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+env_path = Path(sys.argv[2])
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+env = read_env(env_path)
+tokenhub_url = str(env.get("TOKENHUB_URL") or "").strip().rstrip("/")
+tokenhub_key = str(env.get("TOKENHUB_API_KEY") or env.get("TOKENHUB_AGENT_KEY") or "").strip()
+if not tokenhub_url:
+    print("TokenHub runtime config: skipped; TOKENHUB_URL absent")
+    raise SystemExit(0)
+
+config_path.parent.mkdir(parents=True, exist_ok=True)
+if config_path.exists():
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8", errors="ignore")) or {}
+else:
+    loaded = {}
+config = loaded if isinstance(loaded, dict) else {}
+tokenhub_v1 = tokenhub_url.rstrip("/") + "/v1/"
+model = (
+    str(env.get("HERMES_INFERENCE_MODEL") or "").strip()
+    or str(env.get("MAC_HERMES_GATEWAY_MODEL") or "").strip()
+    or "*"
+)
+
+model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
+model_config = dict(model_config)
+model_config["default"] = model
+model_config["provider"] = "tokenhub"
+model_config["base_url"] = tokenhub_v1
+# Keep the client key in .env and point Hermes at it. Inline keys in config.yaml
+# can outlive a TokenHub redeploy and silently break every oneshot worker.
+model_config.pop("api_key", None)
+config["model"] = model_config
+
+providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+providers = dict(providers)
+tokenhub_provider = providers.get("tokenhub") if isinstance(providers.get("tokenhub"), dict) else {}
+tokenhub_provider = dict(tokenhub_provider)
+tokenhub_provider.update(
+    {
+        "name": "tokenhub",
+        "api": tokenhub_v1,
+        "key_env": "TOKENHUB_API_KEY",
+        "transport": "chat_completions",
+        "default_model": model,
+    }
+)
+tokenhub_provider.pop("api_key", None)
+providers["tokenhub"] = tokenhub_provider
+config["providers"] = providers
+
+if tokenhub_key:
+    # Ensure the env file has the key name referenced by config.yaml even when
+    # the deploy input used TOKENHUB_AGENT_KEY.
+    lines = env_path.read_text(encoding="utf-8", errors="ignore").splitlines() if env_path.exists() else []
+    seen = False
+    output: list[str] = []
+    for line in lines:
+        if line.strip().startswith("TOKENHUB_API_KEY="):
+            output.append("TOKENHUB_API_KEY=%s" % tokenhub_key)
+            seen = True
+        else:
+            output.append(line)
+    if not seen:
+        output.append("TOKENHUB_API_KEY=%s" % tokenhub_key)
+    env_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    env_path.chmod(0o600)
+
+config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+config_path.chmod(0o600)
+print("TokenHub runtime config: synced to %s" % config_path)
+PY
+}
+
 sync_hermes_slack_identity_env() {
   log "syncing Hermes Slack identity/routing environment"
   "$PY" - "$ENV_FILE" "$HOME/.hermes/.env" <<'PY'
@@ -3590,6 +3687,7 @@ done
 "$HERMES_DIR/.venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$HERMES_DIR/.venv/bin/python" -m pip install --ignore-requires-python -e "$HERMES_DIR" >/dev/null
 initialize_hermes_home
+sync_hermes_tokenhub_runtime_config
 ensure_hermes_identity_memory_continuity
 apply_hermes_gateway_runtime_shim
 install_hermes_web_deps

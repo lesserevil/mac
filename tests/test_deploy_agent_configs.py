@@ -342,6 +342,11 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
     assert 'updates["TOKENHUB_API_KEY"] = tokenhub_key' in script
     assert 'updates["MAC_HERMES_GATEWAY_API_KEY"] = tokenhub_key' in script
     assert 'write_env(target_path, updates)' in script
+    assert "sync_hermes_tokenhub_runtime_config()" in script
+    assert 'model_config["provider"] = "tokenhub"' in script
+    assert 'model_config.pop("api_key", None)' in script
+    assert '"key_env": "TOKENHUB_API_KEY"' in script
+    assert 'tokenhub_provider.pop("api_key", None)' in script
     assert 'runtime_kwargs["api_key"] = mac_gateway_api_key' in startup
     assert 'runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")' in startup
     assert '[ -f "$HOME/.acc/.env" ]' not in gateway_wrapper
