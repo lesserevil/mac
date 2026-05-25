@@ -9443,12 +9443,12 @@ class ControlPlane:
             if verdict not in {"approved", "rejected"}:
                 problems.append("verdict %s requires verdict approved or rejected" % evidence.id)
                 continue
+            if verdict == "rejected":
+                return evidence, []
             digest = str(manifest.get("worktree_digest") or "").strip()
             if not re.match(r"^sha256:[0-9a-f]{64}$", digest):
                 problems.append("verdict %s requires worktree_digest sha256" % evidence.id)
                 continue
-            if verdict == "rejected":
-                return evidence, []
             executor_repo = executor_manifest.get("repo")
             if isinstance(executor_repo, dict):
                 repo_problems = self._require_pushed_repo_anchor(manifest)

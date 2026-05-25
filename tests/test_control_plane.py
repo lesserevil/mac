@@ -4199,7 +4199,6 @@ def test_rejected_review_verdict_completes_without_clean_pushed_repo(cp):
             "dirty": True,
         },
         "blockers": ["executor evidence does not match the inspected checkout"],
-        "worktree_digest": "sha256:" + ("1" * 64),
     }
     verdict_manifest = _sign(cp, reviewer.id, verdict_manifest)
     verdict = cp.add_evidence(
