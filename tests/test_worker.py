@@ -697,6 +697,54 @@ def test_mac_worker_fails_successful_execution_without_verification_manifest(tmp
     assert cp.list_evidence(task.id)[0].metadata["verification"]["status"] == "missing"
 
 
+def test_mac_worker_accepts_operator_result_without_repository_anchor(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    task = cp.create_task(
+        "Planning task",
+        required_capabilities=["python"],
+        metadata={
+            "execution_contract": {
+                "schema": "mac.task_execution_contract.v1",
+                "type": "operator_directive",
+                "quality": "weak",
+                "evidence_type": "operator_result",
+            }
+        },
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(_task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        manifest = {
+            "schema": "mac.worker_evidence.v1",
+            "status": "complete",
+            "evidence_type": "operator_result",
+            "summary": "Plan produced",
+            "result": "Story graph and verification plan produced.",
+        }
+        (task_dir / "mac-evidence.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return WorkerExecution(0, "plan produced", stdout="plan produced\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path,
+        executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    assert cp.get_task(task.id).state == TaskState.NEEDS_REVIEW.value
+    manifest = cp.list_evidence(task.id)[0].metadata["verification"]
+    assert manifest["evidence_type"] == "operator_result"
+    assert manifest["signed_by"] == agent.id
+
+
 def test_mac_worker_audits_subprocess_commands(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)

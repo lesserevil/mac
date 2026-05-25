@@ -29,6 +29,7 @@ def test_evidence_validators_are_registry_backed_by_type():
         "deployment",
         "documentation",
         "no_change",
+        "operator_result",
         "repo_change",
         "review_verdict",
         "test",
@@ -36,6 +37,18 @@ def test_evidence_validators_are_registry_backed_by_type():
     assert validate_evidence_type(
         "repo_change",
         _repo_manifest(),
+        passed_check_count=_passed_check_count,
+    ) == []
+
+    assert validate_evidence_type(
+        "operator_result",
+        {
+            "schema": "mac.verification.v1",
+            "status": "complete",
+            "evidence_type": "operator_result",
+            "summary": "Plan produced",
+            "result": "Story graph produced.",
+        },
         passed_check_count=_passed_check_count,
     ) == []
 

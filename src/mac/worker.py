@@ -2162,6 +2162,11 @@ def _worker_verification_contract_problems(
         return problems
     if evidence_type == "review_verdict":
         return []
+    if evidence_type == "operator_result":
+        if not str(manifest.get("summary") or manifest.get("result") or "").strip():
+            if not _manifest_list(manifest.get("artifacts")) and not _manifest_list(manifest.get("findings")):
+                return ["operator_result evidence requires summary, result, findings, or artifacts"]
+        return []
     return ["unsupported verification.evidence_type: %s" % evidence_type]
 
 

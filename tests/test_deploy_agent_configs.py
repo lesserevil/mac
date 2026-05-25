@@ -348,6 +348,8 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
     assert '"key_env": "TOKENHUB_API_KEY"' in script
     assert 'tokenhub_provider.pop("api_key", None)' in script
     assert '"chat", "--query", prompt, "--quiet", "--accept-hooks"' in script
+    assert "write_fallback_evidence_manifest(task_workspace, task, result, review_context)" in script
+    assert '"evidence_type": task_evidence_type(task)' in script
     assert 'runtime_kwargs["api_key"] = mac_gateway_api_key' in startup
     assert 'runtime_kwargs["base_url"] = mac_gateway_base_url.rstrip("/")' in startup
     assert '[ -f "$HOME/.acc/.env" ]' not in gateway_wrapper

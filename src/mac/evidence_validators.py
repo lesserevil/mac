@@ -219,6 +219,21 @@ class ReviewVerdictValidator(EvidenceValidator):
         return problems
 
 
+class OperatorResultValidator(EvidenceValidator):
+    evidence_type = "operator_result"
+
+    def validate(
+        self,
+        manifest: VerificationManifest,
+        context: EvidenceValidationContext,
+    ) -> List[str]:
+        if str(manifest.raw.get("summary") or manifest.raw.get("result") or "").strip():
+            return []
+        if _manifest_list(manifest.raw.get("artifacts")) or _manifest_list(manifest.raw.get("findings")):
+            return []
+        return ["operator_result evidence requires summary, result, findings, or artifacts"]
+
+
 VALIDATORS: Dict[str, EvidenceValidator] = {
     validator.evidence_type: validator
     for validator in (
@@ -229,6 +244,7 @@ VALIDATORS: Dict[str, EvidenceValidator] = {
         ArtifactValidator(),
         NoChangeValidator(),
         ReviewVerdictValidator(),
+        OperatorResultValidator(),
     )
 }
 
