@@ -48,6 +48,7 @@ RUNTIME_MARKDOWN_REQUIRED_SNIPPETS = (
     "`tasks`: authority `mac`",
     "`projects`: authority `mac`",
     "`agents`: authority `mac`",
+    "Identity boundary",
     "mac-hermes tasks",
     "mac-hermes projects",
     "mac-hermes agents",

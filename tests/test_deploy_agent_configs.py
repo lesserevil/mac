@@ -213,6 +213,9 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "write_hermes_memory_topology()" in script
     assert "write_hermes_runtime_context()" in script
     assert "register_hermes_runtime_identity()" in script
+    assert "ensure_hermes_identity_memory_continuity()" in script
+    assert 'values.setdefault("SLACK_ALLOWED_USERS", "*")' in script
+    assert 'values.setdefault("SLACK_STRICT_MENTION", "true")' in script
     assert "mac.hermes.runtime_context.v1" in (ROOT / "src" / "mac" / "hermes_runtime.py").read_text(
         encoding="utf-8"
     )
@@ -223,6 +226,8 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert "install_or_validate_shared_services" in script
     assert "install_or_validate_tokenhub_service" in script
     assert "mac.hermes.memory_topology.v1" in script
+    assert '"long_term_memory": "memories/MEMORY.md"' in script
+    assert '"legacy_long_term_memory": "MEMORY.md"' in script
     assert "QDRANT_FLEET_URL" in script
     assert 'if ! truthy "$required"; then' in script
     assert 'values.pop(key, None)' in script
@@ -243,6 +248,8 @@ def test_fleet_deploy_declares_shared_memory_and_supervision_contract():
     assert env_example["MAC_WORKER_HERMES_INSTANCE_ID"] == "hermes_example"
     assert env_example["MAC_WORKER_EXECUTOR"] == "/home/mac/.mac/bin/mac-hermes-task-executor"
     assert env_example["MAC_HERMES_WORKSPACE"] == "/home/mac/.mac/src/mac"
+    assert env_example["SLACK_ALLOWED_USERS"] == "*"
+    assert env_example["SLACK_STRICT_MENTION"] == "true"
     assert env_example["MAC_PROJECT_CONTRACT_FILE"] == "/home/mac/.mac/src/mac/.mac/project.yaml"
     assert '--workspace "$SRC_DIR"' in script
     assert cfg["defaults"]["firecrawl"]["install"] == "auto"
@@ -323,6 +330,7 @@ def test_fleet_deploy_uses_tokenhub_instead_of_direct_provider_secret_paths():
         '. "$ENV_FILE"\n'
         "set +a\n"
         "sync_hermes_tokenhub_client_env\n"
+        "sync_hermes_slack_identity_env\n"
         '[ -x "$MAC_HOME/bin/bd" ] && bootstrap_beads_repositories'
     ) in script
     assert "provider_secret_keys" in script

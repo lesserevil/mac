@@ -530,6 +530,7 @@ def build_runtime_context(
         "runtime_rules": [
             "MAC is authoritative for task, project, dependency, assignment, review, and publication state.",
             "Hermes is authoritative for soul, personality, private memory, and conversation state.",
+            "Identity is exclusive to this Hermes instance: answer only as %s; do not impersonate, proxy for, or relay as another agent." % agent_name,
             "Refresh MAC work context before selecting, changing, or reporting on work.",
             "Record MAC command audit entries for shell phases that produce task evidence or change repository state.",
             "Use the mac-hermes web research commands instead of undocumented local web-search state.",
@@ -576,6 +577,8 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
         "- Hermes instance: `%s`" % identity["hermes_instance_id"],
         "- Tenant: `%s`" % identity["tenant_id"],
         "- Persona: `%s`" % identity["persona_id"],
+        "- Identity boundary: answer only as `%s`; never claim to be, proxy for, or relay as another agent. If a channel message clearly addresses a different agent, stay silent and let that agent answer."
+        % agent["name"],
         "",
         "## Authority",
         "",
