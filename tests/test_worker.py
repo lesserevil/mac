@@ -844,6 +844,71 @@ def test_mac_worker_prepares_repository_task_in_git_worktree(tmp_path: Path):
     assert any(item.name == "worker.repository.worktree_prepared" for item in observations)
 
 
+def test_mac_worker_derives_repo_anchor_for_documentation_evidence(tmp_path: Path):
+    cp = ControlPlane.in_memory()
+    agent = register_worker_fixture(cp)
+    _seed, repo = _git_fixture(tmp_path)
+    _git(repo, "config", "user.email", "mac-tests@example.invalid")
+    _git(repo, "config", "user.name", "mac tests")
+    metadata = _repository_task_metadata(repo)
+    metadata["execution_contract"]["evidence_type"] = "documentation"
+    task = cp.create_task(
+        "Repository docs task",
+        required_capabilities=["python"],
+        metadata=metadata,
+    )
+    client = TestClient(create_app(control_plane=cp))
+
+    def executor(task_payload: Dict[str, Any], task_dir: Path) -> WorkerExecution:
+        runtime = task_payload["metadata"]["runtime"]
+        worktree = Path(runtime["repository_worktree"])
+        branch = runtime["repository_branch"]
+        docs = worktree / "docs"
+        docs.mkdir()
+        (docs / "implementation-plan.md").write_text("plan\n", encoding="utf-8")
+        _git(worktree, "add", "docs/implementation-plan.md")
+        _git(worktree, "commit", "-m", "docs: add implementation plan")
+        _git(worktree, "push", "origin", "HEAD:refs/heads/%s" % branch)
+        (task_dir / "mac-evidence.json").write_text(
+            json.dumps(
+                {
+                    "schema": "mac.worker_evidence.v1",
+                    "status": "complete",
+                    "evidence_type": "documentation",
+                    "summary": "docs updated",
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return WorkerExecution(0, "docs updated", stdout="ok\n")
+
+    worker = MacWorker(
+        MacApiClient("http://mac.test", transport=api_transport(client)),
+        agent.id,
+        tmp_path / "workspaces",
+        executor,
+        attestation_key=cp._agent_attestation_key(agent.id),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "submitted_for_review"
+    evidence = cp.list_evidence(task.id)[0]
+    manifest = evidence.metadata["verification"]
+    repo_anchor = manifest["repo"]
+    assert repo_anchor["head_sha"] == _git(
+        tmp_path / "workspaces" / task.id / ("repo-" + result.lease["id"]),
+        "rev-parse",
+        "HEAD",
+    )
+    assert repo_anchor["dirty"] is False
+    assert repo_anchor["pushed"] is True
+    assert repo_anchor["remote_ref"].startswith("refs/heads/mac/")
+    assert repo_anchor["files_changed"] == ["docs/implementation-plan.md"]
+
+
 def test_mac_worker_fails_dirty_repository_worktree_after_success(tmp_path: Path):
     cp = ControlPlane.in_memory()
     agent = register_worker_fixture(cp)

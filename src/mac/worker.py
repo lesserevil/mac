@@ -2062,11 +2062,25 @@ def _enrich_verification_manifest_from_repository_context(
 ) -> JsonDict:
     if not manifest or not context:
         return manifest
-    repo = manifest.get("repo")
-    if not isinstance(repo, dict):
-        return manifest
     enriched = dict(manifest)
-    repo = dict(repo)
+    repo_value = manifest.get("repo")
+    repo = dict(repo_value) if isinstance(repo_value, dict) else {}
+    worktree_raw = str(context.get("repository_worktree") or "").strip()
+    worktree = Path(worktree_raw).expanduser() if worktree_raw else None
+    if worktree is not None and worktree.exists():
+        if not repo.get("head_sha"):
+            head = _run_git(worktree, ["rev-parse", "HEAD"])
+            if head.returncode == 0 and head.stdout.strip():
+                repo["head_sha"] = head.stdout.strip()
+        if "dirty" not in repo:
+            status = _run_git(worktree, ["status", "--porcelain"])
+            if status.returncode == 0:
+                repo["dirty"] = bool(status.stdout.strip())
+        if not repo.get("files_changed"):
+            files_changed = _repository_context_changed_files(worktree, context)
+            if files_changed:
+                repo["files_changed"] = files_changed
+
     defaults = {
         "path": context.get("repository_worktree"),
         "remote_url": context.get("repository_origin_remote"),
@@ -2078,8 +2092,47 @@ def _enrich_verification_manifest_from_repository_context(
     for key, value in defaults.items():
         if value not in {None, ""} and not repo.get(key):
             repo[key] = value
+    if "pushed" not in repo and worktree is not None and worktree.exists():
+        repo["pushed"] = _repository_context_head_is_pushed(worktree, repo)
     enriched["repo"] = repo
     return enriched
+
+
+def _repository_context_changed_files(worktree: Path, context: JsonDict) -> List[str]:
+    base_sha = str(context.get("repository_base_sha") or "").strip()
+    candidates: List[str] = []
+    if base_sha:
+        diff = _run_git(worktree, ["diff", "--name-only", "%s...HEAD" % base_sha])
+        if diff.returncode != 0:
+            diff = _run_git(worktree, ["diff", "--name-only", base_sha, "HEAD"])
+        if diff.returncode == 0:
+            candidates.extend(line.strip() for line in diff.stdout.splitlines())
+    for args in (["diff", "--name-only"], ["diff", "--cached", "--name-only"]):
+        diff = _run_git(worktree, args)
+        if diff.returncode == 0:
+            candidates.extend(line.strip() for line in diff.stdout.splitlines())
+    return sorted({item for item in candidates if item})
+
+
+def _repository_context_head_is_pushed(worktree: Path, repo: JsonDict) -> bool:
+    head_sha = str(repo.get("head_sha") or "").strip()
+    remote_url = str(repo.get("remote_url") or "").strip()
+    remote_ref = str(repo.get("remote_ref") or "").strip()
+    if not head_sha or not remote_ref:
+        return False
+    if remote_url:
+        remote = _run_git(worktree, ["ls-remote", remote_url, remote_ref])
+        if remote.returncode == 0:
+            for line in remote.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == head_sha and parts[1] == remote_ref:
+                    return True
+    branch = _remote_branch_from_ref(remote_ref)
+    if branch:
+        remote_head = _run_git(worktree, ["rev-parse", "--verify", "origin/%s" % branch])
+        if remote_head.returncode == 0 and remote_head.stdout.strip() == head_sha:
+            return True
+    return False
 
 
 def _repository_context_audit_metadata(context: JsonDict) -> JsonDict:
