@@ -487,6 +487,22 @@ class Machine:
 
 
 @dataclass
+class Fleet:
+    id: str
+    name: str
+    description: str
+    status: str
+    metadata: JsonDict
+    tenant_id: Optional[str]
+    agent_ids: List[str]
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass
 class Agent:
     id: str
     machine_id: str

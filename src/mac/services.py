@@ -48,6 +48,7 @@ from mac.models import (
     EvalSet,
     EvalTargetKind,
     Evidence,
+    Fleet,
     HealthStatus,
     HistoryEvent,
     HermesInstance,
@@ -2472,6 +2473,149 @@ class ControlPlane:
             tasks = [task for task in tasks if self._task_tenant_id(task) == tenant_id]
         return tasks
 
+    def update_task(
+        self,
+        task_id: str,
+        *,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        project: Optional[str] = None,
+        priority: Optional[int] = None,
+        required_capabilities: Optional[Iterable[str]] = None,
+        dependencies: Optional[Iterable[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        max_attempts: Optional[int] = None,
+        actor: str = "human",
+    ) -> Task:
+        task = self.get_task(task_id)
+        updates: List[str] = []
+        params: List[Any] = []
+        detail: JsonDict = {}
+        new_project = task.project
+        new_capabilities = list(task.required_capabilities)
+        new_metadata = task.metadata
+        if title is not None:
+            title_value = str(title or "").strip()
+            if not title_value:
+                raise ValidationError("task title is required")
+            updates.append("title = ?")
+            params.append(title_value)
+            detail["title"] = title_value
+        if description is not None:
+            updates.append("description = ?")
+            params.append(str(description or ""))
+            detail["description_changed"] = True
+        if project is not None:
+            new_project = str(project).strip() or None
+            updates.append("project = ?")
+            params.append(new_project)
+            detail["project"] = new_project
+        if priority is not None:
+            updates.append("priority = ?")
+            params.append(int(priority))
+            detail["priority"] = int(priority)
+        if required_capabilities is not None:
+            new_capabilities = coerce_list(required_capabilities)
+            updates.append("required_capabilities = ?")
+            params.append(json_dumps(new_capabilities))
+            detail["required_capabilities"] = new_capabilities
+        if dependencies is not None:
+            dep_ids = coerce_list(dependencies)
+            if task_id in dep_ids:
+                raise ValidationError("task cannot depend on itself")
+            for dep_id in dep_ids:
+                self.get_task(dep_id)
+            updates.append("dependencies = ?")
+            params.append(json_dumps(dep_ids))
+            detail["dependencies"] = dep_ids
+            if task.state in {TaskState.OPEN.value, TaskState.BLOCKED.value}:
+                next_state = TaskState.BLOCKED.value if dep_ids else TaskState.OPEN.value
+                updates.append("state = ?")
+                params.append(next_state)
+                detail["state"] = next_state
+        if metadata is not None:
+            new_metadata = self._normalize_task_execution_contract(
+                ensure_json_object(metadata),
+                new_project,
+                new_capabilities,
+            )
+            updates.append("metadata = ?")
+            params.append(json_dumps(new_metadata))
+            detail["metadata_changed"] = True
+        elif project is not None or required_capabilities is not None:
+            new_metadata = self._normalize_task_execution_contract(
+                dict(task.metadata),
+                new_project,
+                new_capabilities,
+            )
+            updates.append("metadata = ?")
+            params.append(json_dumps(new_metadata))
+            detail["metadata_reconciled"] = True
+        if max_attempts is not None:
+            if int(max_attempts) < 1:
+                raise ValidationError("max_attempts must be >= 1")
+            updates.append("max_attempts = ?")
+            params.append(int(max_attempts))
+            detail["max_attempts"] = int(max_attempts)
+        if not updates:
+            return task
+        updates.append("updated_at = ?")
+        params.append(utcnow())
+        params.append(task_id)
+        self.store.execute(
+            "UPDATE tasks SET %s WHERE id = ?" % ", ".join(updates),
+            tuple(params),
+        )
+        updated = self.get_task(task_id)
+        self._record_history(
+            task_id,
+            "task.updated",
+            actor,
+            task.state,
+            updated.state,
+            detail,
+        )
+        return updated
+
+    def delete_task(self, task_id: str, *, force: bool = False, actor: str = "human") -> None:
+        task = self.get_task(task_id)
+        active = self.store.query_one(
+            "SELECT 1 FROM leases WHERE task_id = ? AND status = ? LIMIT 1",
+            (task_id, LeaseStatus.ACTIVE.value),
+        )
+        if active is not None:
+            raise ValidationError("task cannot be deleted while it has an active lease")
+        dependents = [item for item in self.list_tasks() if task_id in item.dependencies]
+        if dependents and not force:
+            raise ValidationError(
+                "task has dependent tasks: %s" % ", ".join(item.id for item in dependents)
+            )
+        with self.store.transaction() as conn:
+            for dependent in dependents:
+                remaining = [dep_id for dep_id in dependent.dependencies if dep_id != task_id]
+                next_state = (
+                    TaskState.OPEN.value
+                    if dependent.state == TaskState.BLOCKED.value and not remaining
+                    else dependent.state
+                )
+                conn.execute(
+                    """
+                    UPDATE tasks SET dependencies = ?, state = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (json_dumps(remaining), next_state, utcnow(), dependent.id),
+                )
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+        self.record_notification(
+            "task.deleted",
+            "Task deleted: %s" % task.title,
+            "Task was deleted by %s." % actor,
+            subject_type="task",
+            subject_id=task.id,
+            channels=["dashboard"],
+            metadata={"actor": actor, "force": force},
+        )
+
     @staticmethod
     def _project_item_project_key(item: JsonDict) -> str:
         return str(item.get("project") or item.get("source") or "unassigned")
@@ -2595,6 +2739,98 @@ class ControlPlane:
             "bridge_items": bridge_items,
             "beads_repositories": beads_repositories,
         }
+
+    def update_project(
+        self,
+        name_or_id: str,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+        actor: str = "human",
+    ) -> ProjectRecord:
+        project = self.get_project_record(name_or_id)
+        updates: List[str] = []
+        params: List[Any] = []
+        new_name = project.name
+        if name is not None:
+            name_value = str(name or "").strip()
+            if not name_value:
+                raise ValidationError("project name is required")
+            updates.append("name = ?")
+            params.append(name_value)
+            new_name = name_value
+        if description is not None:
+            updates.append("description = ?")
+            params.append(str(description or ""))
+        if metadata is not None:
+            updates.append("metadata = ?")
+            params.append(json_dumps(ensure_json_object(metadata)))
+        if status is not None:
+            status_value = str(status or "").strip().lower()
+            if status_value not in {"active", "inactive", "archived"}:
+                raise ValidationError("unsupported project status: %s" % status_value)
+            updates.append("status = ?")
+            params.append(status_value)
+        if not updates:
+            return project
+        now = utcnow()
+        with self.store.transaction() as conn:
+            updates.append("updated_at = ?")
+            params.append(now)
+            params.append(project.id)
+            try:
+                conn.execute(
+                    "UPDATE projects SET %s WHERE id = ?" % ", ".join(updates),
+                    tuple(params),
+                )
+            except Exception as exc:  # noqa: BLE001 - normalize sqlite uniqueness errors.
+                if "UNIQUE" in str(exc).upper():
+                    raise ValidationError("project already exists: %s" % new_name) from exc
+                raise
+            if new_name != project.name:
+                conn.execute("UPDATE tasks SET project = ?, updated_at = ? WHERE project = ?", (new_name, now, project.name))
+                conn.execute("UPDATE beads_repositories SET project = ?, updated_at = ? WHERE project = ?", (new_name, now, project.name))
+        self.record_notification(
+            "project.updated",
+            "Project updated: %s" % new_name,
+            "Project was updated by %s." % actor,
+            subject_type="project",
+            subject_id=new_name,
+            channels=["dashboard", "hermes"],
+            metadata={"previous_name": project.name, "actor": actor},
+        )
+        return self.get_project_record(new_name)
+
+    def delete_project(self, name_or_id: str, *, force: bool = False, actor: str = "human") -> None:
+        project = self.get_project_record(name_or_id)
+        tasks = [task for task in self.list_tasks() if task.project == project.name]
+        repo_rows = self.store.query_all(
+            "SELECT id FROM beads_repositories WHERE project = ?",
+            (project.name,),
+        )
+        if (tasks or repo_rows) and not force:
+            blockers = []
+            if tasks:
+                blockers.append("%d task(s)" % len(tasks))
+            if repo_rows:
+                blockers.append("%d Beads repositorie(s)" % len(repo_rows))
+            raise ValidationError("project has linked records: %s" % ", ".join(blockers))
+        with self.store.transaction() as conn:
+            if force:
+                conn.execute("UPDATE tasks SET project = NULL, updated_at = ? WHERE project = ?", (utcnow(), project.name))
+                conn.execute("UPDATE beads_repositories SET enabled = 0, updated_at = ? WHERE project = ?", (utcnow(), project.name))
+            conn.execute("DELETE FROM projects WHERE id = ?", (project.id,))
+        self.record_notification(
+            "project.deleted",
+            "Project deleted: %s" % project.name,
+            "Project was deleted by %s." % actor,
+            subject_type="project",
+            subject_id=project.name,
+            channels=["dashboard"],
+            metadata={"actor": actor, "force": force},
+        )
 
     def task_detail(self, task_id: str) -> JsonDict:
         task = self.get_task(task_id)
@@ -4061,6 +4297,192 @@ class ControlPlane:
 
     def list_machines(self) -> List[Machine]:
         return [self._machine_from_row(row) for row in self.store.query_all("SELECT * FROM machines ORDER BY hostname")]
+
+    # Fleets are user-facing collections of agents. They intentionally do not
+    # own machines or tasks; those remain independent first-class objects.
+
+    def create_fleet(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        status: str = "active",
+        metadata: Optional[Dict[str, Any]] = None,
+        tenant_id: Optional[str] = None,
+        agent_ids: Optional[Iterable[str]] = None,
+        fleet_id: Optional[str] = None,
+        actor: str = "human",
+    ) -> Fleet:
+        fleet_name = str(name or "").strip()
+        if not fleet_name:
+            raise ValidationError("fleet name is required")
+        if tenant_id:
+            self.get_tenant(tenant_id)
+        normalized_status = str(status or "active").strip().lower()
+        if normalized_status not in {"active", "inactive", "retired"}:
+            raise ValidationError("unsupported fleet status: %s" % normalized_status)
+        members = self._validated_fleet_agent_ids(agent_ids or [])
+        now = utcnow()
+        metadata_value = ensure_json_object(metadata)
+        if actor:
+            metadata_value.setdefault("created_by", actor)
+        fid = fleet_id or new_id("fleet")
+        with self.store.transaction() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO fleets (
+                        id, name, description, status, metadata, tenant_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        fid,
+                        fleet_name,
+                        str(description or ""),
+                        normalized_status,
+                        json_dumps(metadata_value),
+                        tenant_id,
+                        now,
+                        now,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - normalize sqlite uniqueness errors.
+                if "UNIQUE" in str(exc).upper():
+                    raise ValidationError("fleet already exists: %s" % fleet_name) from exc
+                raise
+            self._replace_fleet_members(conn, fid, members, now)
+        self.record_notification(
+            "fleet.created",
+            "Fleet created: %s" % fleet_name,
+            str(description or "Fleet %s was created." % fleet_name),
+            subject_type="fleet",
+            subject_id=fid,
+            channels=["dashboard", "hermes"],
+            metadata={"fleet": fleet_name, "actor": actor},
+        )
+        return self.get_fleet(fid)
+
+    def get_fleet(self, fleet_id_or_name: str) -> Fleet:
+        row = self.store.query_one(
+            "SELECT * FROM fleets WHERE id = ? OR name = ?",
+            (fleet_id_or_name, fleet_id_or_name),
+        )
+        if row is None:
+            raise NotFoundError("fleet not found: %s" % fleet_id_or_name)
+        return self._fleet_from_row(row)
+
+    def list_fleets(
+        self,
+        *,
+        status: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List[Fleet]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status).strip().lower())
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.store.query_all(
+            "SELECT * FROM fleets%s ORDER BY name, id" % where,
+            tuple(params),
+        )
+        return [self._fleet_from_row(row) for row in rows]
+
+    def update_fleet(
+        self,
+        fleet_id_or_name: str,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        status: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tenant_id: Optional[str] = None,
+        agent_ids: Optional[Iterable[str]] = None,
+        actor: str = "human",
+    ) -> Fleet:
+        fleet = self.get_fleet(fleet_id_or_name)
+        updates: List[str] = []
+        params: List[Any] = []
+        if name is not None:
+            name_value = str(name or "").strip()
+            if not name_value:
+                raise ValidationError("fleet name is required")
+            updates.append("name = ?")
+            params.append(name_value)
+        if description is not None:
+            updates.append("description = ?")
+            params.append(str(description or ""))
+        if status is not None:
+            status_value = str(status or "").strip().lower()
+            if status_value not in {"active", "inactive", "retired"}:
+                raise ValidationError("unsupported fleet status: %s" % status_value)
+            updates.append("status = ?")
+            params.append(status_value)
+        if metadata is not None:
+            updates.append("metadata = ?")
+            params.append(json_dumps(ensure_json_object(metadata)))
+        if tenant_id is not None:
+            tenant_value = tenant_id.strip()
+            if tenant_value:
+                self.get_tenant(tenant_value)
+                updates.append("tenant_id = ?")
+                params.append(tenant_value)
+            else:
+                updates.append("tenant_id = NULL")
+        members = None
+        if agent_ids is not None:
+            members = self._validated_fleet_agent_ids(agent_ids)
+        if not updates and members is None:
+            return fleet
+        now = utcnow()
+        with self.store.transaction() as conn:
+            if updates:
+                updates.append("updated_at = ?")
+                params.append(now)
+                params.append(fleet.id)
+                try:
+                    conn.execute(
+                        "UPDATE fleets SET %s WHERE id = ?" % ", ".join(updates),
+                        tuple(params),
+                    )
+                except Exception as exc:  # noqa: BLE001 - normalize sqlite uniqueness errors.
+                    if "UNIQUE" in str(exc).upper():
+                        raise ValidationError("fleet already exists: %s" % name) from exc
+                    raise
+            if members is not None:
+                self._replace_fleet_members(conn, fleet.id, members, now)
+                conn.execute("UPDATE fleets SET updated_at = ? WHERE id = ?", (now, fleet.id))
+        self.record_notification(
+            "fleet.updated",
+            "Fleet updated: %s" % (name or fleet.name),
+            "Fleet membership or metadata changed.",
+            subject_type="fleet",
+            subject_id=fleet.id,
+            channels=["dashboard"],
+            metadata={"actor": actor},
+        )
+        return self.get_fleet(fleet.id)
+
+    def delete_fleet(self, fleet_id_or_name: str) -> None:
+        fleet = self.get_fleet(fleet_id_or_name)
+        self.store.execute("DELETE FROM fleets WHERE id = ?", (fleet.id,))
+
+    def _validated_fleet_agent_ids(self, agent_ids: Iterable[str]) -> List[str]:
+        normalized = coerce_list(str(agent_id).strip() for agent_id in (agent_ids or []))
+        for agent_id in normalized:
+            self.get_agent(agent_id)
+        return normalized
+
+    def _replace_fleet_members(self, conn: Any, fleet_id: str, agent_ids: List[str], now: str) -> None:
+        conn.execute("DELETE FROM fleet_agents WHERE fleet_id = ?", (fleet_id,))
+        conn.executemany(
+            "INSERT INTO fleet_agents (fleet_id, agent_id, created_at) VALUES (?, ?, ?)",
+            [(fleet_id, agent_id, now) for agent_id in agent_ids],
+        )
 
     def register_agent(
         self,
@@ -8773,6 +9195,23 @@ class ControlPlane:
             row["updated_at"],
             row["last_seen_at"],
             hardware,
+        )
+
+    def _fleet_from_row(self, row: Any) -> Fleet:
+        member_rows = self.store.query_all(
+            "SELECT agent_id FROM fleet_agents WHERE fleet_id = ? ORDER BY agent_id",
+            (row["id"],),
+        )
+        return Fleet(
+            row["id"],
+            row["name"],
+            row["description"],
+            row["status"],
+            json_loads(row["metadata"], {}),
+            row["tenant_id"],
+            [member["agent_id"] for member in member_rows],
+            row["created_at"],
+            row["updated_at"],
         )
 
     def _agent_from_row(self, row: Any) -> Agent:

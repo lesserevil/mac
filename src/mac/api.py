@@ -166,6 +166,22 @@ class TaskCreate(BaseModel):
     actor: str = "human"
 
 
+class TaskUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    project: Optional[str] = None
+    priority: Optional[int] = None
+    required_capabilities: Optional[List[str]] = None
+    dependencies: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    max_attempts: Optional[int] = None
+    actor: str = "human"
+
+
+class TaskDelete(BaseModel):
+    actor: str = "human"
+
+
 class ProjectCreate(BaseModel):
     name: str
     description: str = ""
@@ -173,6 +189,43 @@ class ProjectCreate(BaseModel):
     status: str = "active"
     actor: str = "human"
     project_id: Optional[str] = None
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    actor: str = "human"
+
+
+class ProjectDelete(BaseModel):
+    actor: str = "human"
+
+
+class FleetCreate(BaseModel):
+    name: str
+    description: str = ""
+    status: str = "active"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    tenant_id: Optional[str] = None
+    agent_ids: List[str] = Field(default_factory=list)
+    fleet_id: Optional[str] = None
+    actor: str = "human"
+
+
+class FleetUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    tenant_id: Optional[str] = None
+    agent_ids: Optional[List[str]] = None
+    actor: str = "human"
+
+
+class FleetDelete(BaseModel):
+    actor: str = "human"
 
 
 class TenantRegister(BaseModel):
@@ -1978,9 +2031,67 @@ def create_app(
     def get_task(task_id: str) -> Dict[str, Any]:
         return cp.task_detail(task_id)
 
+    @app.put("/tasks/{task_id}")
+    def update_task(task_id: str, body: TaskUpdate) -> Dict[str, Any]:
+        data = _data(body)
+        actor = data.pop("actor", "human")
+        if data.get("metadata") is not None:
+            _ensure_payload_bounded(data["metadata"], "task.metadata")
+        return cp.update_task(task_id, actor=actor, **data).to_dict()
+
+    @app.delete("/tasks/{task_id}")
+    def delete_task(
+        task_id: str,
+        force: bool = Query(default=False),
+        actor: str = Query(default="human"),
+    ) -> Dict[str, Any]:
+        cp.delete_task(task_id, force=force, actor=actor)
+        return {"deleted": task_id}
+
     @app.get("/tasks/{task_id}/summary")
     def task_summary(task_id: str) -> Dict[str, Any]:
         return cp.task_summary(task_id)
+
+    @app.post("/fleets")
+    def create_fleet(
+        body: FleetCreate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        _ensure_payload_bounded(body.metadata, "fleet.metadata")
+        return cp.create_fleet(**_data(body)).to_dict()
+
+    @app.get("/fleets")
+    def list_fleets(
+        status: Optional[str] = Query(default=None),
+        tenant_id: Optional[str] = Query(default=None),
+    ) -> List[Dict[str, Any]]:
+        return [fleet.to_dict() for fleet in cp.list_fleets(status=status, tenant_id=tenant_id)]
+
+    @app.get("/fleets/{fleet_id_or_name}")
+    def get_fleet(fleet_id_or_name: str) -> Dict[str, Any]:
+        return cp.get_fleet(fleet_id_or_name).to_dict()
+
+    @app.put("/fleets/{fleet_id_or_name}")
+    def update_fleet(
+        fleet_id_or_name: str,
+        body: FleetUpdate,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        data = _data(body)
+        if data.get("metadata") is not None:
+            _ensure_payload_bounded(data["metadata"], "fleet.metadata")
+        return cp.update_fleet(fleet_id_or_name, **data).to_dict()
+
+    @app.delete("/fleets/{fleet_id_or_name}")
+    def delete_fleet(
+        fleet_id_or_name: str,
+        principal: TokenPrincipal = Depends(_get_principal),
+    ) -> Dict[str, Any]:
+        principal.require_global_fleet()
+        cp.delete_fleet(fleet_id_or_name)
+        return {"deleted": fleet_id_or_name}
 
     @app.get("/projects")
     def list_projects() -> List[Dict[str, Any]]:
@@ -2006,6 +2117,23 @@ def create_app(
     @app.get("/projects/{project}")
     def get_project(project: str) -> Dict[str, Any]:
         return cp.get_project(project)
+
+    @app.put("/projects/{project}")
+    def update_project(project: str, body: ProjectUpdate) -> Dict[str, Any]:
+        data = _data(body)
+        actor = data.pop("actor", "human")
+        if data.get("metadata") is not None:
+            _ensure_payload_bounded(data["metadata"], "project.metadata")
+        return cp.update_project(project, actor=actor, **data).to_dict()
+
+    @app.delete("/projects/{project}")
+    def delete_project(
+        project: str,
+        force: bool = Query(default=False),
+        actor: str = Query(default="human"),
+    ) -> Dict[str, Any]:
+        cp.delete_project(project, force=force, actor=actor)
+        return {"deleted": project}
 
     @app.post("/tasks/{task_id}/transition")
     def transition_task(

@@ -258,6 +258,30 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_agents_status_health
                     ON agents (status, health_status);
 
+                CREATE TABLE IF NOT EXISTS fleets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_fleets_status_name
+                    ON fleets (status, name);
+                CREATE INDEX IF NOT EXISTS idx_fleets_tenant
+                    ON fleets (tenant_id);
+
+                CREATE TABLE IF NOT EXISTS fleet_agents (
+                    fleet_id TEXT NOT NULL REFERENCES fleets(id) ON DELETE CASCADE,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (fleet_id, agent_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fleet_agents_agent
+                    ON fleet_agents (agent_id);
+
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     sender_agent_id TEXT NOT NULL,
