@@ -108,6 +108,7 @@ def test_mac_runtime_context_patch_makes_hermes_prompt_load_runtime_markdown(
                 "# MAC Task and Project Runtime",
                 "",
                 "## First-Class Objects",
+                "- `fleets`: authority `mac`; source `MAC fleet records`",
                 "- `tasks`: authority `mac`; source `mac task records and task history`",
                 "- `projects`: authority `mac`; source `MAC project summaries`",
                 "- `agents`: authority `mac`; source `MAC agent registry`",
@@ -124,6 +125,7 @@ def test_mac_runtime_context_patch_makes_hermes_prompt_load_runtime_markdown(
                 "- `mac-hermes work-context hermes_rocky --active-only`",
                 "- `hermes_oneshot_executor`: `mac-hermes-task-executor`",
                 "- `hgmac agents list`",
+                "- `hgmac fleets list`",
                 "",
             ]
         ),
@@ -144,6 +146,7 @@ def test_mac_runtime_context_patch_makes_hermes_prompt_load_runtime_markdown(
     for rendered in (runtime_context, prompt):
         assert "MAC Task and Project Runtime" in rendered
         assert "First-Class Objects" in rendered
+        assert "`fleets`: authority `mac`" in rendered
         assert "`tasks`: authority `mac`" in rendered
         assert "`projects`: authority `mac`" in rendered
         assert "`agents`: authority `mac`" in rendered
@@ -157,4 +160,5 @@ def test_mac_runtime_context_patch_makes_hermes_prompt_load_runtime_markdown(
         assert "hermes_oneshot_executor" in rendered
         assert "mac-hermes-task-executor" in rendered
         assert "hgmac agents list" in rendered
+        assert "hgmac fleets list" in rendered
     assert "SOUL.md" not in prompt

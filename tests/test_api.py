@@ -208,14 +208,19 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert any("mac-hermes command-audit" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes web-search" in command for command in work_context["operations"]["mac_hermes_cli"])
     assert any("mac-hermes agents" in command for command in work_context["operations"]["mac_hermes_cli"])
+    assert any("hgmac fleets create" in command for command in work_context["operations"]["hgmac_cli"])
+    assert any("hgmac tasks create" in command for command in work_context["operations"]["hgmac_cli"])
+    assert any("hgmac projects create" in command for command in work_context["operations"]["hgmac_cli"])
     assert any("hgmac agents create" in command for command in work_context["operations"]["hgmac_cli"])
     assert work_context["operations"]["dashboard"]["entrypoint"] == "/ui"
-    assert {"work", "map", "agents", "tasks", "hermes"} <= set(
+    assert {"work", "projects", "map", "fleets", "agents", "tasks", "hermes"} <= set(
         work_context["operations"]["dashboard"]["views"]
     )
     assert {"view", "project", "task_state", "selected"} <= set(
         work_context["operations"]["dashboard"]["url_state_parameters"]
     )
+    assert "/ui?view=fleets&selected={fleet_id}" in work_context["operations"]["dashboard"]["deep_link_templates"]["fleets"]
+    assert "/ui?view=projects&project={project}" in work_context["operations"]["dashboard"]["deep_link_templates"]["projects"]
     assert "/ui?view=work&project={project}" in work_context["operations"]["dashboard"]["deep_link_templates"]["projects"]
 
     runtime_proof = client.get("/hermes-instances/%s/runtime-proof" % hermes["id"]).json()
@@ -235,6 +240,11 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert dashboard_url_contract["schema"] == "mac.hermes.dashboard_url_contract.v1"
     assert dashboard_url_contract["ready"] is True
     assert dashboard_url_contract["entrypoint"] == "/ui"
+    assert any(
+        url.startswith("/ui?view=fleets&selected=")
+        for url in dashboard_url_contract["object_deep_links"]["fleets"]["samples"]
+    )
+    assert "/ui?view=projects&project=nanolang" in dashboard_url_contract["object_deep_links"]["projects"]["samples"]
     assert "/ui?view=work&project=nanolang" in dashboard_url_contract["object_deep_links"]["projects"]["samples"]
     assert any(
         url.startswith("/ui?view=agents&selected=%s" % agent["id"])
@@ -251,12 +261,15 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert live_alignment["tasks"]["live_count"] == 2
     assert set(live_alignment["tasks"]["work_context_ids"]) == {dependency["id"], task["id"]}
     assert live_alignment["projects"]["work_context_names"] == ["nanolang", "c26"]
+    assert live_alignment["fleets"]["ready"] is True
     assert live_alignment["agents"]["ready"] is True
     assert "get_runtime_proof" in runtime_proof["evidence"]["api"]["operation_names"]
     assert "list_tasks" in runtime_proof["evidence"]["api"]["task_operation_names"]
     assert "list_projects" in runtime_proof["evidence"]["api"]["project_operation_names"]
+    assert "list_fleets" in runtime_proof["evidence"]["api"]["fleet_operation_names"]
     assert "list_project_items" in runtime_proof["evidence"]["api"]["project_operation_names"]
     assert "list_agents" in runtime_proof["evidence"]["api"]["agent_operation_names"]
+    assert runtime_proof["evidence"]["first_class_objects"]["fleets"]["ready"] is True
     assert runtime_proof["evidence"]["first_class_objects"]["tasks"]["ready"] is True
     assert runtime_proof["evidence"]["first_class_objects"]["projects"]["ready"] is True
     assert runtime_proof["evidence"]["first_class_objects"]["agents"]["ready"] is True
@@ -269,7 +282,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                 "hermes_instance_id": hermes["id"],
                 "prompt_bridge": {"required": True, "present": True},
                 "markdown_contract": {"ready": True, "missing_snippets": []},
-                "first_class_object_names": ["tasks", "projects", "agents"],
+                "first_class_object_names": ["fleets", "tasks", "projects", "agents"],
                 "session_capability_names": [
                     "mac_api",
                     "mac_cli",
@@ -306,7 +319,7 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
                     "hermes_instance_id": hermes["id"],
                     "prompt_bridge": {"required": True, "present": True},
                     "markdown_contract": {"ready": True, "missing_snippets": []},
-                    "first_class_object_names": ["tasks", "projects", "agents"],
+                    "first_class_object_names": ["fleets", "tasks", "projects", "agents"],
                     "session_capability_names": [
                         "mac_api",
                         "mac_cli",
@@ -733,6 +746,7 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert "beads_repositories" in state
     assert "project_summaries" in state
     assert "swarm_summary" in state
+    assert "fleets" in state
     assert state["project_summaries"][0]["project"] == "unassigned"
     assert state["project_summaries"][0]["ready_count"] == 1
     assert state["swarm_summary"]["agent_total"] == 1
@@ -890,6 +904,87 @@ def test_fastapi_exposes_agent_crud_operations():
     assert deleted.status_code == 200
     assert deleted.json() == {"deleted": agent["id"]}
     assert client.get("/agents/%s" % agent["id"]).status_code == 404
+
+
+def test_fastapi_exposes_first_class_object_crud_e2e():
+    client = TestClient(create_app(control_plane=ControlPlane.in_memory()))
+    machine = client.post("/machines", json={"hostname": "crud-host"}).json()
+    agent = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+
+    fleet = client.post(
+        "/fleets",
+        json={
+            "name": "classic",
+            "description": "Rocky-era fleet",
+            "metadata": {"hub": "rocky"},
+            "agent_ids": [agent["id"]],
+        },
+    )
+    assert fleet.status_code == 200, fleet.text
+    fleet_body = fleet.json()
+    assert fleet_body["name"] == "classic"
+    assert fleet_body["agent_ids"] == [agent["id"]]
+    assert client.get("/fleets/classic").json()["id"] == fleet_body["id"]
+    assert client.get("/fleets").json()[0]["name"] == "classic"
+
+    fleet_update = client.put(
+        "/fleets/%s" % fleet_body["id"],
+        json={"status": "inactive", "agent_ids": [], "metadata": {"hub": "rocky", "vpn": "tailscale"}},
+    )
+    assert fleet_update.status_code == 200, fleet_update.text
+    assert fleet_update.json()["status"] == "inactive"
+    assert fleet_update.json()["agent_ids"] == []
+
+    project = client.post(
+        "/projects",
+        json={"name": "nanolang", "description": "language repo", "metadata": {"repo": "nanolang"}},
+    )
+    assert project.status_code == 200, project.text
+    assert project.json()["name"] == "nanolang"
+    assert client.get("/projects/nanolang").json()["project"] == "nanolang"
+
+    task = client.post(
+        "/tasks",
+        json={"title": "Implement parser", "project": "nanolang", "required_capabilities": ["python"]},
+    )
+    assert task.status_code == 200, task.text
+    task_body = task.json()
+    assert client.get("/tasks/%s" % task_body["id"]).json()["task"]["title"] == "Implement parser"
+
+    task_update = client.put(
+        "/tasks/%s" % task_body["id"],
+        json={"title": "Implement parser v2", "priority": 7, "required_capabilities": ["python", "tests"]},
+    )
+    assert task_update.status_code == 200, task_update.text
+    assert task_update.json()["title"] == "Implement parser v2"
+    assert task_update.json()["required_capabilities"] == ["python", "tests"]
+
+    project_update = client.put(
+        "/projects/nanolang",
+        json={"name": "nanolang-core", "status": "active", "metadata": {"repo": "nanolang-core"}},
+    )
+    assert project_update.status_code == 200, project_update.text
+    assert project_update.json()["name"] == "nanolang-core"
+    assert client.get("/tasks/%s" % task_body["id"]).json()["task"]["project"] == "nanolang-core"
+
+    agent_update = client.put(
+        "/agents/%s" % agent["id"],
+        json={"name": "worker-2", "status": "idle", "health_status": "healthy"},
+    )
+    assert agent_update.status_code == 200, agent_update.text
+    assert agent_update.json()["name"] == "worker-2"
+
+    state = client.get("/dashboard/state").json()
+    assert state["overview"]["counts"]["fleets"] == 1
+    assert state["fleets"][0]["name"] == "classic"
+
+    assert client.delete("/tasks/%s" % task_body["id"]).json() == {"deleted": task_body["id"]}
+    assert client.delete("/projects/nanolang-core").json() == {"deleted": "nanolang-core"}
+    assert client.delete("/fleets/classic").json() == {"deleted": "classic"}
+    assert client.delete("/agents/%s" % agent["id"]).json() == {"deleted": agent["id"]}
 
 
 def test_fastapi_exposes_workflow_drafts_preview_and_notifier_channels():
@@ -1253,8 +1348,26 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "URLSearchParams" in app_js
     assert "createDashboardApi" in app_js
     assert "renderWork" in app_js
+    assert "renderProjects" in app_js
+    assert "renderFleets" in app_js
     assert "Epic / Project Frontier" in app_js
     assert "Agent Resource Table" in app_js
+    assert "Fleet CRUD" in app_js
+    assert "Project CRUD" in app_js
+    assert 'data-action="fleetCreate"' in app_js
+    assert 'data-action="fleetUpdate"' in app_js
+    assert 'data-action="fleetDelete"' in app_js
+    assert 'data-action="agentCreate"' in app_js
+    assert 'data-action="agentUpdate"' in app_js
+    assert 'data-action="agentDelete"' in app_js
+    assert 'data-action="taskCreate"' in app_js
+    assert 'data-action="taskUpdate"' in app_js
+    assert 'data-action="taskDelete"' in app_js
+    assert 'data-action="projectCreate"' in app_js
+    assert 'data-action="projectUpdate"' in app_js
+    assert 'data-action="projectDelete"' in app_js
+    assert "putJSON" in app_js
+    assert "deleteJSON" in app_js
     assert "renderWorkflows" in app_js
     assert "workflowGraph" in app_js
     assert "hermes_runtime_proofs" in app_js
@@ -1282,7 +1395,9 @@ def test_dashboard_has_typescript_source_without_node_toolchain_files():
     assert "Project ops" in app_js
     assert "Agent ops" in app_js
     assert 'data-view="work"' in index_html
+    assert 'data-view="projects"' in index_html
     assert 'data-view="map"' in index_html
+    assert 'data-view="fleets"' in index_html
     assert 'data-view="workflows"' in index_html
     assert not (root / "package.json").exists()
     assert not (root / "package-lock.json").exists()

@@ -704,7 +704,7 @@ def test_mac_hermes_cli_submits_local_startup_for_runtime_proof(monkeypatch, cap
     startup = {
         "task_project_runtime": {
             "ready": True,
-            "first_class_object_names": ["tasks", "projects", "agents"],
+            "first_class_object_names": ["fleets", "tasks", "projects", "agents"],
         }
     }
     monkeypatch.setattr(MacApiClient, "request", request)

@@ -219,11 +219,141 @@ def build_parser() -> argparse.ArgumentParser:
     audit_record.add_argument("--returncode", type=int)
     audit_record.add_argument("--metadata-json", default="{}")
     _set(audit_record, cmd_agents_command_audit_record)
+
+    _add_fleet_parsers(sub)
+    _add_task_parsers(sub)
+    _add_project_parsers(sub)
     return parser
 
 
 def _set(parser: argparse.ArgumentParser, func: Callable[[HgMacClient, argparse.Namespace], Any]) -> None:
     parser.set_defaults(func=func)
+
+
+def _add_fleet_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    fleets = sub.add_parser("fleets", help="Fleet CRUD operations")
+    fleet_sub = fleets.add_subparsers(dest="action", required=True)
+
+    list_cmd = fleet_sub.add_parser("list", help="List fleets")
+    list_cmd.add_argument("--status")
+    list_cmd.add_argument("--tenant-id")
+    _set(list_cmd, cmd_fleets_list)
+
+    show = fleet_sub.add_parser("show", help="Show one fleet")
+    show.add_argument("fleet")
+    _set(show, cmd_fleets_show)
+
+    create = fleet_sub.add_parser("create", help="Create a fleet")
+    create.add_argument("--name", required=True)
+    create.add_argument("--description", default="")
+    create.add_argument("--status", default="active")
+    create.add_argument("--metadata-json", default="{}")
+    create.add_argument("--tenant-id")
+    create.add_argument("--agent-id", action="append", default=[])
+    create.add_argument("--agent-ids", default="")
+    create.add_argument("--fleet-id")
+    create.add_argument("--actor", default="human")
+    _set(create, cmd_fleets_create)
+
+    update = fleet_sub.add_parser("update", help="Update a fleet")
+    update.add_argument("fleet")
+    update.add_argument("--name")
+    update.add_argument("--description")
+    update.add_argument("--status")
+    update.add_argument("--metadata-json")
+    update.add_argument("--tenant-id")
+    update.add_argument("--agent-id", action="append", default=None)
+    update.add_argument("--agent-ids")
+    update.add_argument("--actor", default="human")
+    _set(update, cmd_fleets_update)
+
+    delete = fleet_sub.add_parser("delete", help="Delete a fleet")
+    delete.add_argument("fleet")
+    _set(delete, cmd_fleets_delete)
+
+
+def _add_task_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    tasks = sub.add_parser("tasks", help="Task CRUD operations")
+    task_sub = tasks.add_subparsers(dest="action", required=True)
+
+    list_cmd = task_sub.add_parser("list", help="List tasks")
+    list_cmd.add_argument("--state")
+    list_cmd.add_argument("--tenant-id")
+    _set(list_cmd, cmd_tasks_list)
+
+    show = task_sub.add_parser("show", help="Show one task")
+    show.add_argument("task_id")
+    _set(show, cmd_tasks_show)
+
+    create = task_sub.add_parser("create", help="Create a task")
+    create.add_argument("--title", required=True)
+    create.add_argument("--description", default="")
+    create.add_argument("--project")
+    create.add_argument("--priority", type=int, default=0)
+    create.add_argument("--capability", action="append", default=[])
+    create.add_argument("--capabilities", default="")
+    create.add_argument("--dependency", action="append", default=[])
+    create.add_argument("--dependencies", default="")
+    create.add_argument("--metadata-json", default="{}")
+    create.add_argument("--max-attempts", type=int, default=3)
+    create.add_argument("--actor", default="human")
+    _set(create, cmd_tasks_create)
+
+    update = task_sub.add_parser("update", help="Update a task")
+    update.add_argument("task_id")
+    update.add_argument("--title")
+    update.add_argument("--description")
+    update.add_argument("--project")
+    update.add_argument("--priority", type=int)
+    update.add_argument("--capability", action="append", default=None)
+    update.add_argument("--capabilities")
+    update.add_argument("--dependency", action="append", default=None)
+    update.add_argument("--dependencies")
+    update.add_argument("--metadata-json")
+    update.add_argument("--max-attempts", type=int)
+    update.add_argument("--actor", default="human")
+    _set(update, cmd_tasks_update)
+
+    delete = task_sub.add_parser("delete", help="Delete a task")
+    delete.add_argument("task_id")
+    delete.add_argument("--force", action="store_true")
+    delete.add_argument("--actor", default="human")
+    _set(delete, cmd_tasks_delete)
+
+
+def _add_project_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    projects = sub.add_parser("projects", help="Project CRUD operations")
+    project_sub = projects.add_subparsers(dest="action", required=True)
+
+    _set(project_sub.add_parser("list", help="List projects"), cmd_projects_list)
+
+    show = project_sub.add_parser("show", help="Show one project")
+    show.add_argument("project")
+    _set(show, cmd_projects_show)
+
+    create = project_sub.add_parser("create", help="Create a project")
+    create.add_argument("--name", required=True)
+    create.add_argument("--description", default="")
+    create.add_argument("--metadata-json", default="{}")
+    create.add_argument("--status", default="active")
+    create.add_argument("--actor", default="human")
+    create.add_argument("--project-id")
+    _set(create, cmd_projects_create)
+
+    update = project_sub.add_parser("update", help="Update a project")
+    update.add_argument("project")
+    update.add_argument("--name")
+    update.add_argument("--description")
+    update.add_argument("--metadata-json")
+    update.add_argument("--status")
+    update.add_argument("--actor", default="human")
+    _set(update, cmd_projects_update)
+
+    delete = project_sub.add_parser("delete", help="Delete a project")
+    delete.add_argument("project")
+    delete.add_argument("--force", action="store_true")
+    delete.add_argument("--actor", default="human")
+    _set(delete, cmd_projects_delete)
 
 
 def cmd_agents_list(client: HgMacClient, args: argparse.Namespace) -> Any:
@@ -437,6 +567,149 @@ def cmd_agents_command_audit_record(client: HgMacClient, args: argparse.Namespac
     )
 
 
+def cmd_fleets_list(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("GET", "/fleets%s" % _query({"status": args.status, "tenant_id": args.tenant_id}))
+
+
+def cmd_fleets_show(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("GET", "/fleets/%s" % quote(args.fleet))
+
+
+def cmd_fleets_create(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "POST",
+        "/fleets",
+        _drop_none(
+            {
+                "name": args.name,
+                "description": args.description,
+                "status": args.status,
+                "metadata": _json_object(args.metadata_json),
+                "tenant_id": args.tenant_id,
+                "agent_ids": _merged_csv(args.agent_id, args.agent_ids),
+                "fleet_id": args.fleet_id,
+                "actor": args.actor,
+            }
+        ),
+    )
+
+
+def cmd_fleets_update(client: HgMacClient, args: argparse.Namespace) -> Any:
+    body = _drop_none(
+        {
+            "name": args.name,
+            "description": args.description,
+            "status": args.status,
+            "metadata": _json_object(args.metadata_json) if args.metadata_json is not None else None,
+            "tenant_id": args.tenant_id,
+            "agent_ids": _optional_merged_csv(args.agent_id, args.agent_ids),
+            "actor": args.actor,
+        }
+    )
+    return client.request("PUT", "/fleets/%s" % quote(args.fleet), body)
+
+
+def cmd_fleets_delete(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("DELETE", "/fleets/%s" % quote(args.fleet))
+
+
+def cmd_tasks_list(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("GET", "/tasks%s" % _query({"state": args.state, "tenant_id": args.tenant_id}))
+
+
+def cmd_tasks_show(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("GET", "/tasks/%s" % quote(args.task_id))
+
+
+def cmd_tasks_create(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "POST",
+        "/tasks",
+        _drop_none(
+            {
+                "title": args.title,
+                "description": args.description,
+                "project": args.project,
+                "priority": args.priority,
+                "required_capabilities": _merged_csv(args.capability, args.capabilities),
+                "dependencies": _merged_csv(args.dependency, args.dependencies),
+                "metadata": _json_object(args.metadata_json),
+                "max_attempts": args.max_attempts,
+                "actor": args.actor,
+            }
+        ),
+    )
+
+
+def cmd_tasks_update(client: HgMacClient, args: argparse.Namespace) -> Any:
+    body = _drop_none(
+        {
+            "title": args.title,
+            "description": args.description,
+            "project": args.project,
+            "priority": args.priority,
+            "required_capabilities": _optional_merged_csv(args.capability, args.capabilities),
+            "dependencies": _optional_merged_csv(args.dependency, args.dependencies),
+            "metadata": _json_object(args.metadata_json) if args.metadata_json is not None else None,
+            "max_attempts": args.max_attempts,
+            "actor": args.actor,
+        }
+    )
+    return client.request("PUT", "/tasks/%s" % quote(args.task_id), body)
+
+
+def cmd_tasks_delete(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "DELETE",
+        "/tasks/%s%s" % (quote(args.task_id), _query({"force": args.force, "actor": args.actor})),
+    )
+
+
+def cmd_projects_list(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("GET", "/projects")
+
+
+def cmd_projects_show(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request("GET", "/projects/%s" % quote(args.project))
+
+
+def cmd_projects_create(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "POST",
+        "/projects",
+        _drop_none(
+            {
+                "name": args.name,
+                "description": args.description,
+                "metadata": _json_object(args.metadata_json),
+                "status": args.status,
+                "actor": args.actor,
+                "project_id": args.project_id,
+            }
+        ),
+    )
+
+
+def cmd_projects_update(client: HgMacClient, args: argparse.Namespace) -> Any:
+    body = _drop_none(
+        {
+            "name": args.name,
+            "description": args.description,
+            "metadata": _json_object(args.metadata_json) if args.metadata_json is not None else None,
+            "status": args.status,
+            "actor": args.actor,
+        }
+    )
+    return client.request("PUT", "/projects/%s" % quote(args.project), body)
+
+
+def cmd_projects_delete(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "DELETE",
+        "/projects/%s%s" % (quote(args.project), _query({"force": args.force, "actor": args.actor})),
+    )
+
+
 def run(
     argv: Optional[List[str]] = None,
     *,
@@ -482,8 +755,20 @@ def quote(value: str) -> str:
 
 
 def _query(values: JsonDict) -> str:
-    filtered = {key: value for key, value in values.items() if value is not None}
+    filtered = {
+        key: _query_value(value)
+        for key, value in values.items()
+        if value is not None
+    }
     return "?" + urllib.parse.urlencode(filtered) if filtered else ""
+
+
+def _query_value(value: Any) -> Any:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return value
 
 
 def _json_object(value: str) -> JsonDict:
@@ -512,6 +797,21 @@ def _optional_capabilities(args: argparse.Namespace) -> Optional[List[str]]:
     values = list(args.capability or [])
     values.extend(_csv(args.capabilities or ""))
     return sorted({item for item in values if item})
+
+
+def _merged_csv(repeated: Optional[Iterable[str]], csv_value: Optional[str]) -> List[str]:
+    values = list(repeated or [])
+    values.extend(_csv(csv_value or ""))
+    return sorted({item for item in values if item})
+
+
+def _optional_merged_csv(
+    repeated: Optional[Iterable[str]],
+    csv_value: Optional[str],
+) -> Optional[List[str]]:
+    if repeated is None and csv_value is None:
+        return None
+    return _merged_csv(repeated, csv_value)
 
 
 def _csv(value: str) -> List[str]:

@@ -69,12 +69,18 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert stored["authority"]["tasks"] == "mac"
     assert stored["authority"]["projects"] == "mac"
     assert stored["authority"]["agents"] == "mac"
+    assert stored["authority"]["fleets"] == "mac"
     assert stored["authority"]["personality"] == "hermes"
-    assert set(stored["first_class_objects"]["objects"]) == {"tasks", "projects", "agents"}
+    assert set(stored["first_class_objects"]["objects"]) == {"fleets", "tasks", "projects", "agents"}
+    assert stored["first_class_objects"]["objects"]["fleets"]["authority"] == "mac"
     assert stored["first_class_objects"]["objects"]["tasks"]["authority"] == "mac"
     assert stored["first_class_objects"]["objects"]["projects"]["authority"] == "mac"
     assert stored["first_class_objects"]["objects"]["agents"]["authority"] == "mac"
     assert "hgmac agents identity agent_rocky_host" in stored["first_class_objects"]["objects"]["agents"]["hgmac_cli"]
+    assert "hgmac fleets list" in stored["first_class_objects"]["objects"]["fleets"]["hgmac_cli"]
+    assert "hgmac tasks list" in stored["first_class_objects"]["objects"]["tasks"]["hgmac_cli"]
+    assert "hgmac projects list" in stored["first_class_objects"]["objects"]["projects"]["hgmac_cli"]
+    assert "/ui?view=fleets&selected={fleet_id}" in stored["first_class_objects"]["objects"]["fleets"]["dashboard_urls"]
     assert "/ui?view=work&selected={task_id}" in stored["first_class_objects"]["objects"]["tasks"]["dashboard_urls"]
     assert "/ui?view=work&project={project}" in stored["first_class_objects"]["objects"]["projects"]["dashboard_urls"]
     assert "/ui?view=agents&selected={agent_id}" in stored["first_class_objects"]["objects"]["agents"]["dashboard_urls"]
@@ -102,6 +108,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "never claim to be, proxy for, or relay as another agent" in markdown
     assert "mac-hermes tasks --state open" in markdown
     assert "First-Class Objects" in markdown
+    assert "`fleets`: authority `mac`" in markdown
     assert "`tasks`: authority `mac`" in markdown
     assert "`projects`: authority `mac`" in markdown
     assert "`agents`: authority `mac`" in markdown
@@ -116,6 +123,8 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "mac-hermes command-audit list --agent-id agent_rocky_host" in markdown
     assert "Dashboard Views" in markdown
     assert "/ui?view=work&selected={task_id}" in markdown
+    assert "/ui?view=fleets&selected={fleet_id}" in markdown
+    assert "/ui?view=projects&project={project}" in markdown
     assert "/ui?view=work&project={project}" in markdown
     assert "/ui?view=agents&selected={agent_id}" in markdown
     assert "Web Research" in markdown
@@ -125,6 +134,9 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "Direct Session Parity" in markdown
     assert "`bd prime`" in markdown
     assert "`hgmac agents list`" in markdown
+    assert "`hgmac fleets list`" in markdown
+    assert "`hgmac projects list`" in markdown
+    assert "`hgmac tasks list`" in markdown
     assert "`scripts/run-contract-tests.sh`" in markdown
     assert "`hermes_oneshot_executor`" in markdown
     assert "mac-hermes-task-executor" in markdown

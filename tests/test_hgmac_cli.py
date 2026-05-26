@@ -123,3 +123,52 @@ def test_hgmac_covers_related_agent_operations(monkeypatch):
     assert "/nap-runs/nap_1/fail" in paths
     assert any(path.startswith("/command-audit?") for path in paths)
     assert "/agents/agent_1/command-audit" in paths
+
+
+def test_hgmac_first_class_object_crud_commands_use_api_paths():
+    calls = []
+
+    def transport(method, url, body, token):
+        calls.append((method, url, body))
+        return {"ok": True}
+
+    commands = [
+        ["fleets", "list", "--status", "active"],
+        ["fleets", "show", "classic"],
+        ["fleets", "create", "--name", "classic", "--agent-ids", "agent_1,agent_2", "--metadata-json", '{"hub":"rocky"}'],
+        ["fleets", "update", "classic", "--status", "inactive", "--agent-id", "agent_1"],
+        ["fleets", "delete", "classic"],
+        ["tasks", "list", "--state", "open"],
+        ["tasks", "show", "task_1"],
+        ["tasks", "create", "--title", "Do work", "--project", "nanolang", "--capabilities", "python"],
+        ["tasks", "update", "task_1", "--priority", "5", "--dependencies", "task_0"],
+        ["tasks", "delete", "task_1", "--force"],
+        ["projects", "list"],
+        ["projects", "show", "nanolang"],
+        ["projects", "create", "--name", "nanolang", "--metadata-json", '{"repo":"nanolang"}'],
+        ["projects", "update", "nanolang", "--status", "archived"],
+        ["projects", "delete", "nanolang", "--force"],
+    ]
+
+    for command in commands:
+        rc = run(["--url", "http://hub:8789", *command], transport=transport, stdout=io.StringIO())
+        assert rc == 0
+
+    by_method_path = [(method, url.removeprefix("http://hub:8789")) for method, url, _body in calls]
+    assert ("GET", "/fleets?status=active") in by_method_path
+    assert ("GET", "/fleets/classic") in by_method_path
+    assert ("POST", "/fleets") in by_method_path
+    assert ("PUT", "/fleets/classic") in by_method_path
+    assert ("DELETE", "/fleets/classic") in by_method_path
+    assert ("GET", "/tasks?state=open") in by_method_path
+    assert ("GET", "/tasks/task_1") in by_method_path
+    assert ("POST", "/tasks") in by_method_path
+    assert ("PUT", "/tasks/task_1") in by_method_path
+    assert ("DELETE", "/tasks/task_1?force=true&actor=human") in by_method_path
+    assert ("GET", "/projects") in by_method_path
+    assert ("GET", "/projects/nanolang") in by_method_path
+    assert ("POST", "/projects") in by_method_path
+    assert ("PUT", "/projects/nanolang") in by_method_path
+    assert ("DELETE", "/projects/nanolang?force=true&actor=human") in by_method_path
+    assert calls[2][2]["agent_ids"] == ["agent_1", "agent_2"]
+    assert calls[7][2]["required_capabilities"] == ["python"]

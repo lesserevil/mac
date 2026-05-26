@@ -714,11 +714,17 @@ class ControlPlane:
         limit = min(max(1, int(task_limit)), 500)
         limited_tasks = visible_tasks[:limit]
         agents = self.list_agents()
+        fleets = [
+            fleet.to_dict()
+            for fleet in self.list_fleets()
+            if fleet.tenant_id in (None, tenant_id)
+        ]
         project_items = [item.to_dict() for item in self.list_project_items()]
         repositories = [repo.to_dict() for repo in self.list_beads_repositories()]
         return {
             "schema": "mac.hermes_work_context.v1",
             "authority": {
+                "fleets": "mac",
                 "tasks": "mac",
                 "projects": "mac",
                 "agents": "mac",
@@ -730,6 +736,7 @@ class ControlPlane:
             "persona": identity_context["persona"],
             "platform_bindings": identity_context["platform_bindings"],
             "memory_contract": identity_context["memory_contract"],
+            "fleets": fleets,
             "projects": self._hermes_project_contexts(
                 all_tenant_tasks,
                 agents,
@@ -773,6 +780,8 @@ class ControlPlane:
             "create_task_from_conversation",
             "list_tasks",
             "get_task",
+            "update_task",
+            "delete_task",
             "get_task_summary",
             "claim_next_task",
             "claim_task",
@@ -792,6 +801,8 @@ class ControlPlane:
             "create_project",
             "list_projects",
             "get_project",
+            "update_project",
+            "delete_project",
             "import_project_item",
             "list_project_items",
             "register_beads_repository",
@@ -799,12 +810,23 @@ class ControlPlane:
             "poll_beads_repositories",
         }
         expected_agent_api_operations = {
+            "create_agent",
             "list_agents",
             "get_agent",
+            "update_agent",
+            "disable_agent",
+            "delete_agent",
             "get_agent_identity",
             "claim_next_task",
             "record_command_audit",
             "list_command_audit",
+        }
+        expected_fleet_api_operations = {
+            "create_fleet",
+            "list_fleets",
+            "get_fleet",
+            "update_fleet",
+            "delete_fleet",
         }
         mac_cli_commands = [str(command) for command in operations.get("mac_cli", [])]
         mac_hermes_commands = [
@@ -814,7 +836,7 @@ class ControlPlane:
         expected_api_operations = {
             "get_work_context",
             "get_runtime_proof",
-        } | expected_task_api_operations | expected_project_api_operations | expected_agent_api_operations
+        } | expected_task_api_operations | expected_project_api_operations | expected_agent_api_operations | expected_fleet_api_operations
         expected_cli_fragments = (
             "mac-hermes work-context",
             "mac-hermes runtime-proof",
@@ -852,6 +874,21 @@ class ControlPlane:
             "mac-hermes command-audit",
         )
         expected_hgmac_fragments = (
+            "hgmac fleets list",
+            "hgmac fleets show",
+            "hgmac fleets create",
+            "hgmac fleets update",
+            "hgmac fleets delete",
+            "hgmac tasks list",
+            "hgmac tasks show",
+            "hgmac tasks create",
+            "hgmac tasks update",
+            "hgmac tasks delete",
+            "hgmac projects list",
+            "hgmac projects show",
+            "hgmac projects create",
+            "hgmac projects update",
+            "hgmac projects delete",
             "hgmac agents list",
             "hgmac agents show",
             "hgmac agents create",
@@ -954,6 +991,14 @@ class ControlPlane:
                 "live_names": [str(project.get("project")) for project in live_project_contexts],
                 "work_context_names": [str(project.get("project")) for project in project_contexts],
             },
+            "fleets": {
+                "ready": isinstance(work_context.get("fleets"), list),
+                "work_context_names": [
+                    str(fleet.get("name"))
+                    for fleet in work_context.get("fleets", [])
+                    if isinstance(fleet, dict)
+                ],
+            },
             "agents": {
                 "ready": set(context_agent_by_id) == set(live_agent_by_id) and agent_fields_ready,
                 "ids_ready": set(context_agent_by_id) == set(live_agent_by_id),
@@ -972,6 +1017,11 @@ class ControlPlane:
             tasks=context_tasks,
             projects=project_contexts,
             agents=bound_agents or context_agents,
+            fleets=[
+                fleet
+                for fleet in work_context.get("fleets", [])
+                if isinstance(fleet, dict)
+            ],
         )
         dashboard_operation_contract = (
             operations.get("dashboard")
@@ -982,7 +1032,9 @@ class ControlPlane:
             dashboard_operation_contract.get("entrypoint") == "/ui"
             and {
                 "work",
+                "projects",
                 "map",
+                "fleets",
                 "agents",
                 "tasks",
                 "hermes",
@@ -1030,7 +1082,7 @@ class ControlPlane:
             for name in (runtime.get("first_class_object_names") or [])
             if str(name).strip()
         }
-        expected_first_class_objects = {"tasks", "projects", "agents"}
+        expected_first_class_objects = {"fleets", "tasks", "projects", "agents"}
         expected_session_capabilities = {
             "mac_api",
             "mac_cli",
@@ -1069,6 +1121,42 @@ class ControlPlane:
             else True
         )
         first_class_objects: JsonDict = {
+            "fleets": {
+                "authority": authority.get("fleets"),
+                "api_operations": sorted(api_operation_names & expected_fleet_api_operations),
+                "api_ready": expected_fleet_api_operations <= api_operation_names,
+                "hgmac_cli_commands": matching(hgmac_commands, ("hgmac fleets ",)),
+                "hgmac_cli_ready": has_all(
+                    hgmac_commands,
+                    (
+                        "hgmac fleets list",
+                        "hgmac fleets show",
+                        "hgmac fleets create",
+                        "hgmac fleets update",
+                        "hgmac fleets delete",
+                    ),
+                ),
+                "dashboard_projection": {
+                    "state_key": "fleets",
+                    "fields": ["id", "name", "status", "agent_ids"],
+                    "urls": dashboard_url_contract["object_deep_links"]["fleets"]["templates"],
+                },
+                "dashboard_ready": (
+                    isinstance(work_context.get("fleets"), list)
+                    and dashboard_operation_ready
+                    and bool(dashboard_url_contract["object_deep_links"]["fleets"]["ready"])
+                ),
+                "runtime_capabilities": sorted(
+                    session_capabilities
+                    & {
+                        "mac_api",
+                        "shell_execution",
+                        "workspace_file_access",
+                        "hgmac_agent_ops_cli",
+                    }
+                ),
+                "runtime_ready": runtime_capabilities_ready,
+            },
             "tasks": {
                 "authority": authority.get("tasks"),
                 "api_operations": sorted(api_operation_names & expected_task_api_operations),
@@ -1102,6 +1190,17 @@ class ControlPlane:
                         "mac-hermes start",
                         "mac-hermes transition",
                         "mac-hermes command-audit",
+                    ),
+                ),
+                "hgmac_cli_commands": matching(hgmac_commands, ("hgmac tasks ",)),
+                "hgmac_cli_ready": has_all(
+                    hgmac_commands,
+                    (
+                        "hgmac tasks list",
+                        "hgmac tasks show",
+                        "hgmac tasks create",
+                        "hgmac tasks update",
+                        "hgmac tasks delete",
                     ),
                 ),
                 "dashboard_projection": {
@@ -1170,6 +1269,17 @@ class ControlPlane:
                         "mac-hermes poll-beads-repositories",
                     ),
                 ),
+                "hgmac_cli_commands": matching(hgmac_commands, ("hgmac projects ",)),
+                "hgmac_cli_ready": has_all(
+                    hgmac_commands,
+                    (
+                        "hgmac projects list",
+                        "hgmac projects show",
+                        "hgmac projects create",
+                        "hgmac projects update",
+                        "hgmac projects delete",
+                    ),
+                ),
                 "dashboard_projection": {
                     "state_key": "hermes_work_contexts",
                     "fields": ["projects", "projects.bridge_item_count", "projects.repository_count"],
@@ -1233,20 +1343,11 @@ class ControlPlane:
             },
         }
         for object_proof in first_class_objects.values():
-            object_proof["ready"] = all(
-                bool(object_proof.get(check))
-                for check in (
-                    "api_ready",
-                    "mac_cli_ready",
-                    "mac_hermes_cli_ready",
-                    "dashboard_ready",
-                    "runtime_ready",
-                )
-            ) and (
-                bool(object_proof.get("hgmac_cli_ready"))
-                if "hgmac_cli_ready" in object_proof
-                else True
-            )
+            checks = ["api_ready", "dashboard_ready", "runtime_ready"]
+            for optional_check in ("mac_cli_ready", "mac_hermes_cli_ready", "hgmac_cli_ready"):
+                if optional_check in object_proof:
+                    checks.append(optional_check)
+            object_proof["ready"] = all(bool(object_proof.get(check)) for check in checks)
 
         checks: JsonDict = {
             "api_work_context_schema": work_context.get("schema") == "mac.hermes_work_context.v1",
@@ -1254,6 +1355,7 @@ class ControlPlane:
                 authority.get("tasks") == "mac"
                 and authority.get("projects") == "mac"
                 and authority.get("agents") == "mac"
+                and authority.get("fleets") == "mac"
                 and authority.get("personality") == "hermes"
                 and authority.get("user_memory") == "hermes"
             ),
@@ -1326,6 +1428,9 @@ class ControlPlane:
                     "agent_operation_names": sorted(
                         api_operation_names & expected_agent_api_operations
                     ),
+                    "fleet_operation_names": sorted(
+                        api_operation_names & expected_fleet_api_operations
+                    ),
                 },
                 "cli": {
                     "mac_hermes_commands": mac_hermes_commands,
@@ -1389,16 +1494,18 @@ class ControlPlane:
         tasks: List[JsonDict],
         projects: List[JsonDict],
         agents: List[JsonDict],
+        fleets: List[JsonDict],
     ) -> JsonDict:
         """Bookmarkable dashboard URL contract for Hermes-visible objects."""
 
         task_id = str(tasks[0].get("id")) if tasks else "{task_id}"
         project = str(projects[0].get("project")) if projects else "{project}"
         agent_id = str(agents[0].get("id")) if agents else "{agent_id}"
+        fleet_id = str(fleets[0].get("id")) if fleets else "{fleet_id}"
         contract = {
             "schema": "mac.hermes.dashboard_url_contract.v1",
             "entrypoint": "/ui",
-            "required_views": ["work", "map", "agents", "tasks", "hermes", "runtime"],
+            "required_views": ["work", "projects", "map", "fleets", "agents", "tasks", "hermes", "runtime"],
             "url_state_parameters": [
                 {"name": "view", "purpose": "selected dashboard pane"},
                 {"name": "project", "purpose": "project or epic scope"},
@@ -1410,6 +1517,18 @@ class ControlPlane:
                 {"name": "agent_page", "purpose": "agent table page"},
             ],
             "object_deep_links": {
+                "fleets": {
+                    "required_params": ["view", "selected"],
+                    "required_views": ["fleets", "map"],
+                    "templates": [
+                        "/ui?view=fleets&selected={fleet_id}",
+                        "/ui?view=map&selected={fleet_id}",
+                    ],
+                    "samples": [
+                        self._dashboard_url(view="fleets", selected=fleet_id),
+                        self._dashboard_url(view="map", selected=fleet_id),
+                    ],
+                },
                 "tasks": {
                     "required_params": ["view", "selected"],
                     "required_views": ["work", "tasks", "map"],
@@ -1426,13 +1545,15 @@ class ControlPlane:
                 },
                 "projects": {
                     "required_params": ["view", "project"],
-                    "required_views": ["work", "agents", "map"],
+                    "required_views": ["projects", "work", "agents", "map"],
                     "templates": [
+                        "/ui?view=projects&project={project}",
                         "/ui?view=work&project={project}",
                         "/ui?view=agents&project={project}",
                         "/ui?view=map&project={project}",
                     ],
                     "samples": [
+                        self._dashboard_url(view="projects", project=project),
                         self._dashboard_url(view="work", project=project),
                         self._dashboard_url(view="agents", project=project),
                         self._dashboard_url(view="map", project=project),
@@ -1802,6 +1923,8 @@ class ControlPlane:
                 },
                 {"name": "list_tasks", "method": "GET", "path": "/tasks"},
                 {"name": "get_task", "method": "GET", "path": "/tasks/{task_id}"},
+                {"name": "update_task", "method": "PUT", "path": "/tasks/{task_id}"},
+                {"name": "delete_task", "method": "DELETE", "path": "/tasks/{task_id}"},
                 {
                     "name": "get_task_summary",
                     "method": "GET",
@@ -1888,6 +2011,16 @@ class ControlPlane:
                     "path": "/projects/{project}",
                 },
                 {
+                    "name": "update_project",
+                    "method": "PUT",
+                    "path": "/projects/{project}",
+                },
+                {
+                    "name": "delete_project",
+                    "method": "DELETE",
+                    "path": "/projects/{project}",
+                },
+                {
                     "name": "import_project_item",
                     "method": "POST",
                     "path": "/bridge/items",
@@ -1913,6 +2046,36 @@ class ControlPlane:
                     "path": "/bridge/beads/poll",
                 },
                 {
+                    "name": "create_fleet",
+                    "method": "POST",
+                    "path": "/fleets",
+                },
+                {
+                    "name": "list_fleets",
+                    "method": "GET",
+                    "path": "/fleets",
+                },
+                {
+                    "name": "get_fleet",
+                    "method": "GET",
+                    "path": "/fleets/{fleet_id_or_name}",
+                },
+                {
+                    "name": "update_fleet",
+                    "method": "PUT",
+                    "path": "/fleets/{fleet_id_or_name}",
+                },
+                {
+                    "name": "delete_fleet",
+                    "method": "DELETE",
+                    "path": "/fleets/{fleet_id_or_name}",
+                },
+                {
+                    "name": "create_agent",
+                    "method": "POST",
+                    "path": "/agents",
+                },
+                {
                     "name": "list_agents",
                     "method": "GET",
                     "path": "/agents",
@@ -1920,6 +2083,21 @@ class ControlPlane:
                 {
                     "name": "get_agent",
                     "method": "GET",
+                    "path": "/agents/{agent_id}",
+                },
+                {
+                    "name": "update_agent",
+                    "method": "PUT",
+                    "path": "/agents/{agent_id}",
+                },
+                {
+                    "name": "disable_agent",
+                    "method": "POST",
+                    "path": "/agents/{agent_id}/disable",
+                },
+                {
+                    "name": "delete_agent",
+                    "method": "DELETE",
                     "path": "/agents/{agent_id}",
                 },
                 {
@@ -1988,6 +2166,21 @@ class ControlPlane:
                 "mac-hermes writeback %s {task_id}" % hermes_instance_id,
             ],
             "hgmac_cli": [
+                "hgmac fleets list",
+                "hgmac fleets show {fleet}",
+                "hgmac fleets create --name {name}",
+                "hgmac fleets update {fleet}",
+                "hgmac fleets delete {fleet}",
+                "hgmac tasks list",
+                "hgmac tasks show {task_id}",
+                "hgmac tasks create --title {title}",
+                "hgmac tasks update {task_id}",
+                "hgmac tasks delete {task_id}",
+                "hgmac projects list",
+                "hgmac projects show {project}",
+                "hgmac projects create --name {name}",
+                "hgmac projects update {project}",
+                "hgmac projects delete {project}",
                 "hgmac agents list",
                 "hgmac agents show {agent_id}",
                 "hgmac agents create --machine-id {machine_id} --name {name}",
@@ -2006,7 +2199,7 @@ class ControlPlane:
             "dashboard": {
                 "schema": "mac.hermes.dashboard_operation_contract.v1",
                 "entrypoint": "/ui",
-                "views": ["work", "map", "agents", "tasks", "hermes", "runtime"],
+                "views": ["work", "projects", "map", "fleets", "agents", "tasks", "hermes", "runtime"],
                 "url_state_parameters": [
                     "view",
                     "project",
@@ -2018,12 +2211,17 @@ class ControlPlane:
                     "agent_page",
                 ],
                 "deep_link_templates": {
+                    "fleets": [
+                        "/ui?view=fleets&selected={fleet_id}",
+                        "/ui?view=map&selected={fleet_id}",
+                    ],
                     "tasks": [
                         "/ui?view=work&selected={task_id}",
                         "/ui?view=tasks&task_state=open&selected={task_id}",
                         "/ui?view=map&selected={task_id}",
                     ],
                     "projects": [
+                        "/ui?view=projects&project={project}",
                         "/ui?view=work&project={project}",
                         "/ui?view=agents&project={project}",
                         "/ui?view=map&project={project}",

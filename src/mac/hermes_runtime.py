@@ -128,7 +128,7 @@ def _session_capability_contract(
                 "kind": "api",
                 "required": True,
                 "endpoint": mac_url,
-                "purpose": "Read and mutate MAC task, project, agent, review, memory, and dashboard state.",
+                "purpose": "Read and mutate MAC fleet, agent, task, project, review, memory, and dashboard state.",
             },
             {
                 "name": "mac_cli",
@@ -167,7 +167,7 @@ def _session_capability_contract(
                 "required": True,
                 "command": "hgmac agents list",
                 "expected_path": str(mac_home / "venv" / "bin" / "hgmac"),
-                "purpose": "Full CRUD and operational control for MAC agents.",
+                "purpose": "Full CRUD and operational control for MAC fleets, agents, tasks, and projects.",
             },
             {
                 "name": "beads_issue_tracker",
@@ -229,6 +229,9 @@ def _session_capability_contract(
             "mac-hermes project-items",
             "mac-hermes beads-repositories",
             "mac-hermes agents",
+            "hgmac fleets list",
+            "hgmac projects list",
+            "hgmac tasks list",
             "mac-hermes claim-next %s --dry-run" % agent_id,
             "mac-hermes command-audit list --agent-id %s --limit 5" % agent_id,
             "mac-hermes web-search \"project dependency release notes\" --limit 5",
@@ -244,7 +247,7 @@ def _session_capability_contract(
             "git push",
         ],
         "rules": [
-            "Treat MAC tasks, projects, agents, reviews, and publications as first-class operational objects.",
+            "Treat MAC fleets, agents, tasks, and projects as first-class operational objects.",
             "Use Beads for issue tracking in registered project repositories that declare it.",
             "Use hgmac for agent CRUD and operational agent state, not ad hoc database edits.",
             "Record command audit phases for shell work that changes or verifies task state.",
@@ -259,6 +262,30 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
     return {
         "schema": "mac.hermes.first_class_objects.v1",
         "objects": {
+            "fleets": {
+                "authority": "mac",
+                "source_of_truth": "MAC fleet records and fleet-agent membership rows",
+                "identity_fields": ["id", "name", "status", "tenant_id", "agent_ids"],
+                "api_paths": [
+                    "/fleets",
+                    "/fleets/{fleet_id_or_name}",
+                ],
+                "hgmac_cli": [
+                    "hgmac fleets list",
+                    "hgmac fleets show {fleet}",
+                    "hgmac fleets create --name ...",
+                    "hgmac fleets update {fleet}",
+                    "hgmac fleets delete {fleet}",
+                ],
+                "dashboard_state_keys": [
+                    "fleets",
+                ],
+                "dashboard_urls": [
+                    "/ui?view=fleets&selected={fleet_id}",
+                    "/ui?view=map&selected={fleet_id}",
+                ],
+                "runtime_rule": "Use fleets to understand the agent collection and hub topology before changing agent state.",
+            },
             "tasks": {
                 "authority": "mac",
                 "source_of_truth": "mac task records and task history",
@@ -278,6 +305,13 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac task list",
                     "mac task show {task_id}",
                     "mac task create --title ...",
+                ],
+                "hgmac_cli": [
+                    "hgmac tasks list",
+                    "hgmac tasks show {task_id}",
+                    "hgmac tasks create --title ...",
+                    "hgmac tasks update {task_id}",
+                    "hgmac tasks delete {task_id}",
                 ],
                 "mac_hermes_cli": [
                     "mac-hermes tasks --state open",
@@ -331,12 +365,20 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac-hermes register-beads-repository <name> <path> --project <project>",
                     "mac-hermes poll-beads-repositories --repository <repository>",
                 ],
+                "hgmac_cli": [
+                    "hgmac projects list",
+                    "hgmac projects show {project}",
+                    "hgmac projects create --name ...",
+                    "hgmac projects update {project}",
+                    "hgmac projects delete {project}",
+                ],
                 "dashboard_state_keys": [
                     "bridge_items",
                     "beads_repositories",
                     "hermes_work_contexts.{hermes_instance_id}.projects",
                 ],
                 "dashboard_urls": [
+                    "/ui?view=projects&project={project}",
                     "/ui?view=work&project={project}",
                     "/ui?view=agents&project={project}",
                     "/ui?view=map&project={project}",
@@ -350,6 +392,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                 "api_paths": [
                     "/agents",
                     "/agents/{agent_id}",
+                    "/agents/{agent_id}/disable",
                     "/agents/{agent_id}/identity",
                     "/agents/{agent_id}/claim-next",
                     "/agents/{agent_id}/command-audit",
@@ -369,6 +412,12 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                 ],
                 "hgmac_cli": [
                     "hgmac agents list",
+                    "hgmac agents show {agent_id}",
+                    "hgmac agents create --machine-id {machine_id} --name {name}",
+                    "hgmac agents update {agent_id}",
+                    "hgmac agents disable {agent_id}",
+                    "hgmac agents delete {agent_id}",
+                    "hgmac agents heartbeat {agent_id} --status {status}",
                     "hgmac agents identity %s" % agent_id,
                     "hgmac agents claim-next %s --dry-run" % agent_id,
                 ],
@@ -439,6 +488,7 @@ def build_runtime_context(
             "home_ref": str(hermes_home),
         },
         "authority": {
+            "fleets": "mac",
             "tasks": "mac",
             "projects": "mac",
             "agents": "mac",
@@ -471,6 +521,9 @@ def build_runtime_context(
                 "mac-hermes work-context %s --active-only" % resolved_instance_id,
                 "mac-hermes work-brief %s" % resolved_instance_id,
                 "mac-hermes tasks --state open",
+                "hgmac fleets list",
+                "hgmac projects list",
+                "hgmac tasks list",
             ],
             "project_bridge": [
                 "mac-hermes create-project <name> --description <description>",
@@ -490,6 +543,9 @@ def build_runtime_context(
                 "mac-hermes claim-next %s --dry-run" % resolved_agent_id,
                 "mac-hermes command-audit list --agent-id %s --limit 20" % resolved_agent_id,
                 "hgmac agents list",
+                "hgmac fleets list",
+                "hgmac projects list",
+                "hgmac tasks list",
                 "hgmac agents identity %s" % resolved_agent_id,
                 "hgmac agents claim-next %s --dry-run" % resolved_agent_id,
             ],
@@ -529,7 +585,7 @@ def build_runtime_context(
         "workspace": session_capabilities["workspace"],
         "session_capabilities": session_capabilities,
         "runtime_rules": [
-            "MAC is authoritative for task, project, dependency, assignment, review, and publication state.",
+            "MAC is authoritative for fleet, agent, task, project, dependency, assignment, review, and publication state.",
             "Hermes is authoritative for soul, personality, private memory, and conversation state.",
             "Identity is exclusive to this Hermes instance: answer only as %s; do not impersonate, proxy for, or relay as another agent." % agent_name,
             "Refresh MAC work context before selecting, changing, or reporting on work.",
@@ -583,8 +639,8 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
         "",
         "## Authority",
         "",
-        "- Tasks, projects, agents: `%s`, `%s`, `%s`"
-        % (authority["tasks"], authority["projects"], authority["agents"]),
+        "- Fleets, agents, tasks, projects: `%s`, `%s`, `%s`, `%s`"
+        % (authority["fleets"], authority["agents"], authority["tasks"], authority["projects"]),
         "- Personality, user memory, conversation state: `%s`, `%s`, `%s`"
         % (authority["personality"], authority["user_memory"], authority["conversation_state"]),
         "",
@@ -593,7 +649,7 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
     ]
     lines.extend("- `%s`" % command for command in operations["refresh_context"])
     lines.extend(["", "## First-Class Objects", ""])
-    for name in ("tasks", "projects", "agents"):
+    for name in ("fleets", "agents", "tasks", "projects"):
         object_contract = object_map.get(name) if isinstance(object_map.get(name), dict) else {}
         lines.append(
             "- `%s`: authority `%s`; source `%s`"
@@ -610,7 +666,7 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
     for command in operations.get("agent_view", []):
         lines.append("- `%s`" % command)
     lines.extend(["", "## Dashboard Views", ""])
-    for name in ("tasks", "projects", "agents"):
+    for name in ("fleets", "agents", "tasks", "projects"):
         object_contract = object_map.get(name) if isinstance(object_map.get(name), dict) else {}
         for url in object_contract.get("dashboard_urls") or []:
             lines.append("- `%s`: `%s`" % (name, url))

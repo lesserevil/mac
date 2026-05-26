@@ -867,21 +867,28 @@ def test_required_task_project_runtime_context_reports_mac_authority(monkeypatch
     assert report["task_project_runtime"]["schema"] == "mac.hermes.runtime_context.v1"
     assert report["task_project_runtime"]["authority"]["tasks"] == "mac"
     assert report["task_project_runtime"]["authority"]["projects"] == "mac"
+    assert report["task_project_runtime"]["authority"]["agents"] == "mac"
+    assert report["task_project_runtime"]["authority"]["fleets"] == "mac"
     assert report["task_project_runtime"]["hermes_instance_id"] == "hermes_rocky"
     assert report["task_project_runtime"]["agent_id"] == "agent_rocky"
     assert report["task_project_runtime"]["mac_url"] == "http://hub.example.internal:8789"
     assert report["task_project_runtime"]["workspace"]["path"] == str(workspace)
     assert report["task_project_runtime"]["workspace"]["project_contract"]["project"] == "repo-beads-mac"
     assert set(report["task_project_runtime"]["first_class_object_names"]) == {
+        "fleets",
         "tasks",
         "projects",
         "agents",
     }
+    assert report["task_project_runtime"]["first_class_objects"]["fleets"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["tasks"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["projects"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["authority"] == "mac"
     assert report["task_project_runtime"]["first_class_objects"]["agents"]["hgmac_cli"]
+    assert report["task_project_runtime"]["first_class_objects"]["fleets"]["hgmac_cli"]
+    assert "/ui?view=fleets&selected={fleet_id}" in report["task_project_runtime"]["first_class_objects"]["fleets"]["dashboard_urls"]
     assert "/ui?view=work&selected={task_id}" in report["task_project_runtime"]["first_class_objects"]["tasks"]["dashboard_urls"]
+    assert "/ui?view=projects&project={project}" in report["task_project_runtime"]["first_class_objects"]["projects"]["dashboard_urls"]
     assert "/ui?view=work&project={project}" in report["task_project_runtime"]["first_class_objects"]["projects"]["dashboard_urls"]
     assert "/ui?view=agents&selected={agent_id}" in report["task_project_runtime"]["first_class_objects"]["agents"]["dashboard_urls"]
     assert report["task_project_runtime"]["markdown_contract"]["ready"] is True

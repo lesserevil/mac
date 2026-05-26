@@ -5,7 +5,9 @@ import { createDashboardApi } from "./dashboard_api.js";
 type ViewKey =
   | "overview"
   | "work"
+  | "projects"
   | "map"
+  | "fleets"
   | "agents"
   | "tasks"
   | "workflows"
@@ -41,8 +43,18 @@ interface MachineRecord extends ApiRecord {
   resources?: JsonObject;
 }
 
+interface FleetRecord extends ApiRecord {
+  name: string;
+  description?: string;
+  status: string;
+  metadata?: JsonObject;
+  tenant_id?: string | null;
+  agent_ids?: string[];
+}
+
 interface TaskRecord extends ApiRecord {
   title: string;
+  description?: string;
   state: string;
   project?: string | null;
   priority?: number;
@@ -111,11 +123,13 @@ interface ProjectSummary {
   cross_project_edges: JsonObject[];
   bridge_item_count: number;
   repository_count: number;
+  record?: JsonObject | null;
 }
 
 interface HermesWorkContext {
   schema: string;
   authority: Record<string, string>;
+  fleets?: FleetRecord[];
   projects: ProjectSummary[];
   tasks: Array<TaskRecord & { project?: string; origin?: JsonObject }>;
   task_count: number;
@@ -333,6 +347,7 @@ interface DashboardData {
   roles: ApiRecord[];
   provisioning_requests: ApiRecord[];
   machines: MachineRecord[];
+  fleets: FleetRecord[];
   agents: AgentItem[];
   tasks: TaskDetail[];
   dead_letters: TaskRecord[];
@@ -414,7 +429,9 @@ const AGENT_PAGE_SIZE = 50;
 const VIEW_TITLES: Record<ViewKey, string> = {
   overview: "Overview",
   work: "Work",
+  projects: "Projects",
   map: "Map",
+  fleets: "Fleets",
   agents: "Agents",
   tasks: "Tasks",
   workflows: "Workflows",
@@ -530,8 +547,12 @@ function render(): void {
   const body =
     state.activeView === "work"
       ? renderWork()
+      : state.activeView === "projects"
+      ? renderProjects()
       : state.activeView === "map"
       ? renderMap()
+      : state.activeView === "fleets"
+      ? renderFleets()
       : state.activeView === "agents"
       ? renderAgents()
       : state.activeView === "tasks"
@@ -634,6 +655,7 @@ function renderOverview(): string {
   const readyStories = data.project_summaries.reduce((sum, project) => sum + project.ready_count, 0);
   return `
     <section class="metric-grid">
+      ${metric("Fleets", counts.fleets || 0, `${data.fleets.reduce((sum, fleet) => sum + (fleet.agent_ids || []).length, 0)} fleet memberships`)}
       ${metric("Agents", counts.agents || 0, `${counts.healthy_agents || 0} healthy, ${counts.busy_agents || 0} busy`)}
       ${metric("Projects", counts.projects || 0, `${readyStories} ready stories`)}
       ${metric("Active Work", counts.active_tasks || 0, `${counts.dead_letters || 0} dead letters`)}
@@ -719,13 +741,98 @@ function renderWork(): string {
   `;
 }
 
+function renderProjects(): string {
+  const data = mustData();
+  const projects = state.projectFilter === "all"
+    ? data.project_summaries
+    : data.project_summaries.filter((project) => project.project === state.projectFilter);
+  return `
+    <section class="toolbar">
+      <select id="projectFilter">
+        ${option("all", "All projects", state.projectFilter)}
+        ${data.project_summaries.map((project) => option(project.project, project.project, state.projectFilter)).join("")}
+      </select>
+      <button type="button" id="clearWorkScope">Clear Scope</button>
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Create Project</h2>
+        <form class="action-form" data-action="projectCreate">
+          <label>Name <input name="name" required></label>
+          <label>Description <textarea name="description"></textarea></label>
+          <label>Status ${select("status", ["active", "inactive", "archived"], "active")}</label>
+          <label>Metadata JSON <textarea name="metadata" placeholder="{}"></textarea></label>
+          <button type="submit">Create</button>
+        </form>
+      </div>
+      <div class="surface">
+        <h2>Project Metrics</h2>
+        <section class="metric-grid compact-metrics">
+          ${metric("Projects", data.project_summaries.length, `${projects.length} in current scope`)}
+          ${metric("Ready Stories", projects.reduce((sum, project) => sum + project.ready_count, 0), "available for dispatch")}
+          ${metric("Blocked Stories", projects.reduce((sum, project) => sum + project.blocked_count, 0), "waiting on dependencies")}
+          ${metric("Active Agents", new Set(projects.flatMap((project) => project.active_agent_ids)).size, "working in scope")}
+        </section>
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Projects</h2>
+        ${chip(`${projects.length} visible`, "info")}
+      </div>
+      <div class="record-list">
+        ${projects.length ? projects.map(projectCrudRecord).join("") : `<div class="empty-state">No projects</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderFleets(): string {
+  const data = mustData();
+  const activeFleets = data.fleets.filter((fleet) => fleet.status === "active").length;
+  return `
+    <section class="metric-grid">
+      ${metric("Fleets", data.fleets.length, `${activeFleets} active`)}
+      ${metric("Members", data.fleets.reduce((sum, fleet) => sum + (fleet.agent_ids || []).length, 0), "agent memberships")}
+      ${metric("Agents", data.agents.length, "available to assign")}
+      ${metric("Machines", data.machines.length, "registered hosts")}
+    </section>
+    <section class="split">
+      <div class="surface">
+        <h2>Create Fleet</h2>
+        <form class="action-form" data-action="fleetCreate">
+          <label>Name <input name="name" required></label>
+          <label>Description <textarea name="description"></textarea></label>
+          <label>Status ${select("status", ["active", "inactive", "retired"], "active")}</label>
+          <label>Agent IDs <input name="agent_ids" placeholder="agent_a,agent_b"></label>
+          <label>Metadata JSON <textarea name="metadata" placeholder="{}"></textarea></label>
+          <button type="submit">Create</button>
+        </form>
+      </div>
+      <div class="surface">
+        <h2>Fleet Topology</h2>
+        ${fleetMembershipSummary(data)}
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
+        <h2>Fleets</h2>
+        ${chip(`${data.fleets.length} configured`, "info")}
+      </div>
+      <div class="record-list">
+        ${data.fleets.length ? data.fleets.map((fleet) => fleetRecord(fleet, data)).join("") : `<div class="empty-state">No fleets</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderMap(): string {
   const data = mustData();
   const activeTasks = data.tasks.filter((detail) => !TERMINAL_TASK_STATES.has(detail.task.state));
   const dependencyCount = data.tasks.reduce((sum, detail) => sum + (detail.task.dependencies || []).length, 0);
   return `
     <section class="metric-grid">
-      ${metric("Topology Nodes", data.machines.length + data.agents.length + activeTasks.length, "machines, agents, active tasks")}
+      ${metric("Topology Nodes", data.fleets.length + data.machines.length + data.agents.length + activeTasks.length, "fleets, machines, agents, active tasks")}
       ${metric("Dispatch Queue", data.dispatch.open_task_count || 0, "open tasks awaiting agents")}
       ${metric("Dependencies", dependencyCount, "task dependency edges")}
       ${metric("AgentBus", data.agentbus_streams.length, "recent streams")}
@@ -796,6 +903,16 @@ function renderAgents(): string {
       <button type="button" id="clearAgentFilters">Clear</button>
     </section>
     <section class="surface">
+      <h2>Create Agent</h2>
+      <form class="action-form compact" data-action="agentCreate">
+        <label>Machine ${machineSelect("machine_id", data.machines, "")}</label>
+        <label>Name <input name="name" required></label>
+        <label>Capabilities <input name="capabilities" placeholder="python,deploy"></label>
+        <label>Resources JSON <textarea name="resources" placeholder="{}"></textarea></label>
+        <button type="submit">Create</button>
+      </form>
+    </section>
+    <section class="surface">
       <div class="surface-heading">
         <h2>Agent Resource Table</h2>
         ${chip(`${agents.length} matching`, "info")}
@@ -838,6 +955,19 @@ function renderTasks(): string {
         ${TASK_STATES.map((taskState) => option(taskState, labelize(taskState), state.taskFilter)).join("")}
       </select>
       <button type="button" id="clearTaskFilter">Clear</button>
+    </section>
+    <section class="surface">
+      <h2>Create Task</h2>
+      <form class="action-form" data-action="taskCreate">
+        <label>Title <input name="title" required></label>
+        <label>Description <textarea name="description"></textarea></label>
+        <label>Project <input name="project" value="${escapeHtml(state.projectFilter === "all" ? "" : state.projectFilter)}"></label>
+        <label>Priority <input name="priority" type="number" value="0"></label>
+        <label>Capabilities <input name="required_capabilities" placeholder="python,deploy"></label>
+        <label>Dependencies <input name="dependencies" placeholder="task_a,task_b"></label>
+        <label>Metadata JSON <textarea name="metadata" placeholder="{}"></textarea></label>
+        <button type="submit">Create</button>
+      </form>
     </section>
     <section class="task-lanes">
       ${TASK_STATES.filter((taskState) => state.taskFilter === "all" || state.taskFilter === taskState)
@@ -1623,6 +1753,99 @@ function projectFrontierRecord(project: ProjectSummary): string {
   `;
 }
 
+function projectCrudRecord(project: ProjectSummary): string {
+  const record = (project.record || {}) as JsonObject;
+  const description = String(record.description || "");
+  const status = String(record.status || "active");
+  const metadata = record.metadata && typeof record.metadata === "object" ? JSON.stringify(record.metadata) : "{}";
+  return `
+    <article class="record ${state.projectFilter === project.project ? "is-selected" : ""}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(project.project)}</h3><p class="muted small">${project.task_count} stories, ${project.repository_count} repositories</p></div>
+        <button class="link-button" type="button" data-project="${escapeHtml(project.project)}">Focus</button>
+      </div>
+      <div class="chip-row">
+        ${chip(`${project.ready_count} ready`, project.ready_count ? "good" : "info")}
+        ${chip(`${project.active_count} active`, project.active_count ? "warn" : "info")}
+        ${chip(`${project.blocked_count} blocked`, project.blocked_count ? "warn" : "good")}
+        ${chip(status, status === "active" ? "good" : "warn")}
+      </div>
+      <details class="action-box">
+        <summary>Project CRUD</summary>
+        <form class="action-form" data-action="projectUpdate" data-project="${escapeHtml(project.project)}">
+          <label>Name <input name="name" value="${escapeHtml(project.project)}"></label>
+          <label>Description <textarea name="description">${escapeHtml(description)}</textarea></label>
+          <label>Status ${select("status", ["active", "inactive", "archived"], status)}</label>
+          <label>Metadata JSON <textarea name="metadata">${escapeHtml(metadata)}</textarea></label>
+          <button type="submit">Update</button>
+        </form>
+        <form class="action-form compact danger-action" data-action="projectDelete" data-project="${escapeHtml(project.project)}">
+          <label><input name="force" type="checkbox"> Force unlink</label>
+          <label>Actor <input name="actor" value="human"></label>
+          <button type="submit">Delete</button>
+        </form>
+      </details>
+    </article>
+  `;
+}
+
+function fleetMembershipSummary(data: DashboardData): string {
+  if (!data.fleets.length) return `<div class="empty-state">No fleets</div>`;
+  const agentsById = new Map(data.agents.map((item) => [item.agent.id, item]));
+  return `
+    <div class="bucket-list">
+      ${data.fleets.map((fleet) => {
+        const members = (fleet.agent_ids || []).map((agentId) => agentsById.get(agentId)?.agent.name || agentId);
+        return `
+          <button class="bucket-row" type="button" data-select-id="${escapeHtml(fleet.id)}">
+            <span>${escapeHtml(fleet.name)}</span>
+            <span class="bar-track"><span class="bar-fill" style="width:${Math.max(4, Math.min(100, members.length * 12))}%"></span></span>
+            <span class="mono small">${members.length}</span>
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function fleetRecord(fleet: FleetRecord, data: DashboardData): string {
+  const agentsById = new Map(data.agents.map((item) => [item.agent.id, item.agent.name]));
+  const memberNames = (fleet.agent_ids || []).map((agentId) => agentsById.get(agentId) || agentId);
+  const metadata = fleet.metadata && typeof fleet.metadata === "object" ? JSON.stringify(fleet.metadata) : "{}";
+  return `
+    <article class="record ${selectedClass(fleet.id)}">
+      <div class="record-header">
+        <div><h3>${escapeHtml(fleet.name)}</h3><p class="muted small mono">${escapeHtml(fleet.id)}</p></div>
+        <button class="link-button" type="button" data-select-id="${escapeHtml(fleet.id)}">Select</button>
+      </div>
+      <div class="chip-row">
+        ${chip(fleet.status, fleet.status === "active" ? "good" : "warn")}
+        ${chip(`${(fleet.agent_ids || []).length} agents`, "info")}
+        ${fleet.tenant_id ? chip(fleet.tenant_id, "info") : chip("global", "info")}
+      </div>
+      <p class="muted small">${escapeHtml(fleet.description || "")}</p>
+      <div class="row-grid">
+        ${field("Members", memberNames.join(", ") || "none")}
+        ${field("Metadata", jsonSummary(fleet.metadata))}
+      </div>
+      <details class="action-box">
+        <summary>Fleet CRUD</summary>
+        <form class="action-form" data-action="fleetUpdate" data-fleet-id="${escapeHtml(fleet.id)}">
+          <label>Name <input name="name" value="${escapeHtml(fleet.name)}"></label>
+          <label>Description <textarea name="description">${escapeHtml(fleet.description || "")}</textarea></label>
+          <label>Status ${select("status", ["active", "inactive", "retired"], fleet.status)}</label>
+          <label>Agent IDs <input name="agent_ids" value="${escapeHtml((fleet.agent_ids || []).join(","))}"></label>
+          <label>Metadata JSON <textarea name="metadata">${escapeHtml(metadata)}</textarea></label>
+          <button type="submit">Update</button>
+        </form>
+        <form class="action-form compact danger-action" data-action="fleetDelete" data-fleet-id="${escapeHtml(fleet.id)}">
+          <button type="submit">Delete</button>
+        </form>
+      </details>
+    </article>
+  `;
+}
+
 function storyButton(task: TaskRecord): string {
   return `<button class="story-button ${selectedClass(task.id)}" type="button" data-select-id="${escapeHtml(task.id)}"><span>${escapeHtml(task.title)}</span><span class="mono small">${escapeHtml(task.id)}</span></button>`;
 }
@@ -1794,11 +2017,25 @@ function agentRow(item: AgentItem, data: DashboardData): string {
       <td>${escapeHtml((item.agent.capabilities || []).slice(0, 8).join(", ") || "none")}</td>
       <td>${task ? storyButton(task) : `<span class="muted small">none</span>`}</td>
       <td>
-        <form class="inline-form" data-action="agentBulkUpdate">
-          <input type="hidden" name="agent_ids" value="${escapeHtml(item.agent.id)}">
-          <input type="hidden" name="status" value="draining">
-          <button type="submit">Drain</button>
-        </form>
+        <details class="row-actions">
+          <summary>Manage</summary>
+          <form class="inline-form" data-action="agentBulkUpdate">
+            <input type="hidden" name="agent_ids" value="${escapeHtml(item.agent.id)}">
+            <input type="hidden" name="status" value="draining">
+            <button type="submit">Drain</button>
+          </form>
+          <form class="action-form compact" data-action="agentUpdate" data-agent-id="${escapeHtml(item.agent.id)}">
+            <label>Name <input name="name" value="${escapeHtml(item.agent.name)}"></label>
+            <label>Status ${select("status", ["idle", "busy", "draining", "offline"], item.agent.status)}</label>
+            <label>Health ${select("health_status", ["healthy", "degraded", "unhealthy"], item.agent.health_status)}</label>
+            <label>Capabilities <input name="capabilities" value="${escapeHtml((item.agent.capabilities || []).join(","))}"></label>
+            <label>Resources JSON <textarea name="resources">${escapeHtml(JSON.stringify(item.agent.resources || {}))}</textarea></label>
+            <button type="submit">Update</button>
+          </form>
+          <form class="action-form compact danger-action" data-action="agentDelete" data-agent-id="${escapeHtml(item.agent.id)}">
+            <button type="submit">Delete</button>
+          </form>
+        </details>
       </td>
     </tr>
   `;
@@ -1881,6 +2118,21 @@ function taskCard(detail: TaskDetail, agents: AgentItem[]): string {
       </div>
       <details class="action-box">
         <summary>Task actions</summary>
+        <form class="action-form" data-action="taskUpdate" data-task-id="${escapeHtml(task.id)}">
+          <label>Title <input name="title" value="${escapeHtml(task.title)}"></label>
+          <label>Description <textarea name="description">${escapeHtml(String(task.description || ""))}</textarea></label>
+          <label>Project <input name="project" value="${escapeHtml(task.project || "")}"></label>
+          <label>Priority <input name="priority" type="number" value="${escapeHtml(task.priority || 0)}"></label>
+          <label>Capabilities <input name="required_capabilities" value="${escapeHtml((task.required_capabilities || []).join(","))}"></label>
+          <label>Dependencies <input name="dependencies" value="${escapeHtml((task.dependencies || []).join(","))}"></label>
+          <label>Metadata JSON <textarea name="metadata">${escapeHtml(JSON.stringify(task.metadata || {}))}</textarea></label>
+          <button type="submit">Update</button>
+        </form>
+        <form class="action-form compact danger-action" data-action="taskDelete" data-task-id="${escapeHtml(task.id)}">
+          <label><input name="force" type="checkbox"> Force dependents</label>
+          <label>Actor <input name="actor" value="human"></label>
+          <button type="submit">Delete</button>
+        </form>
         <form class="action-form compact" data-action="taskClaim" data-task-id="${escapeHtml(task.id)}">
           <label>Agent ${agentSelect("agent_id", agents, task.owner_agent_id || "")}</label>
           <label>Lease seconds <input name="lease_seconds" type="number" value="900" min="1"></label>
@@ -2459,6 +2711,97 @@ async function runAction(action: string, form: HTMLFormElement, values: JsonObje
       stale_after_seconds: optionalNumber(values.stale_after_seconds),
     });
   }
+  if (action === "fleetCreate") {
+    return postJSON("/fleets", {
+      name: requiredString(values.name),
+      description: String(values.description || ""),
+      status: requiredString(values.status),
+      agent_ids: csvList(values.agent_ids),
+      metadata: parseJsonObject(values.metadata),
+    });
+  }
+  if (action === "fleetUpdate") {
+    return putJSON(`/fleets/${encodeURIComponent(requiredDataset(form, "fleetId"))}`, {
+      name: requiredString(values.name),
+      description: String(values.description || ""),
+      status: requiredString(values.status),
+      agent_ids: csvList(values.agent_ids),
+      metadata: parseJsonObject(values.metadata),
+    });
+  }
+  if (action === "fleetDelete") {
+    return deleteJSON(`/fleets/${encodeURIComponent(requiredDataset(form, "fleetId"))}`);
+  }
+  if (action === "agentCreate") {
+    return postJSON("/agents", {
+      machine_id: requiredString(values.machine_id),
+      name: requiredString(values.name),
+      capabilities: csvList(values.capabilities),
+      resources: parseJsonObject(values.resources),
+    });
+  }
+  if (action === "agentUpdate") {
+    return putJSON(`/agents/${encodeURIComponent(requiredDataset(form, "agentId"))}`, {
+      name: requiredString(values.name),
+      status: requiredString(values.status),
+      health_status: requiredString(values.health_status),
+      capabilities: csvList(values.capabilities),
+      resources: parseJsonObject(values.resources),
+    });
+  }
+  if (action === "agentDelete") {
+    return deleteJSON(`/agents/${encodeURIComponent(requiredDataset(form, "agentId"))}`);
+  }
+  if (action === "projectCreate") {
+    return postJSON("/projects", {
+      name: requiredString(values.name),
+      description: String(values.description || ""),
+      status: requiredString(values.status),
+      metadata: parseJsonObject(values.metadata),
+      actor: "human",
+    });
+  }
+  if (action === "projectUpdate") {
+    return putJSON(`/projects/${encodeURIComponent(requiredDataset(form, "project"))}`, {
+      name: requiredString(values.name),
+      description: String(values.description || ""),
+      status: requiredString(values.status),
+      metadata: parseJsonObject(values.metadata),
+      actor: "human",
+    });
+  }
+  if (action === "projectDelete") {
+    const project = requiredDataset(form, "project");
+    return deleteJSON(`/projects/${encodeURIComponent(project)}?force=${boolValue(values.force)}&actor=${encodeURIComponent(String(values.actor || "human"))}`);
+  }
+  if (action === "taskCreate") {
+    return postJSON("/tasks", {
+      title: requiredString(values.title),
+      description: String(values.description || ""),
+      project: emptyToNull(values.project),
+      priority: numberValue(values.priority, 0),
+      required_capabilities: csvList(values.required_capabilities),
+      dependencies: csvList(values.dependencies),
+      metadata: parseJsonObject(values.metadata),
+      actor: "human",
+    });
+  }
+  if (action === "taskUpdate") {
+    return putJSON(`/tasks/${encodeURIComponent(requiredDataset(form, "taskId"))}`, {
+      title: requiredString(values.title),
+      description: String(values.description || ""),
+      project: emptyToNull(values.project),
+      priority: numberValue(values.priority, 0),
+      required_capabilities: csvList(values.required_capabilities),
+      dependencies: csvList(values.dependencies),
+      metadata: parseJsonObject(values.metadata),
+      actor: "human",
+    });
+  }
+  if (action === "taskDelete") {
+    const taskId = requiredDataset(form, "taskId");
+    return deleteJSON(`/tasks/${encodeURIComponent(taskId)}?force=${boolValue(values.force)}&actor=${encodeURIComponent(String(values.actor || "human"))}`);
+  }
   if (action === "taskClaim") {
     const taskId = requiredDataset(form, "taskId");
     return postJSON(`/tasks/${encodeURIComponent(taskId)}/claim?agent_id=${encodeURIComponent(requiredString(values.agent_id))}&lease_seconds=${numberValue(values.lease_seconds, 900)}`, {});
@@ -2599,6 +2942,14 @@ function postJSON(path: string, body: JsonObject): Promise<unknown> {
   return requestJSON(path, { method: "POST", body: JSON.stringify(body) });
 }
 
+function putJSON(path: string, body: JsonObject): Promise<unknown> {
+  return requestJSON(path, { method: "PUT", body: JSON.stringify(body) });
+}
+
+function deleteJSON(path: string): Promise<unknown> {
+  return requestJSON(path, { method: "DELETE" });
+}
+
 function formValues(form: HTMLFormElement): JsonObject {
   const values: JsonObject = {};
   new FormData(form).forEach((value, key) => {
@@ -2608,6 +2959,7 @@ function formValues(form: HTMLFormElement): JsonObject {
 }
 
 function relationshipGraph(data: DashboardData): string {
+  const fleets = data.fleets.slice(0, 6);
   const machines = data.machines.slice(0, 8);
   const agents = data.agents.slice(0, 12).map((item) => item.agent);
   const activeTasks = data.tasks
@@ -2615,12 +2967,18 @@ function relationshipGraph(data: DashboardData): string {
     .slice(0, 14)
     .map((detail) => detail.task);
   const nodes = [
-    ...machines.map((machine, index) => graphNode(machine.id, machine.hostname, "machine", 80, 60 + index * 58)),
-    ...agents.map((agent, index) => graphNode(agent.id, agent.name, "agent", 330, 46 + index * 48)),
-    ...activeTasks.map((task, index) => graphNode(task.id, task.title, "task", 610, 44 + index * 46)),
+    ...fleets.map((fleet, index) => graphNode(fleet.id, fleet.name, "fleet", 70, 58 + index * 58)),
+    ...machines.map((machine, index) => graphNode(machine.id, machine.hostname, "machine", 235, 58 + index * 58)),
+    ...agents.map((agent, index) => graphNode(agent.id, agent.name, "agent", 430, 46 + index * 48)),
+    ...activeTasks.map((task, index) => graphNode(task.id, task.title, "task", 650, 44 + index * 46)),
   ];
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const edges: Array<{ from: string; to: string; tone: string }> = [];
+  for (const fleet of fleets) {
+    for (const agentId of fleet.agent_ids || []) {
+      edges.push({ from: fleet.id, to: agentId, tone: "fleet-agent" });
+    }
+  }
   for (const agent of agents) {
     edges.push({ from: agent.machine_id, to: agent.id, tone: "machine-agent" });
   }
@@ -2630,7 +2988,7 @@ function relationshipGraph(data: DashboardData): string {
       edges.push({ from: dependency, to: task.id, tone: "dependency" });
     }
   }
-  const height = Math.max(360, 90 + Math.max(machines.length * 58, agents.length * 48, activeTasks.length * 46));
+  const height = Math.max(360, 90 + Math.max(fleets.length * 58, machines.length * 58, agents.length * 48, activeTasks.length * 46));
   const edgeSvg = edges.map((edge) => {
     const from = byId.get(edge.from);
     const to = byId.get(edge.to);
@@ -2646,9 +3004,10 @@ function relationshipGraph(data: DashboardData): string {
   return `
     <div class="graph-wrap">
       <svg class="relationship-graph" viewBox="0 0 760 ${height}" role="img" aria-label="Fleet topology graph">
-        <text class="graph-column-label" x="80" y="24">Machines</text>
-        <text class="graph-column-label" x="330" y="24">Agents</text>
-        <text class="graph-column-label" x="610" y="24">Active Tasks</text>
+        <text class="graph-column-label" x="70" y="24">Fleets</text>
+        <text class="graph-column-label" x="235" y="24">Machines</text>
+        <text class="graph-column-label" x="430" y="24">Agents</text>
+        <text class="graph-column-label" x="650" y="24">Tasks</text>
         ${edgeSvg}
         ${nodeSvg}
       </svg>
@@ -2759,6 +3118,10 @@ function agentSelect(name: string, agents: AgentItem[], selected: string): strin
   return `<select name="${escapeHtml(name)}"><option value="">Select agent</option>${agents.map((item) => option(item.agent.id, item.agent.name, selected)).join("")}</select>`;
 }
 
+function machineSelect(name: string, machines: MachineRecord[], selected: string): string {
+  return `<select name="${escapeHtml(name)}"><option value="">Select machine</option>${machines.map((machine) => option(machine.id, machine.hostname, selected)).join("")}</select>`;
+}
+
 function select(name: string, values: string[], selected: string): string {
   return `<select name="${escapeHtml(name)}">${values.map((value) => option(value, labelize(value), selected)).join("")}</select>`;
 }
@@ -2821,6 +3184,14 @@ function numberValue(value: unknown, fallback: number): number {
 function optionalNumber(value: unknown): number | null {
   const text = String(value || "").trim();
   return text ? numberValue(text, 0) : null;
+}
+
+function boolValue(value: unknown): string {
+  return value === "on" || value === true || value === "true" ? "true" : "false";
+}
+
+function csvList(value: unknown): string[] {
+  return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 function emptyToNull(value: unknown): string | null {

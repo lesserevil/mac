@@ -1570,6 +1570,7 @@ def _dashboard_state(
     machines = cp.list_machines()
     machines_by_id = {machine.id: machine for machine in machines}
     agents = cp.list_agents()
+    fleets = [fleet.to_dict() for fleet in cp.list_fleets()]
     tasks = cp.list_tasks()
     task_dicts = [task.to_dict() for task in tasks]
     dead_letters = [task.to_dict() for task in cp.list_dead_letters()]
@@ -1632,6 +1633,7 @@ def _dashboard_state(
                 "machines": len(machines),
                 "trusted_machines": sum(1 for machine in machines if machine.trusted),
                 "agents": len(agents),
+                "fleets": len(fleets),
                 "healthy_agents": sum(1 for agent in agents if agent.health_status == "healthy"),
                 "busy_agents": sum(1 for agent in agents if agent.status == "busy"),
                 "active_tasks": sum(
@@ -1674,6 +1676,7 @@ def _dashboard_state(
         "roles": roles,
         "provisioning_requests": provisioning_requests,
         "machines": [machine.to_dict() for machine in machines],
+        "fleets": fleets,
         "agents": [
             _dashboard_agent_base(cp, agent, tasks, machines_by_id)
             for agent in agents

@@ -390,6 +390,16 @@ details.action-box {
   padding: 10px 12px;
 }
 
+details.row-actions {
+  min-width: 180px;
+}
+
+details.row-actions summary {
+  cursor: pointer;
+  color: var(--blue);
+  font-weight: 800;
+}
+
 details.action-box summary {
   cursor: pointer;
   font-weight: 800;
@@ -822,6 +832,10 @@ details.action-box summary {
   stroke: #2f6f63;
 }
 
+.graph-edge-fleet-agent {
+  stroke: #5661a6;
+}
+
 .graph-edge-dependency {
   stroke: #9a5b13;
   stroke-dasharray: 5 4;
@@ -840,6 +854,11 @@ details.action-box summary {
 .graph-node-machine rect {
   fill: var(--blue-soft);
   stroke: #bdd4e9;
+}
+
+.graph-node-fleet rect {
+  fill: #f4f1ff;
+  stroke: #cbc2f2;
 }
 
 .graph-node-agent rect {

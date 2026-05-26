@@ -45,6 +45,7 @@ FALSY = {"0", "false", "no", "off"}
 RUNTIME_MARKDOWN_REQUIRED_SNIPPETS = (
     "MAC Task and Project Runtime",
     "First-Class Objects",
+    "`fleets`: authority `mac`",
     "`tasks`: authority `mac`",
     "`projects`: authority `mac`",
     "`agents`: authority `mac`",
@@ -570,6 +571,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
             if isinstance(endpoints.get("mac_api"), str)
             else summary["mac_url"],
             "authority": {
+                "fleets": authority.get("fleets"),
                 "tasks": authority.get("tasks"),
                 "projects": authority.get("projects"),
                 "agents": authority.get("agents"),
@@ -640,7 +642,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
         summary["status"] = "missing_markdown"
         summary["warning"] = "Hermes MAC task/project runtime markdown is missing: %s" % markdown_path
         return summary
-    for key in ("tasks", "projects", "agents"):
+    for key in ("fleets", "tasks", "projects", "agents"):
         if authority.get(key) != "mac":
             summary["ready"] = not required
             summary["status"] = "authority_mismatch"
@@ -650,7 +652,7 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
             return summary
     object_model = summary["first_class_objects"]
     object_model_errors = []
-    for key in ("tasks", "projects", "agents"):
+    for key in ("fleets", "tasks", "projects", "agents"):
         item = object_model.get(key) if isinstance(object_model.get(key), dict) else {}
         if item.get("authority") != "mac":
             object_model_errors.append("%s.authority" % key)
@@ -658,15 +660,16 @@ def _runtime_context_summary(hermes_home: Path) -> Dict[str, Any]:
             "source_of_truth",
             "identity_fields",
             "api_paths",
-            "mac_hermes_cli",
             "dashboard_state_keys",
             "dashboard_urls",
         ):
             value = item.get(field)
             if not value:
                 object_model_errors.append("%s.%s" % (key, field))
-        if key == "agents" and not item.get("hgmac_cli"):
-            object_model_errors.append("agents.hgmac_cli")
+        if key != "fleets" and not item.get("mac_hermes_cli"):
+            object_model_errors.append("%s.mac_hermes_cli" % key)
+        if key in {"fleets", "agents", "tasks", "projects"} and not item.get("hgmac_cli"):
+            object_model_errors.append("%s.hgmac_cli" % key)
     if object_model_errors:
         summary["ready"] = not required
         summary["status"] = "first_class_object_contract_missing"
@@ -1876,6 +1879,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
                 task_project_runtime["authority"].get("tasks") == "mac"
                 and task_project_runtime["authority"].get("projects") == "mac"
                 and task_project_runtime["authority"].get("agents") == "mac"
+                and task_project_runtime["authority"].get("fleets") == "mac"
             )
         ),
         "mac_session_capability_contract_declared": (
@@ -1898,7 +1902,7 @@ def build_hermes_startup_report() -> Dict[str, Any]:
         ),
         "mac_first_class_object_model_declared": (
             not task_project_runtime["required"]
-            or {"tasks", "projects", "agents"}
+            or {"fleets", "tasks", "projects", "agents"}
             <= set(task_project_runtime["first_class_object_names"])
         ),
         "mac_session_capabilities_available": (
