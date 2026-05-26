@@ -1363,12 +1363,22 @@ class MacWorker:
             executor_evidence_id,
             review_id,
         )
+        # Slim task_detail to only what the reviewer needs — the full object
+        # accumulates all evidence/history/reviews over time and can exceed
+        # ARG_MAX when serialised into the hermes --query argument (mac-xyz).
+        slim_task_detail: JsonDict = {
+            "task": task_detail.get("task", {}),
+            "evidence": [
+                e for e in task_detail.get("evidence", [])
+                if isinstance(e, dict) and e.get("id") == executor_evidence_id
+            ],
+        }
         review_context: JsonDict = {
             "task_id": task_id,
             "review_id": review_id,
             "executor_evidence_id": executor_evidence_id,
             "nudge_message_id": message.get("id"),
-            "task_detail": task_detail,
+            "task_detail": slim_task_detail,
             "review_claim": (
                 claim.get("claim")
                 if isinstance(claim.get("claim"), dict)
