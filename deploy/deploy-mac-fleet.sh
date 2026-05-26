@@ -3627,11 +3627,12 @@ values.setdefault("MAC_WORKER_LEASE_SECONDS", "900")
 values.setdefault("MAC_WORKER_EXECUTOR", str(mac_home / "bin" / "mac-hermes-task-executor"))
 values.setdefault("MAC_AGENT_STARTUP_SELF_TEST", "1")
 values.setdefault("MAC_AGENT_STARTUP_SELF_TEST_TIMEOUT", "120")
-values.setdefault("MAC_BEADS_BRIDGE_HUB_AGENT", shared_services_manager)
-values.setdefault("MAC_REVIEW_TICK_HUB_AGENT", shared_services_manager)
+values["MAC_BEADS_BRIDGE_HUB_AGENT"] = shared_services_manager
+values["MAC_REVIEW_TICK_HUB_AGENT"] = shared_services_manager
 values.setdefault("MAC_BEADS_RESTORE_TRACKED_EXPORTS", "1")
-if agent_name == values.get("MAC_BEADS_BRIDGE_HUB_AGENT", ""):
-    values.setdefault("MAC_BEADS_BRIDGE_ON_HEARTBEAT", "1")
+if agent_name == shared_services_manager:
+    values["MAC_BEADS_BRIDGE_ON_HEARTBEAT"] = "1"
+    values["MAC_BEADS_AUTO_PULL"] = "1"
     values.setdefault(
         "MAC_BEADS_REPOSITORIES",
         "mac=%s:repo-beads-mac:repo-beads-mac::30" % (mac_home / "src" / "mac"),
