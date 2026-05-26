@@ -3695,6 +3695,8 @@ log "installing mac Python package"
 "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --upgrade pip wheel >/dev/null
 "$VENV/bin/python" -m pip install -e "$SRC_DIR" >/dev/null
+mkdir -p "$HOME/.local/bin"
+ln -sf "$VENV/bin/mac" "$HOME/.local/bin/mac"
 install_or_validate_web_search_service
 write_hermes_web_search_config
 
