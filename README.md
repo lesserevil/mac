@@ -14,6 +14,10 @@ The goal is to let a user talk to a persistent Hermes agent with a real
 personality and memory, then let that agent create durable work that a broader
 fleet can execute, review, publish, and recover.
 
+If you are new to the project, start with the
+[MAC Quickstart](docs/getting-started.md). It explains the idea, vocabulary, and
+first local commands before fleet deployment.
+
 ## Core Contracts
 
 This project provides durable contracts for coordinating a fleet:
@@ -322,6 +326,7 @@ explicit login server, enrollment-key source, DNS assumption, and health check.
 
 ## Design Docs
 
+- [MAC Quickstart](docs/getting-started.md)
 - [Hermes Boundary](docs/hermes-boundary.md)
 - [Hermes Integration](docs/hermes-integration.md)
 - [Production Deployment](docs/production-deployment.md)
