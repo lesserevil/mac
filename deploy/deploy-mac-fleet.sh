@@ -4731,7 +4731,7 @@ def main() -> int:
         prompt = "\n\n".join(
             [
                 "You are running as a MAC fleet reviewer. Review the executor's work independently.",
-                "Use the task JSON and review_context as the source of truth. Preserve secrets and do not print bearer tokens.",
+                "Use the workspace files as the source of truth. Preserve secrets and do not print bearer tokens.",
                 "Decide whether the executor evidence actually proves the task was completed and verified.",
                 "Approve only when the evidence is coherent, pushed/published when required, and the checks are passing. Reject unverifiable, local-only, failing, or mismatched work.",
                 "If MAC_TASK_REPO_WORKTREE is set, use that local review checkout for independent build/test work; it is prepared from the executor evidence remote/ref/head and is safe for review commands.",
@@ -4744,7 +4744,7 @@ def main() -> int:
                 ),
                 "A review verdict must also include repo copied from the executor verification repo object, with the same repo.head_sha, plus at least one independent passing check as checks=[{\"name\":\"...\",\"returncode\":0}] or status=\"pass\".",
                 "Include worktree_digest as sha256:<64 lowercase hex chars>. If you cannot independently verify the executor result, write verdict=rejected and explain the blocker instead of omitting repo/check fields.",
-                "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
+                "Read the original task from executor-task.json and the executor evidence from executor-evidence.json in your workspace (%s)." % str(task_workspace),
             ]
         )
     else:
@@ -4758,7 +4758,7 @@ def main() -> int:
                 "For no-repository planning or operator directive work, use evidence_type=operator_result with summary and result fields describing the completed work.",
                 "For repo/code work include repo.head_sha, repo.remote_ref or repo.pr_url, repo.pushed=true, repo.dirty=false, repo.files_changed, and passing tests/checks. Passing tests/checks should use returncode=0, status=pass, result=passed, or boolean/count fields that make success unambiguous. For deployments include targets/services plus passing checks. If you cannot produce this manifest, say why; MAC will not auto-publish unverifiable work.",
                 "Repository runtime contract:\n%s" % repository_contract_section(task),
-                "Task JSON:\n%s" % json.dumps(task, indent=2, sort_keys=True),
+                "Read the full task from: %s" % str(task_file),
             ]
         )
     hermes_py = Path.home() / ".mac" / "hermes-agent" / ".venv" / "bin" / "python"

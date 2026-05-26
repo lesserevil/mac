@@ -1363,22 +1363,24 @@ class MacWorker:
             executor_evidence_id,
             review_id,
         )
-        # Slim task_detail to only what the reviewer needs — the full object
-        # accumulates all evidence/history/reviews over time and can exceed
-        # ARG_MAX when serialised into the hermes --query argument (mac-xyz).
-        slim_task_detail: JsonDict = {
-            "task": task_detail.get("task", {}),
-            "evidence": [
-                e for e in task_detail.get("evidence", [])
-                if isinstance(e, dict) and e.get("id") == executor_evidence_id
-            ],
-        }
+        # Write the specific evidence and the original task as discrete workspace
+        # files so the hermes executor can read them on demand.  This keeps the
+        # review_context — and therefore the hermes --query prompt — to IDs only,
+        # avoiding ARG_MAX blowup as evidence accumulates over a task's lifetime.
+        executor_evidence = _task_detail_evidence(task_detail, executor_evidence_id)
+        (task_dir / "executor-evidence.json").write_text(
+            json.dumps(executor_evidence, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        (task_dir / "executor-task.json").write_text(
+            json.dumps(task_detail.get("task", {}), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         review_context: JsonDict = {
             "task_id": task_id,
             "review_id": review_id,
             "executor_evidence_id": executor_evidence_id,
             "nudge_message_id": message.get("id"),
-            "task_detail": slim_task_detail,
             "review_claim": (
                 claim.get("claim")
                 if isinstance(claim.get("claim"), dict)
