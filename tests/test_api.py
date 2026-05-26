@@ -762,6 +762,89 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert agent_detail["availability"]["eligible"] is True
 
 
+def test_tasks_expose_lifecycle_timestamps_and_child_relationships():
+    cp = ControlPlane.in_memory()
+    client = TestClient(create_app(control_plane=cp))
+    machine = client.post("/machines", json={"hostname": "host-1"}).json()
+    agent = client.post(
+        "/agents",
+        json={"machine_id": machine["id"], "name": "worker", "capabilities": ["python"]},
+    ).json()
+    parent = client.post(
+        "/tasks",
+        json={
+            "title": "Parent implementation",
+            "project": "nanolang",
+            "required_capabilities": ["python"],
+        },
+    ).json()
+
+    assert parent["started_at"] is None
+    assert parent["completed_at"] is None
+    assert parent["last_updated_at"] == parent["updated_at"]
+
+    claim = client.post(
+        "/tasks/%s/claim" % parent["id"],
+        params={"agent_id": agent["id"]},
+    ).json()
+    started = client.post(
+        "/tasks/%s/start" % parent["id"],
+        params={"agent_id": agent["id"]},
+    ).json()
+    assert started["started_at"] is not None
+    assert started["completed_at"] is None
+    assert started["last_updated_at"] == started["updated_at"]
+
+    split = client.post(
+        "/tasks/%s/children" % parent["id"],
+        json={
+            "actor": agent["id"],
+            "children": [
+                {
+                    "title": "Implement parser child",
+                    "description": "Smaller scoped parser work",
+                },
+                {
+                    "title": "Test parser child",
+                    "required_capabilities": ["python", "test"],
+                },
+            ],
+        },
+    ).json()
+    child_ids = [child["id"] for child in split["children"]]
+
+    assert split["parent"]["state"] == "blocked"
+    assert split["parent"]["owner_agent_id"] is None
+    assert split["parent"]["lease_id"] is None
+    assert split["parent"]["dependencies"] == child_ids
+    assert split["parent"]["started_at"] == started["started_at"]
+    assert split["relationships"]["blocked_by"] == child_ids
+    assert cp.get_lease(claim["lease"]["id"]).status == "released"
+
+    first_child = split["children"][0]
+    assert first_child["project"] == "nanolang"
+    assert first_child["required_capabilities"] == ["python"]
+    assert first_child["metadata"]["relationships"]["parent_task_id"] == parent["id"]
+    assert first_child["metadata"]["relationships"]["blocks"] == [parent["id"]]
+
+    detail = client.get("/tasks/%s" % parent["id"]).json()
+    assert detail["task"]["last_updated_at"] == detail["task"]["updated_at"]
+    assert any(event["event_type"] == "task.children_added" for event in detail["history"])
+
+    terminal = client.post(
+        "/tasks",
+        json={"title": "Terminal timing", "required_capabilities": ["python"]},
+    ).json()
+    client.post("/tasks/%s/claim" % terminal["id"], params={"agent_id": agent["id"]})
+    client.post("/tasks/%s/start" % terminal["id"], params={"agent_id": agent["id"]})
+    failed = client.post(
+        "/tasks/%s/transition" % terminal["id"],
+        json={"target_state": "failed", "actor": agent["id"], "detail": {"reason": "test"}},
+    ).json()
+    assert failed["completed_at"] is not None
+    assert failed["last_updated_at"] == failed["updated_at"]
+
+
 def test_dashboard_exposes_service_links_with_redacted_credentials(monkeypatch):
     monkeypatch.setenv("MAC_HERMES_STARTUP_CHECK", "0")
     monkeypatch.setenv("TOKENHUB_URL", "http://tokenhub.internal:8090")

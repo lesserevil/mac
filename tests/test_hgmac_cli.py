@@ -141,6 +141,7 @@ def test_hgmac_first_class_object_crud_commands_use_api_paths():
         ["tasks", "list", "--state", "open"],
         ["tasks", "show", "task_1"],
         ["tasks", "create", "--title", "Do work", "--project", "nanolang", "--capabilities", "python"],
+        ["tasks", "add-child", "task_1", "--title", "Child work", "--capabilities", "python,test"],
         ["tasks", "update", "task_1", "--priority", "5", "--dependencies", "task_0"],
         ["tasks", "delete", "task_1", "--force"],
         ["projects", "list"],
@@ -163,6 +164,7 @@ def test_hgmac_first_class_object_crud_commands_use_api_paths():
     assert ("GET", "/tasks?state=open") in by_method_path
     assert ("GET", "/tasks/task_1") in by_method_path
     assert ("POST", "/tasks") in by_method_path
+    assert ("POST", "/tasks/task_1/children") in by_method_path
     assert ("PUT", "/tasks/task_1") in by_method_path
     assert ("DELETE", "/tasks/task_1?force=true&actor=human") in by_method_path
     assert ("GET", "/projects") in by_method_path
@@ -172,3 +174,4 @@ def test_hgmac_first_class_object_crud_commands_use_api_paths():
     assert ("DELETE", "/projects/nanolang?force=true&actor=human") in by_method_path
     assert calls[2][2]["agent_ids"] == ["agent_1", "agent_2"]
     assert calls[7][2]["required_capabilities"] == ["python"]
+    assert calls[8][2]["children"][0]["required_capabilities"] == ["python", "test"]

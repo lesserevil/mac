@@ -178,6 +178,22 @@ class TaskUpdate(BaseModel):
     actor: str = "human"
 
 
+class TaskChildCreate(BaseModel):
+    title: str
+    description: str = ""
+    project: Optional[str] = None
+    priority: Optional[int] = None
+    required_capabilities: Optional[List[str]] = None
+    dependencies: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    max_attempts: Optional[int] = None
+
+
+class TaskChildrenCreate(BaseModel):
+    children: List[TaskChildCreate]
+    actor: str = "human"
+
+
 class TaskDelete(BaseModel):
     actor: str = "human"
 
@@ -2041,6 +2057,18 @@ def create_app(
         if data.get("metadata") is not None:
             _ensure_payload_bounded(data["metadata"], "task.metadata")
         return cp.update_task(task_id, actor=actor, **data).to_dict()
+
+    @app.post("/tasks/{task_id}/children")
+    def add_child_tasks(task_id: str, body: TaskChildrenCreate) -> Dict[str, Any]:
+        data = _data(body)
+        for index, child in enumerate(data.get("children") or [], start=1):
+            if child.get("metadata") is not None:
+                _ensure_payload_bounded(child["metadata"], "task.children.%d.metadata" % index)
+        return cp.add_child_tasks(
+            task_id,
+            data.get("children") or [],
+            actor=data.get("actor", "human"),
+        )
 
     @app.delete("/tasks/{task_id}")
     def delete_task(

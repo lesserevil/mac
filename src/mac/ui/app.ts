@@ -65,6 +65,9 @@ interface TaskRecord extends ApiRecord {
   leased_until?: string | null;
   attempt_count?: number;
   max_attempts?: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  last_updated_at?: string | null;
 }
 
 interface TaskDetail {
@@ -2112,6 +2115,11 @@ function taskCard(detail: TaskDetail, agents: AgentItem[]): string {
         ${owner ? chip(owner.name, "info") : chip("unowned", "warn")}
         ${origin.hermes_instance_id ? chip("Hermes origin", "info") : ""}
       </div>
+      <div class="row-grid compact-fields">
+        ${field("Started", task.started_at ? formatAge(task.started_at) : "not started")}
+        ${field("Completed", task.completed_at ? formatAge(task.completed_at) : "not completed")}
+        ${field("Updated", formatAge(task.last_updated_at || task.updated_at))}
+      </div>
       <p class="small muted">${escapeHtml(String(detail.summary?.summary || ""))}</p>
       <div class="timeline">
         ${detail.history.slice(-3).map((event) => timelineItem(String(event.event_type), String(event.actor || ""), String(event.created_at || ""))).join("")}
@@ -2137,6 +2145,15 @@ function taskCard(detail: TaskDetail, agents: AgentItem[]): string {
           <label>Agent ${agentSelect("agent_id", agents, task.owner_agent_id || "")}</label>
           <label>Lease seconds <input name="lease_seconds" type="number" value="900" min="1"></label>
           <button type="submit">Claim</button>
+        </form>
+        <form class="action-form compact" data-action="taskAddChild" data-task-id="${escapeHtml(task.id)}">
+          <label>Child title <input name="title" required></label>
+          <label>Description <textarea name="description"></textarea></label>
+          <label>Project <input name="project" value="${escapeHtml(task.project || "")}"></label>
+          <label>Capabilities <input name="required_capabilities" value="${escapeHtml((task.required_capabilities || []).join(","))}"></label>
+          <label>Dependencies <input name="dependencies"></label>
+          <label>Actor <input name="actor" value="human"></label>
+          <button type="submit">Add Child</button>
         </form>
         <form class="action-form compact" data-action="taskStart" data-task-id="${escapeHtml(task.id)}">
           <label>Agent ${agentSelect("agent_id", agents, task.owner_agent_id || "")}</label>
@@ -2805,6 +2822,20 @@ async function runAction(action: string, form: HTMLFormElement, values: JsonObje
   if (action === "taskClaim") {
     const taskId = requiredDataset(form, "taskId");
     return postJSON(`/tasks/${encodeURIComponent(taskId)}/claim?agent_id=${encodeURIComponent(requiredString(values.agent_id))}&lease_seconds=${numberValue(values.lease_seconds, 900)}`, {});
+  }
+  if (action === "taskAddChild") {
+    const taskId = requiredDataset(form, "taskId");
+    return postJSON(`/tasks/${encodeURIComponent(taskId)}/children`, {
+      actor: requiredString(values.actor),
+      children: [{
+        title: requiredString(values.title),
+        description: String(values.description || ""),
+        project: emptyToNull(values.project),
+        required_capabilities: csvList(values.required_capabilities),
+        dependencies: csvList(values.dependencies),
+        metadata: {},
+      }],
+    });
   }
   if (action === "taskStart") {
     const taskId = requiredDataset(form, "taskId");

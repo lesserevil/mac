@@ -150,6 +150,7 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     )
     operation_names = {operation["name"] for operation in work_context["operations"]["api"]}
     assert {
+        "add_child_tasks",
         "list_tasks",
         "list_projects",
         "get_project",
@@ -185,6 +186,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
         for command in work_context["operations"]["mac_hermes_cli"]
     )
     assert any(
+        "mac-hermes add-child-task" in command
+        for command in work_context["operations"]["mac_hermes_cli"]
+    )
+    assert any(
         "mac-hermes command-audit" in command
         for command in work_context["operations"]["mac_hermes_cli"]
     )
@@ -194,6 +199,10 @@ def test_hermes_adapter_registers_identity_and_creates_sanitized_task():
     )
     assert any(
         "hgmac agents create" in command
+        for command in work_context["operations"]["hgmac_cli"]
+    )
+    assert any(
+        "hgmac tasks add-child" in command
         for command in work_context["operations"]["hgmac_cli"]
     )
     assert adapter.work_context_brief(registration["hermes_instance"]["id"]).startswith(

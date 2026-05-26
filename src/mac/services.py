@@ -148,6 +148,17 @@ def _manifest_list(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
 
 
+def _unique_ordered(values: Iterable[str]) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if item and item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
+
+
 def _metadata_string_list(value: Any) -> List[str]:
     if isinstance(value, str):
         stripped = value.strip()
@@ -782,6 +793,7 @@ class ControlPlane:
             "get_task",
             "update_task",
             "delete_task",
+            "add_child_tasks",
             "get_task_summary",
             "claim_next_task",
             "claim_task",
@@ -1175,6 +1187,7 @@ class ControlPlane:
                         "mac-hermes claim-next",
                         "mac-hermes claim",
                         "mac-hermes start",
+                        "mac-hermes add-child-task",
                         "mac-hermes transition",
                         "mac-hermes command-audit",
                     ),
@@ -1188,6 +1201,7 @@ class ControlPlane:
                         "mac-hermes claim-next",
                         "mac-hermes claim",
                         "mac-hermes start",
+                        "mac-hermes add-child-task",
                         "mac-hermes transition",
                         "mac-hermes command-audit",
                     ),
@@ -1199,6 +1213,7 @@ class ControlPlane:
                         "hgmac tasks list",
                         "hgmac tasks show",
                         "hgmac tasks create",
+                        "hgmac tasks add-child",
                         "hgmac tasks update",
                         "hgmac tasks delete",
                     ),
@@ -1926,6 +1941,11 @@ class ControlPlane:
                 {"name": "update_task", "method": "PUT", "path": "/tasks/{task_id}"},
                 {"name": "delete_task", "method": "DELETE", "path": "/tasks/{task_id}"},
                 {
+                    "name": "add_child_tasks",
+                    "method": "POST",
+                    "path": "/tasks/{task_id}/children",
+                },
+                {
                     "name": "get_task_summary",
                     "method": "GET",
                     "path": "/tasks/{task_id}/summary",
@@ -2150,6 +2170,7 @@ class ControlPlane:
                 "mac-hermes summary {task_id}",
                 "mac-hermes claim {task_id} {agent_id}",
                 "mac-hermes start {task_id} {agent_id}",
+                "mac-hermes add-child-task {task_id} <title>",
                 "mac-hermes transition {task_id} {target_state} --actor {actor}",
                 "mac-hermes evidence {task_id} --kind test --uri artifact://... --summary ... --created-by {agent_id}",
                 "mac-hermes submit-review {task_id} {agent_id}",
@@ -2174,6 +2195,7 @@ class ControlPlane:
                 "hgmac tasks list",
                 "hgmac tasks show {task_id}",
                 "hgmac tasks create --title {title}",
+                "hgmac tasks add-child {task_id} --title {child}",
                 "hgmac tasks update {task_id}",
                 "hgmac tasks delete {task_id}",
                 "hgmac projects list",
@@ -2511,8 +2533,8 @@ class ControlPlane:
                 id, title, description, project, priority, state,
                 required_capabilities, dependencies, metadata,
                 owner_agent_id, lease_id, leased_until, attempt_count,
-                max_attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?)
+                max_attempts, started_at, completed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?)
             """,
             (
                 task_id,
@@ -2774,6 +2796,202 @@ class ControlPlane:
             detail,
         )
         return updated
+
+    def add_child_tasks(
+        self,
+        task_id: str,
+        children: Iterable[Dict[str, Any]],
+        *,
+        actor: str = "human",
+    ) -> JsonDict:
+        parent = self.get_task(task_id)
+        if parent.state not in {
+            TaskState.OPEN.value,
+            TaskState.BLOCKED.value,
+            TaskState.CLAIMED.value,
+            TaskState.RUNNING.value,
+        }:
+            raise ValidationError(
+                "child tasks can only be added to open, blocked, claimed, or running tasks"
+            )
+        specs = [ensure_json_object(spec) for spec in children]
+        if not specs:
+            raise ValidationError("at least one child task is required")
+
+        prepared: List[JsonDict] = []
+        for index, spec in enumerate(specs, start=1):
+            title = str(spec.get("title") or "").strip()
+            if not title:
+                raise ValidationError("child task %d title is required" % index)
+            child_dependencies = coerce_list(spec.get("dependencies"))
+            if parent.id in child_dependencies:
+                raise ValidationError("child task cannot depend on its parent")
+            for dep_id in child_dependencies:
+                self.get_task(dep_id)
+            child_project = (
+                str(spec.get("project")).strip()
+                if spec.get("project") is not None
+                else parent.project
+            )
+            child_project = child_project or None
+            child_capabilities = (
+                coerce_list(spec.get("required_capabilities"))
+                if spec.get("required_capabilities") is not None
+                else list(parent.required_capabilities)
+            )
+            child_metadata = ensure_json_object(spec.get("metadata"))
+            relationships = ensure_json_object(child_metadata.get("relationships"))
+            relationships["parent_task_id"] = parent.id
+            relationships["relationship"] = "child"
+            relationships["blocks"] = _unique_ordered(
+                [*_metadata_string_list(relationships.get("blocks")), parent.id]
+            )
+            child_metadata["relationships"] = relationships
+            child_metadata.setdefault("parent_task_id", parent.id)
+            child_metadata.setdefault("parent_task_title", parent.title)
+            normalized_metadata = self._normalize_task_execution_contract(
+                child_metadata,
+                child_project,
+                child_capabilities,
+            )
+            prepared.append(
+                {
+                    "id": new_id("task"),
+                    "title": title,
+                    "description": str(spec.get("description") or ""),
+                    "project": child_project,
+                    "priority": int(
+                        spec["priority"]
+                        if spec.get("priority") is not None
+                        else parent.priority
+                    ),
+                    "state": (
+                        TaskState.BLOCKED.value
+                        if child_dependencies
+                        else TaskState.OPEN.value
+                    ),
+                    "required_capabilities": child_capabilities,
+                    "dependencies": child_dependencies,
+                    "metadata": normalized_metadata,
+                    "max_attempts": int(
+                        spec["max_attempts"]
+                        if spec.get("max_attempts") is not None
+                        else parent.max_attempts
+                    ),
+                }
+            )
+            if prepared[-1]["max_attempts"] < 1:
+                raise ValidationError("child task max_attempts must be >= 1")
+
+        now = utcnow()
+        child_ids = [item["id"] for item in prepared]
+        parent_dependencies = _unique_ordered([*parent.dependencies, *child_ids])
+        parent_metadata = ensure_json_object(parent.metadata)
+        parent_relationships = ensure_json_object(parent_metadata.get("relationships"))
+        parent_relationships["child_task_ids"] = _unique_ordered(
+            [*_metadata_string_list(parent_relationships.get("child_task_ids")), *child_ids]
+        )
+        parent_relationships["blocked_by_task_ids"] = parent_dependencies
+        parent_metadata["relationships"] = parent_relationships
+
+        release_lease_id = parent.lease_id
+        with self.store.transaction() as conn:
+            for child in prepared:
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, description, project, priority, state,
+                        required_capabilities, dependencies, metadata,
+                        owner_agent_id, lease_id, leased_until, attempt_count,
+                        max_attempts, started_at, completed_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        child["id"],
+                        child["title"],
+                        child["description"],
+                        child["project"],
+                        child["priority"],
+                        child["state"],
+                        json_dumps(child["required_capabilities"]),
+                        json_dumps(child["dependencies"]),
+                        json_dumps(child["metadata"]),
+                        child["max_attempts"],
+                        now,
+                        now,
+                    ),
+                )
+                self._record_history(
+                    child["id"],
+                    "task.created",
+                    actor,
+                    None,
+                    child["state"],
+                    {
+                        "title": child["title"],
+                        "parent_task_id": parent.id,
+                        "relationship": "child",
+                        "dependencies": child["dependencies"],
+                    },
+                    conn=conn,
+                )
+            if release_lease_id:
+                conn.execute(
+                    "UPDATE leases SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                    (LeaseStatus.RELEASED.value, now, release_lease_id, LeaseStatus.ACTIVE.value),
+                )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET dependencies = ?, metadata = ?, state = ?, owner_agent_id = NULL,
+                    lease_id = NULL, leased_until = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json_dumps(parent_dependencies),
+                    json_dumps(parent_metadata),
+                    TaskState.BLOCKED.value,
+                    now,
+                    parent.id,
+                ),
+            )
+            if parent.owner_agent_id:
+                self._set_agent_idle(parent.owner_agent_id, conn=conn)
+            detail = {
+                "child_task_ids": child_ids,
+                "blocked_by_task_ids": parent_dependencies,
+                "released_lease_id": release_lease_id,
+            }
+            self._record_history(
+                parent.id,
+                "task.children_added",
+                actor,
+                parent.state,
+                TaskState.BLOCKED.value,
+                detail,
+                conn=conn,
+            )
+            self.task_ledger.enqueue_outbox(
+                conn,
+                task_id=parent.id,
+                event_type="beads.ledger",
+                actor=actor,
+                from_state=parent.state,
+                to_state=TaskState.BLOCKED.value,
+                detail=detail,
+                created_at=now,
+            )
+
+        self.drain_task_transition_outbox(task_id=parent.id, limit=20)
+        return {
+            "parent": self.get_task(parent.id).to_dict(),
+            "children": [self.get_task(child_id).to_dict() for child_id in child_ids],
+            "relationships": {
+                "blocked_by": parent_dependencies,
+                "blocks": [],
+                "children": child_ids,
+            },
+        }
 
     def delete_task(self, task_id: str, *, force: bool = False, actor: str = "human") -> None:
         task = self.get_task(task_id)
@@ -3831,6 +4049,7 @@ class ControlPlane:
         leased_until = task.leased_until
         release_lease_id = None
         if target in {
+            TaskState.BLOCKED.value,
             TaskState.OPEN.value,
             TaskState.NEEDS_REVIEW.value,
             TaskState.FAILED.value,
@@ -3849,13 +4068,23 @@ class ControlPlane:
             conn.execute(
                 """
                 UPDATE tasks
-                SET state = ?, owner_agent_id = ?, lease_id = ?, leased_until = ?, updated_at = ?
+                SET state = ?, owner_agent_id = ?, lease_id = ?, leased_until = ?,
+                    started_at = ?, completed_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (target, owner_agent_id, lease_id, leased_until, now, task_id),
+                (
+                    target,
+                    owner_agent_id,
+                    lease_id,
+                    leased_until,
+                    now if target == TaskState.RUNNING.value and not task.started_at else task.started_at,
+                    now if target in TERMINAL_TASK_STATES and not task.completed_at else task.completed_at,
+                    now,
+                    task_id,
+                ),
             )
             if task.owner_agent_id and target in TERMINAL_TASK_STATES.union(
-                {TaskState.OPEN.value, TaskState.NEEDS_REVIEW.value}
+                {TaskState.BLOCKED.value, TaskState.OPEN.value, TaskState.NEEDS_REVIEW.value}
             ):
                 self._set_agent_idle(task.owner_agent_id, conn=conn)
             self._record_history(
@@ -4359,10 +4588,22 @@ class ControlPlane:
                 conn.execute(
                     """
                     UPDATE tasks
-                    SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL, updated_at = ?
+                    SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL,
+                        completed_at = CASE
+                            WHEN ? = ? AND completed_at IS NULL THEN ?
+                            ELSE completed_at
+                        END,
+                        updated_at = ?
                     WHERE id = ?
                     """,
-                    (next_state, timestamp, task.id),
+                    (
+                        next_state,
+                        next_state,
+                        TaskState.FAILED.value,
+                        timestamp,
+                        timestamp,
+                        task.id,
+                    ),
                 )
                 conn.execute(
                     """
@@ -9006,7 +9247,7 @@ class ControlPlane:
                 """
                 UPDATE tasks
                 SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL,
-                    max_attempts = ?, metadata = ?, updated_at = ?
+                    max_attempts = ?, completed_at = NULL, metadata = ?, updated_at = ?
                 WHERE id = ? AND state = ?
                 """,
                 (
@@ -9281,6 +9522,8 @@ class ControlPlane:
             leased_until=row["leased_until"],
             attempt_count=row["attempt_count"],
             max_attempts=row["max_attempts"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -10743,10 +10986,23 @@ class ControlPlane:
                 conn.execute(
                     """
                     UPDATE tasks
-                    SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL, updated_at = ?
+                    SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL,
+                        completed_at = CASE
+                            WHEN ? = ? AND completed_at IS NULL THEN ?
+                            ELSE completed_at
+                        END,
+                        updated_at = ?
                     WHERE id = ? AND lease_id = ?
                     """,
-                    (next_state, timestamp, row["task_id"], row["lease_id"]),
+                    (
+                        next_state,
+                        next_state,
+                        TaskState.FAILED.value,
+                        timestamp,
+                        timestamp,
+                        row["task_id"],
+                        row["lease_id"],
+                    ),
                 )
                 detail = {
                     "lease_id": row["lease_id"],

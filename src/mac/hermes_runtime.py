@@ -232,6 +232,7 @@ def _session_capability_contract(
             "hgmac fleets list",
             "hgmac projects list",
             "hgmac tasks list",
+            "hgmac tasks add-child {task_id} --title <child>",
             "mac-hermes claim-next %s --dry-run" % agent_id,
             "mac-hermes command-audit list --agent-id %s --limit 5" % agent_id,
             "mac-hermes web-search \"project dependency release notes\" --limit 5",
@@ -261,6 +262,27 @@ def _session_capability_contract(
 def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict[str, Any]:
     return {
         "schema": "mac.hermes.first_class_objects.v1",
+        "vocabulary": {
+            "primary_objects": ["fleets", "agents", "tasks", "projects"],
+            "task_relationships": [
+                "blocked_by: dependencies that must complete first",
+                "blocks: tasks that depend on this task",
+                "children: subtasks created when a parent is too large",
+            ],
+            "supporting_objects": [
+                "machines",
+                "tenants/personas/hermes_instances/platform_bindings",
+                "claims/leases",
+                "reviews/evidence/publications",
+                "workflows/workflow_runs",
+                "beads_repositories/project_items",
+                "command_audit/observability_events",
+                "memory_records/agentbus_streams/artifacts",
+                "notifier_channels/integration_findings",
+                "rollouts/environments/evals/secrets",
+            ],
+            "rule": "Use MAC APIs/CLIs for operational state; use Hermes memory for personality, private memory, and conversation context.",
+        },
         "objects": {
             "fleets": {
                 "authority": "mac",
@@ -295,6 +317,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "/hermes-instances/%s/tasks" % hermes_instance_id,
                     "/tasks",
                     "/tasks/{task_id}",
+                    "/tasks/{task_id}/children",
                     "/tasks/{task_id}/summary",
                     "/agents/%s/claim-next" % agent_id,
                     "/agents/%s/command-audit" % agent_id,
@@ -310,6 +333,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "hgmac tasks list",
                     "hgmac tasks show {task_id}",
                     "hgmac tasks create --title ...",
+                    "hgmac tasks add-child {task_id} --title ...",
                     "hgmac tasks update {task_id}",
                     "hgmac tasks delete {task_id}",
                 ],
@@ -321,6 +345,7 @@ def _first_class_object_contract(hermes_instance_id: str, agent_id: str) -> Dict
                     "mac-hermes claim-next %s --dry-run" % agent_id,
                     "mac-hermes claim {task_id} %s" % agent_id,
                     "mac-hermes start {task_id} %s" % agent_id,
+                    "mac-hermes add-child-task {task_id} <title>",
                     "mac-hermes transition {task_id} {target_state} --actor %s" % agent_id,
                     "mac-hermes command-audit list --task-id {task_id}",
                 ],
@@ -564,6 +589,7 @@ def build_runtime_context(
                 "mac-hermes task-detail {task_id}",
                 "mac-hermes claim {task_id} %s" % resolved_agent_id,
                 "mac-hermes start {task_id} %s" % resolved_agent_id,
+                "mac-hermes add-child-task {task_id} <child-title> --description <summary>",
                 "mac-hermes evidence {task_id} --kind test --uri artifact://... --summary ... --created-by %s"
                 % resolved_agent_id,
                 "mac-hermes command-audit record %s --phase started --argv-json '[\"git\",\"status\"]' --cwd %s --task-id {task_id}"
@@ -589,6 +615,7 @@ def build_runtime_context(
             "Hermes is authoritative for soul, personality, private memory, and conversation state.",
             "Identity is exclusive to this Hermes instance: answer only as %s; do not impersonate, proxy for, or relay as another agent." % agent_name,
             "Refresh MAC work context before selecting, changing, or reporting on work.",
+            "If a claimed task is too large, create child tasks; the parent is blocked until those children complete.",
             "Record MAC command audit entries for shell phases that produce task evidence or change repository state.",
             "Use the mac-hermes web research commands instead of undocumented local web-search state.",
             "Do not copy MAC task state into Hermes memory as a source of truth; write only completed-task summaries back to Hermes memory.",
@@ -658,6 +685,20 @@ def render_runtime_markdown(context: Dict[str, Any]) -> str:
                 object_contract.get("authority") or "unknown",
                 object_contract.get("source_of_truth") or "unconfigured",
             )
+        )
+    vocabulary = first_class.get("vocabulary") if isinstance(first_class.get("vocabulary"), dict) else {}
+    if vocabulary:
+        relationships = "; ".join(str(item) for item in vocabulary.get("task_relationships") or [])
+        supporting = ", ".join(str(item) for item in vocabulary.get("supporting_objects") or [])
+        lines.extend(
+            [
+                "",
+                "## MAC Vocabulary",
+                "",
+                "- Task edges: %s" % relationships,
+                "- Supporting objects: %s" % supporting,
+                "- Rule: %s" % (vocabulary.get("rule") or ""),
+            ]
         )
     lines.extend(["", "## Project Bridge", ""])
     for command in operations.get("project_bridge", []):

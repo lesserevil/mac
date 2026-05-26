@@ -242,10 +242,11 @@ class ReviewService:
             cursor = conn.execute(
                 """
                 UPDATE tasks
-                SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL, updated_at = ?
+                SET state = ?, owner_agent_id = NULL, lease_id = NULL, leased_until = NULL,
+                    completed_at = COALESCE(completed_at, ?), updated_at = ?
                 WHERE id = ? AND state = ?
                 """,
-                (TaskState.COMPLETED.value, now, task_id, TaskState.REVIEWING.value),
+                (TaskState.COMPLETED.value, now, now, task_id, TaskState.REVIEWING.value),
             )
             if cursor.rowcount != 1:
                 raise TransitionError("task state changed during publish; retry")

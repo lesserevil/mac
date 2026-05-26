@@ -76,9 +76,13 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert stored["first_class_objects"]["objects"]["tasks"]["authority"] == "mac"
     assert stored["first_class_objects"]["objects"]["projects"]["authority"] == "mac"
     assert stored["first_class_objects"]["objects"]["agents"]["authority"] == "mac"
+    assert "children: subtasks" in "; ".join(
+        stored["first_class_objects"]["vocabulary"]["task_relationships"]
+    )
     assert "hgmac agents identity agent_rocky_host" in stored["first_class_objects"]["objects"]["agents"]["hgmac_cli"]
     assert "hgmac fleets list" in stored["first_class_objects"]["objects"]["fleets"]["hgmac_cli"]
     assert "hgmac tasks list" in stored["first_class_objects"]["objects"]["tasks"]["hgmac_cli"]
+    assert "hgmac tasks add-child {task_id} --title ..." in stored["first_class_objects"]["objects"]["tasks"]["hgmac_cli"]
     assert "hgmac projects list" in stored["first_class_objects"]["objects"]["projects"]["hgmac_cli"]
     assert "/ui?view=fleets&selected={fleet_id}" in stored["first_class_objects"]["objects"]["fleets"]["dashboard_urls"]
     assert "/ui?view=work&selected={task_id}" in stored["first_class_objects"]["objects"]["tasks"]["dashboard_urls"]
@@ -108,6 +112,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert "never claim to be, proxy for, or relay as another agent" in markdown
     assert "mac-hermes tasks --state open" in markdown
     assert "First-Class Objects" in markdown
+    assert "MAC Vocabulary" in markdown
     assert "`fleets`: authority `mac`" in markdown
     assert "`tasks`: authority `mac`" in markdown
     assert "`projects`: authority `mac`" in markdown
@@ -131,6 +136,7 @@ def test_write_runtime_context_materializes_mac_task_project_bridge(tmp_path):
     assert 'mac-hermes web-search "current project dependency release notes" --limit 5' in markdown
     assert "hgmac agents claim-next agent_rocky_host --dry-run" in markdown
     assert "mac-hermes claim {task_id} agent_rocky_host" in markdown
+    assert "mac-hermes add-child-task {task_id} <child-title>" in markdown
     assert "Direct Session Parity" in markdown
     assert "`bd prime`" in markdown
     assert "`hgmac agents list`" in markdown

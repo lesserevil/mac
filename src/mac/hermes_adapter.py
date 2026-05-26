@@ -256,6 +256,40 @@ class HermesMacAdapter:
     def task_detail(self, task_id: str) -> JsonDict:
         return self.client.get("/tasks/%s" % _path_part(task_id))
 
+    def add_child_task(
+        self,
+        task_id: str,
+        *,
+        title: str,
+        description: str = "",
+        project: Optional[str] = None,
+        priority: Optional[int] = None,
+        required_capabilities: Optional[Iterable[str]] = None,
+        dependencies: Optional[Iterable[str]] = None,
+        metadata: Optional[JsonDict] = None,
+        max_attempts: Optional[int] = None,
+        actor: str = "hermes",
+    ) -> JsonDict:
+        child: JsonDict = {
+            "title": title,
+            "description": description,
+            "project": project,
+            "priority": priority,
+            "metadata": _sanitize_json_object(metadata or {}),
+            "max_attempts": max_attempts,
+        }
+        if required_capabilities is not None:
+            child["required_capabilities"] = list(required_capabilities)
+        if dependencies is not None:
+            child["dependencies"] = list(dependencies)
+        return self.client.post(
+            "/tasks/%s/children" % _path_part(task_id),
+            {
+                "actor": actor,
+                "children": [{key: value for key, value in child.items() if value is not None}],
+            },
+        )
+
     def work_context(
         self,
         hermes_instance_id: str,
@@ -1029,6 +1063,27 @@ def _cmd_transition(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_add_child_task(args: argparse.Namespace) -> None:
+    _print(
+        _adapter(args).add_child_task(
+            args.task_id,
+            title=args.title,
+            description=args.description or "",
+            project=args.project,
+            priority=args.priority,
+            required_capabilities=(
+                _csv(args.required_capabilities)
+                if args.required_capabilities is not None
+                else None
+            ),
+            dependencies=_csv(args.dependencies) if args.dependencies is not None else None,
+            metadata=_json_arg(args.metadata, {}),
+            max_attempts=args.max_attempts,
+            actor=args.actor,
+        )
+    )
+
+
 def _cmd_evidence(args: argparse.Namespace) -> None:
     _print(
         _adapter(args).add_evidence(
@@ -1329,6 +1384,19 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("--actor", required=True)
     transition.add_argument("--detail", default="{}")
     transition.set_defaults(func=_cmd_transition)
+
+    add_child_task = sub.add_parser("add-child-task", help="create a child task that blocks its parent")
+    add_child_task.add_argument("task_id")
+    add_child_task.add_argument("title")
+    add_child_task.add_argument("--description", default="")
+    add_child_task.add_argument("--project")
+    add_child_task.add_argument("--priority", type=int)
+    add_child_task.add_argument("--required-capabilities")
+    add_child_task.add_argument("--dependencies")
+    add_child_task.add_argument("--metadata", default="{}")
+    add_child_task.add_argument("--max-attempts", type=int)
+    add_child_task.add_argument("--actor", default="hermes")
+    add_child_task.set_defaults(func=_cmd_add_child_task)
 
     evidence = sub.add_parser("evidence", help="add MAC task evidence")
     evidence.add_argument("task_id")

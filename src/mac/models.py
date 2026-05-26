@@ -94,12 +94,14 @@ TASK_TRANSITIONS = {
         TaskState.FAILED.value,
     },
     TaskState.CLAIMED.value: {
+        TaskState.BLOCKED.value,
         TaskState.OPEN.value,
         TaskState.RUNNING.value,
         TaskState.FAILED.value,
         TaskState.CANCELLED.value,
     },
     TaskState.RUNNING.value: {
+        TaskState.BLOCKED.value,
         TaskState.NEEDS_REVIEW.value,
         TaskState.OPEN.value,
         TaskState.FAILED.value,
@@ -400,11 +402,15 @@ class Task:
     leased_until: Optional[str]
     attempt_count: int
     max_attempts: int
+    started_at: Optional[str]
+    completed_at: Optional[str]
     created_at: str
     updated_at: str
 
     def to_dict(self) -> JsonDict:
-        return asdict(self)
+        data = asdict(self)
+        data["last_updated_at"] = self.updated_at
+        return data
 
 
 @dataclass

@@ -162,6 +162,8 @@ class SQLiteStore:
                     leased_until TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 3,
+                    started_at TEXT,
+                    completed_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -1047,6 +1049,8 @@ class SQLiteStore:
             "agents", "attestation_key_ciphertext", "attestation_key_ciphertext TEXT"
         )
         self._ensure_column("machines", "hardware", "hardware TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("tasks", "started_at", "started_at TEXT")
+        self._ensure_column("tasks", "completed_at", "completed_at TEXT")
         self._ensure_column("tasks", "workflow_run_id", "workflow_run_id TEXT")
         self._ensure_column("tasks", "workflow_node_key", "workflow_node_key TEXT")
 

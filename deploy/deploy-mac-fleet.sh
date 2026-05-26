@@ -1470,6 +1470,7 @@ workspace = sys.argv[1]
 required = [
     "MAC Task and Project Runtime",
     "First-Class Objects",
+    "MAC Vocabulary",
     "`tasks`: authority `mac`",
     "`projects`: authority `mac`",
     "`agents`: authority `mac`",
@@ -1481,6 +1482,7 @@ required = [
     "mac-hermes-task-executor",
     "mac-hermes work-context",
     "mac-hermes tasks",
+    "mac-hermes add-child-task",
     "mac-hermes projects",
     "mac-hermes project-items",
     "mac-hermes agents",

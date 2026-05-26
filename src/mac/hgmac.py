@@ -314,6 +314,21 @@ def _add_task_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) 
     update.add_argument("--actor", default="human")
     _set(update, cmd_tasks_update)
 
+    add_child = task_sub.add_parser("add-child", help="Create a child task that blocks the parent")
+    add_child.add_argument("task_id")
+    add_child.add_argument("--title", required=True)
+    add_child.add_argument("--description", default="")
+    add_child.add_argument("--project")
+    add_child.add_argument("--priority", type=int)
+    add_child.add_argument("--capability", action="append", default=None)
+    add_child.add_argument("--capabilities")
+    add_child.add_argument("--dependency", action="append", default=None)
+    add_child.add_argument("--dependencies")
+    add_child.add_argument("--metadata-json", default="{}")
+    add_child.add_argument("--max-attempts", type=int)
+    add_child.add_argument("--actor", default="human")
+    _set(add_child, cmd_tasks_add_child)
+
     delete = task_sub.add_parser("delete", help="Delete a task")
     delete.add_argument("task_id")
     delete.add_argument("--force", action="store_true")
@@ -656,6 +671,26 @@ def cmd_tasks_update(client: HgMacClient, args: argparse.Namespace) -> Any:
         }
     )
     return client.request("PUT", "/tasks/%s" % quote(args.task_id), body)
+
+
+def cmd_tasks_add_child(client: HgMacClient, args: argparse.Namespace) -> Any:
+    child = _drop_none(
+        {
+            "title": args.title,
+            "description": args.description,
+            "project": args.project,
+            "priority": args.priority,
+            "required_capabilities": _optional_merged_csv(args.capability, args.capabilities),
+            "dependencies": _optional_merged_csv(args.dependency, args.dependencies) or [],
+            "metadata": _json_object(args.metadata_json),
+            "max_attempts": args.max_attempts,
+        }
+    )
+    return client.request(
+        "POST",
+        "/tasks/%s/children" % quote(args.task_id),
+        {"actor": args.actor, "children": [child]},
+    )
 
 
 def cmd_tasks_delete(client: HgMacClient, args: argparse.Namespace) -> Any:
