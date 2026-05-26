@@ -164,6 +164,20 @@ def test_fleet_deploy_does_not_print_worker_token_in_systemd_status():
     assert "-p MainPID" in agent_service
 
 
+def test_darwin_service_wrappers_raise_file_descriptor_limit():
+    script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
+    gateway_wrapper = script.split("install_hermes_gateway_wrapper() {", 1)[1].split(
+        "install_mac_agent_wrapper() {", 1
+    )[0]
+    agent_wrapper = script.split("install_mac_agent_wrapper() {", 1)[1].split(
+        "install_mac_hermes_task_executor() {", 1
+    )[0]
+
+    expected = 'ulimit -n "${MAC_SERVICE_NOFILE_LIMIT:-4096}" 2>/dev/null || true'
+    assert expected in gateway_wrapper
+    assert expected in agent_wrapper
+
+
 def test_fleet_deploy_applies_hermes_patch_set():
     script = (ROOT / "deploy" / "deploy-mac-fleet.sh").read_text(encoding="utf-8")
     quench_patch = ROOT / "deploy" / "hermes" / "disable-shutdown-chat-notices.patch"

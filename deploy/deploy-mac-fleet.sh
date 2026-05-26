@@ -3893,6 +3893,7 @@ install_hermes_gateway_wrapper() {
   cat > "$wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+ulimit -n "${MAC_SERVICE_NOFILE_LIMIT:-4096}" 2>/dev/null || true
 set -a
 set +u
 [ -f "$HOME/.hermes/.env" ] && . "$HOME/.hermes/.env"
@@ -3940,6 +3941,7 @@ install_mac_agent_wrapper() {
   cat > "$wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+ulimit -n "${MAC_SERVICE_NOFILE_LIMIT:-4096}" 2>/dev/null || true
 set -a
 . "$HOME/.mac/mac.env"
 set +a
