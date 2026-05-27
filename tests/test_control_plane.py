@@ -5147,8 +5147,17 @@ def test_events_view_unifies_all_audit_surfaces(cp):
     # Generate one event of each kind.
     worker = register_agent(cp, "worker", ["python"])
     reviewer = register_agent(cp, "reviewer", ["review"])
+    cp.update_agent(reviewer.id, status=AgentStatus.OFFLINE.value, actor="ops")
     task = cp.create_task("audited", required_capabilities=["python"])
     cp.claim_task(task.id, worker.id)
+    # project event
+    project = cp.create_project("audit-project", actor="alice")
+    cp.update_project(project.id, description="tracked", actor="alice")
+    cp.delete_project(project.id, actor="alice")
+    # fleet event
+    fleet = cp.create_fleet("audit-fleet", agent_ids=[worker.id], actor="ops")
+    cp.update_fleet(fleet.id, status="inactive", agent_ids=[worker.id, reviewer.id], actor="ops")
+    cp.delete_fleet(fleet.id, actor="ops")
     # rollout event
     rollout = create_verified_rollout(cp, "8.0")
     cp.advance_rollout(rollout.id, "start_canary", "human")
@@ -5161,7 +5170,7 @@ def test_events_view_unifies_all_audit_surfaces(cp):
 
     events = cp.list_events(limit=500)
     subject_types = {event["subject_type"] for event in events}
-    assert subject_types == {"task", "rollout", "eval_set", "secret"}
+    assert subject_types == {"task", "agent", "project", "fleet", "rollout", "eval_set", "secret"}
     # Each event includes the unified shape.
     for event in events:
         assert set(event.keys()) >= {
@@ -5174,6 +5183,23 @@ def test_events_view_unifies_all_audit_surfaces(cp):
             "created_at",
         }
         assert isinstance(event["detail"], dict)
+    project_events = cp.list_events(subject_type="project", subject_id=project.id)
+    assert {event["event_type"] for event in project_events} >= {
+        "project.created",
+        "project.updated",
+        "project.deleted",
+    }
+    assert project_events[0]["detail"]["project_name"] == "audit-project"
+    fleet_events = cp.list_events(subject_type="fleet", subject_id=fleet.id)
+    assert {event["event_type"] for event in fleet_events} >= {
+        "fleet.created",
+        "fleet.updated",
+        "fleet.deleted",
+    }
+    updated_fleet = next(event for event in fleet_events if event["event_type"] == "fleet.updated")
+    assert updated_fleet["detail"]["added_agent_ids"] == [reviewer.id]
+    agent_events = cp.list_events(subject_type="agent", subject_id=reviewer.id)
+    assert "agent.updated" in {event["event_type"] for event in agent_events}
 
 
 def test_events_filter_by_subject_returns_only_matching_stream(cp):

@@ -687,11 +687,12 @@ process. Restore is a file copy while the service is stopped.
   /notifications/{id}/delivered` marks entries delivered, failed, or skipped.
 
 The FastAPI middleware records per-request `http.request.duration_ms` metrics
-and `http.request` logs. Control-plane task, agent, secret, environment,
-rollout, and eval events are mirrored into the observability stream with their
-original subject ids. The dashboard Observability tab uses the summary endpoint
-and an NDJSON subscription to visualize the live stream, command audit, and the
-operator notification outbox.
+and `http.request` logs. Control-plane task, agent, project, fleet, secret,
+environment, rollout, and eval events are mirrored into the observability
+stream with their original subject ids. The dashboard Observability tab uses
+URL-addressable filters, the summary endpoint, and an NDJSON subscription to
+visualize the live stream, unified events, command audit, and the operator
+notification outbox.
 
 ## Upgrade procedure
 

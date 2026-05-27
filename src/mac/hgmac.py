@@ -220,6 +220,34 @@ def build_parser() -> argparse.ArgumentParser:
     audit_record.add_argument("--metadata-json", default="{}")
     _set(audit_record, cmd_agents_command_audit_record)
 
+    events = sub.add_parser("events", help="Unified structured audit events")
+    events_sub = events.add_subparsers(dest="action", required=True)
+    events_list = events_sub.add_parser("list", help="List unified audit events")
+    events_list.add_argument("--subject-type")
+    events_list.add_argument("--subject-id")
+    events_list.add_argument("--actor")
+    events_list.add_argument("--event-type")
+    events_list.add_argument("--prefix")
+    events_list.add_argument("--since")
+    events_list.add_argument("--until")
+    events_list.add_argument("--limit", type=int, default=100)
+    _set(events_list, cmd_events_list)
+
+    observability = sub.add_parser("observability", help="Structured metric/log observations")
+    observability_sub = observability.add_subparsers(dest="action", required=True)
+    observability_list = observability_sub.add_parser("list", help="List observability rows")
+    observability_list.add_argument("--kind")
+    observability_list.add_argument("--layer")
+    observability_list.add_argument("--level")
+    observability_list.add_argument("--name")
+    observability_list.add_argument("--subject-type")
+    observability_list.add_argument("--subject-id")
+    observability_list.add_argument("--since")
+    observability_list.add_argument("--until")
+    observability_list.add_argument("--after-sequence", type=int)
+    observability_list.add_argument("--limit", type=int, default=100)
+    _set(observability_list, cmd_observability_list)
+
     _add_fleet_parsers(sub)
     _add_task_parsers(sub)
     _add_project_parsers(sub)
@@ -577,6 +605,46 @@ def cmd_agents_command_audit_record(client: HgMacClient, args: argparse.Namespac
                 "lease_id": args.lease_id,
                 "returncode": args.returncode,
                 "metadata": _json_object(args.metadata_json),
+            }
+        ),
+    )
+
+
+def cmd_events_list(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "GET",
+        "/events%s"
+        % _query(
+            {
+                "subject_type": args.subject_type,
+                "subject_id": args.subject_id,
+                "actor": args.actor,
+                "event_type": args.event_type,
+                "event_type_prefix": args.prefix,
+                "since": args.since,
+                "until": args.until,
+                "limit": args.limit,
+            }
+        ),
+    )
+
+
+def cmd_observability_list(client: HgMacClient, args: argparse.Namespace) -> Any:
+    return client.request(
+        "GET",
+        "/observability%s"
+        % _query(
+            {
+                "kind": args.kind,
+                "layer": args.layer,
+                "level": args.level,
+                "name": args.name,
+                "subject_type": args.subject_type,
+                "subject_id": args.subject_id,
+                "since": args.since,
+                "until": args.until,
+                "after_sequence": args.after_sequence,
+                "limit": args.limit,
             }
         ),
     )

@@ -1520,7 +1520,7 @@ class ControlPlane:
         contract = {
             "schema": "mac.hermes.dashboard_url_contract.v1",
             "entrypoint": "/ui",
-            "required_views": ["work", "projects", "map", "fleets", "agents", "tasks", "hermes", "runtime"],
+            "required_views": ["work", "projects", "map", "fleets", "agents", "tasks", "hermes", "runtime", "observability"],
             "url_state_parameters": [
                 {"name": "view", "purpose": "selected dashboard pane"},
                 {"name": "project", "purpose": "project or epic scope"},
@@ -1530,6 +1530,18 @@ class ControlPlane:
                 {"name": "agent_filter", "purpose": "agent status/health/eligibility filter"},
                 {"name": "agent_sort", "purpose": "agent table ordering"},
                 {"name": "agent_page", "purpose": "agent table page"},
+                {"name": "obs_subject_type", "purpose": "observability subject type filter"},
+                {"name": "obs_subject_id", "purpose": "observability subject id filter"},
+                {"name": "obs_event_prefix", "purpose": "observability event/name prefix filter"},
+                {"name": "obs_actor", "purpose": "audit actor filter"},
+                {"name": "obs_layer", "purpose": "observability layer filter"},
+                {"name": "obs_level", "purpose": "observability level filter"},
+                {"name": "obs_agent", "purpose": "agent scoped audit filter"},
+                {"name": "obs_task", "purpose": "task scoped audit filter"},
+                {"name": "obs_project", "purpose": "project scoped audit filter"},
+                {"name": "obs_fleet", "purpose": "fleet scoped audit filter"},
+                {"name": "obs_since", "purpose": "observability lower time bound"},
+                {"name": "obs_until", "purpose": "observability upper time bound"},
             ],
             "object_deep_links": {
                 "fleets": {
@@ -2221,7 +2233,7 @@ class ControlPlane:
             "dashboard": {
                 "schema": "mac.hermes.dashboard_operation_contract.v1",
                 "entrypoint": "/ui",
-                "views": ["work", "projects", "map", "fleets", "agents", "tasks", "hermes", "runtime"],
+                "views": ["work", "projects", "map", "fleets", "agents", "tasks", "hermes", "runtime", "observability"],
                 "url_state_parameters": [
                     "view",
                     "project",
@@ -2231,6 +2243,18 @@ class ControlPlane:
                     "agent_filter",
                     "agent_sort",
                     "agent_page",
+                    "obs_subject_type",
+                    "obs_subject_id",
+                    "obs_event_prefix",
+                    "obs_actor",
+                    "obs_layer",
+                    "obs_level",
+                    "obs_agent",
+                    "obs_task",
+                    "obs_project",
+                    "obs_fleet",
+                    "obs_since",
+                    "obs_until",
                 ],
                 "deep_link_templates": {
                     "fleets": [
@@ -3077,21 +3101,37 @@ class ControlPlane:
         if existing is not None:
             return self._project_record_from_row(existing)
         now = utcnow()
-        self.store.execute(
-            """
-            INSERT INTO projects (id, name, description, metadata, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                project_id or new_id("project"),
-                project_name,
-                str(description or ""),
-                json_dumps(project_metadata),
-                str(status or "active"),
+        pid = project_id or new_id("project")
+        status_value = str(status or "active")
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO projects (id, name, description, metadata, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pid,
+                    project_name,
+                    str(description or ""),
+                    json_dumps(project_metadata),
+                    status_value,
+                    now,
+                    now,
+                ),
+            )
+            self._record_project_event(
+                conn,
+                pid,
+                "project.created",
+                actor,
+                {
+                    "project_id": pid,
+                    "project_name": project_name,
+                    "status": status_value,
+                    "metadata_keys": sorted(project_metadata.keys()),
+                },
                 now,
-                now,
-            ),
-        )
+            )
         notification_body = str(description or "Project %s was created." % project_name)
         self.record_notification(
             "project.created",
@@ -3177,18 +3217,26 @@ class ControlPlane:
             updates.append("name = ?")
             params.append(name_value)
             new_name = name_value
+        changed_fields: List[str] = []
+        if name is not None and new_name != project.name:
+            changed_fields.append("name")
         if description is not None:
             updates.append("description = ?")
             params.append(str(description or ""))
+            if str(description or "") != project.description:
+                changed_fields.append("description")
         if metadata is not None:
             updates.append("metadata = ?")
             params.append(json_dumps(ensure_json_object(metadata)))
+            changed_fields.append("metadata")
         if status is not None:
             status_value = str(status or "").strip().lower()
             if status_value not in {"active", "inactive", "archived"}:
                 raise ValidationError("unsupported project status: %s" % status_value)
             updates.append("status = ?")
             params.append(status_value)
+            if status_value != project.status:
+                changed_fields.append("status")
         if not updates:
             return project
         now = utcnow()
@@ -3208,6 +3256,21 @@ class ControlPlane:
             if new_name != project.name:
                 conn.execute("UPDATE tasks SET project = ?, updated_at = ? WHERE project = ?", (new_name, now, project.name))
                 conn.execute("UPDATE beads_repositories SET project = ?, updated_at = ? WHERE project = ?", (new_name, now, project.name))
+            self._record_project_event(
+                conn,
+                project.id,
+                "project.updated",
+                actor,
+                {
+                    "project_id": project.id,
+                    "project_name": new_name,
+                    "previous_name": project.name,
+                    "changed_fields": sorted(set(changed_fields)),
+                    "previous_status": project.status,
+                    "status": status_value if status is not None else project.status,
+                },
+                now,
+            )
         self.record_notification(
             "project.updated",
             "Project updated: %s" % new_name,
@@ -3233,10 +3296,25 @@ class ControlPlane:
             if repo_rows:
                 blockers.append("%d Beads repositorie(s)" % len(repo_rows))
             raise ValidationError("project has linked records: %s" % ", ".join(blockers))
+        now = utcnow()
         with self.store.transaction() as conn:
             if force:
-                conn.execute("UPDATE tasks SET project = NULL, updated_at = ? WHERE project = ?", (utcnow(), project.name))
-                conn.execute("UPDATE beads_repositories SET enabled = 0, updated_at = ? WHERE project = ?", (utcnow(), project.name))
+                conn.execute("UPDATE tasks SET project = NULL, updated_at = ? WHERE project = ?", (now, project.name))
+                conn.execute("UPDATE beads_repositories SET enabled = 0, updated_at = ? WHERE project = ?", (now, project.name))
+            self._record_project_event(
+                conn,
+                project.id,
+                "project.deleted",
+                actor,
+                {
+                    "project_id": project.id,
+                    "project_name": project.name,
+                    "force": bool(force),
+                    "task_count": len(tasks),
+                    "beads_repository_count": len(repo_rows),
+                },
+                now,
+            )
             conn.execute("DELETE FROM projects WHERE id = ?", (project.id,))
         self.record_notification(
             "project.deleted",
@@ -3311,6 +3389,8 @@ class ControlPlane:
         "conversation_thread",
         "vector_ref",
         "agent",
+        "project",
+        "fleet",
     )
 
     def list_events(
@@ -4790,6 +4870,22 @@ class ControlPlane:
                     raise ValidationError("fleet already exists: %s" % fleet_name) from exc
                 raise
             self._replace_fleet_members(conn, fid, members, now)
+            self._record_fleet_event(
+                conn,
+                fid,
+                "fleet.created",
+                actor,
+                {
+                    "fleet_id": fid,
+                    "fleet_name": fleet_name,
+                    "status": normalized_status,
+                    "tenant_id": tenant_id,
+                    "agent_ids": members,
+                    "agent_count": len(members),
+                    "metadata_keys": sorted(metadata_value.keys()),
+                },
+                now,
+            )
         self.record_notification(
             "fleet.created",
             "Fleet created: %s" % fleet_name,
@@ -4846,35 +4942,54 @@ class ControlPlane:
         fleet = self.get_fleet(fleet_id_or_name)
         updates: List[str] = []
         params: List[Any] = []
+        changed_fields: List[str] = []
+        new_name = fleet.name
+        new_status = fleet.status
+        new_tenant_id = fleet.tenant_id
         if name is not None:
             name_value = str(name or "").strip()
             if not name_value:
                 raise ValidationError("fleet name is required")
             updates.append("name = ?")
             params.append(name_value)
+            new_name = name_value
+            if name_value != fleet.name:
+                changed_fields.append("name")
         if description is not None:
             updates.append("description = ?")
             params.append(str(description or ""))
+            if str(description or "") != fleet.description:
+                changed_fields.append("description")
         if status is not None:
             status_value = str(status or "").strip().lower()
             if status_value not in {"active", "inactive", "retired"}:
                 raise ValidationError("unsupported fleet status: %s" % status_value)
             updates.append("status = ?")
             params.append(status_value)
+            new_status = status_value
+            if status_value != fleet.status:
+                changed_fields.append("status")
         if metadata is not None:
             updates.append("metadata = ?")
             params.append(json_dumps(ensure_json_object(metadata)))
+            changed_fields.append("metadata")
         if tenant_id is not None:
             tenant_value = tenant_id.strip()
             if tenant_value:
                 self.get_tenant(tenant_value)
                 updates.append("tenant_id = ?")
                 params.append(tenant_value)
+                new_tenant_id = tenant_value
             else:
                 updates.append("tenant_id = NULL")
+                new_tenant_id = None
+            if new_tenant_id != fleet.tenant_id:
+                changed_fields.append("tenant_id")
         members = None
         if agent_ids is not None:
             members = self._validated_fleet_agent_ids(agent_ids)
+            if members != fleet.agent_ids:
+                changed_fields.append("agent_ids")
         if not updates and members is None:
             return fleet
         now = utcnow()
@@ -4895,9 +5010,32 @@ class ControlPlane:
             if members is not None:
                 self._replace_fleet_members(conn, fleet.id, members, now)
                 conn.execute("UPDATE fleets SET updated_at = ? WHERE id = ?", (now, fleet.id))
+            next_members = members if members is not None else fleet.agent_ids
+            previous_members = set(fleet.agent_ids)
+            next_member_set = set(next_members)
+            self._record_fleet_event(
+                conn,
+                fleet.id,
+                "fleet.updated",
+                actor,
+                {
+                    "fleet_id": fleet.id,
+                    "fleet_name": new_name,
+                    "previous_name": fleet.name,
+                    "changed_fields": sorted(set(changed_fields)),
+                    "previous_status": fleet.status,
+                    "status": new_status,
+                    "previous_tenant_id": fleet.tenant_id,
+                    "tenant_id": new_tenant_id,
+                    "agent_ids": next_members,
+                    "added_agent_ids": sorted(next_member_set - previous_members),
+                    "removed_agent_ids": sorted(previous_members - next_member_set),
+                },
+                now,
+            )
         self.record_notification(
             "fleet.updated",
-            "Fleet updated: %s" % (name or fleet.name),
+            "Fleet updated: %s" % new_name,
             "Fleet membership or metadata changed.",
             subject_type="fleet",
             subject_id=fleet.id,
@@ -4906,9 +5044,26 @@ class ControlPlane:
         )
         return self.get_fleet(fleet.id)
 
-    def delete_fleet(self, fleet_id_or_name: str) -> None:
+    def delete_fleet(self, fleet_id_or_name: str, *, actor: str = "human") -> None:
         fleet = self.get_fleet(fleet_id_or_name)
-        self.store.execute("DELETE FROM fleets WHERE id = ?", (fleet.id,))
+        now = utcnow()
+        with self.store.transaction() as conn:
+            self._record_fleet_event(
+                conn,
+                fleet.id,
+                "fleet.deleted",
+                actor,
+                {
+                    "fleet_id": fleet.id,
+                    "fleet_name": fleet.name,
+                    "status": fleet.status,
+                    "tenant_id": fleet.tenant_id,
+                    "agent_ids": fleet.agent_ids,
+                    "agent_count": len(fleet.agent_ids),
+                },
+                now,
+            )
+            conn.execute("DELETE FROM fleets WHERE id = ?", (fleet.id,))
 
     def _validated_fleet_agent_ids(self, agent_ids: Iterable[str]) -> List[str]:
         normalized = coerce_list(str(agent_id).strip() for agent_id in (agent_ids or []))
@@ -4931,6 +5086,7 @@ class ControlPlane:
         resources: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None,
         hermes_instance_id: Optional[str] = None,
+        actor: str = "human",
     ) -> Agent:
         self.get_machine(machine_id)
         if not name:
@@ -4941,6 +5097,7 @@ class ControlPlane:
             self.identity.get_hermes_instance(hermes_instance_id)
         now = utcnow()
         aid = agent_id or new_id("agent")
+        existing_agent_row = self.store.query_one("SELECT id FROM agents WHERE id = ?", (aid,))
         if capabilities is None:
             existing_caps = self.store.query_one(
                 "SELECT capabilities FROM agents WHERE id = ?", (aid,)
@@ -4976,40 +5133,59 @@ class ControlPlane:
         else:
             attestation_key_plaintext = _generate_attestation_key()
             attestation_ciphertext = self.secrets._encrypt(attestation_key_plaintext)
-        self.store.execute(
-            """
-            INSERT INTO agents (
-                id, machine_id, name, capabilities, resources, status, health_status,
-                current_task_id, created_at, updated_at, last_seen_at,
-                hermes_instance_id, attestation_key_ciphertext
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                machine_id = excluded.machine_id,
-                name = excluded.name,
-                capabilities = excluded.capabilities,
-                resources = excluded.resources,
-                status = excluded.status,
-                health_status = excluded.health_status,
-                updated_at = excluded.updated_at,
-                last_seen_at = excluded.last_seen_at,
-                hermes_instance_id = excluded.hermes_instance_id,
-                attestation_key_ciphertext = excluded.attestation_key_ciphertext
-            """,
-            (
+        event_type = "agent.reregistered" if existing_agent_row is not None else "agent.registered"
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO agents (
+                    id, machine_id, name, capabilities, resources, status, health_status,
+                    current_task_id, created_at, updated_at, last_seen_at,
+                    hermes_instance_id, attestation_key_ciphertext
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    machine_id = excluded.machine_id,
+                    name = excluded.name,
+                    capabilities = excluded.capabilities,
+                    resources = excluded.resources,
+                    status = excluded.status,
+                    health_status = excluded.health_status,
+                    updated_at = excluded.updated_at,
+                    last_seen_at = excluded.last_seen_at,
+                    hermes_instance_id = excluded.hermes_instance_id,
+                    attestation_key_ciphertext = excluded.attestation_key_ciphertext
+                """,
+                (
+                    aid,
+                    machine_id,
+                    name,
+                    capabilities_json,
+                    resources_json,
+                    AgentStatus.IDLE.value,
+                    HealthStatus.HEALTHY.value,
+                    now,
+                    now,
+                    now,
+                    hermes_instance_id,
+                    attestation_ciphertext,
+                ),
+            )
+            self._record_agent_lifecycle_event(
+                conn,
                 aid,
-                machine_id,
-                name,
-                capabilities_json,
-                resources_json,
-                AgentStatus.IDLE.value,
-                HealthStatus.HEALTHY.value,
+                event_type,
+                actor,
+                {
+                    "agent_id": aid,
+                    "agent_name": name,
+                    "machine_id": machine_id,
+                    "capabilities": json_loads(capabilities_json, []),
+                    "resource_keys": sorted(ensure_json_object(json_loads(resources_json, {})).keys()),
+                    "status": AgentStatus.IDLE.value,
+                    "health_status": HealthStatus.HEALTHY.value,
+                    "hermes_instance_id": hermes_instance_id,
+                },
                 now,
-                now,
-                now,
-                hermes_instance_id,
-                attestation_ciphertext,
-            ),
-        )
+            )
         agent = self.get_agent(aid)
         # Stash the cleartext key on the returned agent so the API layer
         # can surface it to the caller on first registration. The Agent
@@ -5089,22 +5265,37 @@ class ControlPlane:
         status: Optional[str] = None,
         health_status: Optional[str] = None,
         hermes_instance_id: Optional[str] = None,
+        actor: str = "human",
     ) -> Agent:
-        self.get_agent(agent_id)
+        agent_before = self.get_agent(agent_id)
         updates: List[str] = []
         params: List[Any] = []
+        changed_fields: List[str] = []
+        next_name = agent_before.name
+        next_status = agent_before.status
+        next_health_status = agent_before.health_status
+        next_hermes_instance_id = agent_before.hermes_instance_id
         if name is not None:
             name_value = name.strip()
             if not name_value:
                 raise ValidationError("agent name is required")
             updates.append("name = ?")
             params.append(name_value)
+            next_name = name_value
+            if name_value != agent_before.name:
+                changed_fields.append("name")
         if capabilities is not None:
+            capability_list = coerce_list(capabilities)
             updates.append("capabilities = ?")
-            params.append(json_dumps(coerce_list(capabilities)))
+            params.append(json_dumps(capability_list))
+            if capability_list != agent_before.capabilities:
+                changed_fields.append("capabilities")
         if resources is not None:
+            resource_value = ensure_json_object(resources)
             updates.append("resources = ?")
-            params.append(json_dumps(ensure_json_object(resources)))
+            params.append(json_dumps(resource_value))
+            if resource_value != agent_before.resources:
+                changed_fields.append("resources")
         if status is not None:
             status_value = _state_value(status)
             try:
@@ -5117,6 +5308,9 @@ class ControlPlane:
                 self._expire_agent_active_leases(agent_id, utcnow(), "agent_update_offline")
             updates.append("status = ?")
             params.append(status_value)
+            next_status = status_value
+            if status_value != agent_before.status:
+                changed_fields.append("status")
             if status_value in {AgentStatus.IDLE.value, AgentStatus.OFFLINE.value}:
                 updates.append("current_task_id = NULL")
         if health_status is not None:
@@ -5127,37 +5321,82 @@ class ControlPlane:
                 raise ValidationError("unsupported agent health_status: %s" % health_value)
             updates.append("health_status = ?")
             params.append(health_value)
+            next_health_status = health_value
+            if health_value != agent_before.health_status:
+                changed_fields.append("health_status")
         if hermes_instance_id is not None:
             hermes_value = hermes_instance_id.strip()
             if hermes_value:
                 self.identity.get_hermes_instance(hermes_value)
                 updates.append("hermes_instance_id = ?")
                 params.append(hermes_value)
+                next_hermes_instance_id = hermes_value
             else:
                 updates.append("hermes_instance_id = NULL")
+                next_hermes_instance_id = None
+            if next_hermes_instance_id != agent_before.hermes_instance_id:
+                changed_fields.append("hermes_instance_id")
         if not updates:
             return self.get_agent(agent_id)
         updates.append("updated_at = ?")
-        params.append(utcnow())
+        now = utcnow()
+        params.append(now)
         params.append(agent_id)
-        self.store.execute(
-            "UPDATE agents SET %s WHERE id = ?" % ", ".join(updates),
-            tuple(params),
-        )
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE agents SET %s WHERE id = ?" % ", ".join(updates),
+                tuple(params),
+            )
+            self._record_agent_lifecycle_event(
+                conn,
+                agent_id,
+                "agent.updated",
+                actor,
+                {
+                    "agent_id": agent_id,
+                    "agent_name": next_name,
+                    "previous_name": agent_before.name,
+                    "changed_fields": sorted(set(changed_fields)),
+                    "previous_status": agent_before.status,
+                    "status": next_status,
+                    "previous_health_status": agent_before.health_status,
+                    "health_status": next_health_status,
+                    "previous_hermes_instance_id": agent_before.hermes_instance_id,
+                    "hermes_instance_id": next_hermes_instance_id,
+                },
+                now,
+            )
         return self.get_agent(agent_id)
 
-    def disable_agent(self, agent_id: str) -> Agent:
+    def disable_agent(self, agent_id: str, *, actor: str = "human") -> Agent:
         return self.update_agent(
             agent_id,
             status=AgentStatus.OFFLINE.value,
             health_status=HealthStatus.DEGRADED.value,
+            actor=actor,
         )
 
-    def delete_agent(self, agent_id: str) -> None:
+    def delete_agent(self, agent_id: str, *, actor: str = "human") -> None:
         agent = self.get_agent(agent_id)
         if self._agent_has_active_lease(agent_id):
             raise ValidationError("agent cannot be deleted while holding an active lease")
+        now = utcnow()
         with self.store.transaction() as conn:
+            self._record_agent_lifecycle_event(
+                conn,
+                agent_id,
+                "agent.deleted",
+                actor,
+                {
+                    "agent_id": agent.id,
+                    "agent_name": agent.name,
+                    "machine_id": agent.machine_id,
+                    "status": agent.status,
+                    "health_status": agent.health_status,
+                    "hermes_instance_id": agent.hermes_instance_id,
+                },
+                now,
+            )
             conn.execute("DELETE FROM mood_overlays WHERE agent_id = ?", (agent_id,))
             conn.execute("DELETE FROM nap_schedules WHERE agent_id = ?", (agent_id,))
             conn.execute("DELETE FROM nap_runs WHERE agent_id = ?", (agent_id,))
@@ -5172,12 +5411,16 @@ class ControlPlane:
         health_status: Optional[str] = None,
         resources: Optional[Dict[str, Any]] = None,
         running_digest: Optional[str] = None,
+        actor: Optional[str] = None,
     ) -> Agent:
         agent_before = self.get_agent(agent_id)
         now = utcnow()
         updates = ["last_seen_at = ?", "updated_at = ?"]
         params: List[Any] = [now, now]
         status_value: Optional[str] = None
+        health_value: Optional[str] = None
+        next_running_digest = agent_before.running_digest
+        changed_fields: List[str] = []
         if status is not None:
             status_value = _state_value(status)
             try:
@@ -5186,6 +5429,8 @@ class ControlPlane:
                 raise ValidationError("unsupported agent status: %s" % status_value)
             updates.append("status = ?")
             params.append(status_value)
+            if status_value != agent_before.status:
+                changed_fields.append("status")
         if health_status is not None:
             health_value = _state_value(health_status)
             try:
@@ -5194,9 +5439,14 @@ class ControlPlane:
                 raise ValidationError("unsupported agent health_status: %s" % health_value)
             updates.append("health_status = ?")
             params.append(health_value)
+            if health_value != agent_before.health_status:
+                changed_fields.append("health_status")
         if resources is not None:
+            resource_value = ensure_json_object(resources)
             updates.append("resources = ?")
-            params.append(json_dumps(resources))
+            params.append(json_dumps(resource_value))
+            if resource_value != agent_before.resources:
+                changed_fields.append("resources")
         if running_digest is not None:
             digest = running_digest.strip()
             if digest:
@@ -5215,8 +5465,14 @@ class ControlPlane:
                     )
                 updates.append("running_digest = ?")
                 params.append(digest)
+                next_running_digest = digest
+                if digest != agent_before.running_digest:
+                    changed_fields.append("running_digest")
             else:
                 updates.append("running_digest = NULL")
+                next_running_digest = None
+                if agent_before.running_digest is not None:
+                    changed_fields.append("running_digest")
         if status_value == AgentStatus.IDLE.value and self._agent_has_active_lease(agent_id):
             raise ValidationError("agent cannot report idle while holding an active lease")
         if status_value == AgentStatus.DRAINING.value and self._agent_has_active_lease(agent_id):
@@ -5226,7 +5482,27 @@ class ControlPlane:
         if status_value in {AgentStatus.IDLE.value, AgentStatus.OFFLINE.value}:
             updates.append("current_task_id = NULL")
         params.append(agent_id)
-        self.store.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE agents SET %s WHERE id = ?" % ", ".join(updates), tuple(params))
+            if status is not None or health_status is not None or resources is not None or running_digest is not None:
+                self._record_agent_lifecycle_event(
+                    conn,
+                    agent_id,
+                    "agent.heartbeat_updated",
+                    actor or agent_id,
+                    {
+                        "agent_id": agent_id,
+                        "agent_name": agent_before.name,
+                        "changed_fields": sorted(set(changed_fields)),
+                        "previous_status": agent_before.status,
+                        "status": status_value or agent_before.status,
+                        "previous_health_status": agent_before.health_status,
+                        "health_status": health_value or agent_before.health_status,
+                        "previous_running_digest": agent_before.running_digest,
+                        "running_digest": next_running_digest,
+                    },
+                    now,
+                )
         agent = self.get_agent(agent_id)
         self._maybe_poll_beads_bridge_on_heartbeat(agent_before)
         self._maybe_advance_reviews_on_heartbeat(agent_before)
@@ -9764,6 +10040,102 @@ class ControlPlane:
             from_state,
             to_state,
             detail,
+            when,
+        )
+
+    def _record_project_event(
+        self,
+        writer: Any,
+        project_id: str,
+        event_type: str,
+        actor: str,
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        payload = {"actor": actor, **ensure_json_object(detail)}
+        writer.execute(
+            """
+            INSERT INTO project_events (id, project_id, event_type, actor, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_id("pevt"), project_id, event_type, actor, json_dumps(payload), when),
+        )
+        self.observability.insert_observation(
+            writer,
+            "log",
+            event_type,
+            "control_plane",
+            "project",
+            "info",
+            None,
+            "",
+            "project",
+            project_id,
+            payload,
+            when,
+        )
+
+    def _record_fleet_event(
+        self,
+        writer: Any,
+        fleet_id: str,
+        event_type: str,
+        actor: str,
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        payload = {"actor": actor, **ensure_json_object(detail)}
+        writer.execute(
+            """
+            INSERT INTO fleet_events (id, fleet_id, event_type, actor, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_id("fevt"), fleet_id, event_type, actor, json_dumps(payload), when),
+        )
+        self.observability.insert_observation(
+            writer,
+            "log",
+            event_type,
+            "control_plane",
+            "fleet",
+            "info",
+            None,
+            "",
+            "fleet",
+            fleet_id,
+            payload,
+            when,
+        )
+
+    def _record_agent_lifecycle_event(
+        self,
+        writer: Any,
+        agent_id: str,
+        event_type: str,
+        actor: str,
+        detail: Dict[str, Any],
+        when: str,
+    ) -> None:
+        payload = {"actor": actor, **ensure_json_object(detail)}
+        writer.execute(
+            """
+            INSERT INTO agent_lifecycle_events (id, agent_id, event_type, actor, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_id("alce"), agent_id, event_type, actor, json_dumps(payload), when),
+        )
+        self.observability.insert_observation(
+            writer,
+            "log",
+            event_type,
+            "control_plane",
+            "agent",
+            "info",
+            None,
+            "",
+            "agent",
+            agent_id,
+            payload,
             when,
         )
 

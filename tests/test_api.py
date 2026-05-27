@@ -213,10 +213,10 @@ def test_fastapi_exposes_hermes_identity_boundary(monkeypatch, tmp_path):
     assert any("hgmac projects create" in command for command in work_context["operations"]["hgmac_cli"])
     assert any("hgmac agents create" in command for command in work_context["operations"]["hgmac_cli"])
     assert work_context["operations"]["dashboard"]["entrypoint"] == "/ui"
-    assert {"work", "projects", "map", "fleets", "agents", "tasks", "hermes"} <= set(
+    assert {"work", "projects", "map", "fleets", "agents", "tasks", "hermes", "observability"} <= set(
         work_context["operations"]["dashboard"]["views"]
     )
-    assert {"view", "project", "task_state", "selected"} <= set(
+    assert {"view", "project", "task_state", "selected", "obs_subject_type", "obs_event_prefix"} <= set(
         work_context["operations"]["dashboard"]["url_state_parameters"]
     )
     assert "/ui?view=fleets&selected={fleet_id}" in work_context["operations"]["dashboard"]["deep_link_templates"]["fleets"]
@@ -686,6 +686,8 @@ def test_fastapi_serves_dashboard_shell_without_api_token():
     assert "data-action=\"dispatchTick\"" in script_response.text
     assert "renderObservability" in script_response.text
     assert "/observability/stream" in script_response.text
+    assert "Unified Events" in script_response.text
+    assert "obs_subject_type" in script_response.text
 
     assert client.get("/agents").status_code == 403
     assert client.get("/agents", headers={"Authorization": "Bearer reader"}).status_code == 200
@@ -707,6 +709,11 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     task = client.post(
         "/tasks",
         json={"title": "Dashboard task", "required_capabilities": ["python"]},
+    ).json()
+    project = client.post("/projects", json={"name": "Dashboard Project"}).json()
+    fleet = client.post(
+        "/fleets",
+        json={"name": "Dashboard Fleet", "agent_ids": [agent["id"]]},
     ).json()
     secret = client.post(
         "/secrets",
@@ -733,6 +740,11 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert state["secret_audits"][0]["id"] == handle["audit_id"]
     assert "observability" in state
     assert state["observability"]["counts"]["events"] >= 1
+    assert "events" in state
+    event_subjects = {event["subject_type"] for event in state["events"]}
+    assert {"task", "agent", "project", "fleet"} <= event_subjects
+    assert any(event["subject_id"] == project["id"] for event in state["events"])
+    assert any(event["subject_id"] == fleet["id"] for event in state["events"])
     assert "notifications" in state
     assert "integration_findings" in state
     assert "integration_observations" in state
@@ -747,8 +759,8 @@ def test_fastapi_exposes_dashboard_read_models_and_redacts_secret_values():
     assert "project_summaries" in state
     assert "swarm_summary" in state
     assert "fleets" in state
-    assert state["project_summaries"][0]["project"] == "unassigned"
-    assert state["project_summaries"][0]["ready_count"] == 1
+    unassigned = next(item for item in state["project_summaries"] if item["project"] == "unassigned")
+    assert unassigned["ready_count"] == 1
     assert state["swarm_summary"]["agent_total"] == 1
     assert "memory_records" in state
     assert "nap_schedules" in state

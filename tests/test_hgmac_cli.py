@@ -125,6 +125,59 @@ def test_hgmac_covers_related_agent_operations(monkeypatch):
     assert "/agents/agent_1/command-audit" in paths
 
 
+def test_hgmac_exposes_unified_events_and_observability_lists():
+    calls = []
+
+    def transport(method, url, body, token):
+        calls.append((method, url, body))
+        return {"ok": True}
+
+    commands = [
+        [
+            "events",
+            "list",
+            "--subject-type",
+            "project",
+            "--subject-id",
+            "project_1",
+            "--prefix",
+            "project.",
+            "--actor",
+            "alice",
+        ],
+        [
+            "observability",
+            "list",
+            "--kind",
+            "log",
+            "--layer",
+            "control_plane",
+            "--level",
+            "info",
+            "--subject-type",
+            "fleet",
+            "--subject-id",
+            "fleet_1",
+            "--after-sequence",
+            "10",
+        ],
+    ]
+
+    for command in commands:
+        rc = run(["--url", "http://hub:8789", *command], transport=transport, stdout=io.StringIO())
+        assert rc == 0
+
+    paths = [url.removeprefix("http://hub:8789") for _method, url, _body in calls]
+    assert (
+        "/events?subject_type=project&subject_id=project_1&actor=alice&event_type_prefix=project.&limit=100"
+        in paths
+    )
+    assert (
+        "/observability?kind=log&layer=control_plane&level=info&subject_type=fleet&subject_id=fleet_1&after_sequence=10&limit=100"
+        in paths
+    )
+
+
 def test_hgmac_first_class_object_crud_commands_use_api_paths():
     calls = []
 

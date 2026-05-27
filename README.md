@@ -147,7 +147,7 @@ Key route groups:
 - `/bridge/items`, `/memory`
 - `/rollouts`, `/rollouts/{id}/artifact`, `/rollouts/{id}/health`, `/rollouts/{id}/rescue`
 - `/eval-sets`, `/eval-sets/{id}/baseline`, `/eval-sets/{id}/events`, `/eval-runs`
-- `/events` — unified audit stream across task/rollout/eval_set/secret/environment/conversation_thread/vector_ref/agent surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
+- `/events` — unified audit stream across task/agent/project/fleet/rollout/eval_set/secret/environment/conversation_thread/vector_ref surfaces; filter by `subject_type`, `subject_id`, `actor`, `event_type`, `event_type_prefix`, `since`, `until`, `limit`
 - `/observability`, `/observability/metrics`, `/observability/logs`, `/observability/summary`, `/observability/stream` — low-level metric/log ingestion, query, summary, and NDJSON subscription across API, control-plane, worker, Hermes, deploy, and external-agent layers
 - `/notifications`, `/notifications/{id}/delivered`
 - `/integrations/findings`, `/integrations/observations`
@@ -248,11 +248,12 @@ mac --db mac.db rollout advance rollout_... start_canary --actor human
 # promote refused until a passing eval run exists for version 1.3.0
 mac --db mac.db rollout advance rollout_... promote --actor human
 
-# Unified audit stream: one query across task/rollout/eval_set/secret/environment events.
+# Unified audit stream: one query across task/agent/project/fleet/rollout/eval_set/secret/environment events.
 mac --db mac.db events list --limit 50
 mac --db mac.db events list --subject-type rollout --subject-id rollout_...
 mac --db mac.db events list --prefix rollout. --since 2026-05-17T00:00:00+00:00
 mac --db mac.db events list --actor monitor --event-type rollout.health_failure_during_rescue
+mac --db mac.db observability list --layer control_plane --subject-type fleet
 
 # Artifact registry + environment deployments + fleet build inventory.
 mac --db mac.db artifact register image sha256:abc... artifact://mac/v1.2.0 \

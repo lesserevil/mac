@@ -330,6 +330,7 @@ class AgentRegister(BaseModel):
     resources: Dict[str, Any] = Field(default_factory=dict)
     agent_id: Optional[str] = None
     hermes_instance_id: Optional[str] = None
+    actor: str = "human"
 
 
 class AgentAttestationKeyVerify(BaseModel):
@@ -344,6 +345,7 @@ class AgentUpdate(BaseModel):
     status: Optional[str] = None
     health_status: Optional[str] = None
     hermes_instance_id: Optional[str] = None
+    actor: str = "human"
 
 
 class AgentBulkUpdate(BaseModel):
@@ -352,6 +354,7 @@ class AgentBulkUpdate(BaseModel):
     health_status: Optional[str] = None
     capabilities: Optional[List[str]] = None
     hermes_instance_id: Optional[str] = None
+    actor: str = "human"
 
 
 class RoleCreate(BaseModel):
@@ -492,6 +495,7 @@ class HeartbeatRequest(BaseModel):
     health_status: Optional[str] = None
     resources: Optional[Dict[str, Any]] = None
     running_digest: Optional[str] = None
+    actor: Optional[str] = None
 
 
 class LeaseRenewRequest(BaseModel):
@@ -1718,6 +1722,7 @@ def _dashboard_state(
         "integration_findings": integration_findings,
         "integration_observations": integration_observations,
         "service_links": _dashboard_service_links(hermes_startup),
+        "events": cp.list_events(limit=240),
         "command_audit": [
             record.to_dict() for record in cp.list_command_audit(limit=120)
         ],
@@ -2118,10 +2123,11 @@ def create_app(
     @app.delete("/fleets/{fleet_id_or_name}")
     def delete_fleet(
         fleet_id_or_name: str,
+        actor: str = Query(default="human"),
         principal: TokenPrincipal = Depends(_get_principal),
     ) -> Dict[str, Any]:
         principal.require_global_fleet()
-        cp.delete_fleet(fleet_id_or_name)
+        cp.delete_fleet(fleet_id_or_name, actor=actor)
         return {"deleted": fleet_id_or_name}
 
     @app.get("/projects")
@@ -2371,10 +2377,11 @@ def create_app(
     @app.delete("/agents/{agent_id}")
     def delete_agent(
         agent_id: str,
+        actor: str = Query(default="human"),
         principal: TokenPrincipal = Depends(_get_principal),
     ) -> Dict[str, Any]:
         principal.require_global_fleet()
-        cp.delete_agent(agent_id)
+        cp.delete_agent(agent_id, actor=actor)
         return {"deleted": agent_id}
 
     # Agent roles (persona catalog) ---------------------------------

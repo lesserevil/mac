@@ -840,6 +840,26 @@ def cmd_command_audit_list(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_observability_list(args: argparse.Namespace) -> None:
+    _print(
+        [
+            event.to_dict()
+            for event in _plane(args).list_observability(
+                kind=args.kind,
+                layer=args.layer,
+                level=args.level,
+                name=args.name,
+                subject_type=args.subject_type,
+                subject_id=args.subject_id,
+                since=args.since,
+                until=args.until,
+                after_sequence=args.after_sequence,
+                limit=args.limit,
+            )
+        ]
+    )
+
+
 def cmd_notifier_configure(args: argparse.Namespace) -> None:
     _print(
         _plane(args).configure_notifier_channel(
@@ -1517,7 +1537,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     events_list.add_argument(
         "--subject-type",
-        choices=("task", "agent", "rollout", "eval_set", "secret", "environment"),
+        choices=(
+            "task",
+            "agent",
+            "project",
+            "fleet",
+            "rollout",
+            "eval_set",
+            "secret",
+            "environment",
+            "conversation_thread",
+            "vector_ref",
+        ),
     )
     events_list.add_argument("--subject-id")
     events_list.add_argument("--actor")
@@ -1547,6 +1578,24 @@ def build_parser() -> argparse.ArgumentParser:
     command_audit_list.add_argument("--until", help="ISO timestamp upper bound")
     command_audit_list.add_argument("--limit", type=int, default=100)
     _set(cmd_command_audit_list, command_audit_list)
+
+    observability = sub.add_parser(
+        "observability", help="structured metric/log observations"
+    ).add_subparsers(dest="observability_command", required=True)
+    observability_list = observability.add_parser(
+        "list", help="list structured observability metrics and logs"
+    )
+    observability_list.add_argument("--kind", choices=("metric", "log"))
+    observability_list.add_argument("--layer")
+    observability_list.add_argument("--level")
+    observability_list.add_argument("--name")
+    observability_list.add_argument("--subject-type")
+    observability_list.add_argument("--subject-id")
+    observability_list.add_argument("--since", help="ISO timestamp lower bound")
+    observability_list.add_argument("--until", help="ISO timestamp upper bound")
+    observability_list.add_argument("--after-sequence", type=int)
+    observability_list.add_argument("--limit", type=int, default=100)
+    _set(cmd_observability_list, observability_list)
 
     notifier = sub.add_parser(
         "notifier", help="operator notification channel configuration"

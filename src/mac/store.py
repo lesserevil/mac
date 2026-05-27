@@ -284,6 +284,17 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_fleet_agents_agent
                     ON fleet_agents (agent_id);
 
+                CREATE TABLE IF NOT EXISTS fleet_events (
+                    id TEXT PRIMARY KEY,
+                    fleet_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_fleet_events_fleet_created
+                    ON fleet_events (fleet_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     sender_agent_id TEXT NOT NULL,
@@ -413,6 +424,17 @@ class SQLiteStore:
                     ON command_audit (task_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_command_audit_command
                     ON command_audit (command_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS agent_lifecycle_events (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_lifecycle_events_agent_created
+                    ON agent_lifecycle_events (agent_id, created_at);
 
                 -- Per-agent operational events (mood transitions, nap
                 -- lifecycle, future agent-level audit). Flows through the
@@ -639,6 +661,17 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_projects_status_name
                     ON projects (status, name);
+
+                CREATE TABLE IF NOT EXISTS project_events (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_project_events_project_created
+                    ON project_events (project_id, created_at);
 
                 CREATE TABLE IF NOT EXISTS project_items (
                     id TEXT PRIMARY KEY,
@@ -961,6 +994,15 @@ class SQLiteStore:
                     UNION ALL
                     SELECT id, 'environment', environment_id, event_type, actor, detail, created_at
                     FROM environment_events
+                    UNION ALL
+                    SELECT id, 'project', project_id, event_type, actor, detail, created_at
+                    FROM project_events
+                    UNION ALL
+                    SELECT id, 'fleet', fleet_id, event_type, actor, detail, created_at
+                    FROM fleet_events
+                    UNION ALL
+                    SELECT id, 'agent', agent_id, event_type, actor, detail, created_at
+                    FROM agent_lifecycle_events
                     UNION ALL
                     SELECT id, 'agent', agent_id, event_type, actor, detail, created_at
                     FROM agent_events

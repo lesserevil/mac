@@ -15,6 +15,20 @@ const TASK_STATES = [
     "cancelled",
 ];
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled"]);
+const AUDIT_SUBJECT_TYPES = [
+    "",
+    "task",
+    "agent",
+    "project",
+    "fleet",
+    "rollout",
+    "eval_set",
+    "secret",
+    "environment",
+    "conversation_thread",
+    "vector_ref",
+];
+const OBSERVABILITY_LEVELS = ["", "debug", "info", "warning", "error", "critical"];
 const AGENT_PAGE_SIZE = 50;
 const VIEW_TITLES = {
     overview: "Overview",
@@ -49,6 +63,18 @@ const state = {
     projectFilter: DEFAULT_URL_STATE.projectFilter,
     taskFilter: DEFAULT_URL_STATE.taskFilter,
     selectedId: DEFAULT_URL_STATE.selectedId,
+    auditSubjectType: DEFAULT_URL_STATE.auditSubjectType,
+    auditSubjectId: DEFAULT_URL_STATE.auditSubjectId,
+    auditEventPrefix: DEFAULT_URL_STATE.auditEventPrefix,
+    auditActor: DEFAULT_URL_STATE.auditActor,
+    auditLayer: DEFAULT_URL_STATE.auditLayer,
+    auditLevel: DEFAULT_URL_STATE.auditLevel,
+    auditAgentId: DEFAULT_URL_STATE.auditAgentId,
+    auditTaskId: DEFAULT_URL_STATE.auditTaskId,
+    auditProject: DEFAULT_URL_STATE.auditProject,
+    auditFleet: DEFAULT_URL_STATE.auditFleet,
+    auditSince: DEFAULT_URL_STATE.auditSince,
+    auditUntil: DEFAULT_URL_STATE.auditUntil,
     observabilityLive: [],
     observabilityStream: null,
     observabilityStreamStatus: "idle",
@@ -185,6 +211,7 @@ function readUrlState() {
     const params = new URLSearchParams(window.location.search);
     const rawView = params.get("view") || "overview";
     const page = Number(params.get("agent_page") || "1");
+    const subjectType = params.get("obs_subject_type") || "";
     return {
         activeView: VIEW_KEYS.has(rawView) ? rawView : "overview",
         agentQuery: params.get("agent_q") || "",
@@ -194,6 +221,18 @@ function readUrlState() {
         projectFilter: params.get("project") || "all",
         taskFilter: params.get("task_state") || "all",
         selectedId: params.get("selected") || "",
+        auditSubjectType: AUDIT_SUBJECT_TYPES.includes(subjectType) ? subjectType : "",
+        auditSubjectId: params.get("obs_subject_id") || "",
+        auditEventPrefix: params.get("obs_event_prefix") || "",
+        auditActor: params.get("obs_actor") || "",
+        auditLayer: params.get("obs_layer") || "",
+        auditLevel: params.get("obs_level") || "",
+        auditAgentId: params.get("obs_agent") || "",
+        auditTaskId: params.get("obs_task") || "",
+        auditProject: params.get("obs_project") || "",
+        auditFleet: params.get("obs_fleet") || "",
+        auditSince: params.get("obs_since") || "",
+        auditUntil: params.get("obs_until") || "",
     };
 }
 function applyUrlState() {
@@ -206,6 +245,18 @@ function applyUrlState() {
     state.projectFilter = next.projectFilter;
     state.taskFilter = next.taskFilter;
     state.selectedId = next.selectedId;
+    state.auditSubjectType = next.auditSubjectType;
+    state.auditSubjectId = next.auditSubjectId;
+    state.auditEventPrefix = next.auditEventPrefix;
+    state.auditActor = next.auditActor;
+    state.auditLayer = next.auditLayer;
+    state.auditLevel = next.auditLevel;
+    state.auditAgentId = next.auditAgentId;
+    state.auditTaskId = next.auditTaskId;
+    state.auditProject = next.auditProject;
+    state.auditFleet = next.auditFleet;
+    state.auditSince = next.auditSince;
+    state.auditUntil = next.auditUntil;
 }
 function updateUrlState(replace = false) {
     const params = new URLSearchParams();
@@ -225,6 +276,30 @@ function updateUrlState(replace = false) {
         params.set("task_state", state.taskFilter);
     if (state.selectedId)
         params.set("selected", state.selectedId);
+    if (state.auditSubjectType)
+        params.set("obs_subject_type", state.auditSubjectType);
+    if (state.auditSubjectId.trim())
+        params.set("obs_subject_id", state.auditSubjectId.trim());
+    if (state.auditEventPrefix.trim())
+        params.set("obs_event_prefix", state.auditEventPrefix.trim());
+    if (state.auditActor.trim())
+        params.set("obs_actor", state.auditActor.trim());
+    if (state.auditLayer.trim())
+        params.set("obs_layer", state.auditLayer.trim());
+    if (state.auditLevel.trim())
+        params.set("obs_level", state.auditLevel.trim());
+    if (state.auditAgentId.trim())
+        params.set("obs_agent", state.auditAgentId.trim());
+    if (state.auditTaskId.trim())
+        params.set("obs_task", state.auditTaskId.trim());
+    if (state.auditProject.trim())
+        params.set("obs_project", state.auditProject.trim());
+    if (state.auditFleet.trim())
+        params.set("obs_fleet", state.auditFleet.trim());
+    if (state.auditSince.trim())
+        params.set("obs_since", state.auditSince.trim());
+    if (state.auditUntil.trim())
+        params.set("obs_until", state.auditUntil.trim());
     const query = params.toString();
     const nextUrl = `${window.location.pathname}${query ? `?${query}` : ""}`;
     const method = replace ? "replaceState" : "pushState";
@@ -917,12 +992,13 @@ function renderObservability() {
         latest_metrics: [],
     };
     const counts = observability.counts || {};
-    const commandAudit = data.command_audit || [];
+    const auditEvents = filterAuditEvents(data.events || []);
+    const commandAudit = filterCommandAudit(data.command_audit || []);
     const notifications = data.notifications || [];
     const integrationFindings = data.integration_findings || [];
     const openIntegrationFindings = integrationFindings.filter((item) => item.status === "open");
     const pendingNotifications = notifications.filter((item) => item.status === "pending").length;
-    const live = uniqueObservations([...state.observabilityLive, ...(observability.latest || [])]);
+    const live = filterObservability(uniqueObservations([...state.observabilityLive, ...(observability.latest || [])]));
     const layerTotal = Object.values(observability.layers || {}).reduce((sum, value) => sum + Number(value || 0), 0);
     const levelTotal = Object.values(observability.levels || {}).reduce((sum, value) => sum + Number(value || 0), 0);
     return `
@@ -934,6 +1010,7 @@ function renderObservability() {
       ${metric("Integration Findings", integrationFindings.length, `${openIntegrationFindings.length} open`)}
       ${metric("Stream", state.observabilityStreamStatus, `${state.observabilityLive.length} live item(s)`)}
     </section>
+    ${auditFilterToolbar(data)}
     <section class="split">
       <div class="surface">
         <h2>Metric Snapshot</h2>
@@ -971,6 +1048,15 @@ function renderObservability() {
     </section>
     <section class="surface">
       <div class="surface-heading">
+        <h2>Unified Events</h2>
+        ${chip(`${auditEvents.length}`, auditEvents.length ? "info" : "warn")}
+      </div>
+      <div class="observability-feed">
+        ${auditEvents.length ? auditEvents.slice(0, 120).map(auditEventRecord).join("") : `<div class="empty-state">No matching audit events</div>`}
+      </div>
+    </section>
+    <section class="surface">
+      <div class="surface-heading">
         <h2>Command Audit</h2>
         ${chip(`${commandAudit.length}`, commandAudit.length ? "info" : "warn")}
       </div>
@@ -988,6 +1074,120 @@ function renderObservability() {
       </div>
     </section>
   `;
+}
+function auditFilterToolbar(data) {
+    const projectValues = ["", ...data.project_summaries.map((item) => item.project).filter((item) => item && item !== "unassigned")];
+    const fleetValues = ["", ...data.fleets.map((item) => item.name || item.id)];
+    const agentOptions = `<option value="">Any agent</option>${data.agents.map((item) => option(item.agent.id, item.agent.name, state.auditAgentId)).join("")}`;
+    const taskOptions = `<option value="">Any task</option>${data.tasks.map((item) => option(item.task.id, item.task.title, state.auditTaskId)).join("")}`;
+    return `
+    <section class="toolbar audit-toolbar">
+      <select id="auditSubjectType">
+        ${AUDIT_SUBJECT_TYPES.map((value) => option(value, value ? labelize(value) : "Any subject", state.auditSubjectType)).join("")}
+      </select>
+      <input id="auditSubjectId" value="${escapeHtml(state.auditSubjectId)}" placeholder="Subject id">
+      <input id="auditEventPrefix" value="${escapeHtml(state.auditEventPrefix)}" placeholder="Event prefix">
+      <input id="auditActor" value="${escapeHtml(state.auditActor)}" placeholder="Actor">
+      <input id="auditLayer" value="${escapeHtml(state.auditLayer)}" placeholder="Layer">
+      <select id="auditLevel">
+        ${OBSERVABILITY_LEVELS.map((value) => option(value, value ? labelize(value) : "Any level", state.auditLevel)).join("")}
+      </select>
+      <select id="auditAgentId">${agentOptions}</select>
+      <select id="auditTaskId">${taskOptions}</select>
+      <select id="auditProject">${projectValues.map((value) => option(value, value || "Any project", state.auditProject)).join("")}</select>
+      <select id="auditFleet">${fleetValues.map((value) => option(value, value || "Any fleet", state.auditFleet)).join("")}</select>
+      <input id="auditSince" value="${escapeHtml(state.auditSince)}" placeholder="Since ISO">
+      <input id="auditUntil" value="${escapeHtml(state.auditUntil)}" placeholder="Until ISO">
+      <button type="button" id="clearAuditFilters">Clear</button>
+    </section>
+  `;
+}
+function filterAuditEvents(events) {
+    return events.filter((item) => {
+        if (state.auditSubjectType && item.subject_type !== state.auditSubjectType)
+            return false;
+        if (state.auditSubjectId && item.subject_id !== state.auditSubjectId.trim())
+            return false;
+        if (state.auditEventPrefix && !item.event_type.startsWith(state.auditEventPrefix.trim()))
+            return false;
+        if (state.auditActor && item.actor !== state.auditActor.trim())
+            return false;
+        if (state.auditAgentId && !eventReferences(item, state.auditAgentId))
+            return false;
+        if (state.auditTaskId && !eventReferences(item, state.auditTaskId))
+            return false;
+        if (state.auditProject && !eventReferences(item, state.auditProject))
+            return false;
+        if (state.auditFleet && !eventReferences(item, state.auditFleet))
+            return false;
+        if (state.auditSince && item.created_at < state.auditSince.trim())
+            return false;
+        if (state.auditUntil && item.created_at > state.auditUntil.trim())
+            return false;
+        return true;
+    });
+}
+function filterCommandAudit(records) {
+    return records.filter((item) => {
+        if (state.auditAgentId && item.agent_id !== state.auditAgentId)
+            return false;
+        if (state.auditTaskId && item.task_id !== state.auditTaskId)
+            return false;
+        if (state.auditSubjectType === "agent" && state.auditSubjectId && item.agent_id !== state.auditSubjectId.trim())
+            return false;
+        if (state.auditSubjectType === "task" && state.auditSubjectId && item.task_id !== state.auditSubjectId.trim())
+            return false;
+        if (state.auditEventPrefix && !`command.${item.phase}`.startsWith(state.auditEventPrefix.trim()))
+            return false;
+        if (state.auditSince && item.created_at < state.auditSince.trim())
+            return false;
+        if (state.auditUntil && item.created_at > state.auditUntil.trim())
+            return false;
+        return true;
+    });
+}
+function filterObservability(events) {
+    return events.filter((item) => {
+        if (state.auditLayer && item.layer !== state.auditLayer.trim())
+            return false;
+        if (state.auditLevel && item.level !== state.auditLevel.trim())
+            return false;
+        if (state.auditSubjectType && item.subject_type !== state.auditSubjectType)
+            return false;
+        if (state.auditSubjectId && item.subject_id !== state.auditSubjectId.trim())
+            return false;
+        if (state.auditEventPrefix && !item.name.startsWith(state.auditEventPrefix.trim()))
+            return false;
+        if (state.auditAgentId && !observationReferences(item, state.auditAgentId))
+            return false;
+        if (state.auditTaskId && !observationReferences(item, state.auditTaskId))
+            return false;
+        if (state.auditProject && !observationReferences(item, state.auditProject))
+            return false;
+        if (state.auditFleet && !observationReferences(item, state.auditFleet))
+            return false;
+        if (state.auditSince && item.created_at < state.auditSince.trim())
+            return false;
+        if (state.auditUntil && item.created_at > state.auditUntil.trim())
+            return false;
+        return true;
+    });
+}
+function eventReferences(item, value) {
+    const needle = value.trim();
+    if (!needle)
+        return true;
+    if (item.subject_id === needle || item.actor === needle)
+        return true;
+    return JSON.stringify(item.detail || {}).includes(needle);
+}
+function observationReferences(item, value) {
+    const needle = value.trim();
+    if (!needle)
+        return true;
+    if (item.subject_id === needle || item.source === needle)
+        return true;
+    return JSON.stringify(item.detail || {}).includes(needle);
 }
 function integrationFindingRecord(item) {
     const repo = item.detail?.repository;
@@ -2141,6 +2341,51 @@ function bindViewControls() {
             updateUrlState();
             render();
         });
+    bindAuditControl("#auditSubjectType", "auditSubjectType");
+    bindAuditControl("#auditSubjectId", "auditSubjectId", true);
+    bindAuditControl("#auditEventPrefix", "auditEventPrefix", true);
+    bindAuditControl("#auditActor", "auditActor", true);
+    bindAuditControl("#auditLayer", "auditLayer", true);
+    bindAuditControl("#auditLevel", "auditLevel");
+    bindAuditControl("#auditAgentId", "auditAgentId");
+    bindAuditControl("#auditTaskId", "auditTaskId");
+    bindAuditControl("#auditProject", "auditProject");
+    bindAuditControl("#auditFleet", "auditFleet");
+    bindAuditControl("#auditSince", "auditSince", true);
+    bindAuditControl("#auditUntil", "auditUntil", true);
+    const clearAudit = document.querySelector("#clearAuditFilters");
+    if (clearAudit)
+        clearAudit.addEventListener("click", () => {
+            state.auditSubjectType = "";
+            state.auditSubjectId = "";
+            state.auditEventPrefix = "";
+            state.auditActor = "";
+            state.auditLayer = "";
+            state.auditLevel = "";
+            state.auditAgentId = "";
+            state.auditTaskId = "";
+            state.auditProject = "";
+            state.auditFleet = "";
+            state.auditSince = "";
+            state.auditUntil = "";
+            updateUrlState();
+            render();
+        });
+}
+function bindAuditControl(selector, key, replace = false) {
+    const control = document.querySelector(selector);
+    if (!control)
+        return;
+    control.addEventListener("input", (event) => {
+        state[key] = event.target.value;
+        updateUrlState(replace);
+        render();
+    });
+    control.addEventListener("change", (event) => {
+        state[key] = event.target.value;
+        updateUrlState(replace);
+        render();
+    });
 }
 function handleContentClick(event) {
     const projectTarget = event.target?.closest("[data-project]");
@@ -2632,6 +2877,23 @@ function observationRecord(item) {
       </div>
       <div class="muted small">${escapeHtml(item.layer)} / ${escapeHtml(item.source)} ${subject ? `· ${escapeHtml(subject)}` : ""} · ${escapeHtml(formatAge(item.created_at))}</div>
       <div class="observation-detail">${escapeHtml(item.kind === "metric" ? formatMetricValue(item) : jsonSummary(item.detail))}</div>
+    </article>
+  `;
+}
+function auditEventRecord(item) {
+    const tone = item.event_type.includes("deleted") || item.event_type.includes("failed")
+        ? "warn"
+        : item.event_type.includes("error")
+            ? "bad"
+            : "info";
+    return `
+    <article class="observation-row tone-left-${tone}">
+      <div class="observation-main">
+        ${chip(item.subject_type, "info")}
+        <strong>${escapeHtml(item.event_type)}</strong>
+      </div>
+      <div class="muted small">${escapeHtml(item.subject_id)} · ${escapeHtml(item.actor)} · ${escapeHtml(formatAge(item.created_at))}</div>
+      <div class="observation-detail">${escapeHtml(jsonSummary(item.detail))}</div>
     </article>
   `;
 }

@@ -294,22 +294,43 @@ class RolesService:
         # — those gate dispatch, not registration.
         merged = sorted(set(agent.capabilities) | set(role.default_capabilities))
         now = utcnow()
-        self.store.execute(
-            """
-            UPDATE agents
-            SET role_id = ?, capabilities = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (role.id, json_dumps(merged), now, agent.id),
-        )
-        self.observability.record_log(
-            "agent.role_assigned",
-            layer="control_plane",
-            source="roles",
-            subject_type="agent",
-            subject_id=agent.id,
-            detail={"role_id": role.id, "role_slug": role.slug},
-        )
+        detail = {
+            "actor": "human",
+            "agent_id": agent.id,
+            "role_id": role.id,
+            "role_slug": role.slug,
+            "added_capabilities": sorted(set(merged) - set(agent.capabilities)),
+        }
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE agents
+                SET role_id = ?, capabilities = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (role.id, json_dumps(merged), now, agent.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_lifecycle_events (id, agent_id, event_type, actor, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (new_id("alce"), agent.id, "agent.role_assigned", "human", json_dumps(detail), now),
+            )
+            self.observability.insert_observation(
+                conn,
+                "log",
+                "agent.role_assigned",
+                "control_plane",
+                "roles",
+                "info",
+                None,
+                "",
+                "agent",
+                agent.id,
+                detail,
+                now,
+            )
         return self._get_agent(agent.id)
 
     def unassign_role(self, agent_id: str) -> Agent:
@@ -317,18 +338,37 @@ class RolesService:
         if agent.role_id is None:
             return agent
         now = utcnow()
-        self.store.execute(
-            "UPDATE agents SET role_id = NULL, updated_at = ? WHERE id = ?",
-            (now, agent.id),
-        )
-        self.observability.record_log(
-            "agent.role_unassigned",
-            layer="control_plane",
-            source="roles",
-            subject_type="agent",
-            subject_id=agent.id,
-            detail={"previous_role_id": agent.role_id},
-        )
+        detail = {
+            "actor": "human",
+            "agent_id": agent.id,
+            "previous_role_id": agent.role_id,
+        }
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE agents SET role_id = NULL, updated_at = ? WHERE id = ?",
+                (now, agent.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_lifecycle_events (id, agent_id, event_type, actor, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (new_id("alce"), agent.id, "agent.role_unassigned", "human", json_dumps(detail), now),
+            )
+            self.observability.insert_observation(
+                conn,
+                "log",
+                "agent.role_unassigned",
+                "control_plane",
+                "roles",
+                "info",
+                None,
+                "",
+                "agent",
+                agent.id,
+                detail,
+                now,
+            )
         return self._get_agent(agent.id)
 
     # Soul-role compatibility ------------------------------------------
