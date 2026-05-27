@@ -1164,10 +1164,10 @@ validate_tokenhub_endpoint() {
       log "TokenHub is optional and no endpoint is configured"
       return
     fi
-    if curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/healthz" >/dev/null; then
-      log "Optional TokenHub reachable at configured health endpoint"
+    if curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/v1/models" >/dev/null; then
+      log "Optional TokenHub reachable at configured OpenAI-compatible endpoint"
     else
-      log "WARNING: optional TokenHub is unreachable at ${tokenhub_url%/}/healthz"
+      log "WARNING: optional TokenHub is unreachable at ${tokenhub_url%/}/v1/models"
     fi
     return
   fi
@@ -1179,19 +1179,19 @@ validate_tokenhub_endpoint() {
     log "ERROR: TokenHub is required but no endpoint is configured"
     exit 1
   fi
-  if ! curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/healthz" >/dev/null; then
+  if ! curl -fsS --connect-timeout 2 --max-time 5 "${tokenhub_url%/}/v1/models" >/dev/null; then
     # The configured URL may be an external DNS name not reachable from inside this host
     # (e.g. a K8s service FQDN when the service doesn't expose the tokenhub port).
     # Fall back to loopback — valid when tokenhub is installed locally on this node.
     local loopback_port="${MAC_TOKENHUB_PORT:-${TOKENHUB_PORT_CONFIGURED:-8090}}"
-    if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${loopback_port}/healthz" >/dev/null 2>&1; then
-      log "TokenHub health confirmed on loopback; configured URL ${tokenhub_url%/} is not reachable from this host"
+    if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${loopback_port}/v1/models" >/dev/null 2>&1; then
+      log "TokenHub reachable on loopback; configured URL ${tokenhub_url%/} is not reachable from this host"
       tokenhub_url="http://127.0.0.1:${loopback_port}"
     elif truthy "$allow_degraded"; then
-      log "WARNING: TokenHub health endpoint is unreachable; degraded override is active"
+      log "WARNING: TokenHub is unreachable; degraded override is active"
       return
     else
-      log "ERROR: TokenHub is unreachable at ${tokenhub_url%/}/healthz"
+      log "ERROR: TokenHub is unreachable at ${tokenhub_url%/}/v1/models"
       exit 1
     fi
   fi
