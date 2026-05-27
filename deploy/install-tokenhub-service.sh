@@ -569,13 +569,38 @@ EOF
 }
 
 wait_for_tokenhub() {
-  local health_urls=("http://127.0.0.1:${TOKENHUB_PORT}/healthz")
-  local health_url
-  if [ -n "${TOKENHUB_BIND_ADDR:-}" ]; then
-    health_urls+=("http://${TOKENHUB_BIND_ADDR}:${TOKENHUB_PORT}/healthz")
+  local health_urls health_url
+  #
+  # Liveness check via /v1/models rather than /healthz.  TokenHub returns 503
+  # from /healthz when it has no providers configured (it is running but not
+  # yet provisioned).  That 503 triggers curl -f to fail, making the entire
+  # service appear dead during the window before providers are seeded.
+  # The /v1/models endpoint always returns HTTP 200 with a valid JSON body
+  # as long as the HTTP server is up, making it a reliable "is the server
+  # alive?" signal regardless of provisioning state.
+  #
+  # Build list without duplicating entries: only add TOKENHUB_URL if it is
+  # not the same as TOKENHUB_BIND_ADDR (avoids the double-entry that appeared
+  # in past error messages when the bind address was set explicitly to the
+  # loopback equivalent of the fleet URL).
+  #
+  health_urls=()
+  health_urls+=("http://127.0.0.1:${TOKENHUB_PORT}/v1/models")
+  if [ -n "${TOKENHUB_BIND_ADDR:-}" ] && [ "${TOKENHUB_BIND_ADDR}" != "127.0.0.1" ] && [ "${TOKENHUB_BIND_ADDR}" != "::1" ]; then
+    health_urls+=("http://${TOKENHUB_BIND_ADDR}:${TOKENHUB_PORT}/v1/models")
   fi
-  health_urls+=("${TOKENHUB_URL%/}/healthz")
+  # Add TOKENHUB_URL only when it is not already covered by the two above.
+  local canonical_url="${TOKENHUB_URL%/}"
+  local already_covered=0
+  case "$canonical_url" in
+    "http://127.0.0.1:${TOKENHUB_PORT}"|"http://[::1]:${TOKENHUB_PORT}") already_covered=1 ;;
+    "http://${TOKENHUB_BIND_ADDR}:${TOKENHUB_PORT}") already_covered=1 ;;
+  esac
+  [ "$already_covered" = "0" ] && health_urls+=("${canonical_url}/v1/models")
+
+  local attempts=0
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    attempts=$((attempts + 1))
     for health_url in "${health_urls[@]}"; do
       if curl -fsS --connect-timeout 2 --max-time 5 "$health_url" >/dev/null 2>&1; then
         log "TokenHub ready at $health_url"
@@ -584,12 +609,16 @@ wait_for_tokenhub() {
     done
     sleep 2
   done
-  echo "[tokenhub] ERROR: TokenHub did not become ready at ${health_urls[*]}" >&2
+  echo "[tokenhub] ERROR: TokenHub did not become ready after ${attempts} attempts at: ${health_urls[*]}" >&2
   exit 1
 }
 
 tokenhub_admin_base_url() {
-  if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${TOKENHUB_PORT}/healthz" >/dev/null 2>&1; then
+  # Use /v1/models instead of /healthz for the same reason as wait_for_tokenhub:
+  # /healthz returns 503 when no providers are configured (service alive but
+  # unprovisioned), causing this check to fall through to the else branch and
+  # return the external TOKENHUB_URL even when the service is reachable locally.
+  if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${TOKENHUB_PORT}/v1/models" >/dev/null 2>&1; then
     printf 'http://127.0.0.1:%s\n' "$TOKENHUB_PORT"
   else
     printf '%s\n' "${TOKENHUB_URL%/}"
